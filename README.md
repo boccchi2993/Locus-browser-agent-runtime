@@ -1,6 +1,6 @@
 # Browser Agent Runtime (Locus)
 
-A browser-native AI agent runtime that executes file, Python and public-network workloads locally — without a remote sandbox, Docker, local daemon, CLI, or localhost server.
+A Unix-like execution substrate for AI agents, implemented inside a browser tab. Locus aims to handle lightweight computation, files and Internet access locally without requiring a remote sandbox, Docker, local daemon, CLI, or localhost server.
 
 Forked from the terminal UI / model-interaction skeleton of [Whoami_Cli_game](https://github.com/boccchi2993/Whoami_Cli_game). All game content has been removed; this is not a game.
 
@@ -11,25 +11,28 @@ Forked from the terminal UI / model-interaction skeleton of [Whoami_Cli_game](ht
 
 > **Normalize capabilities. Preserve model semantics.**
 
-Locus keeps the model-facing capability surface small and maps familiar operations onto browser, edge and future cloud backends. Domain-specific features should normally grow through extensions rather than by expanding the core tool surface.
+> **If a lightweight task can be expressed as computation + files + network, it should not require a cloud computer.**
+
+Locus keeps the model-facing machine surface small and Unix-like. The browser runtime provides execution, filesystem and network substrate; the harness composes those capabilities and decides when an extension or heavier provider is required. Domain-specific features should normally grow through Plugins, Skills and MCP rather than by expanding the runtime core.
 
 Architecture and planning docs:
 
-- [Architecture and core primitives](docs/ARCHITECTURE.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md)
 - [Model protocol and reasoning replay](docs/MODEL-PROTOCOL.md)
 - [Roadmap](ROADMAP.md)
 - [Implementation TODO](TODO.md)
 
 ## Why
 
-Remote sandboxes should be the fallback, not the default, for lightweight agent workloads. The cheapest, most private place to run an agent task is the environment closest to the data: the user's own browser, on files the user explicitly granted access to. The cloud should only carry LLM inference — and, when browser networking is blocked by CORS, a thin anonymous fetch relay.
+Remote computers should be escalation providers, not the default, for lightweight agent workloads. The cheapest, most private place to run ordinary computation is usually the environment closest to the data: the user's own browser, on files the user explicitly granted access to. Model inference, external authority, relays, authenticated services and genuinely heavyweight execution may remain remote; lightweight execution should not become cloud work merely because the caller is an agent.
 
 ## Current capabilities
 
 - Local workspace access via the File System Access API (user-picked directory, read/write)
 - Browser-local shell abstraction (`bash` tool: `pwd`, `ls`, `cat`, `echo`, `python`, `curl`)
 - Python execution via Pyodide in a Web Worker (lazy-loaded, stdout/stderr/traceback returned, pandas auto-loaded on import)
-- **Browser-native network access through `curl`** (HTTPS GET: `curl <url>` prints text, `curl -o <file> <url>` downloads)
+- **Browser-native network capability currently exposed through `curl`** (HTTPS GET: `curl <url>` prints text, `curl -o <file> <url>` downloads); long term, Python/JS networking should reuse the same runtime boundary
 - **Direct browser fetch with transparent edge relay fallback** (only on genuine CORS/network failure, never on HTTP error statuses)
 - **Binary-safe downloads into the local workspace** (no text decoding anywhere in the network path)
 - Agent tool loop (structured ` ```json ` tool calls, results fed back, max 15 iterations)
@@ -40,22 +43,45 @@ Remote sandboxes should be the fallback, not the default, for lightweight agent 
 
 ## Architecture
 
+Locus separates the Unix-like interface the model sees from the browser-native substrate that implements it:
+
 ```
-User
- ↓
-Agent (LLM, cloud inference only)
- ↓
-bash
- ↓
-Browser Runtime
- ├─ Workspace (File System Access API, path-escape protected)
- ├─ Pyodide (Web Worker, lazy-loaded)
- └─ NetworkRuntime
-      ├─ direct browser fetch
-      └─ edge /fetch relay (only when browser networking blocks the request)
+                    Agent
+                      |
+               +------+------+
+               |             |
+             bash           edit
+               |
+       python / js / curl / Unix utilities
+               |
+        Runtime Substrate
+     execution / filesystem / network
+               |
+             Browser
 ```
 
-The model never sees Pyodide/WebAssembly/fetch internals — it only sees `bash`, a restricted local shell in the user-authorized workspace. The harness decides where each capability runs. A `cloud_bash` tool exists in the interface but is not configured and always returns `success: false` with `Cloud execution is not configured.`
+The current V0.3 implementation is a partial realization of that target:
+
+```
+Agent
+  |
+bash
+  |
+Browser Runtime
+  +-- Workspace ------> File System Access API
+  +-- Python ---------> Pyodide Worker
+  +-- curl -----------> NetworkRuntime
+                         +-- browser-direct
+                         +-- edge /fetch relay
+```
+
+The model should not need to care whether Python is Pyodide, a command is backed by WASM, or HTTP required a relay. `bash` is the Unix-like execution facade; `edit` is the target deterministic mutation interface; execution/filesystem/network are the runtime substrate beneath them.
+
+Plugins add code, Skills add knowledge, and MCP adds external authority. Capabilities such as Excel editing, RAG, ffmpeg, LibreOffice or compilers should normally be composed above the runtime rather than becoming new core tools.
+
+A `cloud_bash` tool exists in the current interface but is not configured and always returns `success: false` with `Cloud execution is not configured.` It represents a future escalation provider for workloads that genuinely need a remote computer.
+
+See [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md) for the detailed layer model.
 
 ```
 index.html            page layout, terminal theme, inline Pyodide worker source
@@ -78,7 +104,7 @@ Note: the Pyodide worker source is embedded in `index.html` (loaded via a Blob U
 
 ## curl in the browser runtime
 
-`curl` is a deliberately small compatibility command, not real curl:
+`curl` is currently the Unix-facing frontend to Locus network capability. It is a deliberately small compatibility command, not real curl:
 
 ```bash
 curl <https-url>               # text-like responses (text/*, JSON, XML, YAML, JS) print to stdout
