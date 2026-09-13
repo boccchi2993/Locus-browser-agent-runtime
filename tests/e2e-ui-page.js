@@ -184,6 +184,55 @@
     check('U38 new task opens fresh empty conversation',
       L.store.conversations[0].items.length === 0 && !!$('.empty-state'));
 
+    // ---------- cross-conversation event isolation (P3.1 race) ----------
+    // Old task's tail events must follow the OLD conversation even after
+    // New task made a new conversation live/active.
+    window.__e2eReplies.push((body, opts) => new Promise((resolve, reject) => {
+      opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+    }));
+    const convA = L.store.conversations.find((c) => c.id === L.store.liveConversationId);
+    const pA2 = L.actions.submit('isolation task A');
+    await waitFor(() => L.store.busy, 3000);
+    // real UI event: New task button click
+    $('.new-task-btn').click();
+    await sleep(80);
+    const convB = L.store.conversations.find((c) => c.id === L.store.liveConversationId);
+    check('U40 new task creates B while A settles', convB && convB.id !== convA.id
+      && L.store.activeConversationId === convB.id);
+    await pA2;
+    await sleep(80);
+    check('U41 A tail events (session_changed) stay in A',
+      convA.status === 'session_changed'
+      && convA.items.some((i) => i.kind === 'warning' && i.code === 'session_changed'));
+    check('U42 B untouched by A tail events',
+      convB.items.length === 0 && convB.status === 'idle');
+    check('U43 busy released only after A settled', L.store.busy === false);
+
+    // B runs its own task; A must receive none of it — and viewing A
+    // mid-task must not reroute B's events.
+    window.__e2eReplies.push(
+      { content: '```json\n{"tool":"bash","input":"ls"}\n```', reasoning: 'B reasoning', reasoningType: 'raw' },
+      (body, opts) => new Promise((resolve) => { window.__e2eGate = () => resolve({ content: 'B final answer', reasoning: null, reasoningType: 'raw', rawMessage: { role: 'assistant', content: 'B final answer' }, stopReason: 'end_turn', usage: null, providerMetadata: null, truncated: false }); }),
+    );
+    window.__e2eToolExecutor = async () => ({ output: 'b-file', success: true, backend: 'browser', operation: 'shell' });
+    const aItemCount = convA.items.length;
+    const pB2 = L.actions.submit('isolation task B');
+    await waitFor(() => convB.items.some((i) => i.kind === 'tool'), 5000);
+    // user browses history (real recents click) while B's task is mid-flight
+    $$('.recent-item').find((el) => el.textContent.includes('isolation task A')).click();
+    await sleep(60);
+    check('U44 viewing A while B runs', L.store.activeConversationId === convA.id
+      && L.store.liveConversationId === convB.id);
+    window.__e2eGate();
+    await pB2;
+    await sleep(80);
+    check('U45 B events all landed in B despite view switch',
+      convB.status === 'completed'
+      && convB.items.some((i) => i.kind === 'assistant' && i.content === 'B final answer')
+      && convB.items.some((i) => i.kind === 'reasoning' && i.content === 'B reasoning'));
+    check('U46 A received none of B events', convA.items.length === aItemCount
+      && !convA.items.some((i) => i.content === 'B final answer'));
+
     // ---------- hygiene ----------
     check('U39 no console errors / unhandled rejections',
       (window.__e2eErrors || []).length === 0, (window.__e2eErrors || []).join(' ; '));

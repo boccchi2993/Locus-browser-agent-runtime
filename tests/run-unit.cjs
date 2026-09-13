@@ -13,6 +13,7 @@ const SUITES = [
   'shell.test.cjs',
   'agent.test.cjs',
   'presentation.test.cjs',
+  'conversation-routing.test.mjs',
   'worker-init.test.cjs',
   'worker-output.test.cjs',
 ];

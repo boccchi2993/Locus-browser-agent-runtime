@@ -116,11 +116,25 @@ function wiredToolExecutor(tool, input, workspace, opts) {
   return executeTool(tool, input, workspace, opts);
 }
 
+// Conversation identity semantics — three DIFFERENT concepts, never merge:
+//   activeConversationId  — which conversation the user is looking at.
+//   liveConversationId    — which conversation the current AgentSession
+//                           session maps to (moved by newTask/mountFolder).
+//   runningConversationId — which conversation the in-flight runtime task's
+//                           events MUST project into, bound at submit() time.
+// A task's events follow the task, not whichever conversation happens to be
+// live when a tail event (warning/session_changed/task_end) arrives.
+let runningConversationId = null;
+
 function handleRuntimeEvent(event) {
-  const conv = store.conversations.find((c) => c.id === store.liveConversationId);
+  const targetId = runningConversationId !== null ? runningConversationId : store.liveConversationId;
+  const conv = store.conversations.find((c) => c.id === targetId);
   if (conv) LocusProjector.projectEvent(conv, event);
   if (event.type === 'tool_result') store.telemetryVersion++;
   if (event.type === 'task_end') {
+    // Reliable lifecycle end: release the binding only when the task that
+    // owned it reports its end.
+    runningConversationId = null;
     store.busy = false;
     store.cancelling = false;
   }
@@ -191,6 +205,12 @@ function startConversation() {
 }
 
 export function newTask() {
+  // Cancel + reset the old session, but do NOT touch runningConversationId:
+  // the old task's tail events (session_changed / task_end) must still
+  // project into ITS conversation. The new conversation becomes live/active
+  // immediately, yet never receives the old task's events. store.busy stays
+  // true until the old task actually ends — the AgentSession concurrent-run
+  // guard is never bypassed by flipping UI flags early.
   if (store.busy) session.cancel();
   session.reset();
   store.attachments = [];
@@ -213,10 +233,23 @@ export async function submit(text) {
   store.plusMenuOpen = false;
   store.busy = true;
   store.cancelling = false;
+  // Bind this task's events to the conversation that is live NOW, before
+  // run() starts. If newTask()/mountFolder() later moves liveConversationId
+  // while this task is still settling, its tail events still land here.
+  if (store.liveConversationId == null) startConversation(); // defensive: never route into a random conversation
+  runningConversationId = store.liveConversationId;
+  const boundId = runningConversationId;
   try {
+    // run() resolves only AFTER task_end has been emitted (the binding is
+    // released by handleRuntimeEvent at that point) — so by the time this
+    // await returns, no late event of this task can still be in flight.
     await session.run(input, { workspace: workspace });
   } catch (e) {
-    const conv = store.conversations.find((c) => c.id === store.liveConversationId);
+    // run() threw without a normal task lifecycle (e.g. the concurrent-run
+    // guard): no task_end will arrive, so release the binding here instead
+    // of leaving a stale route for some future task's events.
+    if (runningConversationId === boundId) runningConversationId = null;
+    const conv = store.conversations.find((c) => c.id === boundId);
     if (conv) {
       LocusProjector.projectEvent(conv, {
         type: 'error',
