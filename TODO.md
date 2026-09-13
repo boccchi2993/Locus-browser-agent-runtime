@@ -211,7 +211,7 @@ Do not declare core frozen until:
 ### Plugins
 
 - [ ] Define minimal plugin manifest.
-- [ ] Plugin can declare required core primitives.
+- [ ] Plugin can declare required runtime capabilities.
 - [ ] Plugin can provide Python packages.
 - [ ] Plugin can provide JavaScript/WASM packages.
 - [ ] Plugin install/load failure is isolated and visible.
