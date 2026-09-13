@@ -1,0 +1,21 @@
+{
+  "name": "locus-browser-agent-runtime",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser-native agent runtime — Vue 3 presentation layer over the UI-independent AgentSession event stream.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 4173 --strictPort",
+    "test": "node tests/run-unit.cjs",
+    "test:e2e": "node tests/e2e.cjs"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.0.7"
+  }
+}
