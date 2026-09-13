@@ -7,15 +7,23 @@
 
 Locus is a browser-native execution harness for AI agents.
 
-It presents familiar computer interfaces to the model while routing each operation to the cheapest, closest, least-privileged environment that can reliably complete it.
+More precisely:
 
-Two short rules summarize the project:
+> **Locus is a Unix-like execution substrate for agents, implemented inside a browser tab.**
+
+It presents familiar computer interfaces to the model while routing operations to the cheapest, closest, least-privileged environment that can reliably complete them.
+
+Three short rules summarize the project:
 
 > **Model decides WHAT. Harness decides WHERE.**
 
 > **Normalize capabilities. Preserve model semantics.**
 
-Locus is not trying to emulate a full Linux machine inside the browser. It is trying to expose a small, stable capability surface that models already understand, then map those capabilities onto browser, edge, external-service, or future cloud execution backends.
+> **If a lightweight task can be expressed as computation + files + network, it should not require a cloud computer.**
+
+Locus is not trying to emulate the Linux kernel or a full POSIX ABI. It is trying to reproduce enough Unix-like userland semantics that an agent can treat a browser tab as its default lightweight computer.
+
+See [CAPABILITY-BOUNDARIES.md](CAPABILITY-BOUNDARIES.md) for the detailed runtime / harness / extension boundary.
 
 ## 2. Core invariants
 
