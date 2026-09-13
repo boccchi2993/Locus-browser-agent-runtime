@@ -70,9 +70,9 @@ Not blocking AgentSession / provider architecture work.
 
 - [x] Introduce AgentSession or equivalent UI-independent runtime. (`src/agent.js` `AgentSession`)
 - [x] Remove terminal object from agent-loop function signatures. (`runAgentTask(term, …)` → `session.run(input, { workspace })`)
-- [x] Remove direct term.echo / render calls from runtime logic. (terminal rendering lives in the ui.js event adapter)
+- [x] Remove direct term.echo / render calls from runtime logic. (V0.3: terminal rendering in ui.js; V0.4: removed, Vue store consumes events)
 - [x] Remove direct DOM dependencies from the agent loop.
-- [x] Inject model adapter instead of reading presentation globals. (`modelClient` injection; `Model.model` is added by the ui.js wiring)
+- [x] Inject model adapter instead of reading presentation globals. (`modelClient` injection; `Model.model` is added by the presentation wiring)
 - [x] Inject workspace/session state instead of reading App.workspace directly. (workspace bound per `run()` call)
 - [x] Keep tool execution behind a runtime dependency boundary. (`toolExecutor` injection)
 - [x] Make one complete agent loop runnable in tests without DOM/UI. (`tests/agent.test.cjs` runs the full loop in Node)
@@ -80,7 +80,7 @@ Not blocking AgentSession / provider architecture work.
 ### Runtime events
 
 A small provider-neutral event surface is implemented and consumed by the
-terminal adapter in `src/ui.js`:
+presentation store in `src/ui/store.js`:
 
 - [x] task_start
 - [x] reasoning (full provider-visible reasoning; presentation truncation is a UI concern)
@@ -124,26 +124,32 @@ Prerequisite: AgentSession must already run without UI dependencies.
 
 ### Project structure
 
-- [ ] Introduce Vue 3 + Vite.
-- [ ] Move current presentation into Vue components/store.
-- [ ] Keep runtime modules framework-independent.
-- [ ] Remove jQuery Terminal as an architectural dependency.
-- [ ] Decide whether a terminal-style component remains as a visual surface.
+- [x] Introduce Vue 3 + Vite. (`package.json`, `vite.config.js`, `src/main.js`, `src/App.vue`)
+- [x] Move current presentation into Vue components/store. (`src/components/`, `src/ui/store.js`)
+- [x] Keep runtime modules framework-independent. (runtime `src/*.js` are classic scripts; no Vue imports — grep-verified)
+- [x] Remove jQuery Terminal as an architectural dependency. (`src/ui.js` deleted; jQuery/jQuery-Terminal CDN removed from index.html)
+- [x] Decide whether a terminal-style component remains as a visual surface. (No terminal surface; a reserved, clearly marked Terminal drawer is the future entry point — not wired to any shell semantics)
+- [x] Pure event→timeline projector, framework-independent and Node-tested. (`src/ui/projector.js`, `tests/presentation.test.cjs`)
 
 ### Main interface
 
-- [ ] Conversation timeline.
-- [ ] User message cards.
-- [ ] Assistant final output.
-- [ ] Collapsible reasoning panels.
-- [ ] Tool-call panels.
-- [ ] Tool-result panels.
-- [ ] Backend badge: browser / browser-direct / edge-relay / cloud.
-- [ ] Workspace selector/status.
-- [ ] Model/provider configuration.
-- [ ] Execution/debug telemetry panel.
-- [ ] Clear error presentation.
-- [ ] Busy/cancel state where supported.
+- [x] Conversation timeline.
+- [x] User message cards.
+- [x] Assistant final output (markdown-lite, escape-first).
+- [x] Collapsible reasoning panels (full content preserved, `summary` labeled "Reasoning summary").
+- [x] Tool-call panels (collapsible; long inputs folded).
+- [x] Tool-result panels (attached to their call; long outputs folded).
+- [x] Backend badge: browser / browser-direct / edge-relay / cloud (only from event metadata).
+- [x] Workspace selector/status (composer chip + context rail; mount = real session boundary).
+- [x] Model/provider configuration (Settings panel: key, endpoint, model, dialect, proxy).
+- [x] Execution/debug telemetry panel (context rail Telemetry section).
+- [x] Clear error presentation.
+- [x] Busy/cancel state where supported (composer Cancel + Escape; AgentSession remains the real guard).
+- [x] Conversation history sidebar (New task / search / recents; page-lifetime only, no durable persistence).
+- [x] Composer `+` context menu: Upload files (seam, marked not-wired) / Mount folder (working) / Open terminal (reserved drawer).
+- [ ] Durable conversation persistence across reloads (recents are page-lifetime by design for now).
+- [ ] Attachment runtime pipeline (upload UI seam exists; files are never sent to the agent yet).
+- [ ] Direct user terminal over the shared workspace authority (drawer reserved; no shell semantics added).
 
 ### UI rule
 

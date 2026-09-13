@@ -48,7 +48,7 @@ Goal: separate the agent runtime from presentation and preserve model-native con
 
 ### Agent/UI separation
 
-Status: implemented (`src/agent.js` `AgentSession` + event adapter in `src/ui.js`; Node coverage in `tests/agent.test.cjs`).
+Status: implemented (`src/agent.js` `AgentSession`; terminal adapter removed in V0.4 — the Vue presentation store now consumes the event stream; Node coverage in `tests/agent.test.cjs`).
 
 - [x] remove direct terminal/DOM dependencies from the agent loop,
 - [x] replace runAgentTask(term, ...) style coupling,
@@ -78,21 +78,23 @@ Goal: make the UI reflect an execution harness rather than a terminal-only demo,
 
 ### Vue UI
 
-Rebuild the presentation layer with Vue 3 + Vite after the runtime loop is UI-independent.
+Status: implemented (Vue 3 + Vite; `src/main.js`, `src/App.vue`, `src/components/`, `src/ui/store.js` + pure projector `src/ui/projector.js`; Node coverage in `tests/presentation.test.cjs`, real-browser UI coverage in `tests/e2e-ui.cjs`).
 
-The UI should present:
+The presentation is a Cowork-style agent workspace — a left task-history sidebar (New task / search / recents), a quiet centered timeline, a bottom composer with a `+` context menu (Upload files / Mount folder / Open terminal), and a collapsible right rail for progress / working folder / context / telemetry. Everything rendered is projected from AgentSession runtime events; the timeline is never used to rebuild provider history.
+
+The UI presents:
 
 - user messages,
-- assistant output,
-- collapsible reasoning when available,
-- tool calls,
-- tool results,
-- execution backend,
-- workspace state,
-- errors and retries,
-- telemetry/debug information.
+- assistant output (markdown-lite, escape-first),
+- collapsible reasoning when available (full content preserved; `summary` presentation labeled),
+- tool calls (collapsible, long inputs folded),
+- tool results (with backend badge taken only from event metadata: browser / browser-direct / edge-relay / cloud),
+- workspace state (composer chip + rail, mount = real session boundary),
+- errors and warnings,
+- busy/cancel state (composer Cancel button + Escape),
+- telemetry in the context rail.
 
-The terminal aesthetic may remain, but terminal rendering should not define the runtime architecture.
+Deferred seams, honestly marked in the UI rather than faked: file-upload attachments (no runtime pipeline yet), the terminal drawer (reserved, not wired), durable cross-reload conversation persistence (recents live for the page session only).
 
 ### JavaScript userland runtime
 

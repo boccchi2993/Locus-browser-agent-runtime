@@ -84,7 +84,9 @@ A `cloud_bash` tool exists in the current interface but is not configured and al
 See [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md) for the detailed layer model.
 
 ```
-index.html            page layout, terminal theme, inline Pyodide worker source
+index.html            Vite entry page + inline Pyodide worker source; loads runtime classic scripts, then the Vue app
+package.json          npm run dev / build / test / test:e2e
+vite.config.js        Vue plugin + copies the un-bundled runtime scripts into dist/
 src/
   model.js            LLM API client (Anthropic/OpenAI dialect fallback, optional CORS proxy)
   agent.js            AgentSession: UI-independent agent tool loop (runtime events, DI) + system prompt + strict tool-call parser
@@ -93,11 +95,17 @@ src/
   network.js          NetworkRuntime: direct fetch with transparent /fetch relay fallback
   workspace.js        WorkspaceAdapter + LocalDirectoryWorkspace
   telemetry.js        in-memory execution log
-  ui.js               setup screen, workspace picker, terminal event adapter (renders runtime events), debug panel
+  main.js             Vue bootstrap (+ ?e2e=1 / ?demo=… QA hooks)
+  App.vue             three-region workspace shell
+  components/         Sidebar (task history), Timeline + item renderers, Composer (+ context menu), ContextRail, SettingsPanel, TerminalPanel
+  ui/store.js         presentation store: owns UI state, wires AgentSession events into the projector
+  ui/projector.js     pure runtime-event → timeline projection (framework-independent, Node-tested)
+  ui/markdown.js      markdown-lite renderer for assistant text (escape-first, XSS-safe)
+  ui/theme.css        Cowork-style neutral theme (light + dark via prefers-color-scheme)
 functions/proxy.js    optional Cloudflare Pages Function (CORS relay for the LLM API)
 functions/fetch.js    optional Cloudflare Pages Function (anonymous public-HTTPS resource relay)
 examples/demo-workspace/sales.csv
-tests/                node unit tests + headless browser regression suite
+tests/                node unit tests + headless browser regression suites (runtime + presentation)
 ```
 
 Note: the Pyodide worker source is embedded in `index.html` (loaded via a Blob URL that is revoked immediately after worker construction) so the page also works when opened directly from `file://`, where browsers block `new Worker('...js')`.
@@ -121,12 +129,15 @@ curl -o <file> <https-url>     # binary-safe download into the workspace (also: 
 
 ## Run
 
-No build step. Either:
+```bash
+npm install
+npm run dev      # Vite dev server (http://localhost:5173)
+npm run build    # static build into dist/ (deployable as-is)
+```
 
-- open `index.html` directly in Chrome/Edge, or
-- deploy the folder as a static site (enables the `/proxy` and `/fetch` Pages Functions)
+The presentation layer is Vue 3 + Vite. It is a **projection of the AgentSession runtime event stream** (`task_start` / `reasoning` / `tool_call` / `tool_result` / `assistant_text` / `warning` / `error` / `task_end`): the runtime under `src/` stays framework-independent classic scripts, and the conversation timeline in the UI is **not** the provider history — provider history is owned by `AgentSession` / the provider adapters, the timeline is owned by the presentation store, and neither is ever reconstructed from the other.
 
-You need an LLM API key (default endpoint: DeepSeek; Anthropic and OpenAI-compatible endpoints also work). The key is never written to the repo; if you opt into "remember", it is kept in `sessionStorage` only (see the security note in `src/ui.js`).
+You need an LLM API key (default endpoint: DeepSeek; Anthropic and OpenAI-compatible endpoints also work) — set it in the Settings panel. The key is never written to the repo; if you opt into "remember", it is kept in `sessionStorage` only (cleared when the tab closes).
 
 Connection behavior: if you configure an explicit proxy URL it is always used. Otherwise the app calls the model API directly; only on a genuine network/CORS failure (and only when hosted over HTTP(S)) does it fall back to a same-origin `/proxy`. HTTP 4xx/5xx provider responses are never re-sent elsewhere.
 
@@ -155,7 +166,7 @@ Both are intentionally provider/site-agnostic for demo and development use, with
 - **External-edit conflicts (F11)**: before overwriting or deleting a file, the real file is compared against the sync-in snapshot. If it changed on disk during the run (user/editor), the commit is refused, the on-disk version kept, and a recoverable `[conflict: path: reason]` is returned.
 - **Partial snapshots are honest (F10)**: files over the sync limits (200 files / 5 MiB per file / 25 MiB total) are reported by **path and reason**, Python is told they are not visible, and any file Python creates at an unsynced path is refused instead of clobbering the real one.
 - **Workspace switch is a real session boundary (F02/F03)**: a running task binds its workspace and a session generation; switching workspace cancels the task and waits for it to stop before applying, late model responses/tool results are discarded, and the Pyodide worker is rebuilt — Python globals, imported modules and `/tmp` do not leak across sessions. `reset` starts a fresh session (history + Python) without unmounting the workspace; `cancel` aborts the running task.
-- **Cancellation everywhere (F07)**: model requests, tool execution, Python runs, network fetches and write-back all honor one AbortSignal; cancelled work never commits afterwards. Cancellation is re-checked after every asynchronous pre-check (external-edit detection, delete validation, echo/curl write-back reads), and a workspace collection that finishes after a cancel never starts Python. While a task runs it can be cancelled from the status-bar **Cancel** button or the **Escape** key (the terminal input itself is paused mid-task, so the `cancel` command is only a fallback). A current-session cancel is NOT a rollback: if the tool already completed, its real result — including exactly what was written / deleted / not persisted — is shown to the user and recorded in history, and only then does the model loop stop. A session switch (workspace change / `reset`) is a different event: late results of the old session are discarded and never shown or recorded in the new one.
+- **Cancellation everywhere (F07)**: model requests, tool execution, Python runs, network fetches and write-back all honor one AbortSignal; cancelled work never commits afterwards. Cancellation is re-checked after every asynchronous pre-check (external-edit detection, delete validation, echo/curl write-back reads), and a workspace collection that finishes after a cancel never starts Python. While a task runs it can be cancelled from the composer **Cancel** button or the **Escape** key. A current-session cancel is NOT a rollback: if the tool already completed, its real result — including exactly what was written / deleted / not persisted — is shown to the user and recorded in history, and only then does the model loop stop. A session switch (workspace change / `reset`) is a different event: late results of the old session are discarded and never shown or recorded in the new one.
 - **Model protocol envelope (F09)**: `callModel()` returns `{ content, reasoning, stopReason, usage, rawMessage, truncated }`; provider-native messages (incl. reasoning blocks) are replayed unchanged, reasoning is shown (dim) when the provider returns it, and truncated answers are flagged instead of treated as clean completions.
 - **Error taxonomy (F08/F09)**: failures are classified by phase and type — pre-headers transport (TypeError) / post-headers body-read (`BodyReadError`, keeps HTTP status + cause) / HTTP status / parse / timeout / cancellation. Parse errors, timeouts and body-read failures after HTTP 200 never trigger endpoint re-probing or a second paid inference; automatic `/proxy` fallback preserves the relay's authoritative 401/402/429/5xx (marked via `X-Locus-Relay: 1`) instead of masking them with the original CORS error, and only a genuinely missing/unreachable relay resurfaces the direct error.
 - **Network resource bounds (F07/F13)**: direct and relay fetches carry client deadlines covering headers **and** the full body (every body read races the deadline/cancel signal, so a stalled body still loses), a 16MB streaming cap, `credentials: 'omit'`, and URL-userinfo rejection; timeouts/caps/cancellations are never misread as CORS and retried. The direct and relay attempts carry separate deadline options (`timeoutMs`, default 60s; `relayTimeoutMs`, default 45s — just above the relay's own 30s upstream timeout). Stream cleanup on the timeout/cancel/size-cap exit path is best-effort and never awaited: a response stream whose `cancel()` hangs or rejects cannot block the caller's exit or produce unhandled rejections, and the original error classification (timeout / cancelled / too large) is preserved.
@@ -168,9 +179,9 @@ Both are intentionally provider/site-agnostic for demo and development use, with
 
 ### Local data demo (no network)
 
-1. Open the page, enter your API key, connect.
-2. Click **Select Workspace** and choose `examples/demo-workspace/` (contains `sales.csv`).
-3. Type:
+1. `npm run dev`, open the page, set your API key in **Settings**.
+2. Use the composer's **+ → Mount folder** and choose `examples/demo-workspace/` (contains `sales.csv`).
+3. Type in the composer:
 
    ```
    分析 sales.csv，计算 revenue 和 cost 的平均值，并保存到 summary.csv。
@@ -216,13 +227,17 @@ Both are intentionally provider/site-agnostic for demo and development use, with
 - **Untrusted tool output**: tool results are fed back wrapped in `<tool_result>` with an explicit "untrusted data, not instructions" marker, and the system prompt states that file contents are never policy.
 - **Hosted-mode proxy fallback**: no more forced `/proxy` on any HTTP host (see "Connection behavior" above).
 - **`verifyConnection`** tests the user-configured model instead of a hardcoded one.
-- **`clear`** is a real local terminal command (never sent to the model).
 - **Telemetry bytes** are real UTF-8 bytes (`utf8ByteLength`), and `window.__telemetry` keeps array identity across log trimming.
-- **CDN pins**: jquery 3.7.1, jquery.terminal 2.47.0, Pyodide v0.26.4.
+- **CDN pins**: Pyodide v0.26.4. (The jQuery Terminal presentation layer was removed in V0.4 in favor of the Vue app; nothing runtime-side ever depended on it.)
 
 ## Tests
 
-Node unit tests (mocked fetch / stubbed boundaries, no internet required):
+```bash
+npm test          # all Node unit suites (no internet required)
+npm run test:e2e  # full browser e2e: runtime regression + /fetch isolation + Vue presentation
+```
+
+Node unit suites individually (mocked fetch / stubbed boundaries, no internet required):
 
 ```bash
 node tests/model.test.cjs        # model dialects, fallback, envelope, error taxonomy, cancel/timeout, body-read phases, non-blocking stream cleanup
@@ -232,12 +247,13 @@ node tests/network.test.cjs      # curl + NetworkRuntime: routing, anonymity, fu
 node tests/workspace.test.cjs    # stat options (WebIDL-conforming handles), exists() semantics, append, snapshot skips
 node tests/shell.test.cjs        # quoted tokenizer, write-back failures, external-edit conflicts, pre-commit cancel checks
 node tests/agent.test.cjs        # session binding, cancellation vs session-switch semantics, byte-based history budget with whole-task trimming
+node tests/presentation.test.cjs # runtime-event → timeline projection, markdown-lite safety, AgentSession→projector integration
 node tests/worker-init.test.cjs  # Pyodide init-failure recovery (real worker source from index.html)
 node tests/worker-output.test.cjs # worker diffOut limits: structured uncollected status, rename safety, real commit logic
 node tests/verify-active-content.cjs # /fetch active-content isolation through the REAL handler in headless Chrome
 ```
 
-A headless browser regression suite exercises the full local chain against the real Pyodide CDN and **native FileSystemDirectoryHandle** (OPFS) — no MemWS substitute for the file layer:
+A headless browser regression suite exercises the full local chain against the real Pyodide CDN and **native FileSystemDirectoryHandle** (OPFS) — no MemWS substitute for the file layer. It runs as part of `npm run test:e2e`, or standalone:
 
 ```bash
 chrome --headless=new --allow-file-access-from-files --remote-debugging-port=9333 \
@@ -245,7 +261,9 @@ chrome --headless=new --allow-file-access-from-files --remote-debugging-port=933
 node tests/run-e2e.cjs
 ```
 
-Covered: path-escape rejection, strict tool parser, UTF-8 telemetry bytes, telemetry array identity, unsupported-command error, `cloud_bash` failure semantics, heredoc Python, pandas CSV demo, deletion sync, rename semantics, 30s Python timeout + worker recovery, curl → download → Pyodide → report.csv, binary byte-exactness, **native-handle stat/cat/append/Python sync (OPFS)**, **quoted `>` writing nothing**, **Python globals + /tmp isolation across session reset**, **mid-task cancellation through the real UI event path (status-bar button click and Escape abort the in-flight model request)**, and a capability check that Python's JS bridge exposes `fetch` (see the security note below).
+Covered: path-escape rejection, strict tool parser, UTF-8 telemetry bytes, telemetry array identity, unsupported-command error, `cloud_bash` failure semantics, heredoc Python, pandas CSV demo, deletion sync, rename semantics, 30s Python timeout + worker recovery, curl → download → Pyodide → report.csv, binary byte-exactness, **native-handle stat/cat/append/Python sync (OPFS)**, **quoted `>` writing nothing**, **Python globals + /tmp isolation across session reset**, mid-task cancellation semantics at the runtime boundary, and a capability check that Python's JS bridge exposes `fetch` (see the security note below).
+
+The presentation e2e (also part of `npm run test:e2e`) builds the app, serves it with `vite preview`, and drives the **real Vue UI** through CDP with the model/tool layer faked at the documented AgentSession injection seam: sidebar/history, plus menu (Upload files / Mount folder / Open terminal), composer submit via real Enter keydown, reasoning/tool-call/tool-result/assistant rendering, cancel via the real Cancel button **and** Escape, workspace mount through an OPFS handle as a full session boundary, telemetry surfaced in the context rail, dialect settings wiring, new-task history separation, and a no-console-error / no-unhandled-rejection gate.
 
 A separate real-browser verification proves the `/fetch` active-content isolation end-to-end — through the **real** `functions/fetch.js` handler (only the upstream payload is mocked; a payload page that beacons `sessionStorage` executes without the isolation headers and is fully neutralized by the handler's actual response):
 
@@ -282,7 +300,7 @@ Network executions carry an `operation: "network"` field and a more specific bac
 { "tool": "bash", "operation": "network", "backend": "edge-relay", "duration_ms": 210, "input_bytes": 45, "output_bytes": 12345, "success": true }
 ```
 
-View it via the **log** button, the `telemetry` command, or `window.__telemetry` in the console. Byte counts are real UTF-8 bytes. KPIs (Local Execution Rate, bytes kept local, fallback rate, …) are intentionally not computed in V0.
+View it in the context rail's **Telemetry** section, or `window.__telemetry` in the console. Byte counts are real UTF-8 bytes. KPIs (Local Execution Rate, bytes kept local, fallback rate, …) are intentionally not computed in V0.
 
 ## Non-goals for V0
 
