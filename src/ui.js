@@ -218,7 +218,7 @@ function initTerminal() {
     height: '100%',
     completion: ['help', 'clear', 'workspace', 'telemetry'],
     onInit: function () {
-      this.echo('[[;var(--text-dim);]Browser Agent Runtime v0.1.0]');
+      this.echo('[[;var(--text-dim);]Browser Agent Runtime v0.2.0]');
       this.echo('[[;var(--text-dim);]所有文件与 Python 执行均在浏览器本地完成，云端仅用于 LLM 推理。]');
       this.echo('[[;var(--text-dim);]1) 点击右上角 Select Workspace 授权一个本地目录]');
       this.echo('[[;var(--text-dim);]2) 直接用自然语言描述任务，例如: 分析 sales.csv，计算每列平均值，保存到 summary.csv]');

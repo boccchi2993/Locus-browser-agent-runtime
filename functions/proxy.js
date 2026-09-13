@@ -72,8 +72,11 @@ async function readBody(req, maxBodyBytes) {
 }
 
 // Read a response body with a hard byte cap, aborting mid-stream when the
-// upstream uses chunked encoding and exceeds the limit.
-async function readResponseCapped(upstream, maxBytes) {
+// upstream uses chunked encoding and exceeds the limit. The caller's
+// AbortController governs the whole body lifetime: if the upstream stalls
+// mid-body and the controller fires, this surfaces as `timedOut` so the
+// caller can answer 504 instead of a generic 502/413.
+async function readResponseCapped(upstream, maxBytes, controller) {
   const contentLength = Number.parseInt(upstream.headers.get('content-length') || '', 10);
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
     return { error: json(413, { error: { message: 'Upstream response too large' } }) };
@@ -97,6 +100,9 @@ async function readResponseCapped(upstream, maxBytes) {
       }
       chunks.push(value);
     }
+  } catch (e) {
+    if (controller && controller.signal.aborted) return { timedOut: true };
+    throw e;
   } finally {
     reader.releaseLock();
   }
@@ -128,42 +134,51 @@ export async function onRequestPost(context) {
 
   const controller = new AbortController();
   const timeoutMs = getTimeoutMs(env);
+  // The timeout covers the FULL upstream lifecycle: request start →
+  // response headers → response body complete. Headers arriving quickly
+  // must not disarm the timer while the body still hangs.
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let upstream;
   try {
-    upstream = await fetch(target.href, {
-      method: 'POST',
-      headers,
-      body,
-      redirect: 'manual',
-      signal: controller.signal,
-    });
-  } catch (e) {
-    if (controller.signal.aborted) {
+    try {
+      upstream = await fetch(target.href, {
+        method: 'POST',
+        headers,
+        body,
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (controller.signal.aborted) {
+        return json(504, { error: { message: 'Upstream timed out after ' + timeoutMs + 'ms' } });
+      }
+      return json(502, { error: { message: 'proxy: upstream fetch failed' } });
+    }
+
+    // Do not follow redirects; an API endpoint that redirects is almost
+    // certainly a misconfiguration or a protocol downgrade attempt.
+    if (upstream.status >= 300 && upstream.status < 400) {
+      return json(502, { error: { message: 'Upstream returned a redirect (HTTP ' + upstream.status + '); redirects are not followed' } });
+    }
+
+    const { body: responseBody, error: responseError, timedOut } =
+      await readResponseCapped(upstream, getMaxResponseBytes(env), controller);
+    if (timedOut) {
       return json(504, { error: { message: 'Upstream timed out after ' + timeoutMs + 'ms' } });
     }
-    return json(502, { error: { message: 'proxy: upstream fetch failed' } });
+    if (responseError) return responseError;
+
+    return new Response(responseBody, {
+      status: upstream.status,
+      headers: {
+        'Content-Type': upstream.headers.get('content-type') || 'application/json',
+        ...CORS_HEADERS,
+      },
+    });
   } finally {
     clearTimeout(timer);
   }
-
-  // Do not follow redirects; an API endpoint that redirects is almost
-  // certainly a misconfiguration or a protocol downgrade attempt.
-  if (upstream.status >= 300 && upstream.status < 400) {
-    return json(502, { error: { message: 'Upstream returned a redirect (HTTP ' + upstream.status + '); redirects are not followed' } });
-  }
-
-  const { body: responseBody, error: responseError } = await readResponseCapped(upstream, getMaxResponseBytes(env));
-  if (responseError) return responseError;
-
-  return new Response(responseBody, {
-    status: upstream.status,
-    headers: {
-      'Content-Type': upstream.headers.get('content-type') || 'application/json',
-      ...CORS_HEADERS,
-    },
-  });
 }
 
 // OPTIONS /proxy (CORS preflight)

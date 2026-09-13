@@ -14,6 +14,8 @@ async function executeTool(name, input, workspace) {
   let output = '';
   let success = true;
   let error = null;
+  let backend = toolName === 'cloud_bash' ? 'cloud' : 'browser';
+  let operation = null;
   let ioIn = utf8ByteLength(input || '');
   let ioOut = 0;
 
@@ -25,8 +27,16 @@ async function executeTool(name, input, workspace) {
       if (res.isError) error = firstLine(res.output);
       ioIn = res.io.in;
       ioOut = res.io.out;
+      // A shell command may run on a more specific backend than the tool
+      // default (e.g. curl → browser-direct / edge-relay network fetch).
+      if (res.backend) backend = res.backend;
+      if (res.operation) operation = res.operation;
     } else if (toolName === 'cloud_bash') {
+      // Unconfigured cloud execution is a FAILURE, not a successful stub:
+      // the agent and telemetry must both see success=false.
       output = 'Cloud execution is not configured.';
+      success = false;
+      error = output;
     } else {
       output = TOOL_NOT_FOUND(toolName || '(empty)');
       success = false;
@@ -38,17 +48,19 @@ async function executeTool(name, input, workspace) {
     error = output;
   }
 
-  Telemetry.record({
+  const record = {
     tool: toolName,
-    backend: toolName === 'cloud_bash' ? 'cloud' : 'browser',
+    backend,
     duration_ms: Math.round(performance.now() - started),
     success,
     input_bytes: ioIn,
     output_bytes: ioOut || utf8ByteLength(output),
     error,
-  });
+  };
+  if (operation) record.operation = operation;
+  Telemetry.record(record);
 
-  return { output, success };
+  return { output, success, backend, operation };
 }
 
 function firstLine(s) {

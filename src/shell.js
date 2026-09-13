@@ -18,7 +18,15 @@ const PythonRuntime = {
     if (this.worker) return;
     const src = document.getElementById('py-worker-src').textContent;
     const blob = new Blob([src], { type: 'text/javascript' });
-    this.worker = new Worker(URL.createObjectURL(blob));
+    // The Blob URL is only needed to construct the Worker; revoke it
+    // immediately so repeated worker timeout/recovery cycles do not
+    // accumulate live Blob URLs.
+    const workerUrl = URL.createObjectURL(blob);
+    try {
+      this.worker = new Worker(workerUrl);
+    } finally {
+      URL.revokeObjectURL(workerUrl);
+    }
     this.worker.onmessage = (ev) => {
       const msg = ev.data || {};
       const pending = this._pending.get(msg.id);
@@ -269,6 +277,9 @@ async function runShellCommand(input, workspace) {
       case 'python3':
         return await runPython(args, workspace);
 
+      case 'curl':
+        return await runCurl(args, workspace, line);
+
       default:
         return err(shellError(cmd));
     }
@@ -331,4 +342,95 @@ async function runPythonCode(code, workspace) {
     isError: !!res.error,
     io: { in: utf8ByteLength(code) + res.inputBytes, out: utf8ByteLength(output) + res.outputBytes },
   };
+}
+
+// ---------- curl (NetworkRuntime) ----------
+// Deliberately NOT full curl. Supported forms only:
+//   curl <https-url>                 → text responses printed to stdout
+//   curl -o <file> <https-url>       → binary-safe download into workspace
+//   curl --output <file> <https-url> → same as -o
+// Everything else (headers, methods, POST bodies, cookies, auth) is out of
+// scope for the browser runtime and fails with a clear message.
+
+const TEXT_LIKE_MIMES = new Set([
+  'application/json',
+  'application/xml',
+  'application/javascript',
+  'application/x-javascript',
+  'application/x-yaml',
+  'application/yaml',
+  'application/x-www-form-urlencoded',
+  'image/svg+xml',
+]);
+
+function isTextLikeMime(contentType) {
+  const mime = String(contentType || '').split(';')[0].trim().toLowerCase();
+  if (!mime || mime === 'text/plain') return true; // unknown → assume text
+  return mime.startsWith('text/') || TEXT_LIKE_MIMES.has(mime)
+    || mime.endsWith('+json') || mime.endsWith('+xml');
+}
+
+async function runCurl(args, workspace, line) {
+  const io = { in: utf8ByteLength(line), out: 0 };
+  const netResult = (output, isError, net) => ({
+    output,
+    isError,
+    io: { in: io.in, out: io.out || utf8ByteLength(output) },
+    // network metadata flows up to telemetry via executeTool
+    backend: net && net.backend,
+    operation: 'network',
+  });
+
+  // Parse: exactly one URL positional; only -o/--output takes a value.
+  let outFile = null;
+  let url = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-o' || a === '--output') {
+      outFile = args[++i];
+      if (!outFile) return netResult('curl: -o requires a file path', true);
+    } else if (a.startsWith('-')) {
+      return netResult('curl: option not supported in local browser runtime: ' + a, true);
+    } else if (url) {
+      return netResult('curl: only one URL is supported', true);
+    } else {
+      url = a;
+    }
+  }
+  if (!url) return netResult('usage: curl <https-url> | curl -o <file> <https-url>', true);
+
+  let res;
+  try {
+    res = await NetworkRuntime.fetch(url);
+  } catch (e) {
+    return netResult('curl: ' + (e && e.message ? e.message : String(e)), true);
+  }
+  io.out = res.bytes.byteLength;
+
+  // An HTTP error status is an authoritative response, not a transport
+  // failure — report the status (with a text body preview when sensible).
+  if (res.status >= 400) {
+    let output = 'curl: HTTP ' + res.status + ' from ' + res.finalUrl;
+    if (isTextLikeMime(res.headers['content-type']) && res.bytes.byteLength) {
+      const preview = new TextDecoder().decode(res.bytes.slice(0, 500)).replace(/\n$/, '');
+      if (preview.trim()) output += '\n' + preview;
+    }
+    return netResult(output, true, res);
+  }
+
+  if (outFile) {
+    if (!workspace) return netResult('curl: no workspace selected', true, res);
+    // Binary-safe: raw bytes go straight into the workspace, no decoding.
+    await workspace.write(outFile, res.bytes);
+    return netResult('[written to workspace: ' + outFile + ', ' + res.bytes.byteLength + ' bytes]', false, res);
+  }
+
+  if (isTextLikeMime(res.headers['content-type'])) {
+    return netResult(new TextDecoder('utf-8').decode(res.bytes).replace(/\n$/, ''), false, res);
+  }
+
+  const mime = String(res.headers['content-type'] || 'application/octet-stream').split(';')[0].trim();
+  return netResult(
+    'curl: binary response (' + mime + ', ' + res.bytes.byteLength + ' bytes); use curl -o <file> <url>',
+    false, res);
 }

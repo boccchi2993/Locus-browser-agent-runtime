@@ -1,0 +1,185 @@
+// Network/curl/tool-routing regression tests (node, mocked fetch).
+// Run: node tests/network.test.cjs
+// No real internet access — global fetch is fully mocked.
+
+const fs = require('fs');
+const path = require('path');
+
+// --- browser stubs ---
+global.window = { location: { protocol: 'https:' } }; // hosted page → relay available
+
+// --- load the real browser-layer sources in one shared scope ---
+const src = ['telemetry.js', 'workspace.js', 'network.js', 'shell.js', 'tools.js']
+  .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
+  .join('\n;\n');
+const M = eval(src + '\n;({ Telemetry, WorkspaceAdapter, normalizeWorkspacePath, NetworkRuntime, runShellCommand, executeTool });');
+
+// --- byte-exact in-memory workspace ---
+class MemWS extends M.WorkspaceAdapter {
+  constructor(files) {
+    super();
+    this.name = 'mem';
+    this.files = {};
+    for (const k in (files || {})) this.files[k] = new TextEncoder().encode(files[k]);
+  }
+  async list() { return Object.keys(this.files).map((n) => ({ name: n, kind: 'file' })); }
+  async read(p) { return new TextDecoder().decode(await this.readBytes(p)); }
+  async readBytes(p) {
+    p = M.normalizeWorkspacePath(p);
+    if (!(p in this.files)) throw new Error('No such file: ' + p);
+    return this.files[p];
+  }
+  async write(p, data) {
+    p = M.normalizeWorkspacePath(p);
+    this.files[p] = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data);
+  }
+  async remove(p) { p = M.normalizeWorkspacePath(p); delete this.files[p]; }
+  async exists(p) { try { p = M.normalizeWorkspacePath(p); } catch (e) { return false; } return p in this.files; }
+  async stat(p) { p = M.normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); return { kind: 'file', size: this.files[p].byteLength, modified: 0 }; }
+}
+
+// --- fetch mock ---
+let calls = []; // every fetch() invocation: {url}
+let routes = []; // [{match: (url)=>bool, respond: (url)=>Response|throw}]
+function on(match, respond) { routes.push({ match, respond }); }
+global.fetch = async (url, opts) => {
+  calls.push({ url: String(url), opts: opts || {} });
+  for (const r of routes) {
+    if (r.match(String(url))) return r.respond(String(url));
+  }
+  throw new Error('no mock route for ' + url);
+};
+function jsonResponse(body, headers) {
+  return new Response(body, { status: 200, headers: Object.assign({ 'content-type': 'application/json' }, headers) });
+}
+const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF, 0xFE, 0x80]);
+
+let passed = 0, failed = 0;
+function check(name, cond, detail) {
+  if (cond) { passed++; console.log('PASS ' + name); }
+  else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + detail : '')); }
+}
+function reset() { calls = []; routes = []; M.Telemetry.records.length = 0; }
+function lastRec() { return M.Telemetry.records[M.Telemetry.records.length - 1]; }
+
+async function run() {
+  const ws = new MemWS();
+
+  // ---------- 1. curl text → stdout ----------
+  reset();
+  on((u) => u === 'https://example.test/data.json', () => jsonResponse('{"hello":"world"}'));
+  const t1 = await M.executeTool('bash', 'curl https://example.test/data.json', ws);
+  check('N1 curl text stdout', t1.success && t1.output.includes('{"hello":"world"}'), JSON.stringify(t1.output));
+  check('N1b backend browser-direct', t1.backend === 'browser-direct', t1.backend);
+  check('N1c telemetry operation=network', lastRec().operation === 'network' && lastRec().backend === 'browser-direct'
+    && lastRec().success === true, JSON.stringify(lastRec()));
+
+  // ---------- 2. curl -o text file → workspace bytes ----------
+  reset();
+  on((u) => u === 'https://example.test/data.json', () => jsonResponse('{"hello":"world"}'));
+  const t2 = await M.executeTool('bash', 'curl -o raw.json https://example.test/data.json', ws);
+  check('N2 curl -o text written', t2.success && t2.output === '[written to workspace: raw.json, 17 bytes]',
+    JSON.stringify(t2.output));
+  check('N2b workspace content exact', new TextDecoder().decode(ws.files['raw.json'] || []) === '{"hello":"world"}');
+
+  // ---------- 3. curl -o binary → byte-perfect ----------
+  reset();
+  on((u) => u === 'https://example.test/i.png', () =>
+    new Response(PNG_BYTES, { status: 200, headers: { 'content-type': 'image/png' } }));
+  const t3 = await M.executeTool('bash', 'curl -o image.png https://example.test/i.png', ws);
+  const written = ws.files['image.png'];
+  check('N3 curl -o binary written', t3.success && !!written, JSON.stringify(t3.output));
+  check('N3b bytes byte-perfect', !!written && written.length === PNG_BYTES.length
+    && written.every((b, i) => b === PNG_BYTES[i]),
+    written ? Array.from(written).join(',') : 'missing');
+
+  // ---------- 4. binary to stdout → no garbage, hint to use -o ----------
+  reset();
+  on((u) => u === 'https://example.test/i.png', () =>
+    new Response(PNG_BYTES, { status: 200, headers: { 'content-type': 'image/png' } }));
+  const t4 = await M.executeTool('bash', 'curl https://example.test/i.png', ws);
+  check('N4 binary stdout hint', t4.output.includes('binary response') && t4.output.includes('image/png')
+    && t4.output.includes('use curl -o') && !t4.output.includes('PNG\r\n'),
+    JSON.stringify(t4.output));
+
+  // ---------- 5. only HTTPS ----------
+  reset();
+  const t5 = await M.executeTool('bash', 'curl http://example.com', ws);
+  check('N5 http rejected', !t5.success && t5.output.includes('only HTTPS URLs are supported'), t5.output);
+  check('N5b no fetch attempted', calls.length === 0);
+
+  // ---------- 6. unsupported option ----------
+  reset();
+  const t6 = await M.executeTool('bash', 'curl -H "X-Test: 1" https://example.com', ws);
+  check('N6 -H rejected', !t6.success && t6.output === 'curl: option not supported in local browser runtime: -H', t6.output);
+  const t6b = await M.executeTool('bash', 'curl -X POST https://example.com', ws);
+  check('N6b -X rejected', !t6b.success && t6b.output.includes('option not supported'), t6b.output);
+
+  // ---------- 7/8. network/CORS failure → transparent edge relay ----------
+  reset();
+  on((u) => u === 'https://blocked.test/data.json', () => { throw new TypeError('Failed to fetch'); });
+  on((u) => u.startsWith('/fetch?'), (u) => {
+    check('N8 relay URL encodes target', u === '/fetch?url=' + encodeURIComponent('https://blocked.test/data.json'), u);
+    return jsonResponse('{"via":"relay"}', { 'x-locus-final-url': 'https://blocked.test/data.json' });
+  });
+  const t7 = await M.executeTool('bash', 'curl https://blocked.test/data.json', ws);
+  check('N7 CORS failure falls back to relay', t7.success && t7.output.includes('{"via":"relay"}'), JSON.stringify(t7.output));
+  check('N7b backend edge-relay', t7.backend === 'edge-relay' && lastRec().backend === 'edge-relay', t7.backend);
+  check('N7c exactly 2 fetches (direct + relay)', calls.length === 2, calls.map((c) => c.url).join(','));
+
+  // ---------- 8b. file:// + CORS failure → clear error, no relay ----------
+  reset();
+  global.window.location.protocol = 'file:';
+  on((u) => u === 'https://blocked.test/x', () => { throw new TypeError('Failed to fetch'); });
+  const t8 = await M.executeTool('bash', 'curl https://blocked.test/x', ws);
+  check('N8b file:// clear error', !t8.success && t8.output.includes('no edge relay is available'), t8.output);
+  check('N8c no relay attempted from file://', calls.length === 1, calls.map((c) => c.url).join(','));
+  global.window.location.protocol = 'https:';
+
+  // ---------- 9. HTTP 404 is authoritative — never relayed ----------
+  reset();
+  on((u) => u === 'https://example.test/missing', () =>
+    new Response('{"error":"not found"}', { status: 404, headers: { 'content-type': 'application/json' } }));
+  on((u) => u.startsWith('/fetch?'), () => { throw new Error('relay must NOT be called'); });
+  const t9 = await M.executeTool('bash', 'curl https://example.test/missing', ws);
+  check('N9 404 reported, not relayed', !t9.success && t9.output.includes('HTTP 404')
+    && calls.length === 1 && t9.backend === 'browser-direct',
+    t9.output + ' | calls=' + calls.length + ' | backend=' + t9.backend);
+
+  // ---------- 10. relay binary safety ----------
+  reset();
+  on((u) => u === 'https://blocked.test/i.png', () => { throw new TypeError('Failed to fetch'); });
+  on((u) => u.startsWith('/fetch?'), () =>
+    new Response(PNG_BYTES, { status: 200, headers: { 'content-type': 'image/png', 'x-locus-final-url': 'https://blocked.test/i.png' } }));
+  const t10 = await M.executeTool('bash', 'curl -o r.png https://blocked.test/i.png', ws);
+  const wb = ws.files['r.png'];
+  check('N10 relay binary byte-perfect', t10.success && t10.backend === 'edge-relay' && !!wb
+    && wb.length === PNG_BYTES.length && wb.every((b, i) => b === PNG_BYTES[i]),
+    t10.output + ' | backend=' + t10.backend);
+
+  // ---------- relay's own errors surface clearly ----------
+  reset();
+  on((u) => u === 'https://blocked.test/slow', () => { throw new TypeError('Failed to fetch'); });
+  on((u) => u.startsWith('/fetch?'), () =>
+    new Response(JSON.stringify({ error: { message: 'Upstream timed out after 30000ms' } }),
+      { status: 504, headers: { 'content-type': 'application/json', 'x-locus-relay-error': '1' } }));
+  const t11 = await M.executeTool('bash', 'curl https://blocked.test/slow', ws);
+  check('N11 relay error surfaced', !t11.success && t11.output.includes('Upstream timed out after 30000ms'), t11.output);
+
+  // ---------- 13. cloud_bash still unsuccessful ----------
+  reset();
+  const t13 = await M.executeTool('cloud_bash', 'curl https://example.com', ws);
+  check('N13 cloud_bash success=false', t13.success === false && t13.output === 'Cloud execution is not configured.'
+    && lastRec().backend === 'cloud' && lastRec().success === false);
+
+  // ---------- ordinary commands keep backend=browser ----------
+  reset();
+  const t14 = await M.executeTool('bash', 'echo hi', ws);
+  check('N14 non-network bash keeps backend=browser', t14.backend === 'browser' && lastRec().backend === 'browser'
+    && !lastRec().operation, JSON.stringify(lastRec()));
+
+  console.log('\n' + passed + ' passed, ' + failed + ' failed');
+  process.exit(failed ? 1 : 0);
+}
+
+run().catch((e) => { console.error('TEST RUNNER FAIL', e); process.exit(1); });

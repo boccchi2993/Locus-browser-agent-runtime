@@ -6,6 +6,7 @@
 <pre id="out">RUNNING</pre>
 <script src="../src/telemetry.js"></script>
 <script src="../src/workspace.js"></script>
+<script src="../src/network.js"></script>
 <script src="../src/shell.js"></script>
 <script src="../src/tools.js"></script>
 <script src="../src/agent.js"></script>
@@ -60,9 +61,15 @@
     check('smoke cat', (await executeTool('bash', 'cat sales.csv', ws)).output.includes('A,100,40'));
     check('smoke unsupported', (await executeTool('bash', 'sudo rm x', ws)).output === 'bash: sudo: command not available in local browser runtime');
 
-    // ---------- H. cloud_bash stays a stub ----------
+    // ---------- H. cloud_bash stays an unsuccessful stub ----------
+    Telemetry.records.length = 0;
     const cloud = await executeTool('cloud_bash', 'ls', ws);
-    check('H cloud_bash stub', cloud.output === 'Cloud execution is not configured.');
+    check('H1 cloud_bash stub message', cloud.output === 'Cloud execution is not configured.');
+    check('H2 cloud_bash success=false', cloud.success === false);
+    const cloudRec = Telemetry.records[0];
+    check('H3 cloud_bash telemetry failure', cloudRec && cloudRec.tool === 'cloud_bash'
+      && cloudRec.backend === 'cloud' && cloudRec.success === false
+      && cloudRec.error === 'Cloud execution is not configured.', JSON.stringify(cloudRec));
 
     // ---------- B. telemetry UTF-8 bytes ----------
     Telemetry.records.length = 0;
@@ -107,6 +114,30 @@
     const gr = await executeTool('bash', "python <<'PY'\nimport os\nos.rename('summary.csv', 'renamed.csv')\nPY", ws);
     check('G rename', !('summary.csv' in ws.files) && ws.files['renamed.csv'] === 'column,mean\nrevenue,200.0\ncost,80.0\n',
       Object.keys(ws.files).join(','));
+
+    // ---------- I. V0.2 acceptance chain: curl → local python → report.csv ----------
+    const realFetch = window.fetch;
+    window.fetch = async (url) => {
+      if (String(url) === 'https://api.example.test/metrics.json') {
+        return new Response(JSON.stringify({ values: [10, 20, 30] }),
+          { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new TypeError('Failed to fetch');
+    };
+    try {
+      const dl = await executeTool('bash', 'curl -o raw.json https://api.example.test/metrics.json', ws);
+      check('I1 curl download into workspace', dl.success && dl.backend === 'browser-direct'
+        && ws.files['raw.json'] === '{"values":[10,20,30]}', JSON.stringify(dl.output) + ' | backend=' + dl.backend);
+      const dlRec = Telemetry.records[Telemetry.records.length - 1];
+      check('I1b telemetry network backend', dlRec.operation === 'network' && dlRec.backend === 'browser-direct'
+        && dlRec.success === true, JSON.stringify(dlRec));
+      const ana = await executeTool('bash', "python <<'PY'\nimport json\nvals = json.load(open('raw.json'))['values']\nopen('report.csv', 'w').write('metric,value\\ncount,%d\\nsum,%d\\nmean,%.1f\\n' % (len(vals), sum(vals), sum(vals)/len(vals)))\nPY", ws);
+      check('I2 downloaded data processed by local Pyodide', ana.success
+        && ws.files['report.csv'] === 'metric,value\ncount,3\nsum,60\nmean,20.0\n',
+        JSON.stringify(ws.files['report.csv']));
+    } finally {
+      window.fetch = realFetch;
+    }
 
     // ---------- E. python timeout + worker recovery (runs last) ----------
     const t0 = performance.now();
