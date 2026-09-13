@@ -4,18 +4,63 @@ This file is for concrete implementation work.
 
 Architecture-level decisions belong in docs/ARCHITECTURE.md and docs/MODEL-PROTOCOL.md. Milestones belong in ROADMAP.md.
 
+## Done on fix/v0.3-reliability
+
+Two audit rounds (baselines da94d1f and 40a22d2) are complete; checked items
+below are reflected in the roadmap sections.
+
+### Round 1 (V0.3, commit 40a22d2)
+
+- [x] Real-directory stat options + exists() fault propagation (F01)
+- [x] Write-back failure stops deletions; staged commit states reported honestly (F04)
+- [x] External-edit conflict detection on write/delete (F11)
+- [x] Skipped snapshot paths recorded and protected from overwrite (F10)
+- [x] Workspace switch = real session boundary (cancel task, generation, Python rebuild) (F02/F03)
+- [x] End-to-end cancellation (model → tools → python → write-back) (F07)
+- [x] Model envelope + error taxonomy; relay authoritative errors preserved (F08/F09)
+- [x] Network deadlines/caps/anonymity; no CORS misclassification (F07/F13)
+- [x] Python stdout/stderr/output caps enforced in-worker (F18)
+- [x] Pyodide init-failure recovery (F14)
+- [x] Quote-aware tokenizer; unsupported shell syntax fails loudly (F15)
+- [x] Relay null-body statuses, stream-error mapping, /proxy inbound limits, active-content isolation (F12/F16/F05)
+- [x] Session reset command + history budget (F17)
+
+### Round 2 (V0.3.1)
+
+- [x] Output-limit overflow returns structured `uncollectedFiles`; incomplete change sets block deletions (rename no longer loses files)
+- [x] Network deadline/cancel covers headers AND full body (direct, relay, relay error JSON); every read races the abort signal
+- [x] Cancel reachable while busy: status-bar button + Escape, verified through real UI events in headless Chrome
+- [x] Cancellation re-checked after every async pre-check (conflict detect, delete validation, echo/curl write-back, workspace collection)
+- [x] History transport budget in UTF-8 bytes (incl. reasoning/native fields); whole-task trimming via internal `_taskStart` markers; oversized single task fails loudly
+- [x] Model body-read failures after headers classified as BodyReadError (no relay fallback, no double-billed inference)
+- [x] verify-active-content serves the real functions/fetch.js handler response
+
+### Round 3 (V0.3.2)
+
+- [x] Cancel vs session switch distinguished in the agent loop: a current-session cancel after a completed tool call shows the tool's real commit report (written/deleted/not-persisted), records it in history and stops the model loop — cancellation is never presented as a rollback; a session switch still discards late results without leaking them
+- [x] Stream cleanup (reader.cancel()) on timeout/cancel/size-cap exits is best-effort and never awaited in network.js and model.js — a hanging or rejecting cancel() can no longer block the caller or cause unhandled rejections; error classification preserved
+- [x] relayTimeoutMs is a real NetworkRuntime.fetch option, plumbed fetch → _relay; N23 now proves the passed deadline is actually used (elapsed-time assertion) and that the 45s default is retained
+
 ## Immediate — V0.2.1
 
 ### Network consistency
 
-- [ ] Add timeout to NetworkRuntime browser-direct fetch.
-- [ ] Add browser-direct response-size cap.
-- [ ] Avoid unbounded arrayBuffer() reads for large direct responses.
-- [ ] Keep browser-direct and edge-relay timeout/error semantics aligned.
-- [ ] Check workspace before starting curl -o downloads.
-- [ ] Add regression tests for direct-fetch timeout.
-- [ ] Add regression tests for direct-fetch response-size cap.
-- [ ] Add regression test proving curl -o without a workspace performs no network request.
+- [x] Add timeout to NetworkRuntime browser-direct fetch.
+- [x] Add browser-direct response-size cap.
+- [x] Avoid unbounded arrayBuffer() reads for large direct responses.
+- [x] Keep browser-direct and edge-relay timeout/error semantics aligned.
+- [x] Check workspace before starting curl -o downloads.
+- [x] Add regression tests for direct-fetch timeout.
+- [x] Add regression tests for direct-fetch response-size cap.
+- [x] Add regression test proving curl -o without a workspace performs no network request.
+
+## V0.3.x — Reliability leftovers (this branch)
+
+- [ ] Bound the workspace collection phase (huge directory traversal has no deadline yet).
+- [ ] On-demand file bridging or incremental sync instead of full snapshot per python call.
+- [ ] Empty-directory preservation and file↔directory type-change semantics in snapshot/diff.
+- [ ] `lstat`-style handling for special entries in the Pyodide MEMFS walk.
+- [ ] API base URL normalization hints (e.g. base already ending in `/v1` → avoid `/v1/v1/...`).
 
 ## V0.3 — Agent loop / UI separation
 
@@ -49,22 +94,27 @@ Do not over-design the event schema before the first real consumer exists.
 
 ### Model protocol
 
-- [ ] Replace callModelText() with a structured callModel() response.
-- [ ] Introduce a response envelope.
-- [ ] Separate visible content from provider-native replay state.
-- [ ] Preserve native assistant messages when exact replay is required.
-- [ ] Preserve reasoning_content when a provider/model requires it.
-- [ ] Preserve Anthropic-style thinking/redacted/opaque blocks when required.
-- [ ] Do not expose opaque continuation state as user-visible prose.
-- [ ] Do not invent reasoning for providers that do not return it.
-- [ ] Keep provider-specific replay policy inside provider adapters.
-- [ ] Preserve stop reason.
-- [ ] Preserve usage metadata where available.
-- [ ] Add tests for raw reasoning replay.
+- [x] Replace callModelText() with a structured callModel() response.
+- [x] Introduce a response envelope.
+- [x] Separate visible content from provider-native replay state.
+- [x] Preserve native assistant messages when exact replay is required.
+- [x] Preserve reasoning_content when a provider/model requires it.
+- [x] Preserve Anthropic-style thinking/redacted/opaque blocks when required.
+- [x] Do not expose opaque continuation state as user-visible prose.
+- [x] Do not invent reasoning for providers that do not return it.
+- [ ] Keep provider-specific replay policy inside provider adapters (currently per-dialect parsers in one model.js; no separate adapter modules yet).
+- [x] Preserve stop reason.
+- [x] Preserve usage metadata where available.
+- [ ] Add tests for raw reasoning replay (preservation is tested; full replay round-trip is not).
 - [ ] Add tests for reasoning summary presentation.
 - [ ] Add tests for opaque-state preservation.
 - [ ] Add tests proving visible UI history is not used to reconstruct provider history.
-- [ ] Reset/scope provider-native state when switching workspace/session.
+- [x] Reset/scope provider-native state when switching workspace/session.
+
+### Harder isolation (declared gap, see README security note)
+
+- [ ] Evaluate isolated-origin execution (separate opaque origin iframe/worker + explicit RPC bridge) so Python compute loses direct network capability instead of merely declaring it.
+- [ ] Telemetry coverage for Python-originated network once a controlled bridge exists.
 
 ## V0.4 — Vue presentation layer
 
@@ -137,10 +187,10 @@ Do not declare core frozen until:
 - [ ] Python primitive is isolated and reliable.
 - [ ] JavaScript primitive is isolated and reliable.
 - [ ] Edit/state mutation is deterministic.
-- [ ] curl connectivity is bounded and reliable.
-- [ ] Workspace authority is explicit.
+- [x] curl connectivity is bounded and reliable.
+- [x] Workspace authority is explicit.
 - [ ] Agent loop is UI-independent.
-- [ ] Model protocol preserves provider-native continuation semantics.
+- [x] Model protocol preserves provider-native continuation semantics.
 - [ ] Runtime event stream exists.
 - [ ] A capability can be added without editing the agent loop.
 
@@ -194,5 +244,7 @@ Do not declare core frozen until:
 - [ ] Full POSIX shell.
 - [ ] Full curl implementation.
 - [ ] Local model runtime.
+- [ ] Vue migration, MCP, JS runtime primitive, edit primitive (pre-AgentSession).
+- [ ] Domain allowlists (provider/site-agnostic by design).
 
 These may become future providers/plugins/community work. They are not prerequisites for freezing the Locus core architecture.

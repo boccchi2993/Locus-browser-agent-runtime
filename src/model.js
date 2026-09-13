@@ -6,6 +6,19 @@
 //
 //  Core distinction: provider identity ≠ API dialect. Dialect is
 //  detected from the endpoint shape, never from a provider name list.
+//
+//  The response is a structured envelope (see docs/MODEL-PROTOCOL.md):
+//    { content, reasoning, stopReason, usage, rawMessage, truncated }
+//  visible text is NOT the complete conversation state — rawMessage is
+//  the provider-native assistant message used for replay.
+//
+//  Error taxonomy (fallback policy keys off these, never strings):
+//    TypeError            — genuine network/CORS transport failure
+//    HttpError (.status)  — authoritative HTTP answer from provider/relay
+//    ParseError           — HTTP 200 but unusable body (never re-requested:
+//                           the inference already happened and was billed)
+//    TimeoutError         — client deadline hit (never blindly re-requested)
+//    AbortError           — caller cancelled
 // ============================================================
 const Model = {
   apiKey: '',
@@ -13,6 +26,12 @@ const Model = {
   model: 'deepseek-v4-pro',
   proxy: '',
 };
+
+// Model inference deadline: covers request start → headers → full body.
+// Deliberately longer than ordinary download deadlines — reasoning models
+// can legitimately think for over a minute.
+const MODEL_TIMEOUT_MS = 180000;
+const MODEL_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 function sanitizeKey(k) {
   return String(k || '').replace(/[^\x20-\x7E]/g, '').trim();
@@ -52,64 +71,263 @@ function toOpenAIBody(body) {
   return { model: body.model, messages, max_tokens: body.max_tokens || 2000 };
 }
 
-function parseAnthropicResp(data) {
-  // content is a block array; only visible text blocks count.
-  // thinking / reasoning / tool-use / unknown blocks are ignored —
-  // internal reasoning must never reach the agent loop or history.
-  if (Array.isArray(data.content)) {
-    const text = data.content
-      .filter((part) => part && part.type === 'text' && typeof part.text === 'string')
-      .map((part) => part.text)
-      .join('');
-    if (text) return text;
-
-    if (data.stop_reason === 'max_tokens') {
-      throw new Error('响应中没有可见文本内容（可能在生成最终回答前达到 token 上限）');
-    }
-    throw new Error('响应中没有可见文本内容');
-  }
-
-  if (typeof data.content === 'string' && data.content) {
-    return data.content;
-  }
-
-  if (data.error) {
-    throw new Error(data.error.message || data.error.type || JSON.stringify(data.error));
-  }
-  throw new Error('响应中没有可见文本内容');
-}
-
-function parseOpenAIResp(data) {
-  if (data.choices && data.choices[0]) {
-    const msg = data.choices[0].message || data.choices[0].delta || {};
-    if (msg.content) return msg.content;
-  }
-  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
-  throw new Error('响应格式不符合预期');
-}
-
+// ---------- error types ----------
 // HTTP errors carry .status so fallback policy never parses strings.
 function makeHttpError(status, message) {
   const err = new Error(message || ('HTTP ' + status));
+  err.name = 'HttpError';
   err.status = status;
   return err;
 }
 
-async function fetchJsonPost(fetchUrl, headers, body) {
-  const res = await fetch(fetchUrl, {
-    method: 'POST',
-    headers: headers,
-    body: JSON.stringify(body),
-  });
-  const text = await res.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : {}; } catch (e) {}
-  if (!res.ok) {
-    const msg = data && data.error ? (data.error.message || data.error.type) : ('HTTP ' + res.status);
-    throw makeHttpError(res.status, msg);
+// The response HEADERS already arrived but consuming the BODY failed
+// (connection reset mid-stream, truncated transfer, …). The inference may
+// already be running or billed — this is NOT a transport/CORS failure and
+// must never trigger an automatic re-send to another endpoint.
+function makeBodyReadError(status, cause) {
+  const err = new Error('response body read failed after HTTP ' + status +
+    ': ' + (cause && cause.message ? cause.message : String(cause)));
+  err.name = 'BodyReadError';
+  err.status = status;
+  err.cause = cause;
+  err.noFallback = true;
+  return err;
+}
+
+// HTTP 200 but the body cannot be used (not JSON, wrong shape, empty
+// visible content). The inference DID happen — re-sending the request to
+// another endpoint would bill a second generation for the same prompt.
+function makeParseError(message) {
+  const err = new Error(message);
+  err.name = 'ParseError';
+  err.noFallback = true;
+  return err;
+}
+
+function makeTimeoutError(message) {
+  const err = new Error(message);
+  err.name = 'TimeoutError';
+  err.timeout = true;
+  err.noFallback = true;
+  return err;
+}
+
+function makeModelCancelledError() {
+  const err = new Error('model request cancelled');
+  err.name = 'AbortError';
+  err.cancelled = true;
+  return err;
+}
+
+// ---------- response envelope parsers ----------
+function parseAnthropicResp(data) {
+  if (!Array.isArray(data.content)) {
+    if (typeof data.content === 'string' && data.content) {
+      return {
+        content: data.content,
+        reasoning: null,
+        stopReason: data.stop_reason || null,
+        usage: data.usage || null,
+        rawMessage: { role: 'assistant', content: data.content },
+        truncated: data.stop_reason === 'max_tokens',
+      };
+    }
+    if (data.error) {
+      throw makeParseError(data.error.message || data.error.type || JSON.stringify(data.error));
+    }
+    throw makeParseError('响应中没有可见文本内容');
   }
-  if (!data) throw new Error('响应不是 JSON');
-  return data;
+
+  // content is a block array. Visible text blocks become `content`;
+  // thinking blocks are preserved for display AND replay (rawMessage
+  // keeps the exact block array); redacted/opaque blocks are preserved
+  // for replay but never rendered as fake prose.
+  const text = data.content
+    .filter((part) => part && part.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('');
+  const reasoning = data.content
+    .filter((part) => part && part.type === 'thinking' && typeof part.thinking === 'string')
+    .map((part) => part.thinking)
+    .join('\n') || null;
+
+  const envelope = {
+    content: text,
+    reasoning,
+    stopReason: data.stop_reason || null,
+    usage: data.usage || null,
+    rawMessage: { role: 'assistant', content: data.content },
+    truncated: data.stop_reason === 'max_tokens',
+  };
+  if (!text) {
+    if (data.stop_reason === 'max_tokens') {
+      throw makeParseError('模型在生成可见回答前达到 token 上限（stop_reason: max_tokens）');
+    }
+    throw makeParseError('响应中没有可见文本内容（stop_reason: ' + (data.stop_reason || 'unknown') + '）');
+  }
+  return envelope;
+}
+
+function parseOpenAIResp(data) {
+  if (data.choices && data.choices[0]) {
+    const choice = data.choices[0];
+    const msg = choice.message || choice.delta || {};
+    const content = typeof msg.content === 'string' ? msg.content : '';
+    const envelope = {
+      content,
+      reasoning: typeof msg.reasoning_content === 'string' && msg.reasoning_content ? msg.reasoning_content : null,
+      stopReason: choice.finish_reason || null,
+      usage: data.usage || null,
+      // Replay the provider-native message object unchanged (keeps
+      // reasoning_content and any provider-specific continuation fields).
+      rawMessage: msg,
+      truncated: choice.finish_reason === 'length',
+    };
+    if (content) return envelope;
+    if (choice.finish_reason === 'length') {
+      throw makeParseError('模型在生成可见回答前达到 token 上限（finish_reason: length）');
+    }
+    throw makeParseError('响应中没有可见文本内容（finish_reason: ' + (choice.finish_reason || 'unknown') + '）');
+  }
+  if (data.error) throw makeParseError(data.error.message || JSON.stringify(data.error));
+  throw makeParseError('响应格式不符合预期');
+}
+
+// ---------- transport ----------
+// Read a response body as text with a hard byte cap and deadline
+// enforcement shared with the caller's AbortController.
+function headerValue(res, name) {
+  try {
+    return res.headers && typeof res.headers.get === 'function' ? res.headers.get(name) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function readTextCapped(res, maxBytes, signal) {
+  const contentLength = Number.parseInt(headerValue(res, 'content-length') || '', 10);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw makeParseError('response too large (>' + maxBytes + ' bytes)');
+  }
+  if (!res.body || !res.body.getReader) {
+    const text = await raceSignal(res.text(), signal);
+    if (text.length > maxBytes) throw makeParseError('response too large (>' + maxBytes + ' bytes)');
+    return text;
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+  try {
+    for (;;) {
+      const { done, value } = await raceSignal(reader.read(), signal);
+      if (done) break;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        cancelReaderQuietly(reader);
+        throw makeParseError('response too large (>' + maxBytes + ' bytes)');
+      }
+      chunks.push(value);
+    }
+  } catch (e) {
+    if (e && (e.cancelled || e.name === 'AbortError')) {
+      cancelReaderQuietly(reader);
+    }
+    throw e;
+  } finally {
+    try { reader.releaseLock(); } catch (e) { /* already released */ }
+  }
+  const merged = new Uint8Array(received);
+  let offset = 0;
+  for (const c of chunks) { merged.set(c, offset); offset += c.byteLength; }
+  return new TextDecoder().decode(merged);
+}
+
+// Best-effort stream cleanup on the way out (timeout / cancel / size
+// cap). NEVER awaited: the underlying source's cancel() may return a
+// promise that never settles (a stalled stream need not react to
+// cancellation), and awaiting it would block the caller's exit path
+// indefinitely — after the race was already lost. The rejection handler
+// is attached immediately so a failed cleanup never surfaces as an
+// unhandled rejection.
+function cancelReaderQuietly(reader) {
+  try {
+    const p = reader.cancel();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch (e) { /* synchronous cancel failure: ignore */ }
+}
+
+// Race a promise against the deadline/cancellation signal so a stalled
+// body loses the race even if the underlying stream never reacts to abort.
+function raceSignal(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(makeModelCancelledError());
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(makeModelCancelledError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (v) => { signal.removeEventListener('abort', onAbort); resolve(v); },
+      (e) => { signal.removeEventListener('abort', onAbort); reject(e); }
+    );
+  });
+}
+
+// One POST with full-lifecycle deadline (headers AND body), optional
+// external cancellation, and a response size cap.
+async function fetchJsonPost(fetchUrl, headers, body, opts) {
+  const o = opts || {};
+  const timeoutMs = o.timeoutMs || MODEL_TIMEOUT_MS;
+  const external = o.signal || null;
+  if (external && external.aborted) throw makeModelCancelledError();
+
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+  const onExternalAbort = () => controller.abort();
+  if (external) external.addEventListener('abort', onExternalAbort, { once: true });
+
+  let res;
+  try {
+    try {
+      res = await fetch(fetchUrl, {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (external && external.aborted) throw makeModelCancelledError();
+      if (timedOut) throw makeTimeoutError('model request timed out after ' + timeoutMs + 'ms (waiting for response headers)');
+      throw e; // genuine network/CORS TypeError
+    }
+
+    let text;
+    try {
+      text = await readTextCapped(res, MODEL_MAX_RESPONSE_BYTES, controller.signal);
+    } catch (e) {
+      // Classify by failure PHASE: headers already arrived, so a failure
+      // here is a body-read failure — never a CORS/transport candidate.
+      if (external && external.aborted) throw makeModelCancelledError();
+      if (timedOut) throw makeTimeoutError('model request timed out after ' + timeoutMs + 'ms (response body incomplete)');
+      if (e && e.noFallback) throw e; // size-cap ParseError etc.
+      if (e && (e.cancelled || e.name === 'AbortError')) throw makeModelCancelledError();
+      throw makeBodyReadError(res.status, e);
+    }
+
+    let data = null;
+    try { data = text ? JSON.parse(text) : {}; } catch (e) { /* handled below */ }
+    if (!res.ok) {
+      const msg = data && data.error ? (data.error.message || data.error.type) : ('HTTP ' + res.status);
+      const err = makeHttpError(res.status, msg);
+      // A relay that answered proves it exists (see tryFetch fallback policy).
+      if (headerValue(res, 'x-locus-relay')) err.relaySeen = true;
+      throw err;
+    }
+    if (!data) throw makeParseError('响应不是 JSON');
+    return data;
+  } finally {
+    clearTimeout(timer);
+    if (external) external.removeEventListener('abort', onExternalAbort);
+  }
 }
 
 // fetch() rejects with TypeError only on genuine network/CORS failures.
@@ -119,29 +337,38 @@ function isNetworkError(e) {
   return e instanceof TypeError;
 }
 
-async function tryFetch(url, headers, body, parser) {
+async function tryFetch(url, headers, body, parser, opts) {
   // 1. Explicit proxy configured → always use it.
   if (Model.proxy) {
     const proxy = Model.proxy.replace(/\/+$/, '');
-    const data = await fetchJsonPost(proxy, Object.assign({}, headers, { 'X-Target-URL': url }), body);
+    const data = await fetchJsonPost(proxy, Object.assign({}, headers, { 'X-Target-URL': url }), body, opts);
     return parser(data);
   }
 
   // 2. Direct fetch first.
   try {
-    const data = await fetchJsonPost(url, headers, body);
+    const data = await fetchJsonPost(url, headers, body, opts);
     return parser(data);
   } catch (e) {
     // 3. Only on genuine network/CORS failure, and only when hosted
-    //    (non-file://), try the same-origin /proxy relay.
+    //    (non-file://), try the same-origin /proxy relay. Parse errors,
+    //    timeouts, HTTP statuses and cancellations are NEVER relayed.
     if (!isNetworkError(e) || window.location.protocol === 'file:') throw e;
     const directError = e;
     try {
-      const data = await fetchJsonPost('/proxy', Object.assign({}, headers, { 'X-Target-URL': url }), body);
+      const data = await fetchJsonPost('/proxy', Object.assign({}, headers, { 'X-Target-URL': url }), body, opts);
       return parser(data);
     } catch (e2) {
-      // 4. /proxy missing or also failing → report the original error.
-      throw directError;
+      // 4. The relay answered → its HTTP/parse error is the AUTHORITATIVE
+      //    result of the request (401/402/429/5xx/quota/…). Never mask it
+      //    with the original CORS error and never trigger further retries.
+      //    Only when the relay itself is missing/unreachable (network
+      //    failure, or a 404 from a deployment without the function) is
+      //    the original direct error the more honest thing to show.
+      if (isNetworkError(e2) || (e2 && e2.status === 404 && !e2.relaySeen)) {
+        throw directError;
+      }
+      throw e2;
     }
   }
 }
@@ -159,11 +386,18 @@ function isAuthoritativeError(e) {
 }
 
 function isFallbackableError(e) {
-  // Network/CORS failures (no status), non-JSON responses, and 404/405.
-  return !e || e.status === undefined || FALLBACK_STATUS.indexOf(e.status) !== -1;
+  if (!e) return true;
+  // Parse errors, timeouts, cancellations: the request already reached a
+  // working endpoint — trying another one cannot help and may double-bill.
+  if (e.noFallback || e.timeout || e.cancelled || e.name === 'AbortError') return false;
+  // Network/CORS failures (no status), and 404/405.
+  return e.status === undefined || FALLBACK_STATUS.indexOf(e.status) !== -1;
 }
 
-async function callModelText(body) {
+// Structured model call. opts.signal cancels the request.
+// Returns the response envelope { content, reasoning, stopReason, usage,
+// rawMessage, truncated }.
+async function callModel(body, opts) {
   const key = sanitizeKey(Model.apiKey);
   const dialect = detectDialect(Model.apiBase);
 
@@ -197,14 +431,21 @@ async function callModelText(body) {
   let firstErr = null;
   for (const attempt of attempts) {
     try {
-      return await tryFetch(attempt.url, attempt.h, attempt.b, attempt.p);
+      return await tryFetch(attempt.url, attempt.h, attempt.b, attempt.p, opts);
     } catch (e) {
       if (isAuthoritativeError(e)) throw e;       // 401/402/403/429: stop now
-      if (!isFallbackableError(e)) throw e;       // 400/422/5xx etc: don't retry blindly
+      if (!isFallbackableError(e)) throw e;       // HTTP errors, parse errors, timeouts, cancellations
       if (!firstErr) firstErr = e;                // keep the most relevant error
     }
   }
   throw firstErr || new Error('连接失败');
+}
+
+// Compatibility wrapper for callers that only need visible text
+// (e.g. verifyConnection).
+async function callModelText(body, opts) {
+  const envelope = await callModel(body, opts);
+  return envelope.content;
 }
 
 async function verifyConnection() {

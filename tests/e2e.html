@@ -3,13 +3,31 @@
 <head><meta charset="UTF-8"><title>e2e</title></head>
 <body>
 <div id="sb-python"></div>
+<!-- DOM skeleton required by src/ui.js boot (initSetup + status bar buttons) -->
+<div id="screen-zero" style="display:none">
+  <button id="adv-toggle" type="button"></button>
+  <div id="adv-panel"></div>
+  <input id="api-key-input"><input id="api-base-input"><input id="model-input"><input id="proxy-input">
+  <input id="remember-session-key-check" type="checkbox">
+  <button id="setup-go" type="button"></button>
+  <div id="init-result"></div>
+</div>
+<div id="app">
+  <span id="sb-workspace"></span>
+  <button id="btn-workspace" type="button"></button>
+  <button id="btn-cancel" type="button" disabled>Cancel</button>
+  <button id="btn-log" type="button"></button>
+  <div id="debug-panel"><div id="dp-list"></div></div>
+</div>
 <pre id="out">RUNNING</pre>
 <script src="../src/telemetry.js"></script>
 <script src="../src/workspace.js"></script>
 <script src="../src/network.js"></script>
 <script src="../src/shell.js"></script>
 <script src="../src/tools.js"></script>
+<script src="../src/model.js"></script>
 <script src="../src/agent.js"></script>
+<script src="../src/ui.js"></script>
 <script>
 (async () => {
   const lines = [];
@@ -137,6 +155,112 @@
         JSON.stringify(ws.files['report.csv']));
     } finally {
       window.fetch = realFetch;
+    }
+
+    // ---------- J. REAL native FileSystemDirectoryHandle via OPFS (F01) ----------
+    // LocalDirectoryWorkspace against a browser-native handle (not a mock):
+    // stat options, exists() semantics, cat, append, python sync.
+    try {
+      const opfsRoot = await navigator.storage.getDirectory();
+      const dirName = 'locus-e2e-' + Date.now();
+      const dir = await opfsRoot.getDirectoryHandle(dirName, { create: true });
+      const realWs = new LocalDirectoryWorkspace(dir);
+      try {
+        check('J1 native exists(missing) === false', (await realWs.exists('none.txt')) === false);
+        await realWs.write('a.txt', 'hello\n');
+        const jst = await realWs.stat('a.txt');
+        check('J2 native stat file', jst.kind === 'file' && jst.size === 6, JSON.stringify(jst));
+        const jcat = await executeTool('bash', 'cat a.txt', realWs);
+        check('J3 native cat', jcat.success && jcat.output.replace(/\n$/, '') === 'hello', JSON.stringify(jcat.output));
+        await executeTool('bash', 'echo first > log.txt', realWs);
+        await executeTool('bash', 'echo second >> log.txt', realWs);
+        check('J4 native append preserves content', (await realWs.read('log.txt')) === 'first\nsecond\n',
+          JSON.stringify(await realWs.read('log.txt')));
+        const jpy = await executeTool('bash', "python <<'PY'\ndata = open('a.txt').read()\nprint('read:' + data.strip())\nopen('py-out.txt', 'w').write(data.upper())\nPY", realWs);
+        check('J5 native python sync in/out', jpy.success && jpy.output.includes('read:hello')
+          && (await realWs.read('py-out.txt')) === 'HELLO\n', JSON.stringify(jpy.output).slice(0, 200));
+
+        // F15 in a real browser: quoted > is text, not a redirect
+        const jq = await executeTool('bash', 'echo ">" victim.txt', realWs);
+        check('J6 quoted > writes nothing', jq.success && jq.output === '> victim.txt'
+          && (await realWs.exists('victim.txt')) === false, JSON.stringify(jq.output));
+      } finally {
+        await opfsRoot.removeEntry(dirName, { recursive: true });
+      }
+    } catch (e) {
+      check('J0 OPFS native handle available', false, String(e && e.message || e));
+    }
+
+    // ---------- K. Python session isolation (F03): reset kills globals AND /tmp ----------
+    await executeTool('bash', "python <<'PY'\nsecret = 'leak'\nopen('/tmp/leak.txt', 'w').write('leak')\nPY", ws);
+    PythonRuntime.reset();
+    const k1 = await executeTool('bash', "python <<'PY'\nimport os\ntry:\n    print('var:' + secret)\nexcept NameError:\n    print('var:gone')\nprint('tmp:' + str(os.path.exists('/tmp/leak.txt')))\nPY", ws);
+    check('K1 python globals isolated after reset', k1.success && k1.output.includes('var:gone'), JSON.stringify(k1.output));
+    check('K2 /tmp isolated after reset', k1.output.includes('tmp:False'), JSON.stringify(k1.output));
+
+    // ---------- L. F06 capability check: Python CAN reach js.fetch ----------
+    // This documents the real capability boundary (declared in README):
+    // the Pyodide worker has network access via the JS bridge; the
+    // anonymous-GET policy is enforced at the curl layer, not by sandboxing
+    // Python. The check must print True — if it ever prints False the
+    // declaration in README needs revisiting.
+    const l1 = await executeTool('bash', "python <<'PY'\nimport js\nprint('js.fetch callable: ' + str(callable(js.fetch)))\nPY", ws);
+    check('L1 python js bridge exposes fetch (capability documented)',
+      l1.success && l1.output.includes('js.fetch callable: True'), JSON.stringify(l1.output));
+
+    // ---------- M. cancel reachable while busy — REAL UI event path (Finding 3) ----------
+    // The in-flight task is cancelled by dispatching genuine UI events
+    // (button click / Escape keydown), not by calling cancelAgentTask().
+    {
+      const termStub = { echo: () => {}, pause: () => {}, resume: () => {}, update: () => {} };
+      const origCallModel = window.callModel;
+      let modelAborted = 0;
+      window.callModel = (req, opts) => new Promise((resolve, reject) => {
+        opts.signal.addEventListener('abort', () => {
+          modelAborted++;
+          reject(Object.assign(new Error('model request aborted'), { name: 'AbortError' }));
+        });
+      });
+      const btnCancel = document.getElementById('btn-cancel');
+      try {
+        check('M1 cancel button disabled when idle', btnCancel.disabled === true);
+
+        // start a task that hangs inside the model request
+        App.busy = true; updateCancelButton();
+        const task1 = runAgentTask(termStub, 'hang on model');
+        check('M2 cancel button enabled while busy', btnCancel.disabled === false);
+        btnCancel.click(); // real UI event
+        await task1;
+        check('M3 button click aborts the in-flight model request', modelAborted === 1, 'aborts=' + modelAborted);
+        check('M4 task object cleared after cancel', Agent.task === null);
+        App.busy = false; updateCancelButton();
+        check('M5 button disabled again after task ends', btnCancel.disabled === true);
+
+        // Escape keydown path
+        App.busy = true; updateCancelButton();
+        const task2 = runAgentTask(termStub, 'hang on model 2');
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+        await task2;
+        check('M6 Escape aborts the in-flight request', modelAborted === 2, 'aborts=' + modelAborted);
+        App.busy = false; updateCancelButton();
+
+        // idle click must be harmless (no throw, no state change)
+        btnCancel.click();
+        check('M7 idle click is harmless', Agent.task === null && App.busy === false);
+
+        // double cancel while already cancelling must not throw or re-abort
+        App.busy = true; updateCancelButton();
+        const task3 = runAgentTask(termStub, 'hang on model 3');
+        btnCancel.click();
+        btnCancel.click();
+        await task3;
+        check('M8 double cancel is safe', modelAborted === 3 && Agent.task === null, 'aborts=' + modelAborted);
+        App.busy = false; updateCancelButton();
+      } finally {
+        window.callModel = origCallModel;
+        App.busy = false; updateCancelButton();
+        Agent.history = [];
+      }
     }
 
     // ---------- E. python timeout + worker recovery (runs last) ----------

@@ -8,7 +8,7 @@
 
 const TOOL_NOT_FOUND = (name) => 'unknown tool: ' + name + '. Available tools: bash, cloud_bash';
 
-async function executeTool(name, input, workspace) {
+async function executeTool(name, input, workspace, opts) {
   const started = performance.now();
   const toolName = String(name || '').trim();
   let output = '';
@@ -21,7 +21,7 @@ async function executeTool(name, input, workspace) {
 
   try {
     if (toolName === 'bash') {
-      const res = await runShellCommand(input, workspace);
+      const res = await runShellCommand(input, workspace, opts);
       output = res.output;
       success = !res.isError;
       if (res.isError) error = firstLine(res.output);

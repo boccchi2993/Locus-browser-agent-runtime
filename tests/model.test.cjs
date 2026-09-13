@@ -7,22 +7,67 @@ const path = require('path');
 // --- browser stubs (model.js touches window only for the /proxy fallback) ---
 global.window = { location: { protocol: 'file:' } };
 
+// Cleanup rejections must never surface as unhandled rejections (P6/P10).
+const unhandled = [];
+process.on('unhandledRejection', (e) => { unhandled.push(e); });
+
 // --- load the real model.js ---
 const M = eval(
   fs.readFileSync(path.join(__dirname, '..', 'src', 'model.js'), 'utf8') +
-  '\n;({ detectDialect, callModelText, verifyConnection, Model });'
+  '\n;({ detectDialect, callModel, callModelText, verifyConnection, Model });'
 );
 
 // --- fetch mock: records requests, replays queued responses ---
+// queued item: {status, json, headers?, typeError?, hang?}
 let calls = [];
 let queue = [];
 global.fetch = async (url, opts) => {
   calls.push({ url, headers: opts.headers, body: JSON.parse(opts.body) });
   const next = queue.length ? queue.shift() : { status: 500, json: { error: { message: 'no mock queued' } } };
+  if (next.typeError) throw new TypeError('Failed to fetch'); // genuine CORS/network failure
+  if (next.hang) {
+    await new Promise((resolve, reject) => {
+      if (opts.signal) {
+        opts.signal.addEventListener('abort', () => {
+          const e = new Error('The operation was aborted');
+          e.name = 'AbortError';
+          reject(e);
+        });
+      }
+    });
+  }
+  if (next.bodyStreamError) {
+    // Headers arrive fine, then the BODY stream dies mid-read — the exact
+    // shape of a truncated/reset connection after HTTP 200.
+    return {
+      ok: next.status >= 200 && next.status < 300,
+      status: next.status,
+      headers: { get: (n) => (next.headers || {})[String(n).toLowerCase()] || null },
+      body: new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('{"partial":'));
+          c.error(new TypeError('Failed to fetch'));
+        },
+      }),
+      text: async () => { throw new TypeError('Failed to fetch'); },
+    };
+  }
+  if (next.bodyStream) {
+    // Native ReadableStream body with caller-defined behavior — used to
+    // exercise stalled reads and hanging/rejecting cleanup (cancel()).
+    return {
+      ok: next.status >= 200 && next.status < 300,
+      status: next.status,
+      headers: { get: (n) => (next.headers || {})[String(n).toLowerCase()] || null },
+      body: next.bodyStream(),
+      text: async () => { throw new Error('text() not available in bodyStream mock'); },
+    };
+  }
   return {
     ok: next.status >= 200 && next.status < 300,
     status: next.status,
-    text: async () => JSON.stringify(next.json),
+    headers: { get: (n) => (next.headers || {})[String(n).toLowerCase()] || null },
+    text: async () => (next.rawText !== undefined ? next.rawText : JSON.stringify(next.json)),
   };
 };
 
@@ -162,7 +207,7 @@ async function run() {
   queue.push({ status: 200, json: { content: [{ type: 'thinking', thinking: '...' }] } });
   let jeErr = null;
   try { await M.callModelText(body); } catch (e) { jeErr = e; }
-  check('J-E no visible text error', jeErr && jeErr.message === '响应中没有可见文本内容', jeErr && jeErr.message);
+  check('J-E no visible text error', jeErr && jeErr.message.includes('响应中没有可见文本内容'), jeErr && jeErr.message);
 
   // J-E2: no visible text + stop_reason max_tokens → hint included
   queue.push({ status: 200, json: { content: [{ type: 'thinking', thinking: '...' }], stop_reason: 'max_tokens' } });
@@ -185,6 +230,211 @@ async function run() {
   queue.push(ANTHROPIC_OK);
   await M.verifyConnection();
   check('L verifyConnection max_tokens is 128', calls[0].body.max_tokens === 128, 'max_tokens=' + calls[0].body.max_tokens);
+
+  // ---------- M. auto /proxy fallback preserves authoritative relay errors (F08) ----------
+  global.window.location.protocol = 'https:'; // hosted → relay fallback available
+  reset('https://api.deepseek.com');
+  queue.push(
+    { typeError: true }, // direct: CORS
+    { status: 429, json: { error: { message: 'quota exhausted' } }, headers: { 'x-locus-relay': '1' } }, // relay answers
+  );
+  let mErr = null;
+  try { await M.callModelText(body); } catch (e) { mErr = e; }
+  check('M1 relay 429 preserved (not masked by CORS)', mErr && mErr.status === 429 && mErr.message === 'quota exhausted',
+    mErr && mErr.status + '/' + mErr.message);
+  check('M1b exactly 2 requests (direct + relay), no endpoint probing', calls.length === 2, 'calls=' + calls.length);
+
+  // relay missing (404 without the relay marker) → original direct error wins
+  reset('https://api.deepseek.com/anthropic');
+  queue.push(
+    { typeError: true },
+    { status: 404, json: { error: { message: 'not found' } } }, // no x-locus-relay header
+  );
+  let m2Err = null;
+  try { await M.callModelText(body); } catch (e) { m2Err = e; }
+  check('M2 missing relay → original CORS error', m2Err && m2Err instanceof TypeError && calls.length === 2,
+    (m2Err && m2Err.message) + ' calls=' + calls.length);
+
+  // ---------- N. HTTP 200 semantic errors never trigger another paid request (F09) ----------
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, json: { choices: [{ message: { content: null, reasoning_content: 'thinking' }, finish_reason: 'length' }] } });
+  let nErr = null;
+  try { await M.callModelText(body); } catch (e) { nErr = e; }
+  check('N1 reasoning-only + length → parse error mentioning token limit',
+    nErr && nErr.message.includes('token 上限'), nErr && nErr.message);
+  check('N1b exactly 1 request (no second endpoint attempt)', calls.length === 1, 'calls=' + calls.length);
+
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, json: { choices: [{ message: { content: '' }, finish_reason: 'stop' }] } });
+  let n2Err = null;
+  try { await M.callModelText(body); } catch (e) { n2Err = e; }
+  check('N2 empty content + stop → no retry', n2Err && calls.length === 1, 'calls=' + calls.length);
+
+  // non-JSON body on HTTP 200 is a parse error, not an endpoint error
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, rawText: '<html>not json</html>' });
+  let n3Err = null;
+  try { await M.callModelText(body); } catch (e) { n3Err = e; }
+  check('N3 non-JSON 200 → parse error, no retry', n3Err && n3Err.message === '响应不是 JSON' && calls.length === 1,
+    (n3Err && n3Err.message) + ' calls=' + calls.length);
+
+  // ---------- O. structured envelope (MODEL-PROTOCOL) ----------
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, json: { choices: [{ message: { content: 'visible', reasoning_content: 'raw thinking' }, finish_reason: 'stop' }], usage: { total_tokens: 42 } } });
+  const oEnv = await M.callModel(body);
+  check('O1 openai envelope: content/reasoning/stopReason/usage separated',
+    oEnv.content === 'visible' && oEnv.reasoning === 'raw thinking' && oEnv.stopReason === 'stop'
+    && oEnv.usage && oEnv.usage.total_tokens === 42 && oEnv.truncated === false, JSON.stringify(oEnv));
+  check('O1b rawMessage preserves provider-native reasoning_content',
+    oEnv.rawMessage && oEnv.rawMessage.reasoning_content === 'raw thinking');
+
+  reset('https://api.deepseek.com/anthropic');
+  queue.push({ status: 200, json: { content: [
+    { type: 'thinking', thinking: 'chain' },
+    { type: 'text', text: 'answer' },
+  ], stop_reason: 'end_turn', usage: { input_tokens: 3 } } });
+  const o2Env = await M.callModel(body);
+  check('O2 anthropic envelope: thinking preserved, blocks replayable',
+    o2Env.content === 'answer' && o2Env.reasoning === 'chain' && o2Env.stopReason === 'end_turn'
+    && Array.isArray(o2Env.rawMessage.content) && o2Env.rawMessage.content[0].type === 'thinking',
+    JSON.stringify(o2Env));
+
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, json: { choices: [{ message: { content: 'partial answer' }, finish_reason: 'length' }] } });
+  const o3Env = await M.callModel(body);
+  check('O3 truncated non-empty content kept with truncated flag',
+    o3Env.content === 'partial answer' && o3Env.truncated === true && o3Env.stopReason === 'length');
+
+  // ---------- P. cancellation & timeout ----------
+  reset('https://api.deepseek.com');
+  const ac = new AbortController();
+  ac.abort();
+  let pErr = null;
+  try { await M.callModel(body, { signal: ac.signal }); } catch (e) { pErr = e; }
+  check('P1 pre-aborted signal cancels before any request', pErr && pErr.name === 'AbortError' && calls.length === 0,
+    (pErr && pErr.name) + ' calls=' + calls.length);
+
+  reset('https://api.deepseek.com');
+  queue.push({ hang: true });
+  const ac2 = new AbortController();
+  setTimeout(() => ac2.abort(), 20);
+  let p2Err = null;
+  try { await M.callModel(body, { signal: ac2.signal }); } catch (e) { p2Err = e; }
+  check('P2 mid-flight abort → cancelled, no retry', p2Err && p2Err.name === 'AbortError' && calls.length === 1,
+    (p2Err && p2Err.name) + ' calls=' + calls.length);
+
+  reset('https://api.deepseek.com');
+  queue.push({ hang: true });
+  let p3Err = null;
+  try { await M.callModel(body, { timeoutMs: 30 }); } catch (e) { p3Err = e; }
+  check('P3 client deadline → timeout error, no endpoint retry',
+    p3Err && p3Err.timeout === true && p3Err.message.includes('timed out') && calls.length === 1,
+    (p3Err && p3Err.message) + ' calls=' + calls.length);
+
+  // ---------- Q. body-read failure AFTER headers is not a CORS fallback (Finding 6) ----------
+  global.window.location.protocol = 'https:';
+  // Q1: HTTP 200, body stream dies mid-read → BodyReadError, NO /proxy re-send
+  reset('https://model.test');
+  queue.push({ status: 200, bodyStreamError: true });
+  let q1Err = null;
+  try { await M.callModel(body); } catch (e) { q1Err = e; }
+  check('Q1 200 body interruption → BodyReadError (not TypeError/CORS)',
+    q1Err && q1Err.name === 'BodyReadError' && q1Err.noFallback === true,
+    q1Err && q1Err.name + '/' + q1Err.message);
+  check('Q1b status and cause preserved', q1Err && q1Err.status === 200 && q1Err.cause instanceof TypeError,
+    q1Err && String(q1Err.status) + '/' + (q1Err.cause && q1Err.cause.message));
+  check('Q1c no second request (no double-billed inference)', calls.length === 1,
+    'calls=' + calls.length + ' ' + calls.map((c) => c.url).join(','));
+
+  // Q2: error status, body dies before the error JSON can be read → still no fallback
+  reset('https://model.test');
+  queue.push({ status: 500, bodyStreamError: true });
+  let q2Err = null;
+  try { await M.callModel(body); } catch (e) { q2Err = e; }
+  check('Q2 500 body interruption → BodyReadError keeps HTTP status, no retry',
+    q2Err && q2Err.name === 'BodyReadError' && q2Err.status === 500 && calls.length === 1,
+    (q2Err && q2Err.name + '/' + q2Err.status) + ' calls=' + calls.length);
+
+  // Q3: genuine pre-headers CORS failure still falls back to /proxy (regression guard)
+  reset('https://model.test');
+  queue.push({ typeError: true }, OPENAI_OK);
+  const q3 = await M.callModelText(body);
+  check('Q3 pre-headers TypeError still relays to /proxy', q3 === 'OK' && calls.length === 2
+    && calls[1].url === '/proxy', calls.map((c) => c.url).join(','));
+
+  global.window.location.protocol = 'file:';
+
+  // ---------- R. stream cleanup never blocks timeout/cancel/size-cap exits ----------
+  // Native ReadableStream bodies whose cancel() hangs / rejects / resolves.
+  const stallStream = (cancelImpl) => () => new ReadableStream({
+    start() { /* read stalls forever */ },
+    cancel: cancelImpl,
+  });
+
+  // R1: body stall + hanging cancel() → timeout exit must not be blocked
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, bodyStream: stallStream(() => new Promise(() => {})) });
+  let r1Err = null;
+  const r1start = Date.now();
+  try { await M.callModel(body, { timeoutMs: 40 }); } catch (e) { r1Err = e; }
+  const r1elapsed = Date.now() - r1start;
+  check('R1 hanging reader.cancel() does not block the timeout exit',
+    r1Err && r1Err.timeout === true && r1Err.message.includes('body incomplete') && r1elapsed < 5000,
+    (r1Err && r1Err.name + '/' + r1Err.message) + ' after ' + r1elapsed + 'ms');
+  check('R1b no endpoint retry (single paid request)', calls.length === 1, 'calls=' + calls.length);
+
+  // R2: rejecting cancel() keeps the timeout classification
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, bodyStream: stallStream(() => Promise.reject(new Error('cleanup blew up'))) });
+  let r2Err = null;
+  try { await M.callModel(body, { timeoutMs: 40 }); } catch (e) { r2Err = e; }
+  check('R2 rejecting reader.cancel() keeps the timeout classification',
+    r2Err && r2Err.timeout === true, r2Err && r2Err.message);
+
+  // R3: normal cancel() still runs and resolves
+  reset('https://api.deepseek.com');
+  let r3cancelled = false;
+  queue.push({ status: 200, bodyStream: stallStream(() => { r3cancelled = true; return Promise.resolve(); }) });
+  let r3Err = null;
+  try { await M.callModel(body, { timeoutMs: 40 }); } catch (e) { r3Err = e; }
+  check('R3 resolving reader.cancel() → timeout error, cleanup ran',
+    r3Err && r3Err.timeout === true && r3cancelled === true,
+    (r3Err && r3Err.message) + ' cancelled=' + r3cancelled);
+
+  // R4: streamed body over the size cap + hanging cancel() → parse error promptly
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, bodyStream: () => new ReadableStream({
+    start(c) {
+      const mb = new Uint8Array(1024 * 1024);
+      for (let i = 0; i < 17; i++) c.enqueue(mb); // 17 MiB > 16 MiB cap
+    },
+    cancel() { return new Promise(() => {}); },
+  }) });
+  let r4Err = null;
+  const r4start = Date.now();
+  try { await M.callModel(body, { timeoutMs: 30000 }); } catch (e) { r4Err = e; }
+  const r4elapsed = Date.now() - r4start;
+  check('R4 size-cap exit not blocked by hanging cleanup (ParseError, no retry)',
+    r4Err && r4Err.name === 'ParseError' && r4Err.noFallback === true
+    && r4Err.message.includes('too large') && r4elapsed < 5000 && calls.length === 1,
+    (r4Err && r4Err.name + '/' + r4Err.message) + ' after ' + r4elapsed + 'ms calls=' + calls.length);
+
+  // R5: external cancel during stalled body + hanging cleanup → AbortError promptly
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, bodyStream: stallStream(() => new Promise(() => {})) });
+  const ac5 = new AbortController();
+  setTimeout(() => ac5.abort(), 30);
+  let r5Err = null;
+  const r5start = Date.now();
+  try { await M.callModel(body, { signal: ac5.signal, timeoutMs: 60000 }); } catch (e) { r5Err = e; }
+  const r5elapsed = Date.now() - r5start;
+  check('R5 external cancel + hanging cleanup → AbortError, not blocked',
+    r5Err && r5Err.name === 'AbortError' && r5elapsed < 5000 && calls.length === 1,
+    (r5Err && r5Err.name) + ' after ' + r5elapsed + 'ms calls=' + calls.length);
+
+  await new Promise((r) => setTimeout(r, 50)); // let any stray rejection surface
+  check('R6 no unhandled rejections from stream cleanup', unhandled.length === 0,
+    unhandled.map((e) => String(e)).join(' | '));
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);

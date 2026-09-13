@@ -126,6 +126,58 @@ async function run() {
   check('F10 upstream 404 passed through', r10.status === 404 && !r10.headers.get('x-locus-relay-error')
     && (await r10.text()) === '{"error":"nope"}', 'status=' + r10.status);
 
+  // ---------- F11. null-body statuses must not throw ----------
+  for (const [tag, status] of [['F11a', 204], ['F11b', 205], ['F11c', 304]]) {
+    reset();
+    on(() => true, () => new Response(null, { status }));
+    const r = await onRequestGet({ request: req('?url=' + encodeURIComponent('https://example.test/nobody')), env: {} });
+    const buf = await r.arrayBuffer();
+    check(tag + ' upstream ' + status + ' → ' + status + ', empty body', r.status === status && buf.byteLength === 0,
+      'status=' + r.status + ' bytes=' + buf.byteLength);
+  }
+
+  // ---------- F12. mid-body stream error (not timeout) → 502 ----------
+  reset();
+  on(() => true, () => {
+    const stream = new ReadableStream({
+      start(ctrl) {
+        ctrl.enqueue(new TextEncoder().encode('partial'));
+        ctrl.error(new Error('upstream reset'));
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  const r12 = await onRequestGet({
+    request: req('?url=' + encodeURIComponent('https://example.test/broken')),
+    env: { FETCH_TIMEOUT_MS: '5000' },
+  });
+  const b12 = await r12.json();
+  check('F12 mid-body stream error → 502 relay error', r12.status === 502
+    && r12.headers.get('x-locus-relay-error') === '1'
+    && /Upstream body read failed/.test(b12.error.message),
+    'status=' + r12.status + ' ' + JSON.stringify(b12));
+
+  // ---------- F13. active content gets CSP sandbox + nosniff ----------
+  reset();
+  on(() => true, () => new Response('<html><script>alert(1)</script></html>', {
+    status: 200,
+    headers: { 'content-type': 'text/html; charset=utf-8' },
+  }));
+  const r13 = await onRequestGet({ request: req('?url=' + encodeURIComponent('https://example.test/page')), env: {} });
+  check('F13 text/html → CSP sandbox + nosniff', r13.status === 200
+    && r13.headers.get('content-security-policy') === 'sandbox'
+    && r13.headers.get('x-content-type-options') === 'nosniff',
+    'csp=' + r13.headers.get('content-security-policy') + ' nosniff=' + r13.headers.get('x-content-type-options'));
+
+  // ---------- F14. passive content gets nosniff but no CSP sandbox ----------
+  reset();
+  on(() => true, () => new Response('{"a":1}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  const r14 = await onRequestGet({ request: req('?url=' + encodeURIComponent('https://example.test/data.json')), env: {} });
+  check('F14 application/json → nosniff, no CSP sandbox', r14.status === 200
+    && r14.headers.get('x-content-type-options') === 'nosniff'
+    && !r14.headers.get('content-security-policy'),
+    'csp=' + r14.headers.get('content-security-policy'));
+
   globalThis.fetch = realFetch;
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
