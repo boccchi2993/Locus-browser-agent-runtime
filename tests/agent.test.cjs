@@ -385,6 +385,111 @@ async function run() {
       && withWs.includes('cloud_bash') && withWs.includes("python <<'PY'"));
   }
 
+  // ---------- S19. concurrent run() is rejected by the runtime itself (P1.1-1) ----------
+  {
+    let modelCalls = 0;
+    const { session, events } = newSession({
+      modelClient: (body, opts) => {
+        modelCalls++;
+        if (modelCalls > 1) return Promise.resolve(FINAL); // task C completes normally
+        return new Promise((resolve, reject) => {
+          opts.signal.addEventListener('abort', () => {
+            const e = new Error('model request cancelled'); e.name = 'AbortError'; e.cancelled = true;
+            reject(e);
+          });
+        });
+      },
+      toolExecutor: async () => { throw new Error('must not run'); },
+    });
+    const taskA = session.run('task A', { workspace: WS_A });
+    await new Promise((r) => setTimeout(r, 10)); // task A is inside the model call
+    const taskRef = session.task;
+    const historyLen = session.history.length;
+
+    let rejected = null;
+    try {
+      await session.run('task B', { workspace: WS_A });
+    } catch (e) { rejected = e; }
+    check('S19 second run rejects while a task is live',
+      rejected && rejected.message.includes('already has a running task'), rejected && rejected.message);
+    check('S19b rejected run left no history trace', session.history.length === historyLen);
+    check('S19c rejected run made no model call', modelCalls === 1, 'modelCalls=' + modelCalls);
+    check('S19d session.task still belongs to task A', session.task === taskRef);
+    check('S19e no second task_start event',
+      events.filter((e) => e.type === 'task_start').length === 1, evTypes(events));
+
+    session.cancel(); // end task A
+    await taskA;
+    check('S19f after task A ends a new run works',
+      session.task === null && (await session.run('task C', { workspace: WS_A }), true));
+    check('S19g task C completed normally',
+      events.some((e) => e.type === 'task_end' && e.reason === 'completed'), evTypes(events));
+  }
+
+  // ---------- S20. reset() aborts the in-flight model request (P1.1-2A) ----------
+  {
+    let sawSignal = null;
+    let modelCalls = 0;
+    const gen0 = (() => { let g; return { set: (v) => { g = v; }, get: () => g }; })();
+    const { session, events, resetCalls } = newSession({
+      modelClient: (body, opts) => {
+        modelCalls++;
+        if (modelCalls > 1) return Promise.resolve(FINAL); // post-reset run completes
+        return new Promise((resolve, reject) => {
+          sawSignal = opts.signal;
+          opts.signal.addEventListener('abort', () => {
+            const e = new Error('model request cancelled'); e.name = 'AbortError'; e.cancelled = true;
+            reject(e);
+          });
+        });
+      },
+    });
+    gen0.set(session.generation);
+    const task = session.run('task', { workspace: WS_A });
+    await new Promise((r) => setTimeout(r, 10)); // inside the model call
+    session.reset();
+    check('S20 reset aborts the in-flight model request', sawSignal && sawSignal.aborted === true);
+    check('S20b history cleared synchronously', session.history.length === 0);
+    check('S20c generation bumped', session.generation === gen0.get() + 1);
+    check('S20d reset hook fired', resetCalls.n === 1);
+    await task;
+    check('S20e old task ends stale (session_changed), writes nothing back',
+      session.history.length === 0
+      && events.some((e) => e.type === 'warning' && e.code === 'session_changed')
+      && events.some((e) => e.type === 'task_end' && e.reason === 'session_changed'), evTypes(events));
+    await session.run('fresh task', { workspace: WS_A });
+    check('S20f new run works after reset',
+      events.filter((e) => e.type === 'task_end' && e.reason === 'completed').length === 1, evTypes(events));
+  }
+
+  // ---------- S21. reset() during tool execution: abort + late result discarded (P1.1-2B) ----------
+  {
+    let toolSignal = null;
+    let resolveTool;
+    let modelCalls = 0;
+    const { session, events } = newSession({
+      modelClient: async () => { modelCalls++; return modelCalls === 1 ? TOOL_CALL : FINAL; },
+      toolExecutor: (t, input, ws, opts) => {
+        toolSignal = opts && opts.signal;
+        return new Promise((r) => { resolveTool = () => r({ output: 'late secret', success: true }); });
+      },
+    });
+    const task = session.run('task', { workspace: WS_A });
+    await new Promise((r) => setTimeout(r, 10)); // tool started
+    session.reset();
+    check('S21 reset aborts the in-flight tool', toolSignal && toolSignal.aborted === true);
+    resolveTool(); // late tool result arrives AFTER the reset
+    await task;
+    check('S21b late tool result never enters new history', session.history.length === 0,
+      JSON.stringify(session.history));
+    check('S21c no tool_result presentation event from the old session',
+      !events.some((e) => e.type === 'tool_result'), evTypes(events));
+    check('S21d old task reported as session_changed',
+      events.some((e) => e.type === 'warning' && e.code === 'session_changed')
+      && events.some((e) => e.type === 'task_end' && e.reason === 'session_changed'), evTypes(events));
+    check('S21e no further model call from the stale task', modelCalls === 1, 'modelCalls=' + modelCalls);
+  }
+
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
 }

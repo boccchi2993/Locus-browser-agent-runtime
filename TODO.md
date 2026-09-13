@@ -54,7 +54,9 @@ below are reflected in the roadmap sections.
 - [x] Add regression tests for direct-fetch response-size cap.
 - [x] Add regression test proving curl -o without a workspace performs no network request.
 
-## V0.3.x — Reliability leftovers (this branch)
+## Deferred runtime reliability improvements
+
+Not blocking AgentSession / provider architecture work.
 
 - [ ] Bound the workspace collection phase (huge directory traversal has no deadline yet).
 - [ ] On-demand file bridging or incremental sync instead of full snapshot per python call.

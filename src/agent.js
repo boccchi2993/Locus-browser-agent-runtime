@@ -159,7 +159,12 @@ class AgentSession {
 
   // Full session reset: conversation history, generation, and (via the
   // injected hook) the Python interpreter — nothing leaks across the boundary.
+  // An active task is aborted FIRST: it immediately receives the abort
+  // signal, and the generation bump makes every late result stale, so it
+  // can never write into the new history. reset() stays a lightweight
+  // synchronous API — it never waits for the old task to finish.
   reset() {
+    if (this.task) this.task.controller.abort();
     this.history = [];
     this.generation++;
     if (this.onSessionReset) this.onSessionReset();
@@ -214,7 +219,15 @@ class AgentSession {
   // if the user switches workspace or resets the session mid-flight, every
   // late model response, tool result and write-back belonging to this task
   // is discarded instead of executing into the new session.
+  //
+  // Runtime invariant: ONE active task per session. This is enforced here,
+  // not delegated to the UI (App.busy): a second run() while a task is
+  // live rejects BEFORE touching task state, history, events, model or
+  // tools — the failed call leaves no trace in the session.
   async run(userText, opts) {
+    if (this.task) {
+      throw new Error('AgentSession already has a running task');
+    }
     const workspace = opts && 'workspace' in opts ? opts.workspace : null;
     const generation = this.generation;
     const controller = new AbortController();
