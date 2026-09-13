@@ -144,6 +144,8 @@ Model adapter
 
 The `/proxy` and `/fetch` relays are intentionally separate because they carry different authority and protocol semantics.
 
+The current implementation has not yet fully virtualized Python-originated networking through NetworkRuntime. Pyodide can still reach Worker `fetch` through the JS bridge. That is a declared implementation gap, not the target architecture.
+
 ## 5. Extension model
 
 Locus extensions should fall into three distinct categories.
@@ -291,14 +293,16 @@ The absence of a native implementation today is not a reason to put a domain-spe
 
 The core capability surface can be considered ready to freeze when all of the following are true:
 
-- Python compute is reliable and isolated.
-- JavaScript compute is reliable and isolated.
-- deterministic edit/state mutation exists.
-- public HTTPS connectivity through curl is reliable.
-- workspace authority boundaries are explicit.
-- browser/edge routing semantics are consistent.
-- model protocol preserves provider-native continuation semantics.
-- the agent loop is UI-independent and testable without DOM presentation.
-- extension capabilities can be registered without modifying the agent loop.
+- the browser runtime reliably provides execution,
+- the browser runtime reliably provides filesystem/state,
+- the browser runtime reliably provides network connectivity through a common capability boundary,
+- Python and JavaScript behave as userland execution environments rather than special architectural cases,
+- deterministic edit/state mutation exists,
+- workspace authority boundaries are explicit,
+- browser/edge routing semantics are consistent,
+- model protocol preserves provider-native continuation semantics,
+- the agent loop is UI-independent and testable without DOM presentation,
+- extension capabilities can be registered without modifying the agent loop,
+- workloads outside browser capability have an explicit escalation/provider path.
 
-After this point, additions to core should require a substantially higher bar than additions to the extension layer.
+After this point, additions to runtime/core should require a substantially higher bar than additions to the extension layer.
