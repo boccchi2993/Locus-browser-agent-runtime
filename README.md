@@ -4,6 +4,22 @@ A browser-native AI agent runtime that executes file, Python and public-network 
 
 Forked from the terminal UI / model-interaction skeleton of [Whoami_Cli_game](https://github.com/boccchi2993/Whoami_Cli_game). All game content has been removed; this is not a game.
 
+
+## Design principles
+
+> **Model decides WHAT. Harness decides WHERE.**
+
+> **Normalize capabilities. Preserve model semantics.**
+
+Locus keeps the model-facing capability surface small and maps familiar operations onto browser, edge and future cloud backends. Domain-specific features should normally grow through extensions rather than by expanding the core tool surface.
+
+Architecture and planning docs:
+
+- [Architecture and core primitives](docs/ARCHITECTURE.md)
+- [Model protocol and reasoning replay](docs/MODEL-PROTOCOL.md)
+- [Roadmap](ROADMAP.md)
+- [Implementation TODO](TODO.md)
+
 ## Why
 
 Remote sandboxes should be the fallback, not the default, for lightweight agent workloads. The cheapest, most private place to run an agent task is the environment closest to the data: the user's own browser, on files the user explicitly granted access to. The cloud should only carry LLM inference — and, when browser networking is blocked by CORS, a thin anonymous fetch relay.
