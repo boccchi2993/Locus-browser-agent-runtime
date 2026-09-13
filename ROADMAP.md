@@ -48,12 +48,14 @@ Goal: separate the agent runtime from presentation and preserve model-native con
 
 ### Agent/UI separation
 
-- remove direct terminal/DOM dependencies from the agent loop,
-- replace runAgentTask(term, ...) style coupling,
-- introduce an AgentSession or equivalent runtime object,
-- expose structured runtime events,
-- inject workspace/model/execution dependencies rather than reading UI globals,
-- make the full agent loop testable without presentation code.
+Status: implemented (`src/agent.js` `AgentSession` + event adapter in `src/ui.js`; Node coverage in `tests/agent.test.cjs`).
+
+- [x] remove direct terminal/DOM dependencies from the agent loop,
+- [x] replace runAgentTask(term, ...) style coupling,
+- [x] introduce an AgentSession or equivalent runtime object,
+- [x] expose structured runtime events,
+- [x] inject workspace/model/execution dependencies rather than reading UI globals,
+- [x] make the full agent loop testable without presentation code.
 
 ### Model protocol refactor
 

@@ -87,13 +87,13 @@ See [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md) for the detailed laye
 index.html            page layout, terminal theme, inline Pyodide worker source
 src/
   model.js            LLM API client (Anthropic/OpenAI dialect fallback, optional CORS proxy)
-  agent.js            agent tool loop + system prompt + strict tool-call parser
+  agent.js            AgentSession: UI-independent agent tool loop (runtime events, DI) + system prompt + strict tool-call parser
   tools.js            tool router (bash / cloud_bash) + telemetry hooks
   shell.js            browser shell compat layer (incl. curl + python heredoc) + Python runtime bridge
   network.js          NetworkRuntime: direct fetch with transparent /fetch relay fallback
   workspace.js        WorkspaceAdapter + LocalDirectoryWorkspace
   telemetry.js        in-memory execution log
-  ui.js               setup screen, workspace picker, terminal, debug panel
+  ui.js               setup screen, workspace picker, terminal event adapter (renders runtime events), debug panel
 functions/proxy.js    optional Cloudflare Pages Function (CORS relay for the LLM API)
 functions/fetch.js    optional Cloudflare Pages Function (anonymous public-HTTPS resource relay)
 examples/demo-workspace/sales.csv
@@ -209,7 +209,7 @@ Both are intentionally provider/site-agnostic for demo and development use, with
 ## V0.1 reliability & safety fixes
 
 - **Python timeout + recovery**: `python` executions time out after 30s (`PYTHON_TIMEOUT_MS`); the worker is terminated, all pending calls fail with `python execution timed out after 30000ms`, and the next call boots a fresh worker automatically.
-- **Workspace context isolation**: successfully selecting a new workspace resets the agent conversation (`Agent.history = []`) so file contents from workspace A never leak into LLM context for workspace B. Cancelling the picker does not reset.
+- **Workspace context isolation**: successfully selecting a new workspace resets the agent session (`AgentSession.reset()`: history cleared, generation bumped, Python state reset) so file contents from workspace A never leak into LLM context for workspace B. Cancelling the picker does not reset.
 - **File deletion sync**: Python-side `os.remove` / `os.rename` now propagate to the real workspace (`WorkspaceAdapter.remove`); previously only create/modify were synced.
 - **Python heredoc**: `python <<'PY' ... PY` passes multi-line code (any quotes, JSON, etc.) to Python verbatim; `python -c` remains for one-liners.
 - **Strict tool-call parsing**: a tool call executes only when the entire model reply is a single ` ```json ` block; prose-wrapped blocks are treated as plain text.

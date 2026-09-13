@@ -1,14 +1,31 @@
 // ============================================================
-//  UI
+//  UI — terminal adapter over the UI-independent agent runtime
 //  Setup screen, workspace selection, terminal wiring, debug panel.
 //  Terminal chrome adapted from Whoami_Cli_game.
+//
+//  The agent loop lives in src/agent.js (AgentSession) and knows
+//  nothing about this file. Everything presentation-side stays here:
+//  the thinking spinner, terminal colors/escaping, truncation for
+//  display, and the mapping from runtime events to terminal output.
 // ============================================================
 
 const App = {
   term: null,
   workspace: null, // LocalDirectoryWorkspace | null
   busy: false,
+  session: null,   // AgentSession (created below)
 };
+
+// Wire the runtime to the real model/tool layers. Model configuration
+// (Model.model etc.) is owned by this UI layer; the session itself never
+// reads it. The workspace is bound per task at run() time.
+App.session = new AgentSession({
+  modelClient: (body, opts) => callModel(Object.assign({ model: Model.model }, body), opts),
+  toolExecutor: (tool, input, workspace, opts) => executeTool(tool, input, workspace, opts),
+  buildSystemPrompt: buildSystemPrompt,
+  emit: (event) => { if (App.term) renderRuntimeEventToTerminal(event, App.term); },
+  onSessionReset: () => { if (typeof PythonRuntime !== 'undefined') PythonRuntime.reset(); },
+});
 
 const REMEMBER_SESSION_KEY = 'bar.v0.rememberSessionKey.v1';
 const SESSION_CONFIG_KEY = 'bar.v0.sessionConfig.v1';
@@ -120,7 +137,7 @@ async function selectWorkspace() {
     // response, tool result or write-back can land in the new workspace.
     if (App.busy) {
       App.term && App.term.echo('[[;var(--text-dim);]正在取消当前任务以切换 Workspace…]');
-      cancelAgentTask();
+      App.session.cancel();
       updateCancelButton();
       const stopped = await waitFor(() => !App.busy, 10000);
       if (!stopped) {
@@ -139,7 +156,7 @@ async function selectWorkspace() {
     // Python interpreter (globals / modules / /tmp) are all reset, so
     // nothing from the previous workspace leaks into the new one. Only on
     // success — picker cancellation and failures never reset.
-    resetAgentSession();
+    App.session.reset();
     document.getElementById('sb-workspace').textContent = 'Workspace: ' + App.workspace.name;
     if (App.term) {
       App.term.echo('[[;var(--accent);]Workspace 已挂载: ' + escapeTerm(App.workspace.name) + '/]');
@@ -201,7 +218,7 @@ function toggleDebugPanel() {
 function updateCancelButton() {
   const btn = document.getElementById('btn-cancel');
   if (!btn) return;
-  const task = Agent.task;
+  const task = App.session.task;
   if (App.busy && task && task.controller.signal.aborted) {
     btn.disabled = true;
     btn.textContent = 'Cancelling…';
@@ -216,13 +233,13 @@ function updateCancelButton() {
 
 function requestTaskCancel(term) {
   const out = term || App.term;
-  if (!App.busy || !Agent.task) {
+  if (!App.busy || !App.session.task) {
     out && out.echo('[[;var(--text-dim);]当前没有正在执行的任务。]');
     updateCancelButton();
     return;
   }
-  if (!Agent.task.controller.signal.aborted) {
-    cancelAgentTask();
+  if (!App.session.task.controller.signal.aborted) {
+    App.session.cancel();
     out && out.echo('[[;var(--text-dim);]已请求取消当前任务。]');
   }
   updateCancelButton();
@@ -250,9 +267,9 @@ const LOCAL_COMMANDS = {
   reset: (args, term) => {
     if (App.busy) {
       term.echo('[[;var(--text-dim);]正在取消当前任务并重置会话…]');
-      cancelAgentTask();
+      App.session.cancel();
     }
-    resetAgentSession();
+    App.session.reset();
     term.echo('[[;var(--accent);]会话已重置：对话历史与 Python 状态已清空。]');
   },
   cancel: (args, term) => requestTaskCancel(term),
@@ -263,6 +280,103 @@ const LOCAL_COMMANDS = {
       : '[[;var(--text-dim);]Workspace: Not selected. 点击右上角 Select Workspace。]');
   },
 };
+
+// ---------- terminal event adapter ----------
+// Presentation constants and helpers live ONLY here. The runtime emits
+// complete data (full reasoning, full tool output); how much of it is
+// shown, in which color, is the adapter's decision.
+const TERMINAL_ECHO_MAX_CHARS = 1500; // tool output shown in the UI
+const REASONING_ECHO_MAX_CHARS = 400;
+
+// ---------- thinking spinner (adapted from Whoami) ----------
+let thinkingSpinner = null;
+function startThinking(term) {
+  stopThinking();
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let i = 0;
+  term.echo('[[;var(--text-dim);]thinking ' + frames[0] + ']');
+  const timer = setInterval(() => {
+    try {
+      i = (i + 1) % frames.length;
+      term.update(-1, '[[;var(--text-dim);]thinking ' + frames[i] + ']');
+    } catch (e) {}
+  }, 90);
+  thinkingSpinner = { timer };
+}
+
+function stopThinking() {
+  if (thinkingSpinner) clearInterval(thinkingSpinner.timer);
+  thinkingSpinner = null;
+}
+
+// ---------- terminal escaping (from Whoami) ----------
+function escapeTerm(text) {
+  return String(text || '').replace(/([\[\]])/g, '\\$1');
+}
+
+function renderAgentText(term, text) {
+  const say = String(text || '').trim() || '(no response)';
+  say.split(/\r?\n/).forEach((line) => {
+    term.echo('[[;var(--accent);]AGENT>] [[;var(--text);]' + escapeTerm(line) + ']');
+  });
+}
+
+// Warnings that report committed work / truncation get the attention
+// color; pure discard/cancel notes stay dim.
+const WARNING_ORANGE = {
+  model_truncated: true,
+  answer_truncated: true,
+  task_cancelled_committed: true,
+  iteration_limit: true,
+};
+
+// The single mapping from runtime events to terminal output.
+// Spinner lifecycle: a model request is in flight between task_start /
+// tool_result and the first reasoning/warning/tool_call/assistant_text/
+// error/task_end that follows it.
+function renderRuntimeEventToTerminal(event, term) {
+  switch (event.type) {
+    case 'task_start':
+      startThinking(term);
+      break;
+    case 'reasoning':
+      stopThinking();
+      term.echo('[[;var(--text-dim);]thinking: ' + escapeTerm(truncateFor(event.content, REASONING_ECHO_MAX_CHARS)) + ']');
+      break;
+    case 'tool_call':
+      stopThinking();
+      term.echo('[[;var(--text-dim);]$ ' + escapeTerm(event.tool) + '(' + escapeTerm(truncateFor(event.input, 200)) + ')]');
+      break;
+    case 'tool_result': {
+      stopThinking();
+      const echoText = truncateFor(event.output, TERMINAL_ECHO_MAX_CHARS);
+      if (echoText) {
+        echoText.split(/\r?\n/).forEach((line) => {
+          term.echo('[[;var(--text-dim);]' + escapeTerm(line) + ']');
+        });
+      }
+      startThinking(term); // the next model request starts now
+      break;
+    }
+    case 'assistant_text':
+      stopThinking();
+      renderAgentText(term, event.content);
+      break;
+    case 'warning':
+      stopThinking();
+      term.echo(WARNING_ORANGE[event.code]
+        ? '[[;var(--orange);][' + escapeTerm(event.message) + ']]'
+        : '[[;var(--text-dim);][' + escapeTerm(event.message) + ']]');
+      break;
+    case 'error':
+      stopThinking();
+      term.echo('[[;var(--red);][' + escapeTerm(event.message) + ']]');
+      break;
+    case 'task_end':
+      stopThinking();
+      break;
+  }
+}
 
 // ---------- terminal ----------
 function initTerminal() {
@@ -281,7 +395,7 @@ function initTerminal() {
     this.pause();
     updateCancelButton();
     try {
-      await runAgentTask(this, input);
+      await App.session.run(input, { workspace: App.workspace });
     } catch (e) {
       this.echo('[[;var(--red);][错误: ' + escapeTerm(e.message || String(e)) + ']]');
     }

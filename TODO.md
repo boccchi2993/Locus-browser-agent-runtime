@@ -66,29 +66,28 @@ below are reflected in the roadmap sections.
 
 ### Runtime boundary
 
-- [ ] Introduce AgentSession or equivalent UI-independent runtime.
-- [ ] Remove terminal object from agent-loop function signatures.
-- [ ] Remove direct term.echo / render calls from runtime logic.
-- [ ] Remove direct DOM dependencies from the agent loop.
-- [ ] Inject model adapter instead of reading presentation globals.
-- [ ] Inject workspace/session state instead of reading App.workspace directly.
-- [ ] Keep tool execution behind a runtime dependency boundary.
-- [ ] Make one complete agent loop runnable in tests without DOM/UI.
+- [x] Introduce AgentSession or equivalent UI-independent runtime. (`src/agent.js` `AgentSession`)
+- [x] Remove terminal object from agent-loop function signatures. (`runAgentTask(term, …)` → `session.run(input, { workspace })`)
+- [x] Remove direct term.echo / render calls from runtime logic. (terminal rendering lives in the ui.js event adapter)
+- [x] Remove direct DOM dependencies from the agent loop.
+- [x] Inject model adapter instead of reading presentation globals. (`modelClient` injection; `Model.model` is added by the ui.js wiring)
+- [x] Inject workspace/session state instead of reading App.workspace directly. (workspace bound per `run()` call)
+- [x] Keep tool execution behind a runtime dependency boundary. (`toolExecutor` injection)
+- [x] Make one complete agent loop runnable in tests without DOM/UI. (`tests/agent.test.cjs` runs the full loop in Node)
 
 ### Runtime events
 
-Define a small provider-neutral event surface.
+A small provider-neutral event surface is implemented and consumed by the
+terminal adapter in `src/ui.js`:
 
-Candidate events:
-
-- [ ] assistant_start
-- [ ] reasoning
-- [ ] tool_call
-- [ ] tool_result
-- [ ] assistant_text
-- [ ] routing/backend metadata where useful
-- [ ] error
-- [ ] done
+- [x] task_start
+- [x] reasoning (full provider-visible reasoning; presentation truncation is a UI concern)
+- [x] tool_call
+- [x] tool_result (incl. backend/operation routing metadata)
+- [x] assistant_text
+- [x] warning (model_truncated / answer_truncated / task_cancelled / task_cancelled_committed / session_changed / iteration_limit)
+- [x] error
+- [x] task_end
 
 Do not over-design the event schema before the first real consumer exists.
 
@@ -108,7 +107,7 @@ Do not over-design the event schema before the first real consumer exists.
 - [ ] Add tests for raw reasoning replay (preservation is tested; full replay round-trip is not).
 - [ ] Add tests for reasoning summary presentation.
 - [ ] Add tests for opaque-state preservation.
-- [ ] Add tests proving visible UI history is not used to reconstruct provider history.
+- [x] Add tests proving visible UI history is not used to reconstruct provider history. (events are never serialized; provider history is session-owned, `tests/agent.test.cjs` S2/S11)
 - [x] Reset/scope provider-native state when switching workspace/session.
 
 ### Network virtualization (declared gap, see README security note)
@@ -192,9 +191,9 @@ Do not declare core frozen until:
 - [ ] Edit/state mutation is deterministic.
 - [x] Current curl connectivity is bounded and reliable.
 - [x] Workspace authority is explicit.
-- [ ] Agent loop is UI-independent.
+- [x] Agent loop is UI-independent.
 - [x] Model protocol preserves provider-native continuation semantics.
-- [ ] Runtime event stream exists.
+- [x] Runtime event stream exists.
 - [ ] A capability can be added without editing the agent loop.
 
 ## V0.5 — Extension layer
