@@ -53,9 +53,30 @@ function toOpenAIBody(body) {
 }
 
 function parseAnthropicResp(data) {
-  if (data.content && data.content[0] && data.content[0].text) return data.content[0].text;
-  if (data.error) throw new Error(data.error.message || data.error.type || JSON.stringify(data.error));
-  throw new Error('响应格式不符合预期');
+  // content is a block array; only visible text blocks count.
+  // thinking / reasoning / tool-use / unknown blocks are ignored —
+  // internal reasoning must never reach the agent loop or history.
+  if (Array.isArray(data.content)) {
+    const text = data.content
+      .filter((part) => part && part.type === 'text' && typeof part.text === 'string')
+      .map((part) => part.text)
+      .join('');
+    if (text) return text;
+
+    if (data.stop_reason === 'max_tokens') {
+      throw new Error('响应中没有可见文本内容（可能在生成最终回答前达到 token 上限）');
+    }
+    throw new Error('响应中没有可见文本内容');
+  }
+
+  if (typeof data.content === 'string' && data.content) {
+    return data.content;
+  }
+
+  if (data.error) {
+    throw new Error(data.error.message || data.error.type || JSON.stringify(data.error));
+  }
+  throw new Error('响应中没有可见文本内容');
 }
 
 function parseOpenAIResp(data) {
@@ -191,7 +212,9 @@ async function verifyConnection() {
   // substitute a different model for the connection check.
   const body = {
     model: Model.model || 'deepseek-v4-pro',
-    max_tokens: 8,
+    // 128: reasoning models may spend tokens on internal thinking before
+    // emitting the visible text block; 8 was too small to ever see one.
+    max_tokens: 128,
     system: '只回复 OK。',
     messages: [{ role: 'user', content: 'OK' }],
   };

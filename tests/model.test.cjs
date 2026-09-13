@@ -26,7 +26,7 @@ global.fetch = async (url, opts) => {
   };
 };
 
-const ANTHROPIC_OK = { status: 200, json: { content: [{ text: 'OK' }] } };
+const ANTHROPIC_OK = { status: 200, json: { content: [{ type: 'text', text: 'OK' }] } };
 const OPENAI_OK = { status: 200, json: { choices: [{ message: { content: 'OK' } }] } };
 
 let passed = 0, failed = 0;
@@ -127,6 +127,64 @@ async function run() {
   check('I2 X-Target-URL set', calls[0].headers['X-Target-URL'] === 'https://api.deepseek.com/anthropic/v1/messages');
   check('I3 auth headers forwarded via proxy', calls[0].headers['x-api-key'] === 'sk-test-key'
     && calls[0].headers['anthropic-version'] === '2023-06-01');
+
+  // ---------- J. Anthropic response parsing: visible text blocks only ----------
+  reset('https://api.deepseek.com/anthropic');
+
+  // J-A: plain text block
+  queue.push({ status: 200, json: { content: [{ type: 'text', text: 'OK' }] } });
+  check('J-A plain text block', await M.callModelText(body) === 'OK');
+
+  // J-B: thinking + text → thinking must not leak
+  queue.push({ status: 200, json: { content: [
+    { type: 'thinking', thinking: 'internal reasoning' },
+    { type: 'text', text: 'OK' },
+  ] } });
+  const jb = await M.callModelText(body);
+  check('J-B thinking excluded, text returned', jb === 'OK' && !jb.includes('internal reasoning'), JSON.stringify(jb));
+
+  // J-C: multiple text blocks joined in order, thinking in between ignored
+  queue.push({ status: 200, json: { content: [
+    { type: 'text', text: 'hello ' },
+    { type: 'thinking', thinking: 'secret' },
+    { type: 'text', text: 'world' },
+  ] } });
+  check('J-C multiple text blocks joined', await M.callModelText(body) === 'hello world');
+
+  // J-D: unknown block types ignored
+  queue.push({ status: 200, json: { content: [
+    { type: 'server_tool_use' },
+    { type: 'text', text: 'OK' },
+  ] } });
+  check('J-D unknown blocks ignored', await M.callModelText(body) === 'OK');
+
+  // J-E: no visible text → clear error
+  queue.push({ status: 200, json: { content: [{ type: 'thinking', thinking: '...' }] } });
+  let jeErr = null;
+  try { await M.callModelText(body); } catch (e) { jeErr = e; }
+  check('J-E no visible text error', jeErr && jeErr.message === '响应中没有可见文本内容', jeErr && jeErr.message);
+
+  // J-E2: no visible text + stop_reason max_tokens → hint included
+  queue.push({ status: 200, json: { content: [{ type: 'thinking', thinking: '...' }], stop_reason: 'max_tokens' } });
+  let je2Err = null;
+  try { await M.callModelText(body); } catch (e) { je2Err = e; }
+  check('J-E2 max_tokens hint', je2Err && je2Err.message.includes('token 上限'), je2Err && je2Err.message);
+
+  // J-F: string content compatibility
+  queue.push({ status: 200, json: { content: 'OK' } });
+  check('J-F string content', await M.callModelText(body) === 'OK');
+
+  // ---------- K. OpenAI parser: reasoning_content never leaks ----------
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, json: { choices: [{ message: { reasoning_content: 'internal', content: 'OK' } }] } });
+  const kRes = await M.callModelText(body);
+  check('K reasoning_content excluded', kRes === 'OK' && !kRes.includes('internal'), JSON.stringify(kRes));
+
+  // ---------- L. verifyConnection token budget ----------
+  reset('https://api.deepseek.com/anthropic');
+  queue.push(ANTHROPIC_OK);
+  await M.verifyConnection();
+  check('L verifyConnection max_tokens is 128', calls[0].body.max_tokens === 128, 'max_tokens=' + calls[0].body.max_tokens);
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
