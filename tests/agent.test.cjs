@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'agent.js'), 'utf8');
-const M = eval(src + '\n;({ AgentSession, buildSystemPrompt, parseToolCall, stripInternalFields, truncateFor, HISTORY_BUDGET_BYTES });');
+const M = eval(src + '\n;({ AgentSession, buildSystemPrompt, parseToolCall, stripInternalFields, truncateFor, HISTORY_BUDGET_BYTES, MAX_TOOL_ITERATIONS });');
 
 function envelope(text, extra) {
   return Object.assign({
@@ -324,7 +324,7 @@ async function run() {
       'history=' + session.history.length + ' modelCalls=' + modelCalls);
   }
 
-  // ---------- S14. iteration limit ----------
+  // ---------- S14. iteration limit (MAX_TOOL_ITERATIONS = 32) ----------
   {
     let modelCalls = 0;
     let toolExecs = 0;
@@ -333,11 +333,27 @@ async function run() {
       toolExecutor: async () => { toolExecs++; return { output: 'ok', success: true }; },
     });
     await session.run('loop forever', { workspace: WS_A });
-    check('S14 iteration cap stops the loop at 15',
-      modelCalls === 15 && toolExecs === 15, 'model=' + modelCalls + ' tools=' + toolExecs);
+    check('S14 iteration cap stops the loop at MAX_TOOL_ITERATIONS',
+      M.MAX_TOOL_ITERATIONS === 32 && modelCalls === 32 && toolExecs === 32,
+      'max=' + M.MAX_TOOL_ITERATIONS + ' model=' + modelCalls + ' tools=' + toolExecs);
     check('S14b iteration_limit warning + task_end',
       events.some((e) => e.type === 'warning' && e.code === 'iteration_limit')
       && events.some((e) => e.type === 'task_end' && e.reason === 'iteration_limit'), evTypes(events));
+  }
+
+  // ---------- S14c. more than 15 progressing tool calls must NOT hit the cap ----------
+  {
+    let modelCalls = 0;
+    const { session, events } = newSession({
+      modelClient: async () => {
+        modelCalls++;
+        return modelCalls <= 20 ? TOOL_CALL : FINAL; // 20 tool rounds, then the answer
+      },
+    });
+    await session.run('long but finite exploration', { workspace: WS_A });
+    check('S14c 20 tool calls complete normally (no premature iteration_limit)',
+      modelCalls === 21 && events.some((e) => e.type === 'task_end' && e.reason === 'completed')
+      && !events.some((e) => e.code === 'iteration_limit'), 'model=' + modelCalls + ' ' + evTypes(events));
   }
 
   // ---------- S15. truncated model output → warning events, still completed ----------

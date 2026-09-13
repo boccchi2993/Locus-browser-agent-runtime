@@ -17,6 +17,9 @@
   const lines = [];
   const log = (m) => { lines.push(m); document.getElementById('out').textContent = lines.join('\n'); };
   const check = (name, cond, detail) => log((cond ? 'PASS' : 'FAIL') + ' ' + name + (detail !== undefined ? ' | ' + detail : ''));
+  // Any console-level fault fails the suite (no console errors / no unhandled rejections).
+  window.addEventListener('error', (e) => check('window error: ' + (e && e.message), false));
+  window.addEventListener('unhandledrejection', (e) => check('unhandled rejection: ' + (e && e.reason && e.reason.message || e && e.reason), false));
   try {
     // Pull the real worker source out of index.html so we test the shipped artifact.
     const html = await (await fetch('../index.html')).text();
@@ -61,7 +64,8 @@
     // ---------- existing smoke: ls / cat / unsupported / cloud ----------
     check('smoke ls', (await executeTool('bash', 'ls', ws)).output === 'sales.csv');
     check('smoke cat', (await executeTool('bash', 'cat sales.csv', ws)).output.includes('A,100,40'));
-    check('smoke unsupported', (await executeTool('bash', 'sudo rm x', ws)).output === 'bash: sudo: command not available in local browser runtime');
+    check('smoke unsupported', (await executeTool('bash', 'sudo rm x', ws)).output
+      .startsWith('bash: sudo: command not available in local browser runtime'));
 
     // ---------- H. cloud_bash stays an unsuccessful stub ----------
     Telemetry.records.length = 0;
@@ -220,6 +224,48 @@
       hanging.cancel(); // double cancel must be safe
       await t2;
       check('M3 double cancel is safe', modelAborted === 2 && hanging.task === null, 'aborts=' + modelAborted);
+    }
+
+    // ---------- N. shell compatibility baseline (real browser runtime, real FS handles) ----------
+    // The exact compound shapes models already produce in the wild must work:
+    // sequencing, ls flags, find|head pipelines, invocation-local cd.
+    try {
+      const opfsRoot2 = await navigator.storage.getDirectory();
+      const dirName2 = 'locus-e2e-sh-' + Date.now();
+      const dir2 = await opfsRoot2.getDirectoryHandle(dirName2, { create: true });
+      const shWs = new LocalDirectoryWorkspace(dir2);
+      try {
+        await shWs.write('a.md', '# A\n');
+        await shWs.write('b.txt', 'one\ntwo\nthree\n');
+        await shWs.write('sub/c.js', 'console.log(1)\n');
+
+        const n1 = await executeTool('bash', "echo '=== root ==='; ls -la; echo; find . -type f | head -n 5", shWs);
+        check('N1 compound: sequence + ls -la + find|head', n1.success
+          && n1.output.includes('=== root ===') && n1.output.includes('sub/')
+          && n1.output.includes('./a.md') && n1.output.includes('./sub/c.js'), JSON.stringify(n1.output));
+
+        const n2 = await executeTool('bash', 'cd sub && pwd && ls', shWs);
+        check('N2 cd invocation-local', n2.success && n2.output === '/sub\nc.js', JSON.stringify(n2.output));
+        const n3 = await executeTool('bash', 'pwd', shWs);
+        check('N3 next invocation back at root', n3.success && n3.output === '/', JSON.stringify(n3.output));
+
+        const n4 = await executeTool('bash', 'echo "a;b" && echo "x|y"', shWs);
+        check('N4 quoted operators are text', n4.success && n4.output === 'a;b\nx|y', JSON.stringify(n4.output));
+
+        const n5 = await executeTool('bash', 'grep -n two b.txt | wc -l', shWs);
+        check('N5 grep|wc pipeline', n5.success && n5.output === '1', JSON.stringify(n5.output));
+
+        const n6 = await executeTool('bash', 'cd ../../.. && pwd', shWs);
+        check('N6 cd escape rejected', !n6.success && n6.output.includes('escapes workspace'), JSON.stringify(n6.output));
+
+        const n7 = await executeTool('bash', 'help', shWs);
+        check('N7 help lists the contract', n7.success && n7.output.includes('Unix-like compatibility shell')
+          && n7.output.includes('grep') && n7.output.includes('&&'), JSON.stringify(n7.output).slice(0, 100));
+      } finally {
+        await opfsRoot2.removeEntry(dirName2, { recursive: true });
+      }
+    } catch (e) {
+      check('N0 OPFS shell-compat workspace available', false, String(e && e.message || e));
     }
 
     // ---------- E. python timeout + worker recovery (runs last) ----------
