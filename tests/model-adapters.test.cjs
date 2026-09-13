@@ -107,6 +107,23 @@ async function run() {
   check('E5 official anthropic keeps direct-browser-access header',
     M.AnthropicAdapter.buildHeaders({ apiKey: 'k', apiBase: 'https://api.anthropic.com' })['anthropic-dangerous-direct-browser-access'] === 'true');
 
+  // Explicit dialect must never rewrite the user's base path: a path
+  // segment named /anthropic is endpoint identity, not a protocol hint.
+  const gwBase = 'https://gateway.example.com/anthropic';
+  check('E6 explicit openai + /anthropic path → OpenAIAdapter',
+    M.getProviderAdapter({ dialect: 'openai', apiBase: gwBase }).dialect === 'openai');
+  check('E7 explicit openai preserves the /anthropic path segment verbatim',
+    JSON.stringify(M.OpenAIAdapter.buildEndpoints(gwBase)) ===
+    JSON.stringify(['https://gateway.example.com/anthropic/chat/completions',
+      'https://gateway.example.com/anthropic/v1/chat/completions']),
+    JSON.stringify(M.OpenAIAdapter.buildEndpoints(gwBase)));
+  check('E8 auto heuristic unchanged: /anthropic suffix → AnthropicAdapter',
+    M.getProviderAdapter({ dialect: 'auto', apiBase: gwBase }).dialect === 'anthropic');
+  check('E9 arbitrary base path appended verbatim, never rewritten',
+    JSON.stringify(M.OpenAIAdapter.buildEndpoints('https://gateway.example.com/company/proxy')) ===
+    JSON.stringify(['https://gateway.example.com/company/proxy/chat/completions',
+      'https://gateway.example.com/company/proxy/v1/chat/completions']));
+
   // ---------- 4. OpenAI reasoning_content replay round-trip ----------
   const oaiResp = {
     id: 'chatcmpl-1', model: 'deepseek-reasoner',

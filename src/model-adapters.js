@@ -66,8 +66,12 @@ const OpenAIAdapter = {
   // Tolerate both endpoint layouts: bare base + /chat/completions first,
   // then the /v1 variant (fallback policy in model.js decides when the
   // second attempt is allowed — never on authoritative/parse/timeout errors).
+  // The user's base path is appended verbatim: with an explicit dialect
+  // selected, a path segment like /anthropic is just part of the endpoint
+  // identity (e.g. an enterprise gateway route), never a protocol hint
+  // to strip. Only redundant trailing slashes are removed.
   buildEndpoints(apiBase) {
-    const root = String(apiBase || '').replace(/\/+$/, '').replace(/\/anthropic\/?$/, '');
+    const root = String(apiBase || '').replace(/\/+$/, '');
     return [root + '/chat/completions', root + '/v1/chat/completions'];
   },
 
