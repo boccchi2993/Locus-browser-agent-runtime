@@ -41,7 +41,7 @@ below are reflected in the roadmap sections.
 - [x] Stream cleanup (reader.cancel()) on timeout/cancel/size-cap exits is best-effort and never awaited in network.js and model.js — a hanging or rejecting cancel() can no longer block the caller or cause unhandled rejections; error classification preserved
 - [x] relayTimeoutMs is a real NetworkRuntime.fetch option, plumbed fetch → _relay; N23 now proves the passed deadline is actually used (elapsed-time assertion) and that the 45s default is retained
 
-## Immediate — V0.2.1
+## Completed — V0.2.1
 
 ### Network consistency
 

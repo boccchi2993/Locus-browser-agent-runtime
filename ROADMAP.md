@@ -28,17 +28,19 @@ without requiring a remote execution sandbox.
 
 ## V0.2.1 — Network semantic cleanup
 
+Status: implemented (completed in later commits; regression coverage in `tests/network.test.cjs`).
+
 Goal: make direct browser networking obey the same resource semantics as the edge relay.
 
-Tasks:
+Completed:
 
-- add timeout to browser-direct network reads,
-- add browser-direct response-size cap,
-- stream/read with bounded memory where practical,
-- check workspace availability before starting curl -o downloads,
-- keep direct and relay error semantics consistent.
+- timeout on browser-direct network reads,
+- browser-direct response-size cap,
+- bounded streaming/reads instead of unbounded `arrayBuffer()`,
+- `curl -o` fails before any network request when no workspace is selected,
+- consistent direct/relay timeout and error semantics.
 
-No new model-facing capability should be introduced in this milestone.
+No new model-facing capability was introduced in this milestone.
 
 ## V0.3 — Architecture stabilization
 

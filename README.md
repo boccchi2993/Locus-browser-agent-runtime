@@ -231,7 +231,8 @@ node tests/verify-active-content.cjs
 
 - Only the user-selected workspace is accessible; paths are normalized and `..` escapes are rejected
 - No native shell, no `child_process`, no localhost server, no remote code execution
-- Workspace files are never uploaded to any execution server (only text the agent explicitly reads is sent to the LLM API)
+- Locus does not automatically upload workspace files to any execution server; only content explicitly surfaced through the agent conversation (tool results the model chose to read) is sent to the model API
+- The Pyodide runtime is **not** a network sandbox: model-generated Python can reach `fetch` through the Worker JS bridge and transmit workspace data it can read, subject to browser networking rules (CORS, mixed content). That traffic bypasses NetworkRuntime, the curl anonymous-GET-only policy, and network telemetry — see the Python capability declaration below
 - Network access via `curl` is anonymous HTTPS GET only: no cookies (`credentials: 'omit'`), no auth headers, no URL userinfo, no custom request headers, no POST
 - Switching workspaces or `reset` is a full session boundary: the running task is cancelled, history is cleared, and the Python interpreter is rebuilt
 - API keys are never committed; opt-in session persistence uses `sessionStorage` only
