@@ -55,13 +55,13 @@ Those are harness decisions.
 
 ### 2.3 Minimal core
 
-Domain-specific features should not become core primitives merely because they are useful.
+Domain-specific features should not become runtime capabilities merely because they are useful.
 
-Excel, DOCX, image processing, scraping helpers, archive formats, database clients, SDKs, and similar capabilities should normally be expressed by combining core primitives with extensions.
+Excel, DOCX, image processing, RAG, scraping helpers, archive formats, database clients, SDKs, and similar capabilities should normally be expressed by combining execution, filesystem and network with extensions.
 
-A proposed new core primitive must first answer:
+A proposed new core capability must first answer:
 
-> Why can this not be expressed reliably through the existing primitives plus a Plugin, MCP integration, or Skill?
+> Why can this not be expressed reliably through the existing runtime substrate plus a Plugin, MCP integration, or Skill?
 
 ### 2.4 No silent authority expansion
 
@@ -168,14 +168,14 @@ Examples:
 - ffmpeg.wasm
 - a future compiler compiled to WASM
 
-A plugin should declare the primitives it requires and the runtime capability it provides.
+A plugin should declare the runtime capabilities it requires and the code/library capability it provides.
 
 Example direction:
 
 ```json
 {
   "name": "openpyxl",
-  "requires": ["python"],
+  "requires": ["execution:python", "filesystem"],
   "provides": ["python-package"],
   "packages": ["openpyxl"]
 }
@@ -214,7 +214,7 @@ Examples:
 
 Skills do not grant new authority.
 
-A Skill may depend on core primitives, Plugins, and MCP capabilities.
+A Skill may depend on runtime capabilities, Plugins, and MCP capabilities.
 
 ## 6. Capability registry direction
 
@@ -223,7 +223,7 @@ Future extension work should converge on a capability registry rather than an ev
 A capability can describe:
 
 - identifier,
-- required primitives,
+- required substrate capabilities,
 - provider/backend,
 - authority level,
 - availability,
@@ -283,7 +283,7 @@ The following are not automatically core features:
 - email-specific tools,
 - browser automation,
 - authenticated website sessions,
-- provider-specific model features exposed as generic execution primitives.
+- provider-specific model features exposed as generic core tools.
 
 Some of these may later be implemented as Plugins, MCP integrations, Skills, browser capabilities, or cloud providers.
 
