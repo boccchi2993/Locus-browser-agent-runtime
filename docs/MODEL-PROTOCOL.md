@@ -61,27 +61,29 @@ These states are semantically different. Locus must not apply one global "discar
 
 ## 3. Response envelope
 
-The model layer should evolve from:
+The model layer evolved from:
 
 ```
 callModelText() -> string
 ```
 
-toward a structured response envelope:
+to a structured response envelope (implemented in `src/model-adapters.js`):
 
 ```js
 {
   content,
   reasoning,
-  toolCalls,
+  reasoningType,   // 'raw' | null today; summary/hidden reserved
+  toolCalls,       // placeholder (null) — native tool calling not enabled
   rawMessage,
   stopReason,
   usage,
-  providerMetadata
+  providerMetadata, // light metadata (id, model, …), never a body copy
+  truncated
 }
 ```
 
-The exact implementation shape may vary by provider adapter. The important invariant is that visible content and provider-native replay state remain distinct.
+The exact implementation shape varies by provider adapter. The important invariant is that visible content and provider-native replay state remain distinct.
 
 ### content
 
@@ -150,20 +152,18 @@ The presentation timeline is not the canonical serializer for future model reque
 
 The UI must never become responsible for reconstructing provider conversation state.
 
-## 5. Replay policy belongs in the provider adapter
+## 5. Replay policy lives in the provider adapter
 
-Each provider/model adapter should determine how assistant state is replayed.
+Implemented: each provider adapter (`src/model-adapters.js`) determines how assistant state is replayed.
 
-Possible policies include:
+Current policies:
 
-- no reasoning replay required,
-- preserve returned reasoning fields,
-- preserve exact block ordering,
-- preserve opaque state unchanged,
-- provider-managed hidden state,
-- native tool-call replay required.
+- OpenAI-compatible: the provider-native message object is replayed unchanged (`reasoning_content` and unknown provider fields survive into the next request),
+- Anthropic-compatible: the exact block array is replayed in order (text, thinking, redacted_thinking, opaque/unknown blocks preserved byte-identically),
+- opaque state is preserved for replay but never rendered as visible reasoning,
+- hidden reasoning is never fabricated.
 
-The agent loop should not need provider-specific branches such as:
+The agent loop contains no provider-specific branches such as:
 
 ```
 if model is X, copy reasoning_content
@@ -277,22 +277,26 @@ Unknown does not mean irrelevant.
 
 The harness should avoid silently deleting model state merely because the current UI does not know how to render it.
 
-## 11. Target refactor
+## 11. Current architecture
 
-The current V0.x model layer is allowed to be transitional.
-
-The architectural target is:
+Implemented (P2, `refactor/provider-adapter`):
 
 ```
-ProviderAdapter
+ProviderAdapter (src/model-adapters.js)
   |
-  +-- request serialization
-  +-- response parsing
-  +-- provider-native replay state
-  +-- reasoning semantics
-  +-- tool-call semantics
+  +-- request serialization     (serializeRequest / prepareHistory)
+  +-- response parsing          (parseResponse → envelope)
+  +-- provider-native replay state (rawMessage round-trip)
+  +-- reasoning semantics       (reasoning + reasoningType)
+  +-- tool-call seam            (toolCalls placeholder; not consumed yet)
   |
-AgentSession
+ModelClient (src/model.js)
+  |
+  +-- adapter selection (getProviderAdapter: auto/openai/anthropic)
+  +-- transport: direct fetch, /proxy relay fallback
+  +-- deadlines, size caps, error taxonomy, endpoint fallback
+  |
+AgentSession (src/agent.js)
   |
   +-- provider-neutral runtime events
   +-- tool execution
@@ -304,4 +308,5 @@ UI
   +-- never reconstructs provider state
 ```
 
-This refactor should happen before the model layer accumulates more provider-specific exceptions around a string-only API.
+Adding a new API dialect means implementing a new ProviderAdapter — no
+AgentSession or transport changes required.

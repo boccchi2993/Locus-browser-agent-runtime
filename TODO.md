@@ -103,12 +103,13 @@ Do not over-design the event schema before the first real consumer exists.
 - [x] Preserve Anthropic-style thinking/redacted/opaque blocks when required.
 - [x] Do not expose opaque continuation state as user-visible prose.
 - [x] Do not invent reasoning for providers that do not return it.
-- [ ] Keep provider-specific replay policy inside provider adapters (currently per-dialect parsers in one model.js; no separate adapter modules yet).
+- [x] Keep provider-specific replay policy inside provider adapters. (`src/model-adapters.js`: `OpenAIAdapter` / `AnthropicAdapter` behind `getProviderAdapter()`; model.js keeps only transport/fallback orchestration)
+- [x] Explicit API dialect override (`auto`/`openai`/`anthropic`) so arbitrary hostnames/gateways can pick a protocol; provider identity stays decoupled from API dialect.
 - [x] Preserve stop reason.
 - [x] Preserve usage metadata where available.
-- [ ] Add tests for raw reasoning replay (preservation is tested; full replay round-trip is not).
+- [x] Add tests for raw reasoning replay (round-trip: parse → rawMessage → next request body, `tests/model-adapters.test.cjs` O6–O8 / A6–A7 / I3 / I5).
 - [ ] Add tests for reasoning summary presentation.
-- [ ] Add tests for opaque-state preservation.
+- [x] Add tests for opaque-state preservation (redacted_thinking / unknown blocks survive parse→replay byte-identically and never render as visible reasoning).
 - [x] Add tests proving visible UI history is not used to reconstruct provider history. (events are never serialized; provider history is session-owned, `tests/agent.test.cjs` S2/S11)
 - [x] Reset/scope provider-native state when switching workspace/session.
 

@@ -59,10 +59,14 @@ Status: implemented (`src/agent.js` `AgentSession` + event adapter in `src/ui.js
 
 ### Model protocol refactor
 
+Status: implemented (`src/model-adapters.js` ProviderAdapter boundary + provider-neutral transport in `src/model.js`; Node coverage in `tests/model-adapters.test.cjs`).
+
 - replace string-only callModelText semantics with structured model responses,
 - separate visible assistant content from provider-native replay state,
 - preserve reasoning/continuation state when required,
 - keep opaque provider state intact,
+- isolate provider-specific serialization/parsing/replay behind the ProviderAdapter interface,
+- explicit API dialect override (auto/openai/anthropic) for arbitrary endpoints, provider identity decoupled from dialect,
 - support reasoning presentation independently from transport,
 - ensure workspace/session switching scopes all provider state.
 
