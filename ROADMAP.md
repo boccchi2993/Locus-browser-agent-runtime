@@ -66,7 +66,7 @@ Goal: separate the agent runtime from presentation and preserve model-native con
 
 See docs/MODEL-PROTOCOL.md.
 
-## V0.4 — UI rebuild and core primitive completion
+## V0.4 — UI rebuild and runtime substrate completion
 
 Goal: make the UI reflect an execution harness rather than a terminal-only demo, while finishing the target core primitive set.
 
@@ -88,7 +88,7 @@ The UI should present:
 
 The terminal aesthetic may remain, but terminal rendering should not define the runtime architecture.
 
-### JavaScript primitive
+### JavaScript userland runtime
 
 Add isolated JavaScript execution.
 
@@ -118,33 +118,41 @@ The final decision on whether edit is exposed as a shell compatibility command o
 
 ## Core Capability Freeze
 
-After V0.4, the default core target is:
+After V0.4, the default runtime target is:
 
 ```
-Compute:
-  JavaScript
+Runtime substrate:
+  Execution
+  Filesystem
+  Network
+
+Unix-like interface:
+  bash
+  edit
+
+Userland examples:
   Python
-
-State:
-  Workspace
-  Edit
-
-Connectivity:
+  JavaScript
   curl
+  file/Unix utilities
 
 Escalation:
   cloud_bash (future provider)
 ```
 
-At this point, new domain-specific features should normally be implemented as extensions instead of new core primitives.
+Python/JavaScript are execution environments and `curl` is a network frontend; they are not separate architectural primitives.
+
+At this point, new domain-specific features should normally be implemented as extensions instead of new runtime primitives.
 
 A new core proposal must explain why it cannot be expressed through:
 
-- existing primitives,
+- execution + filesystem + network,
 - Plugin,
 - MCP,
 - Skill,
 - or an execution backend/provider.
+
+See `docs/CAPABILITY-BOUNDARIES.md`.
 
 ## V0.5 — Extension layer
 
@@ -165,7 +173,7 @@ The registry should support:
 
 ### Plugins
 
-Plugins add implementation code or libraries.
+Plugins add implementation code or libraries above the runtime substrate.
 
 Examples:
 
@@ -192,7 +200,7 @@ Examples:
 
 ### MCP
 
-MCP adds external authority and structured access to remote systems.
+MCP adds external authority, durable remote state, credentials, or structured access to remote systems. Durable/shared RAG belongs naturally here; ephemeral local retrieval may remain Plugin + Skill composition.
 
 Examples:
 
