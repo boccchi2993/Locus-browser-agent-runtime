@@ -18,7 +18,10 @@
 //  state (rawMessage), events carry visible/runtime information.
 // ============================================================
 
-const MAX_TOOL_ITERATIONS = 15;
+// Hard cap on tool iterations per task. Complex workspace exploration
+// legitimately chains more than a dozen calls; 32 covers realistic
+// exploration while still bounding runaway loops.
+const MAX_TOOL_ITERATIONS = 32;
 const TOOL_RESULT_MAX_CHARS = 6000; // fed back to the model
 // Transport byte budget for one model request (UTF-8 bytes of the
 // serialized body: system prompt + every message incl. reasoning and
@@ -80,22 +83,14 @@ function buildSystemPrompt(opts) {
     '{"tool": "bash", "input": "ls"}',
     '```',
     'Available tools:',
-    '- bash: a restricted shell running in the user\'s local environment, inside the user-authorized workspace directory.',
-    '  Supported commands: pwd, ls [path], cat <file...>, echo <text> (supports > and >> file redirect), python, curl.',
-    '  curl usage (public HTTPS resources only):',
-    '    curl <https-url>                  fetches a URL; text/JSON/XML responses are printed directly.',
-    '    curl -o <file> <https-url>        downloads binary-safe into the workspace file (use this for images,',
-    '                                      PDFs, archives, or any data you want to keep or process).',
-    '  curl supports NO other flags (no -H/-X/-d/-u/cookies). URLs must be https://.',
-    '  Network access may be served by a direct browser fetch or a transparent relay — you do not need to',
-    '  know or care which. If curl fails, report the error; do NOT switch to cloud_bash for network access.',
-    '  python usage: for short one-liners use python -c "<code>"; for anything multi-line or containing mixed quotes,',
-    '  prefer the heredoc form — the code between the markers is passed to Python verbatim:',
-    '    python <<\'PY\'',
-    '    import pandas as pd',
-    '    print(pd.DataFrame({"a": [1]}).to_json())',
-    '    PY',
-    '  python has the standard library and pandas available. Working directory is the workspace root; use relative paths.',
+    '- bash: a Unix-like compatibility shell running locally in the user\'s browser, inside the user-authorized workspace directory.',
+    // The shell capability contract is generated from the same registry the
+    // executor and the `help` command use (src/shell.js) — one canonical
+    // source, so the prompt can never drift from what actually runs.
+    // (Standalone test harnesses load agent.js without shell.js: fall back.)
+    (typeof shellSystemPromptSection === 'function'
+      ? shellSystemPromptSection()
+      : "  Supported commands: pwd, ls, cat, echo, python, curl. Multi-line python: python <<'PY' ... PY."),
     '- cloud_bash: an expensive remote execution fallback. It is currently NOT configured. Do not use it unless the user explicitly asks for cloud execution.',
     '',
     '## Rules',
