@@ -230,6 +230,62 @@ async function run() {
     cancelErr && cancelErr.name === 'AbortError' && calls.length === 0,
     (cancelErr && cancelErr.name) + ' | calls=' + calls.length);
 
+  // ---------- 20. deadline covers the BODY, not just headers (Finding 2) ----------
+  // headers arrive immediately, body never completes → must still time out
+  reset();
+  on((u) => u === 'https://stall.test/x', () => new Response(
+    new ReadableStream({ start() { /* never enqueues, never closes */ } }),
+    { status: 200, headers: { 'content-type': 'text/plain' } }));
+  on((u) => u.startsWith('/fetch?'), () => { throw new Error('relay must NOT be called on timeout'); });
+  let t20Err = null;
+  const t20start = Date.now();
+  try { await M.NetworkRuntime.fetch('https://stall.test/x', { timeoutMs: 40 }); } catch (e) { t20Err = e; }
+  check('N20 body stall times out', t20Err && t20Err.timeout === true && t20Err.message.includes('timed out'),
+    (t20Err && t20Err.message) + ' after ' + (Date.now() - t20start) + 'ms');
+  check('N20b body-stall timeout is not relayed', calls.length === 1, 'calls=' + calls.length);
+
+  // ---------- 21. external cancel during body read ----------
+  reset();
+  on((u) => u === 'https://slowbody.test/x', () => new Response(
+    new ReadableStream({
+      start(ctrl) { ctrl.enqueue(new TextEncoder().encode('chunk1')); /* then stalls */ },
+    }),
+    { status: 200, headers: { 'content-type': 'text/plain' } }));
+  const ac21 = new AbortController();
+  setTimeout(() => ac21.abort(), 30);
+  let t21Err = null;
+  try { await M.NetworkRuntime.fetch('https://slowbody.test/x', { signal: ac21.signal, timeoutMs: 5000 }); } catch (e) { t21Err = e; }
+  check('N21 cancel during body read → AbortError', t21Err && t21Err.name === 'AbortError',
+    t21Err && t21Err.name + '/' + t21Err.message);
+
+  // ---------- 22. slow body INSIDE the deadline completes fine ----------
+  reset();
+  on((u) => u === 'https://trickle.test/x', () => new Response(
+    new ReadableStream({
+      async start(ctrl) {
+        for (let i = 0; i < 5; i++) {
+          ctrl.enqueue(new TextEncoder().encode('c' + i));
+          await new Promise((r) => setTimeout(r, 15));
+        }
+        ctrl.close();
+      },
+    }),
+    { status: 200, headers: { 'content-type': 'text/plain' } }));
+  const t22 = await M.NetworkRuntime.fetch('https://trickle.test/x', { timeoutMs: 5000 });
+  check('N22 slow body within deadline completes', new TextDecoder().decode(t22.bytes) === 'c0c1c2c3c4'
+    && t22.backend === 'browser-direct', new TextDecoder().decode(t22.bytes));
+
+  // ---------- 23. relay body stall also times out (as timeout, not 'unreachable') ----------
+  reset();
+  on((u) => u === 'https://blocked2.test/x', () => { throw new TypeError('Failed to fetch'); });
+  on((u) => u.startsWith('/fetch?'), () => new Response(
+    new ReadableStream({ start() { /* stalls */ } }),
+    { status: 200, headers: { 'content-type': 'text/plain' } }));
+  let t23Err = null;
+  try { await M.NetworkRuntime.fetch('https://blocked2.test/x', { timeoutMs: 40, relayTimeoutMs: 40 }); } catch (e) { t23Err = e; }
+  check('N23 relay body stall → timeout error (not unreachable, not retry loop)',
+    t23Err && t23Err.timeout === true, t23Err && t23Err.message);
+
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
 }

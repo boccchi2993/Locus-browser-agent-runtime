@@ -80,6 +80,20 @@ function makeHttpError(status, message) {
   return err;
 }
 
+// The response HEADERS already arrived but consuming the BODY failed
+// (connection reset mid-stream, truncated transfer, …). The inference may
+// already be running or billed — this is NOT a transport/CORS failure and
+// must never trigger an automatic re-send to another endpoint.
+function makeBodyReadError(status, cause) {
+  const err = new Error('response body read failed after HTTP ' + status +
+    ': ' + (cause && cause.message ? cause.message : String(cause)));
+  err.name = 'BodyReadError';
+  err.status = status;
+  err.cause = cause;
+  err.noFallback = true;
+  return err;
+}
+
 // HTTP 200 but the body cannot be used (not JSON, wrong shape, empty
 // visible content). The inference DID happen — re-sending the request to
 // another endpoint would bill a second generation for the same prompt.
@@ -190,13 +204,13 @@ function headerValue(res, name) {
   }
 }
 
-async function readTextCapped(res, maxBytes) {
+async function readTextCapped(res, maxBytes, signal) {
   const contentLength = Number.parseInt(headerValue(res, 'content-length') || '', 10);
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
     throw makeParseError('response too large (>' + maxBytes + ' bytes)');
   }
   if (!res.body || !res.body.getReader) {
-    const text = await res.text();
+    const text = await raceSignal(res.text(), signal);
     if (text.length > maxBytes) throw makeParseError('response too large (>' + maxBytes + ' bytes)');
     return text;
   }
@@ -205,7 +219,7 @@ async function readTextCapped(res, maxBytes) {
   let received = 0;
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await raceSignal(reader.read(), signal);
       if (done) break;
       received += value.byteLength;
       if (received > maxBytes) {
@@ -214,13 +228,33 @@ async function readTextCapped(res, maxBytes) {
       }
       chunks.push(value);
     }
+  } catch (e) {
+    if (e && (e.cancelled || e.name === 'AbortError')) {
+      await reader.cancel().catch(() => {});
+    }
+    throw e;
   } finally {
-    reader.releaseLock();
+    try { reader.releaseLock(); } catch (e) { /* already released */ }
   }
   const merged = new Uint8Array(received);
   let offset = 0;
   for (const c of chunks) { merged.set(c, offset); offset += c.byteLength; }
   return new TextDecoder().decode(merged);
+}
+
+// Race a promise against the deadline/cancellation signal so a stalled
+// body loses the race even if the underlying stream never reacts to abort.
+function raceSignal(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(makeModelCancelledError());
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(makeModelCancelledError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (v) => { signal.removeEventListener('abort', onAbort); resolve(v); },
+      (e) => { signal.removeEventListener('abort', onAbort); reject(e); }
+    );
+  });
 }
 
 // One POST with full-lifecycle deadline (headers AND body), optional
@@ -254,11 +288,15 @@ async function fetchJsonPost(fetchUrl, headers, body, opts) {
 
     let text;
     try {
-      text = await readTextCapped(res, MODEL_MAX_RESPONSE_BYTES);
+      text = await readTextCapped(res, MODEL_MAX_RESPONSE_BYTES, controller.signal);
     } catch (e) {
+      // Classify by failure PHASE: headers already arrived, so a failure
+      // here is a body-read failure — never a CORS/transport candidate.
       if (external && external.aborted) throw makeModelCancelledError();
       if (timedOut) throw makeTimeoutError('model request timed out after ' + timeoutMs + 'ms (response body incomplete)');
-      throw e;
+      if (e && e.noFallback) throw e; // size-cap ParseError etc.
+      if (e && (e.cancelled || e.name === 'AbortError')) throw makeModelCancelledError();
+      throw makeBodyReadError(res.status, e);
     }
 
     let data = null;

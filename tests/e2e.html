@@ -3,13 +3,31 @@
 <head><meta charset="UTF-8"><title>e2e</title></head>
 <body>
 <div id="sb-python"></div>
+<!-- DOM skeleton required by src/ui.js boot (initSetup + status bar buttons) -->
+<div id="screen-zero" style="display:none">
+  <button id="adv-toggle" type="button"></button>
+  <div id="adv-panel"></div>
+  <input id="api-key-input"><input id="api-base-input"><input id="model-input"><input id="proxy-input">
+  <input id="remember-session-key-check" type="checkbox">
+  <button id="setup-go" type="button"></button>
+  <div id="init-result"></div>
+</div>
+<div id="app">
+  <span id="sb-workspace"></span>
+  <button id="btn-workspace" type="button"></button>
+  <button id="btn-cancel" type="button" disabled>Cancel</button>
+  <button id="btn-log" type="button"></button>
+  <div id="debug-panel"><div id="dp-list"></div></div>
+</div>
 <pre id="out">RUNNING</pre>
 <script src="../src/telemetry.js"></script>
 <script src="../src/workspace.js"></script>
 <script src="../src/network.js"></script>
 <script src="../src/shell.js"></script>
 <script src="../src/tools.js"></script>
+<script src="../src/model.js"></script>
 <script src="../src/agent.js"></script>
+<script src="../src/ui.js"></script>
 <script>
 (async () => {
   const lines = [];
@@ -189,6 +207,61 @@
     const l1 = await executeTool('bash', "python <<'PY'\nimport js\nprint('js.fetch callable: ' + str(callable(js.fetch)))\nPY", ws);
     check('L1 python js bridge exposes fetch (capability documented)',
       l1.success && l1.output.includes('js.fetch callable: True'), JSON.stringify(l1.output));
+
+    // ---------- M. cancel reachable while busy — REAL UI event path (Finding 3) ----------
+    // The in-flight task is cancelled by dispatching genuine UI events
+    // (button click / Escape keydown), not by calling cancelAgentTask().
+    {
+      const termStub = { echo: () => {}, pause: () => {}, resume: () => {}, update: () => {} };
+      const origCallModel = window.callModel;
+      let modelAborted = 0;
+      window.callModel = (req, opts) => new Promise((resolve, reject) => {
+        opts.signal.addEventListener('abort', () => {
+          modelAborted++;
+          reject(Object.assign(new Error('model request aborted'), { name: 'AbortError' }));
+        });
+      });
+      const btnCancel = document.getElementById('btn-cancel');
+      try {
+        check('M1 cancel button disabled when idle', btnCancel.disabled === true);
+
+        // start a task that hangs inside the model request
+        App.busy = true; updateCancelButton();
+        const task1 = runAgentTask(termStub, 'hang on model');
+        check('M2 cancel button enabled while busy', btnCancel.disabled === false);
+        btnCancel.click(); // real UI event
+        await task1;
+        check('M3 button click aborts the in-flight model request', modelAborted === 1, 'aborts=' + modelAborted);
+        check('M4 task object cleared after cancel', Agent.task === null);
+        App.busy = false; updateCancelButton();
+        check('M5 button disabled again after task ends', btnCancel.disabled === true);
+
+        // Escape keydown path
+        App.busy = true; updateCancelButton();
+        const task2 = runAgentTask(termStub, 'hang on model 2');
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+        await task2;
+        check('M6 Escape aborts the in-flight request', modelAborted === 2, 'aborts=' + modelAborted);
+        App.busy = false; updateCancelButton();
+
+        // idle click must be harmless (no throw, no state change)
+        btnCancel.click();
+        check('M7 idle click is harmless', Agent.task === null && App.busy === false);
+
+        // double cancel while already cancelling must not throw or re-abort
+        App.busy = true; updateCancelButton();
+        const task3 = runAgentTask(termStub, 'hang on model 3');
+        btnCancel.click();
+        btnCancel.click();
+        await task3;
+        check('M8 double cancel is safe', modelAborted === 3 && Agent.task === null, 'aborts=' + modelAborted);
+        App.busy = false; updateCancelButton();
+      } finally {
+        window.callModel = origCallModel;
+        App.busy = false; updateCancelButton();
+        Agent.history = [];
+      }
+    }
 
     // ---------- E. python timeout + worker recovery (runs last) ----------
     const t0 = performance.now();

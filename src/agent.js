@@ -9,10 +9,16 @@
 const MAX_TOOL_ITERATIONS = 15;
 const TOOL_RESULT_MAX_CHARS = 6000; // fed back to the model
 const TERMINAL_ECHO_MAX_CHARS = 1500; // shown in the UI
-// Session-wide history budget (chars). Per-message truncation only bounds
-// single entries; without a session budget a long conversation eventually
-// exceeds the provider context window and the /proxy body limit.
-const HISTORY_BUDGET_CHARS = 200000;
+// Transport byte budget for one model request (UTF-8 bytes of the
+// serialized body: system prompt + every message incl. reasoning and
+// other provider-native fields + request structure). This is NOT a token
+// context budget — tokens are provider-specific, bytes are what actually
+// hits the wire. Kept below the default /proxy 1 MiB inbound body limit
+// so a long session fails here with a clear error instead of a relay 413.
+const HISTORY_BUDGET_BYTES = 768 * 1024;
+// Slack for the request envelope itself (model, max_tokens, JSON keys,
+// base64-free system framing, etc.).
+const REQUEST_OVERHEAD_BYTES = 4096;
 
 const Agent = {
   history: [],    // provider conversation history for the API
@@ -35,21 +41,49 @@ function cancelAgentTask() {
   if (Agent.task) Agent.task.controller.abort();
 }
 
-function historyChars() {
-  let n = 0;
-  for (const m of Agent.history) {
-    n += typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content || '').length;
+// Internal bookkeeping fields (task boundaries) are prefixed with '_' and
+// are NEVER sent to a provider — stripInternalFields removes them when a
+// request is built.
+function stripInternalFields(messages) {
+  return messages.map((m) => {
+    const out = {};
+    for (const k in m) if (k.charCodeAt(0) !== 95 /* '_' */) out[k] = m[k];
+    return out;
+  });
+}
+
+// UTF-8 byte size of the request as it will actually be serialized:
+// system prompt + every message with ALL provider-native fields
+// (reasoning_content, opaque state, …) + structural overhead. Counting
+// chars would under-count multibyte text (e.g. Chinese ≈ 3 bytes/char).
+function historyRequestBytes() {
+  const enc = new TextEncoder();
+  let n = REQUEST_OVERHEAD_BYTES + enc.encode(buildSystemPrompt()).byteLength;
+  for (const m of stripInternalFields(Agent.history)) {
+    n += enc.encode(JSON.stringify(m)).byteLength + 16;
   }
   return n;
 }
 
-// Trim oldest turns when over budget. Only whole leading messages are
-// dropped and the first surviving message is always a user message, so
-// provider-native tool/assistant pairing is never broken mid-exchange.
+// Trim whole oldest TASKS (never individual messages) until the request
+// fits the transport budget. Task boundaries are the explicit `_taskStart`
+// markers on genuine user-task messages — tool feedback also uses the user
+// role, so role alone cannot identify a boundary. Cutting only at
+// boundaries keeps every tool call paired with its result. If the current
+// task alone exceeds the budget, fail loudly instead of sending an
+// unbounded request or silently dropping the user's own input.
 function enforceHistoryBudget() {
-  while (Agent.history.length > 2 && historyChars() > HISTORY_BUDGET_CHARS) {
-    Agent.history.shift();
-    if (Agent.history.length && Agent.history[0].role !== 'user') Agent.history.shift();
+  while (historyRequestBytes() > HISTORY_BUDGET_BYTES) {
+    let cut = -1;
+    for (let i = 1; i < Agent.history.length; i++) {
+      if (Agent.history[i]._taskStart) { cut = i; break; }
+    }
+    if (cut === -1) {
+      throw new Error(
+        'current task alone exceeds the history transport budget (' +
+        HISTORY_BUDGET_BYTES + ' bytes) — run `reset` to start a new session or narrow the task');
+    }
+    Agent.history.splice(0, cut); // drop the entire oldest task
   }
 }
 
@@ -142,7 +176,7 @@ async function runAgentTask(term, userText) {
   };
 
   try {
-    Agent.history.push({ role: 'user', content: userText });
+    Agent.history.push({ role: 'user', content: userText, _taskStart: true });
 
     for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
       enforceHistoryBudget();
@@ -153,7 +187,7 @@ async function runAgentTask(term, userText) {
           model: Model.model,
           max_tokens: 2000,
           system: buildSystemPrompt(),
-          messages: Agent.history,
+          messages: stripInternalFields(Agent.history),
         }, { signal: controller.signal });
       } catch (e) {
         stopThinking(thinking);

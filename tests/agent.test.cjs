@@ -13,7 +13,7 @@ global.Model = { model: 'm' };
 global.PythonRuntime = { resetCalls: 0, reset() { this.resetCalls++; } };
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'agent.js'), 'utf8');
-const M = eval(src + '\n;({ Agent, runAgentTask, resetAgentSession, cancelAgentTask, parseToolCall, HISTORY_BUDGET_CHARS });');
+const M = eval(src + '\n;({ Agent, runAgentTask, resetAgentSession, cancelAgentTask, parseToolCall, enforceHistoryBudget, historyRequestBytes, stripInternalFields, HISTORY_BUDGET_BYTES });');
 
 const term = { lines: [], echo(s) { this.lines.push(String(s)); }, update() {} };
 
@@ -118,20 +118,73 @@ async function run() {
     && M.Agent.history[3].role === 'assistant',
     JSON.stringify(M.Agent.history.map((h) => h.role)));
 
-  // ---------- G5. history budget trims oldest turns, keeps user-first shape (F17) ----------
+  // ---------- G5. history budget trims whole oldest TASKS, byte-based (Finding 5) ----------
   resetState();
-  for (let i = 0; i < 50; i++) {
-    M.Agent.history.push({ role: 'user', content: 'x'.repeat(10000) });
-    M.Agent.history.push({ role: 'assistant', content: 'y'.repeat(10000) });
+  for (let i = 0; i < 40; i++) {
+    M.Agent.history.push({ role: 'user', content: 'task' + i + ' ' + 'x'.repeat(30000), _taskStart: true });
+    M.Agent.history.push({ role: 'assistant', content: 'y'.repeat(30000) });
   }
   global.callModel = async () => FINAL;
   global.executeTool = async () => ({ output: '', success: true });
   await M.runAgentTask(term, 'final question');
-  let chars = 0;
-  for (const m of M.Agent.history) chars += String(m.content).length;
-  check('G5 history bounded by budget', chars <= M.HISTORY_BUDGET_CHARS + 25000, 'chars=' + chars);
-  check('G5b first surviving message is a user turn', M.Agent.history[0].role === 'user',
-    M.Agent.history[0].role);
+  check('G5 request bytes bounded by budget', M.historyRequestBytes() <= M.HISTORY_BUDGET_BYTES,
+    'bytes=' + M.historyRequestBytes());
+  check('G5b first surviving message is a task boundary', M.Agent.history[0]._taskStart === true
+    && M.Agent.history[0].role === 'user', JSON.stringify(M.Agent.history[0]).slice(0, 60));
+  check('G5c whole tasks dropped (no orphan assistant first)',
+    M.Agent.history.every((m, i) => i === 0 || !m._taskStart || m.role === 'user'), '');
+
+  // ---------- G6. reasoning_content counts toward the budget ----------
+  resetState();
+  M.Agent.history.push({ role: 'user', content: 'tiny visible task', _taskStart: true });
+  M.Agent.history.push({ role: 'assistant', content: 'ok',
+    reasoning_content: 'R'.repeat(800 * 1024) }); // huge reasoning, tiny visible text
+  M.Agent.history.push({ role: 'user', content: 'current task', _taskStart: true });
+  M.enforceHistoryBudget();
+  check('G6 giant reasoning task trimmed despite tiny visible content',
+    M.Agent.history.length === 1 && M.Agent.history[0].content === 'current task',
+    'len=' + M.Agent.history.length);
+
+  // ---------- G7. UTF-8 bytes, not chars (Chinese ≈ 3 bytes/char) ----------
+  resetState();
+  M.Agent.history.push({ role: 'user', content: '汉'.repeat(100000), _taskStart: true });
+  const g7bytes = M.historyRequestBytes();
+  check('G7 multibyte content counted as UTF-8 bytes', g7bytes >= 300000, 'bytes=' + g7bytes);
+
+  // ---------- G8. user-role tool feedback is NOT a task boundary ----------
+  resetState();
+  const big = 'z'.repeat(300 * 1024);
+  M.Agent.history.push({ role: 'user', content: 'old task ' + big, _taskStart: true });
+  M.Agent.history.push({ role: 'assistant', content: 'call ' + big });
+  M.Agent.history.push({ role: 'user', content: '<tool_result>feedback ' + big + '</tool_result>' });
+  M.Agent.history.push({ role: 'user', content: 'current', _taskStart: true });
+  M.enforceHistoryBudget();
+  check('G8 partial task never survives: feedback dropped with its task',
+    M.Agent.history.length === 1 && M.Agent.history[0].content === 'current'
+    && M.Agent.history[0]._taskStart === true, JSON.stringify(M.Agent.history.map((m) => m.role)));
+
+  // ---------- G9. current task alone over budget → explicit error, no send ----------
+  resetState();
+  let g9called = false;
+  global.callModel = async () => { g9called = true; return FINAL; };
+  let g9err = null;
+  try {
+    await M.runAgentTask(term, 'huge '.repeat(200 * 1024)); // ~1 MB user input
+  } catch (e) { g9err = e; }
+  check('G9 oversized single task fails loudly', g9err && g9err.message.includes('transport budget'),
+    g9err && g9err.message);
+  check('G9b oversized request never sent to the model', g9called === false);
+  resetState();
+
+  // ---------- G10. internal _taskStart marker never sent to the provider ----------
+  resetState();
+  let captured = null;
+  global.callModel = async (body) => { captured = body; return FINAL; };
+  await M.runAgentTask(term, 'marker check');
+  check('G10 marker kept internally', M.Agent.history[0]._taskStart === true);
+  check('G10b marker stripped from the wire',
+    captured && captured.messages.every((m) => !Object.keys(m).some((k) => k.startsWith('_'))),
+    JSON.stringify(captured && captured.messages[0] && Object.keys(captured.messages[0])));
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);

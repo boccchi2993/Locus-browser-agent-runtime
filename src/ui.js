@@ -121,6 +121,7 @@ async function selectWorkspace() {
     if (App.busy) {
       App.term && App.term.echo('[[;var(--text-dim);]正在取消当前任务以切换 Workspace…]');
       cancelAgentTask();
+      updateCancelButton();
       const stopped = await waitFor(() => !App.busy, 10000);
       if (!stopped) {
         App.term && App.term.echo('[[;var(--red);]当前任务未能停止，已放弃切换 Workspace（原 Workspace 保持不变）。]');
@@ -192,6 +193,41 @@ function toggleDebugPanel() {
   if (panel.classList.contains('open')) renderDebugPanel();
 }
 
+// ---------- task cancellation (reachable while a task is running) ----------
+// The terminal input is paused during a task, so `cancel` typed at the
+// prompt can never arrive mid-task. The ALWAYS-mounted cancel button in
+// the status bar and the Escape shortcut are the real in-flight entries;
+// the local `cancel` command only covers the (rare) non-paused case.
+function updateCancelButton() {
+  const btn = document.getElementById('btn-cancel');
+  if (!btn) return;
+  const task = Agent.task;
+  if (App.busy && task && task.controller.signal.aborted) {
+    btn.disabled = true;
+    btn.textContent = 'Cancelling…';
+  } else if (App.busy) {
+    btn.disabled = false;
+    btn.textContent = 'Cancel (Esc)';
+  } else {
+    btn.disabled = true;
+    btn.textContent = 'Cancel';
+  }
+}
+
+function requestTaskCancel(term) {
+  const out = term || App.term;
+  if (!App.busy || !Agent.task) {
+    out && out.echo('[[;var(--text-dim);]当前没有正在执行的任务。]');
+    updateCancelButton();
+    return;
+  }
+  if (!Agent.task.controller.signal.aborted) {
+    cancelAgentTask();
+    out && out.echo('[[;var(--text-dim);]已请求取消当前任务。]');
+  }
+  updateCancelButton();
+}
+
 // ---------- local terminal commands ----------
 function printHelp(term) {
   [
@@ -219,14 +255,7 @@ const LOCAL_COMMANDS = {
     resetAgentSession();
     term.echo('[[;var(--accent);]会话已重置：对话历史与 Python 状态已清空。]');
   },
-  cancel: (args, term) => {
-    if (!App.busy) {
-      term.echo('[[;var(--text-dim);]当前没有正在执行的任务。]');
-      return;
-    }
-    cancelAgentTask();
-    term.echo('[[;var(--text-dim);]已请求取消当前任务。]');
-  },
+  cancel: (args, term) => requestTaskCancel(term),
   telemetry: (args, term) => toggleDebugPanel(),
   workspace: (args, term) => {
     term.echo(App.workspace
@@ -250,12 +279,14 @@ function initTerminal() {
 
     App.busy = true;
     this.pause();
+    updateCancelButton();
     try {
       await runAgentTask(this, input);
     } catch (e) {
       this.echo('[[;var(--red);][错误: ' + escapeTerm(e.message || String(e)) + ']]');
     }
     App.busy = false;
+    updateCancelButton();
     this.resume();
   }, {
     prompt: '[[;var(--accent);]>] ',
@@ -279,4 +310,10 @@ window.addEventListener('DOMContentLoaded', () => {
   initSetup();
   document.getElementById('btn-workspace').addEventListener('click', selectWorkspace);
   document.getElementById('btn-log').addEventListener('click', toggleDebugPanel);
+  const cancelBtn = document.getElementById('btn-cancel');
+  if (cancelBtn) cancelBtn.addEventListener('click', () => requestTaskCancel());
+  // Escape cancels the running task even while the terminal is paused.
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && App.busy) requestTaskCancel();
+  });
 });

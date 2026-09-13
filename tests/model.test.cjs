@@ -32,6 +32,22 @@ global.fetch = async (url, opts) => {
       }
     });
   }
+  if (next.bodyStreamError) {
+    // Headers arrive fine, then the BODY stream dies mid-read — the exact
+    // shape of a truncated/reset connection after HTTP 200.
+    return {
+      ok: next.status >= 200 && next.status < 300,
+      status: next.status,
+      headers: { get: (n) => (next.headers || {})[String(n).toLowerCase()] || null },
+      body: new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('{"partial":'));
+          c.error(new TypeError('Failed to fetch'));
+        },
+      }),
+      text: async () => { throw new TypeError('Failed to fetch'); },
+    };
+  }
   return {
     ok: next.status >= 200 && next.status < 300,
     status: next.status,
@@ -299,6 +315,37 @@ async function run() {
   check('P3 client deadline → timeout error, no endpoint retry',
     p3Err && p3Err.timeout === true && p3Err.message.includes('timed out') && calls.length === 1,
     (p3Err && p3Err.message) + ' calls=' + calls.length);
+
+  // ---------- Q. body-read failure AFTER headers is not a CORS fallback (Finding 6) ----------
+  global.window.location.protocol = 'https:';
+  // Q1: HTTP 200, body stream dies mid-read → BodyReadError, NO /proxy re-send
+  reset('https://model.test');
+  queue.push({ status: 200, bodyStreamError: true });
+  let q1Err = null;
+  try { await M.callModel(body); } catch (e) { q1Err = e; }
+  check('Q1 200 body interruption → BodyReadError (not TypeError/CORS)',
+    q1Err && q1Err.name === 'BodyReadError' && q1Err.noFallback === true,
+    q1Err && q1Err.name + '/' + q1Err.message);
+  check('Q1b status and cause preserved', q1Err && q1Err.status === 200 && q1Err.cause instanceof TypeError,
+    q1Err && String(q1Err.status) + '/' + (q1Err.cause && q1Err.cause.message));
+  check('Q1c no second request (no double-billed inference)', calls.length === 1,
+    'calls=' + calls.length + ' ' + calls.map((c) => c.url).join(','));
+
+  // Q2: error status, body dies before the error JSON can be read → still no fallback
+  reset('https://model.test');
+  queue.push({ status: 500, bodyStreamError: true });
+  let q2Err = null;
+  try { await M.callModel(body); } catch (e) { q2Err = e; }
+  check('Q2 500 body interruption → BodyReadError keeps HTTP status, no retry',
+    q2Err && q2Err.name === 'BodyReadError' && q2Err.status === 500 && calls.length === 1,
+    (q2Err && q2Err.name + '/' + q2Err.status) + ' calls=' + calls.length);
+
+  // Q3: genuine pre-headers CORS failure still falls back to /proxy (regression guard)
+  reset('https://model.test');
+  queue.push({ typeError: true }, OPENAI_OK);
+  const q3 = await M.callModelText(body);
+  check('Q3 pre-headers TypeError still relays to /proxy', q3 === 'OK' && calls.length === 2
+    && calls[1].url === '/proxy', calls.map((c) => c.url).join(','));
 
   global.window.location.protocol = 'file:';
 

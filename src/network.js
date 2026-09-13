@@ -58,63 +58,63 @@ const NetworkRuntime = {
   },
 
   async _direct(url, externalSignal, timeoutMs) {
-    const res = await fetchWithDeadline(url, {
+    return fetchWithDeadline(url, {
       method: 'GET',
       redirect: 'follow',
       credentials: 'omit', // anonymous by construction — never send cookies
-    }, timeoutMs, externalSignal);
-    const bytes = await readBytesCapped(res, NETWORK_MAX_BYTES);
-    return {
+    }, timeoutMs, externalSignal, async (res, signal) => ({
       status: res.status,
       statusText: res.statusText || '',
       headers: headersToObject(res.headers),
-      bytes,
+      bytes: await readBytesCapped(res, NETWORK_MAX_BYTES, signal),
       finalUrl: res.url || url,
       backend: 'browser-direct',
-    };
+    }));
   },
 
-  async _relay(url, externalSignal) {
-    let res;
+  async _relay(url, externalSignal, timeoutMs) {
     try {
-      res = await fetchWithDeadline(this.relayPath + '?url=' + encodeURIComponent(url), {
+      return await fetchWithDeadline(this.relayPath + '?url=' + encodeURIComponent(url), {
         method: 'GET',
         credentials: 'omit',
-      }, RELAY_CLIENT_TIMEOUT_MS, externalSignal);
+      }, timeoutMs || RELAY_CLIENT_TIMEOUT_MS, externalSignal, async (res, signal) => {
+        // The relay's OWN failures (bad URL, non-HTTPS target, timeout, size
+        // cap, redirect cap) are marked with X-Locus-Relay-Error and carry a
+        // JSON {error:{message}} body — read INSIDE the same deadline, then
+        // surface the message; never treat them as upstream content.
+        if (res.headers.get('x-locus-relay-error')) {
+          let msg = 'edge relay error (HTTP ' + res.status + ')';
+          try {
+            const j = await raceAbort(res.json(), signal);
+            if (j && j.error && j.error.message) msg = j.error.message;
+          } catch (e) {
+            if (e && (e.cancelled || e.timeout)) throw e;
+          }
+          throw new Error('edge relay: ' + msg);
+        }
+        return {
+          status: res.status,
+          statusText: res.statusText || '',
+          headers: headersToObject(res.headers),
+          bytes: await readBytesCapped(res, NETWORK_MAX_BYTES, signal),
+          finalUrl: res.headers.get('x-locus-final-url') || url,
+          backend: 'edge-relay',
+        };
+      });
     } catch (e) {
       if (isNetworkFailure(e)) {
         throw new Error('edge relay unreachable: ' + (e && e.message ? e.message : String(e)));
       }
-      throw e; // timeout / cancellation: surfaced as-is, never retried
+      throw e; // timeout / cancellation / size cap: surfaced as-is, never retried
     }
-    // The relay's OWN failures (bad URL, non-HTTPS target, timeout, size
-    // cap, redirect cap) are marked with X-Locus-Relay-Error and carry a
-    // JSON {error:{message}} body — surface the message, don't treat them
-    // as upstream content.
-    if (res.headers.get('x-locus-relay-error')) {
-      let msg = 'edge relay error (HTTP ' + res.status + ')';
-      try {
-        const j = await res.json();
-        if (j && j.error && j.error.message) msg = j.error.message;
-      } catch (e) {}
-      throw new Error('edge relay: ' + msg);
-    }
-    const bytes = await readBytesCapped(res, NETWORK_MAX_BYTES);
-    return {
-      status: res.status,
-      statusText: res.statusText || '',
-      headers: headersToObject(res.headers),
-      bytes,
-      finalUrl: res.headers.get('x-locus-final-url') || url,
-      backend: 'edge-relay',
-    };
   },
 };
 
-// fetch + deadline covering response headers, with optional external
-// cancellation. Body reading is bounded separately by readBytesCapped
-// under the same deadline semantics (callers read immediately after).
-async function fetchWithDeadline(url, init, timeoutMs, externalSignal) {
+// fetch + FULL body consumption + cleanup in ONE lifecycle: the deadline
+// and the external abort listener stay armed until the body has been read
+// to completion (or has failed / been capped / been cancelled).
+// consume(res) must read the entire body it needs.
+async function fetchWithDeadline(url, init, timeoutMs, externalSignal, consume) {
   if (externalSignal && externalSignal.aborted) throw makeNetCancelledError();
   const controller = new AbortController();
   let timedOut = false;
@@ -122,7 +122,8 @@ async function fetchWithDeadline(url, init, timeoutMs, externalSignal) {
   const onExternalAbort = () => controller.abort();
   if (externalSignal) externalSignal.addEventListener('abort', onExternalAbort, { once: true });
   try {
-    return await fetch(url, Object.assign({}, init, { signal: controller.signal }));
+    const res = await fetch(url, Object.assign({}, init, { signal: controller.signal }));
+    return await consume(res, controller.signal);
   } catch (e) {
     if (externalSignal && externalSignal.aborted) throw makeNetCancelledError();
     if (timedOut) throw makeNetTimeoutError(timeoutMs);
@@ -135,8 +136,10 @@ async function fetchWithDeadline(url, init, timeoutMs, externalSignal) {
 
 // Read a response body with a hard byte cap (streaming when possible, so
 // oversized responses are cut off mid-stream instead of after a full
-// unbounded read into memory).
-async function readBytesCapped(res, maxBytes) {
+// unbounded read into memory). `signal` is the deadline/cancellation
+// signal: every pending read is raced against it, so a stalled body still
+// loses the race even if the underlying stream never reacts to abort.
+async function readBytesCapped(res, maxBytes, signal) {
   let contentLength = NaN;
   try {
     contentLength = Number.parseInt(res.headers && res.headers.get
@@ -146,7 +149,7 @@ async function readBytesCapped(res, maxBytes) {
     throw makeNetTooLargeError(maxBytes);
   }
   if (!res.body || typeof res.body.getReader !== 'function') {
-    const buf = await res.arrayBuffer();
+    const buf = await raceAbort(res.arrayBuffer(), signal);
     if (buf.byteLength > maxBytes) throw makeNetTooLargeError(maxBytes);
     return new Uint8Array(buf);
   }
@@ -155,7 +158,7 @@ async function readBytesCapped(res, maxBytes) {
   let received = 0;
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await raceAbort(reader.read(), signal);
       if (done) break;
       received += value.byteLength;
       if (received > maxBytes) {
@@ -166,11 +169,13 @@ async function readBytesCapped(res, maxBytes) {
     }
   } catch (e) {
     if (e && e.tooLarge) throw e;
-    if (e && (e.cancelled || e.name === 'AbortError')) throw makeNetCancelledError();
-    if (e instanceof TypeError) throw e; // genuine mid-body network failure
-    throw e;
+    if (e && (e.cancelled || e.name === 'AbortError')) {
+      await reader.cancel().catch(() => {});
+      throw makeNetCancelledError();
+    }
+    throw e; // genuine mid-body network failure (TypeError) or stream error
   } finally {
-    reader.releaseLock();
+    try { reader.releaseLock(); } catch (e) { /* lock may already be released */ }
   }
   const merged = new Uint8Array(received);
   let offset = 0;
@@ -179,6 +184,22 @@ async function readBytesCapped(res, maxBytes) {
     offset += chunk.byteLength;
   }
   return merged;
+}
+
+// Race a promise against an abort signal. Rejects with the standard
+// cancellation error as soon as the signal fires, without waiting for the
+// promise (which may never settle — e.g. a stalled response body).
+function raceAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(makeNetCancelledError());
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(makeNetCancelledError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (v) => { signal.removeEventListener('abort', onAbort); resolve(v); },
+      (e) => { signal.removeEventListener('abort', onAbort); reject(e); }
+    );
+  });
 }
 
 function makeNetTimeoutError(timeoutMs) {

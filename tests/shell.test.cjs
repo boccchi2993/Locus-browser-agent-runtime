@@ -167,6 +167,78 @@ async function run() {
   const x1 = await M.runShellCommand("python -c 'print(1)'", new MemWS(), { signal: ac.signal });
   check('X1 pre-aborted python → cancelled', x1.isError && x1.output.includes('cancelled'), x1.output);
 
+  // ---------- Y. cancellation landing DURING async pre-checks (Finding 4) ----------
+
+  // Y1: abort inside the conflict pre-check's readBytes → the write must NOT start
+  const wsY1 = new MemWS({ 'a.txt': 'before' });
+  const acY1 = new AbortController();
+  let readsY1 = 0;
+  const origReadY1 = wsY1.readBytes.bind(wsY1);
+  wsY1.readBytes = async (p) => {
+    readsY1++;
+    const data = await origReadY1(p);
+    if (p === 'a.txt' && readsY1 === 2) acY1.abort(); // 1st read = snapshot, 2nd = conflict check
+    return data;
+  };
+  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: 'a.txt', b64: b64('python') }], deleted: [], uncollectedFiles: [] });
+  const y1 = await M.executeTool('bash', "python -c 'x'", wsY1, { signal: acY1.signal });
+  check('Y1 cancel during write pre-check → no write starts',
+    new TextDecoder().decode(wsY1.files['a.txt']) === 'before', new TextDecoder().decode(wsY1.files['a.txt']));
+  check('Y1b reported as not-persisted + failure', y1.success === false && y1.output.includes('cancelled before write'),
+    JSON.stringify(y1.output));
+
+  // Y2: abort inside the delete verification read → the remove must NOT start
+  const wsY2 = new MemWS({ 'b.txt': 'keep' });
+  const acY2 = new AbortController();
+  let readsY2 = 0;
+  const origReadY2 = wsY2.readBytes.bind(wsY2);
+  wsY2.readBytes = async (p) => {
+    readsY2++;
+    const data = await origReadY2(p);
+    if (p === 'b.txt' && readsY2 === 2) acY2.abort();
+    return data;
+  };
+  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [], deleted: ['b.txt'], uncollectedFiles: [] });
+  const y2 = await M.executeTool('bash', "python -c 'x'", wsY2, { signal: acY2.signal });
+  check('Y2 cancel during delete verification → file preserved',
+    !!wsY2.files['b.txt'] && new TextDecoder().decode(wsY2.files['b.txt']) === 'keep');
+  check('Y2b delete reported as not executed + failure', y2.success === false && y2.output.includes('cancelled before commit'),
+    JSON.stringify(y2.output));
+
+  // Y3: abort during workspace collection → the python run never starts
+  const wsY3 = new MemWS({ 'c.txt': 'data' });
+  const acY3 = new AbortController();
+  const origListY3 = wsY3.list.bind(wsY3);
+  wsY3.list = async (p) => { acY3.abort(); return origListY3(p); };
+  let startedY3 = 0;
+  M.PythonRuntime._ensureWorker = () => {};
+  M.PythonRuntime.worker = { postMessage() { startedY3++; } };
+  const y3 = await M.executeTool('bash', "python -c 'x'", wsY3, { signal: acY3.signal });
+  check('Y3 cancel during collection → worker never starts', startedY3 === 0 && !y3.success
+    && y3.output.includes('cancelled'), 'started=' + startedY3 + ' out=' + JSON.stringify(y3.output));
+
+  // Y4: echo >> — abort during the read of the old content → no write
+  const wsY4 = new MemWS({ 'log.txt': 'old\n' });
+  const acY4 = new AbortController();
+  const origReadY4 = wsY4.read.bind(wsY4);
+  wsY4.read = async (p) => { const t = await origReadY4(p); acY4.abort(); return t; };
+  const y4 = await M.executeTool('bash', 'echo new >> log.txt', wsY4, { signal: acY4.signal });
+  check('Y4 echo >> cancel during read → no write', y4.success === false
+    && new TextDecoder().decode(wsY4.files['log.txt']) === 'old\n', JSON.stringify(y4.output));
+
+  // Y5: curl -o — abort after the fetch resolves → no file written
+  const wsY5 = new MemWS();
+  const acY5 = new AbortController();
+  const origFetch = global.fetch;
+  global.fetch = async () => {
+    acY5.abort();
+    return new Response('data', { status: 200, headers: { 'content-type': 'text/plain' } });
+  };
+  const y5 = await M.executeTool('bash', 'curl -o dl.txt https://example.test/x', wsY5, { signal: acY5.signal });
+  global.fetch = origFetch;
+  check('Y5 curl -o cancel after fetch → no write', y5.success === false && !('dl.txt' in wsY5.files),
+    JSON.stringify(y5.output));
+
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
 }

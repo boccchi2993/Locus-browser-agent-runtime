@@ -1,15 +1,18 @@
-// F05 verification: active content served by a /fetch-style relay must not
-// execute as a same-origin page. Spins up a local HTTP server that mimics
-// the relay response (harmless payload that tries to read sessionStorage
-// and beacon it back), navigates REAL headless Chrome to it, and checks
-// whether the payload ran.
+// F05 verification: active content served by the /fetch relay must not
+// execute as a same-origin page. This test forwards responses from the
+// REAL functions/fetch.js handler (only the upstream payload is mocked)
+// through a local HTTP server, navigates REAL headless Chrome to it, and
+// checks whether the payload ran.
 //
 //   /set-secret  app page: sessionStorage.setItem('apiKey', 'sk-demo')
 //   /control     payload WITHOUT isolation headers (pre-fix behavior)
-//   /fixed       payload WITH CSP sandbox + nosniff (functions/fetch.js behavior)
+//   /fixed       response produced by the real onRequestGet handler
 //
 // Expected: control exfiltrates (GET /exfil?k=sk-demo hits the server);
-// fixed does not run the script at all (no /exfil hit, window.__pwned unset).
+// the real handler's response neutralizes the payload (CSP sandbox), so no
+// /exfil hit and window.__pwned unset. If functions/fetch.js ever loses
+// its isolation headers, the FIXED check fails — the test exercises the
+// shipped artifact, not a handwritten header copy.
 //
 // Run: node tests/verify-active-content.cjs
 // Uses its own Chrome instance on port 9334. No external network needed.
@@ -29,14 +32,28 @@ const PAYLOAD = '<!doctype html><html><body><script>\n' +
   'try { fetch("/exfil?k=" + encodeURIComponent(sessionStorage.getItem("apiKey") || "none")); } catch (e) {}\n' +
   '</script></body></html>';
 
-const FIXED_HEADERS = {
-  'content-type': 'text/html',
-  'x-content-type-options': 'nosniff',
-  'content-security-policy': 'sandbox',
+const UPSTREAM_URL = 'https://evil.test/p';
+
+// Mock only the UPSTREAM network: the real handler's fetch() of the target
+// URL returns our harmless-but-active payload. Everything else (status,
+// headers incl. CSP/nosniff, body) comes from the real handler.
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url, opts) => {
+  if (String(url) === UPSTREAM_URL) {
+    return new Response(PAYLOAD, {
+      status: 200,
+      headers: { 'content-type': 'text/html', 'content-length': String(Buffer.byteLength(PAYLOAD)) },
+    });
+  }
+  // CDP / local HTTP calls made by this script itself use undici's fetch —
+  // route them back to the real implementation.
+  return realFetch(url, opts);
 };
 
 const exfilHits = [];
-const server = http.createServer((req, res) => {
+let handler; // real onRequestGet from functions/fetch.js
+
+const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
   if (u.pathname === '/set-secret') {
     res.writeHead(200, { 'content-type': 'text/html' });
@@ -45,8 +62,20 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/html' });
     res.end(PAYLOAD);
   } else if (u.pathname === '/fixed') {
-    res.writeHead(200, FIXED_HEADERS);
-    res.end(PAYLOAD);
+    try {
+      const cfRes = await handler({
+        request: new Request('http://local.test/fetch?url=' + encodeURIComponent(UPSTREAM_URL)),
+        env: {},
+      });
+      const headers = {};
+      cfRes.headers.forEach((v, k) => { headers[k] = v; });
+      delete headers['content-length']; // re-computed by res.end with the exact body
+      res.writeHead(cfRes.status, headers);
+      res.end(Buffer.from(await cfRes.arrayBuffer()));
+    } catch (e) {
+      res.writeHead(500, { 'content-type': 'text/plain' });
+      res.end('handler threw: ' + (e && e.stack || e));
+    }
   } else if (u.pathname === '/exfil') {
     exfilHits.push(u.searchParams.get('k'));
     res.writeHead(204);
@@ -58,6 +87,9 @@ const server = http.createServer((req, res) => {
 });
 
 async function main() {
+  handler = (await import('../functions/fetch.js')).onRequestGet;
+  if (typeof handler !== 'function') throw new Error('onRequestGet not exported by functions/fetch.js');
+
   await new Promise((r) => server.listen(HTTP_PORT, '127.0.0.1', r));
   const chrome = spawn(CHROME, [
     '--headless=new',
@@ -72,7 +104,7 @@ async function main() {
     let target = null;
     for (let i = 0; i < 40 && !target; i++) {
       try {
-        const list = await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json();
+        const list = await (await realFetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json();
         target = list.find((t) => t.type === 'page');
       } catch (e) {}
       await sleep(500);
@@ -112,6 +144,17 @@ async function main() {
       else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + detail : '')); }
     };
 
+    // Node-side: the real handler must actually emit the isolation headers.
+    const cfRes = await handler({
+      request: new Request('http://local.test/fetch?url=' + encodeURIComponent(UPSTREAM_URL)),
+      env: {},
+    });
+    check('HANDLER emits CSP sandbox + nosniff for text/html',
+      cfRes.headers.get('content-security-policy') === 'sandbox'
+      && cfRes.headers.get('x-content-type-options') === 'nosniff'
+      && cfRes.status === 200,
+      'csp=' + cfRes.headers.get('content-security-policy') + ' status=' + cfRes.status);
+
     await visit('/set-secret');
 
     // control: same payload WITHOUT isolation headers → script executes and
@@ -123,11 +166,11 @@ async function main() {
       control.pwned === true && exfilHits.length > before && exfilHits[exfilHits.length - 1] === 'sk-demo',
       JSON.stringify(control) + ' exfil=' + JSON.stringify(exfilHits));
 
-    // fixed: the headers functions/fetch.js now sends → script never runs
+    // fixed: the response the REAL handler produces → script never runs
     const beforeFixed = exfilHits.length;
     const fixed = await visit('/fixed');
     await sleep(800);
-    check('FIXED payload neutralized by CSP sandbox (no script execution)',
+    check('FIXED real-handler payload neutralized (no script execution, no exfil)',
       fixed.pwned === false && fixed.title !== 'PWNED' && exfilHits.length === beforeFixed,
       JSON.stringify(fixed) + ' exfil=' + JSON.stringify(exfilHits));
 

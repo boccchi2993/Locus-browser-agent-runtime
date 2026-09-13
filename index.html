@@ -143,6 +143,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
     <div class="right">
       <span id="sb-workspace">Workspace: Not selected</span>
       <button class="sb-btn" id="btn-workspace" type="button">Select Workspace</button>
+      <button class="sb-btn" id="btn-cancel" type="button" disabled>Cancel</button>
       <span id="sb-python" class="cold">Python: cold</span>
     </div>
   </div>
@@ -233,6 +234,13 @@ function syncIn(files) {
   return manifest;
 }
 
+// Output caps, enforced inside the worker BEFORE anything is posted to the
+// main thread — a runaway print loop or huge artifact must not OOM the page.
+const MAX_STDOUT_CHARS = 1024 * 1024;
+const MAX_STDERR_CHARS = 1024 * 1024;
+const MAX_OUT_FILES = 200;
+const MAX_OUT_TOTAL_BYTES = 25 * 1024 * 1024;
+
 function walkFs(dir, prefix, out) {
   for (const entry of py.FS.readdir(dir)) {
     if (entry === '.' || entry === '..') continue;
@@ -241,39 +249,56 @@ function walkFs(dir, prefix, out) {
     if (py.FS.isDir(stat.mode)) {
       walkFs(full, prefix + entry + '/', out);
     } else {
-      out.push({ path: prefix + entry, full: full });
+      out.push({ path: prefix + entry, full: full, size: stat.size });
     }
   }
 }
 
-// Output caps, enforced inside the worker BEFORE anything is posted to the
-// main thread — a runaway print loop or huge artifact must not OOM the page.
-const MAX_STDOUT_CHARS = 1024 * 1024;
-const MAX_STDERR_CHARS = 1024 * 1024;
-const MAX_OUT_FILES = 200;
-const MAX_OUT_TOTAL_BYTES = 25 * 1024 * 1024;
+function b64Size(b64) {
+  const len = b64.length;
+  let pad = 0;
+  if (b64[len - 1] === '=') pad++;
+  if (b64[len - 2] === '=') pad++;
+  return Math.floor(len / 4) * 3 - pad;
+}
 
-function diffOut(manifest, warnings) {
+// Collect the output changeset. Files that cannot be collected within the
+// caps are reported as STRUCTURED uncollected paths — the changeset is then
+// incomplete and the main thread must not treat deletions as committable
+// (a rename target among the uncollected files would lose the source).
+// Sizes are checked via stat BEFORE reading/base64-encoding a file.
+function diffOut(manifest) {
   const entries = [];
   walkFs(WORK_ROOT, '', entries);
   const changed = [];
+  const uncollected = [];
   const present = new Set();
   let total = 0;
   for (const e of entries) {
     present.add(e.path);
-    const b64 = bytesToB64(py.FS.readFile(e.full));
-    if (manifest[e.path] === b64) continue;
-    const size = Math.floor(b64.length / 4) * 3;
-    if (changed.length >= MAX_OUT_FILES) {
-      warnings.push('more than ' + MAX_OUT_FILES + ' output files; "' + e.path + '" and further files were not collected');
+    const snapB64 = manifest[e.path];
+    const snapSize = snapB64 !== undefined ? b64Size(snapB64) : -1;
+    if (snapSize >= 0 && e.size === snapSize) {
+      // Possibly unchanged (same size as the sync-in snapshot, which is
+      // bounded by the sync-in caps): read and compare to be sure.
+      const b64 = bytesToB64(py.FS.readFile(e.full));
+      if (snapB64 === b64) continue;
+      if (changed.length >= MAX_OUT_FILES || total + e.size > MAX_OUT_TOTAL_BYTES) {
+        uncollected.push(e.path);
+        continue;
+      }
+      total += e.size;
+      changed.push({ path: e.path, b64: b64 });
       continue;
     }
-    if (total + size > MAX_OUT_TOTAL_BYTES) {
-      warnings.push('output exceeds ' + MAX_OUT_TOTAL_BYTES + ' bytes total; "' + e.path + '" and further files were not collected');
+    // Definitely new or changed (no snapshot, or size differs): check the
+    // budget from stat.size BEFORE reading the file into memory.
+    if (changed.length >= MAX_OUT_FILES || total + e.size > MAX_OUT_TOTAL_BYTES) {
+      uncollected.push(e.path);
       continue;
     }
-    total += size;
-    changed.push({ path: e.path, b64: b64 });
+    total += e.size;
+    changed.push({ path: e.path, b64: bytesToB64(py.FS.readFile(e.full)) });
   }
   // Files that were synced in but no longer exist after the run were
   // deleted (or renamed away) by the Python code.
@@ -281,7 +306,7 @@ function diffOut(manifest, warnings) {
   for (const path of Object.keys(manifest)) {
     if (!present.has(path)) deleted.push(path);
   }
-  return { changed: changed, deleted: deleted };
+  return { changed: changed, deleted: deleted, uncollected: uncollected };
 }
 
 self.onmessage = async (ev) => {
@@ -294,26 +319,25 @@ self.onmessage = async (ev) => {
     self.postMessage({ id: id, type: 'status', status: 'ready' });
 
     const manifest = syncIn(msg.files || []);
-    const warnings = [];
 
     let stdout = '';
     let stderr = '';
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     py.setStdout({ batched: (s) => {
-      if (stdout.length < MAX_STDOUT_CHARS) stdout += s + '\n';
+      if (stdoutTruncated) return;
+      stdout += s + '\n';
       if (stdout.length > MAX_STDOUT_CHARS) {
         stdout = stdout.slice(0, MAX_STDOUT_CHARS);
-        if (warnings.indexOf('stdout truncated at ' + MAX_STDOUT_CHARS + ' chars') === -1) {
-          warnings.push('stdout truncated at ' + MAX_STDOUT_CHARS + ' chars');
-        }
+        stdoutTruncated = true;
       }
     } });
     py.setStderr({ batched: (s) => {
-      if (stderr.length < MAX_STDERR_CHARS) stderr += s + '\n';
+      if (stderrTruncated) return;
+      stderr += s + '\n';
       if (stderr.length > MAX_STDERR_CHARS) {
         stderr = stderr.slice(0, MAX_STDERR_CHARS);
-        if (warnings.indexOf('stderr truncated at ' + MAX_STDERR_CHARS + ' chars') === -1) {
-          warnings.push('stderr truncated at ' + MAX_STDERR_CHARS + ' chars');
-        }
+        stderrTruncated = true;
       }
     } });
 
@@ -328,10 +352,15 @@ self.onmessage = async (ev) => {
       error = String(e && e.message ? e.message : e);
     }
 
-    const diff = diffOut(manifest, warnings);
-    self.postMessage({ id: id, type: 'result', stdout: stdout, stderr: stderr, error: error, files: diff.changed, deleted: diff.deleted, syncWarnings: warnings });
+    const diff = diffOut(manifest);
+    self.postMessage({
+      id: id, type: 'result', stdout: stdout, stderr: stderr, error: error,
+      files: diff.changed, deleted: diff.deleted,
+      uncollectedFiles: diff.uncollected,
+      stdoutTruncated: stdoutTruncated, stderrTruncated: stderrTruncated,
+    });
   } catch (e) {
-    self.postMessage({ id: id, type: 'result', stdout: '', stderr: '', error: String(e && e.message ? e.message : e), files: [], deleted: [], syncWarnings: [] });
+    self.postMessage({ id: id, type: 'result', stdout: '', stderr: '', error: String(e && e.message ? e.message : e), files: [], deleted: [], uncollectedFiles: [], stdoutTruncated: false, stderrTruncated: false });
   }
 };
 </script>

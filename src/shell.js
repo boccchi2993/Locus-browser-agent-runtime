@@ -18,6 +18,13 @@ function isCancelledError(e) {
   return !!e && (e.cancelled || e.name === 'AbortError');
 }
 
+// Uniform cancellation gate used by python commits, echo redirects, curl
+// downloads and workspace collection: re-checked after every async
+// pre-check, before every side effect.
+function throwIfCancelled(signal, what) {
+  if (signal && signal.aborted) throw makeCancelledError(what || 'operation');
+}
+
 // ---------- Python runtime bridge (Web Worker + lazy Pyodide) ----------
 const PythonRuntime = {
   worker: null,
@@ -103,32 +110,39 @@ const PythonRuntime = {
   },
 
   // Run Python code with the workspace mirrored in.
-  // opts.signal (optional AbortSignal) cancels the run: a pending
-  // execution kills the worker; cancellation during write-back stops any
-  // further commits.
+  // opts.signal (optional AbortSignal) cancels the run: cancellation is
+  // checked before starting, during workspace collection, after the worker
+  // reply, after EVERY async pre-check and before EVERY commit side effect.
+  // Commits already finished are not rolled back — the result reports
+  // exactly what committed and what never ran.
   // Returns {
   //   stdout, stderr, error,            — compute outcome
   //   written, deleted,                 — paths actually committed
   //   conflicts: [{path, reason}],      — commits refused (external change / unsynced path)
   //   writeFailed: [description],       — commits attempted but failed
   //   notPersisted: [paths],            — generated files never written (no workspace / cancelled)
-  //   skipped: [paths],                 — workspace files NOT mirrored into Python
+  //   skipped: [{path, reason}],        — workspace files NOT mirrored into Python
+  //   uncollected: [paths],             — python outputs over the worker caps (changeset incomplete)
+  //   stdoutTruncated, stderrTruncated, — output notice flags (NOT commit failures)
   // }
   async run(code, workspace, opts) {
     const signal = opts && opts.signal;
     this._ensureWorker();
     this._setStatus('loading');
-    if (signal && signal.aborted) throw makeCancelledError('python execution');
+    throwIfCancelled(signal, 'python execution');
 
     let files = [];
     let skipped = [];
     const snapshot = {}; // path → b64 at sync-in time (optimistic concurrency base)
     if (workspace) {
-      const collected = await collectWorkspaceFiles(workspace);
+      const collected = await collectWorkspaceFiles(workspace, signal);
       files = collected.files;
       skipped = collected.skipped;
       for (const f of files) snapshot[f.path] = f.b64;
     }
+    // The abort may have landed DURING collection (no listener was attached
+    // yet) — never start the worker run on a cancelled task.
+    throwIfCancelled(signal, 'python execution');
 
     const id = ++this._reqId;
     const onAbort = () => this._killWorker('python execution cancelled');
@@ -145,14 +159,19 @@ const PythonRuntime = {
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort);
     }
-    if (signal && signal.aborted) throw makeCancelledError('python execution');
+    throwIfCancelled(signal, 'python execution');
 
     const skippedSet = new Set(skipped.map((s) => s.path));
+    const uncollected = result.uncollectedFiles || [];
     const written = [];
     const conflicts = [];
     const writeFailed = [];
     const notPersisted = [];
     const outFiles = result.files || [];
+
+    for (const p of uncollected) {
+      notPersisted.push(p + ' (over python output limit; changeset incomplete)');
+    }
 
     if (!workspace && outFiles.length) {
       // Files were generated but there is nowhere to persist them — say so.
@@ -187,6 +206,12 @@ const PythonRuntime = {
           conflicts.push(conflict);
           continue;
         }
+        // The pre-check awaited: cancellation may have landed meanwhile.
+        // Re-check BEFORE the side effect, not just at the loop top.
+        if (signal && signal.aborted) {
+          notPersisted.push(f.path + ' (cancelled before write)');
+          continue;
+        }
         try {
           await workspace.write(f.path, bytes);
           written.push(f.path);
@@ -197,11 +222,12 @@ const PythonRuntime = {
     }
 
     // ---- commit phase 2: deletions (rename = delete + create) ----
-    // If ANY write failed or was refused, the run's new state is
-    // incomplete — deleting sources could destroy the only good copy
-    // (e.g. a rename whose target never landed). Stop the delete phase.
+    // If ANY write failed, was refused, or the worker could not collect the
+    // full changeset, the run's new state is incomplete — deleting sources
+    // could destroy the only good copy (e.g. a rename whose target never
+    // landed). Stop the delete phase.
     const deleted = [];
-    const deletesBlocked = writeFailed.length > 0 || conflicts.length > 0;
+    const deletesBlocked = writeFailed.length > 0 || conflicts.length > 0 || uncollected.length > 0;
     if (workspace && result.deleted && result.deleted.length && !deletesBlocked) {
       for (const p of result.deleted) {
         if (signal && signal.aborted) {
@@ -225,6 +251,11 @@ const PythonRuntime = {
             continue;
           }
         }
+        // Verification awaited: re-check cancellation BEFORE removing.
+        if (signal && signal.aborted) {
+          notPersisted.push('delete ' + p + ' (cancelled before commit)');
+          continue;
+        }
         try {
           await workspace.remove(p);
           deleted.push(p);
@@ -233,7 +264,10 @@ const PythonRuntime = {
         }
       }
     } else if (workspace && result.deleted && result.deleted.length && deletesBlocked) {
-      notPersisted.push('deletions skipped (' + result.deleted.join(', ') + '): earlier commits failed, sources preserved');
+      const why = uncollected.length > 0
+        ? 'output changeset incomplete (' + uncollected.length + ' file(s) not collected), sources preserved'
+        : 'earlier commits failed, sources preserved';
+      notPersisted.push('deletions skipped (' + result.deleted.join(', ') + '): ' + why);
     }
 
     return {
@@ -246,7 +280,9 @@ const PythonRuntime = {
       writeFailed,
       notPersisted,
       skipped,
-      syncWarnings: result.syncWarnings || [],
+      uncollected,
+      stdoutTruncated: !!result.stdoutTruncated,
+      stderrTruncated: !!result.stderrTruncated,
       inputBytes: files.reduce((n, f) => n + b64ByteLength(f.b64), 0),
       outputBytes: outFiles.reduce((n, f) => n + b64ByteLength(f.b64), 0),
     };
@@ -326,13 +362,15 @@ const SYNC_MAX_FILES = 200;
 const SYNC_MAX_FILE_BYTES = 5 * 1024 * 1024;
 const SYNC_MAX_TOTAL_BYTES = 25 * 1024 * 1024;
 
-async function collectWorkspaceFiles(workspace) {
+async function collectWorkspaceFiles(workspace, signal) {
   const files = [];
   const skipped = [];
   let total = 0;
 
   async function walk(rel) {
+    throwIfCancelled(signal, 'workspace collection');
     const entries = await workspace.list(rel);
+    throwIfCancelled(signal, 'workspace collection');
     for (const e of entries) {
       const childRel = rel ? rel + '/' + e.name : e.name;
       if (e.kind === 'directory') {
@@ -353,6 +391,7 @@ async function collectWorkspaceFiles(workspace) {
         continue;
       }
       const bytes = await workspace.readBytes(childRel);
+      throwIfCancelled(signal, 'workspace collection');
       total += bytes.byteLength;
       files.push({ path: childRel, b64: bytesToB64(bytes) });
     }
@@ -507,6 +546,8 @@ async function runShellCommand(input, workspace, opts) {
           if (redirect === '>>' && (await workspace.exists(target.text))) {
             text = (await workspace.read(target.text)) + text;
           }
+          // reads above awaited: re-check cancellation before writing
+          throwIfCancelled(opts && opts.signal, 'echo');
           await workspace.write(target.text, text);
           return ok('');
         }
@@ -579,8 +620,11 @@ async function runPythonCode(code, workspace, opts) {
   if (res.stdout) output += res.stdout.replace(/\n$/, '');
   if (res.stderr) output += (output ? '\n' : '') + res.stderr.replace(/\n$/, '');
   if (res.error) output += (output ? '\n' : '') + res.error;
-  for (const w of res.syncWarnings || []) {
-    output += (output ? '\n' : '') + '[python output limit: ' + w + ']';
+  if (res.stdoutTruncated) {
+    output += (output ? '\n' : '') + '[python output limit: stdout truncated]';
+  }
+  if (res.stderrTruncated) {
+    output += (output ? '\n' : '') + '[python output limit: stderr truncated]';
   }
   if (res.skipped && res.skipped.length) {
     const shown = res.skipped.slice(0, 10).map((s) => s.path + ' (' + s.reason + ')');
@@ -698,6 +742,8 @@ async function runCurl(args, workspace, line, opts) {
   }
 
   if (outFile) {
+    // The fetch awaited: re-check cancellation before writing the file.
+    throwIfCancelled(opts && opts.signal, 'curl');
     // Binary-safe: raw bytes go straight into the workspace, no decoding.
     await workspace.write(outFile, res.bytes);
     return netResult('[written to workspace: ' + outFile + ', ' + res.bytes.byteLength + ' bytes]', false, res);
