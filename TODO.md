@@ -248,7 +248,7 @@ Do not declare core frozen until:
 - [ ] Full curl implementation.
 - [ ] RAG as a core primitive (local retrieval should compose Plugin + Skill; durable/external retrieval should normally be MCP).
 - [ ] Local model runtime.
-- [ ] Vue migration, MCP, JS runtime primitive, edit primitive (pre-AgentSession).
+- [ ] Vue migration, MCP, JS userland runtime, edit capability (pre-AgentSession).
 - [ ] Domain allowlists (provider/site-agnostic by design).
 
 These may become future providers/plugins/community work. They are not prerequisites for freezing the Locus core architecture.
