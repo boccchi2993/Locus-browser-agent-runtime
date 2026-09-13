@@ -1,8 +1,11 @@
 // ============================================================
 //  MODEL LAYER
-//  Adapted from Whoami_Cli_game: multi-dialect LLM API client with
-//  automatic fallback between Anthropic-style and OpenAI-style
-//  endpoints, plus an optional CORS proxy.
+//  Adapted from Whoami_Cli_game: LLM API client supporting two API
+//  dialects (Anthropic-compatible and OpenAI-compatible) over any
+//  HTTPS endpoint, plus an optional CORS proxy.
+//
+//  Core distinction: provider identity ≠ API dialect. Dialect is
+//  detected from the endpoint shape, never from a provider name list.
 // ============================================================
 const Model = {
   apiKey: '',
@@ -13,6 +16,22 @@ const Model = {
 
 function sanitizeKey(k) {
   return String(k || '').replace(/[^\x20-\x7E]/g, '').trim();
+}
+
+// API dialect is determined by the endpoint form:
+// - api.anthropic.com            → anthropic
+// - any base ending in /anthropic → anthropic (e.g. api.deepseek.com/anthropic)
+// - everything else               → openai
+function detectDialect(apiBase) {
+  const base = String(apiBase || '').replace(/\/+$/, '');
+  if (/api\.anthropic\.com/i.test(base) || /\/anthropic$/i.test(base)) {
+    return 'anthropic';
+  }
+  return 'openai';
+}
+
+function isOfficialAnthropic(apiBase) {
+  return /api\.anthropic\.com/i.test(String(apiBase || ''));
 }
 
 function anthropicUrl() {
@@ -48,6 +67,13 @@ function parseOpenAIResp(data) {
   throw new Error('响应格式不符合预期');
 }
 
+// HTTP errors carry .status so fallback policy never parses strings.
+function makeHttpError(status, message) {
+  const err = new Error(message || ('HTTP ' + status));
+  err.status = status;
+  return err;
+}
+
 async function fetchJsonPost(fetchUrl, headers, body) {
   const res = await fetch(fetchUrl, {
     method: 'POST',
@@ -59,7 +85,7 @@ async function fetchJsonPost(fetchUrl, headers, body) {
   try { data = text ? JSON.parse(text) : {}; } catch (e) {}
   if (!res.ok) {
     const msg = data && data.error ? (data.error.message || data.error.type) : ('HTTP ' + res.status);
-    throw new Error(msg);
+    throw makeHttpError(res.status, msg);
   }
   if (!data) throw new Error('响应不是 JSON');
   return data;
@@ -99,39 +125,65 @@ async function tryFetch(url, headers, body, parser) {
   }
 }
 
+// Auth/quota/permission/rate-limit answers are authoritative: switching
+// dialect or endpoint path can never fix them. Stop immediately.
+const AUTHORITATIVE_STATUS = [401, 402, 403, 429];
+
+// Only these plausibly mean "wrong endpoint path / dialect mismatch"
+// and justify trying the next compatible endpoint.
+const FALLBACK_STATUS = [404, 405];
+
+function isAuthoritativeError(e) {
+  return e && AUTHORITATIVE_STATUS.indexOf(e.status) !== -1;
+}
+
+function isFallbackableError(e) {
+  // Network/CORS failures (no status), non-JSON responses, and 404/405.
+  return !e || e.status === undefined || FALLBACK_STATUS.indexOf(e.status) !== -1;
+}
+
 async function callModelText(body) {
   const key = sanitizeKey(Model.apiKey);
-  const isAnthropicHost = Model.apiBase.indexOf('api.anthropic.com') !== -1;
-  const aUrl = anthropicUrl();
-  const oUrl = openaiUrl();
-  const oUrlV1 = openaiUrlV1();
-  const oaiBody = toOpenAIBody(body);
-  const hBearer = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key };
-  const hNone = { 'Content-Type': 'application/json' };
-  const hAnthropicXKey = isAnthropicHost
-    ? { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' }
-    : hBearer;
-  const hAnthropicBearer = isAnthropicHost
-    ? { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' }
-    : hBearer;
+  const dialect = detectDialect(Model.apiBase);
 
-  const attempts = isAnthropicHost ? [
-    { url: aUrl, h: hAnthropicXKey, b: body, p: parseAnthropicResp },
-    { url: aUrl, h: hAnthropicBearer, b: body, p: parseAnthropicResp },
-    { url: aUrl, h: hNone, b: body, p: parseAnthropicResp },
-  ] : [
-    { url: aUrl, h: hBearer, b: body, p: parseAnthropicResp },
-    { url: oUrl, h: hBearer, b: oaiBody, p: parseOpenAIResp },
-    { url: oUrlV1, h: hBearer, b: oaiBody, p: parseOpenAIResp },
-    { url: aUrl, h: hNone, b: body, p: parseAnthropicResp },
-  ];
-
-  let lastErr = null;
-  for (const attempt of attempts) {
-    try { return await tryFetch(attempt.url, attempt.h, attempt.b, attempt.p); }
-    catch (e) { lastErr = e; }
+  let attempts;
+  if (dialect === 'anthropic') {
+    // Anthropic-compatible: x-api-key + anthropic-version.
+    // anthropic-dangerous-direct-browser-access is only for the official
+    // API's direct browser access; third-party compatible endpoints are
+    // not required to recognize it.
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-api-key': key,
+      'anthropic-version': '2023-06-01',
+    };
+    if (isOfficialAnthropic(Model.apiBase)) {
+      headers['anthropic-dangerous-direct-browser-access'] = 'true';
+    }
+    attempts = [
+      { url: anthropicUrl(), h: headers, b: body, p: parseAnthropicResp },
+    ];
+  } else {
+    // OpenAI-compatible: Bearer auth, tolerate both endpoint layouts.
+    const headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key };
+    const oaiBody = toOpenAIBody(body);
+    attempts = [
+      { url: openaiUrl(), h: headers, b: oaiBody, p: parseOpenAIResp },
+      { url: openaiUrlV1(), h: headers, b: oaiBody, p: parseOpenAIResp },
+    ];
   }
-  throw lastErr || new Error('连接失败');
+
+  let firstErr = null;
+  for (const attempt of attempts) {
+    try {
+      return await tryFetch(attempt.url, attempt.h, attempt.b, attempt.p);
+    } catch (e) {
+      if (isAuthoritativeError(e)) throw e;       // 401/402/403/429: stop now
+      if (!isFallbackableError(e)) throw e;       // 400/422/5xx etc: don't retry blindly
+      if (!firstErr) firstErr = e;                // keep the most relevant error
+    }
+  }
+  throw firstErr || new Error('连接失败');
 }
 
 async function verifyConnection() {
