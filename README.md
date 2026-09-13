@@ -30,12 +30,12 @@ Remote computers should be escalation providers, not the default, for lightweigh
 ## Current capabilities
 
 - Local workspace access via the File System Access API (user-picked directory, read/write)
-- Browser-local shell abstraction (`bash` tool: `pwd`, `ls`, `cat`, `echo`, `python`, `curl`)
+- Unix-like compatibility shell (`bash` tool): `pwd`, `cd` (invocation-local), `ls` (`-a`/`-l`/`-h`), `cat`, `echo` (`>`/`>>`), `find`, `grep`, `head`, `tail`, `wc`, `python`, `curl`, `help`, with `;`, `&&` and `|` command composition — see "The Unix compatibility shell" below
 - Python execution via Pyodide in a Web Worker (lazy-loaded, stdout/stderr/traceback returned, pandas auto-loaded on import)
 - **Browser-native network capability currently exposed through `curl`** (HTTPS GET: `curl <url>` prints text, `curl -o <file> <url>` downloads); long term, Python/JS networking should reuse the same runtime boundary
 - **Direct browser fetch with transparent edge relay fallback** (only on genuine CORS/network failure, never on HTTP error statuses)
 - **Binary-safe downloads into the local workspace** (no text decoding anywhere in the network path)
-- Agent tool loop (structured ` ```json ` tool calls, results fed back, max 15 iterations)
+- Agent tool loop (structured ` ```json ` tool calls, results fed back, max 32 iterations)
 - Local file output written back into the real workspace directory (create / modify / delete / rename), with external-edit conflict detection and staged (non-atomic) commit reporting
 - Session boundaries that actually isolate: switching workspace or `reset` cancels the running task, clears history, and rebuilds the Python interpreter
 - Structured model responses (visible content / reasoning / stop reason / usage / provider-native replay state) — HTTP 200 semantic errors never trigger a second paid request
@@ -109,6 +109,21 @@ tests/                node unit tests + headless browser regression suites (runt
 ```
 
 Note: the Pyodide worker source is embedded in `index.html` (loaded via a Blob URL that is revoked immediately after worker construction) so the page also works when opened directly from `file://`, where browsers block `new Worker('...js')`.
+
+## The Unix compatibility shell
+
+The `bash` tool is a **Unix-like compatibility shell, not full POSIX bash**. It exists so the small Unix vocabulary models already speak (`ls -la`, `find src -name '*.java' | grep builder`, `cd foo && cat foo.txt`) works locally. Everything is parsed by Locus itself — no `eval`, no system shell — and every simple command lands in an explicit, controlled handler.
+
+- **Grammar**: `pipeline ((';' | '&&') pipeline)*` where `pipeline := simple_command ('|' simple_command)*`. `;` always runs the next command, `&&` runs it only on success, `|` feeds stdout into the next command's stdin (`cat`/`grep`/`head`/`tail`/`wc` consume stdin; piping into anything else fails loudly). Quoted operators are always data: `echo "a;b"` prints text.
+- **Virtual cwd**: every bash invocation starts at the mounted workspace root (`/`). `cd` changes the cwd only within that one invocation and can never escape the workspace (`cd ../../..` is rejected). Relative paths in all commands resolve against the virtual cwd; Python's own filesystem root stays the workspace root (only the script path of `python script.py` resolves against the shell cwd).
+- **ls**: `-a` (show dotfiles; `.`/`..` are never synthesized — the File System Access API has no such entries), `-l` (type/size/modified — no fake uid/gid/permissions/inodes), `-h` (deterministic human sizes: `421 B`, `12.4 KiB`, `3.1 MiB`), combined short flags, multiple paths. Compatibility semantics, not bit-perfect GNU ls.
+- **find** (bounded subset): `find [path...] [-name glob] [-type f|d] [-maxdepth N]`, glob supports `*`/`?` only. Deterministic order, workspace-confined, cancellation-aware, capped at 5000 visited entries / 1000 results with an explicit truncation note. No `-exec`/`-delete`/`-size`/boolean expressions.
+- **grep** (bounded subset): `grep [-n] [-i] [-r|-R] [-E] <pattern> [path...]` — patterns are **JavaScript regexes** (invalid patterns fail with a clear error). Recursive search is capped (500 files / 2 MiB per file / 500 matches), skips non-UTF-8 files with a note, and is cancellation-aware. Zero matches are a successful empty answer, not an error.
+- **head/tail**: `-n N` (default 10), `tail -n +N`; **wc**: `-l`/`-w`/`-c`, `-c` counts real UTF-8 bytes.
+- **Bounds**: intermediate pipeline data is capped at 1 MiB (`SHELL_PIPE_MAX_BYTES`) and **fails loudly** rather than forwarding silently truncated input; terminal-facing reads stay under the existing 512 KiB file cap.
+- **Not supported** (clear errors naming the supported alternative): `||`, `&`, `$(...)`, backticks, subshells, variables/`export`, glob expansion, input redirect (`<`), stderr redirect (`2>`), `sed`/`awk`/`xargs`/`jq`/`sort`/…
+- `help` prints the live contract. The runtime dispatch, `help` and the system prompt are all generated from one capability registry (`SHELL_COMMANDS` in `src/shell.js`), so the advertised surface cannot drift from what executes.
+- A compound command that performs exactly one network fetch keeps its real backend telemetry (`browser-direct`/`edge-relay`); multiple network operations are honestly marked `operation: "compound"`.
 
 ## curl in the browser runtime
 
@@ -246,7 +261,8 @@ node tests/fetch.test.mjs        # /fetch guardrails: https-only, redirects, cap
 node tests/network.test.cjs      # curl + NetworkRuntime: routing, anonymity, full-lifecycle deadlines (incl. relayTimeoutMs), caps, cancellation, non-blocking stream cleanup
 node tests/workspace.test.cjs    # stat options (WebIDL-conforming handles), exists() semantics, append, snapshot skips
 node tests/shell.test.cjs        # quoted tokenizer, write-back failures, external-edit conflicts, pre-commit cancel checks
-node tests/agent.test.cjs        # session binding, cancellation vs session-switch semantics, byte-based history budget with whole-task trimming
+node tests/shell-compat.test.cjs # Unix compatibility baseline: ; && |, cd/virtual cwd, ls flags, find, grep, head, tail, wc, help, bounds, cancellation
+node tests/agent.test.cjs        # session binding, cancellation vs session-switch semantics, byte-based history budget with whole-task trimming, 32-iteration cap
 node tests/presentation.test.cjs # runtime-event → timeline projection, markdown-lite safety, AgentSession→projector integration
 node tests/worker-init.test.cjs  # Pyodide init-failure recovery (real worker source from index.html)
 node tests/worker-output.test.cjs # worker diffOut limits: structured uncollected status, rename safety, real commit logic
@@ -308,7 +324,7 @@ View it in the context rail's **Telemetry** section, or `window.__telemetry` in 
 - browser automation / Chromium control
 - Office rendering / DOCX / XLSX / PDF / LibreOffice
 - WebContainer / WASI / arbitrary native binaries
-- full POSIX shell (only `pwd`, `ls`, `cat`, `echo`, `python`, `curl`) and full curl (no `-H`/`-X`/`-d`/`-u`/cookies/POST)
+- full POSIX shell (the `bash` tool is a bounded Unix-*compatibility* shell: `pwd`, `cd`, `ls -a/-l/-h`, `cat`, `echo`, `find`, `grep`, `head`, `tail`, `wc`, `python`, `curl`, `help` + `;`/`&&`/`|` — no `||`, `&`, `$()`, subshells, variables, glob expansion or full redirects) and full curl (no `-H`/`-X`/`-d`/`-u`/cookies/POST)
 - authenticated website sessions
 - local models
 - additional workspace adapters (OPFS / Memory / Cloud — adapter interface is ready)

@@ -4,6 +4,21 @@ This file is for concrete implementation work.
 
 Architecture-level decisions belong in docs/ARCHITECTURE.md and docs/MODEL-PROTOCOL.md. Milestones belong in ROADMAP.md.
 
+## Done on feat/shell-compat-baseline
+
+Unix compatibility baseline (so future telemetry records unknown gaps, not known ones):
+
+- [x] Shell parser/executor: `;`, `&&`, `|` composition; quoted operators stay data; unsupported syntax (`||`, `&`, `<`, `2>`, trailing `|`/`&&`) fails with the supported alternative
+- [x] Invocation-local virtual cwd (`cd`, `pwd`); every bash call starts at workspace root; `..` escape rejected; relative paths resolve against cwd in ls/cat/echo redirect/find/grep/head/tail/wc/python script/curl -o
+- [x] `ls -a/-l/-h` (combined flags, dotfile semantics, human sizes)
+- [x] `find` subset (`-name` `*?` glob, `-type f|d`, `-maxdepth N`), bounded + deterministic + cancellation-aware
+- [x] `grep` subset (`-n -i -r -R -E`, JS regex semantics), bounded, binary-safe skip, cancellation-aware
+- [x] `head`/`tail` (`-n N`, `tail -n +N`), `wc` (`-l -w -c`, `-c` = UTF-8 bytes); stdin consumers: cat/grep/head/tail/wc
+- [x] Pipeline inter-stage cap (`SHELL_PIPE_MAX_BYTES` = 1 MiB) fails loudly
+- [x] `SHELL_COMMANDS` registry = single source for runtime dispatch, `help`, and the system prompt
+- [x] MAX_TOOL_ITERATIONS 15 → 32 (S14/S14c cover both sides of the cap)
+- [x] Compound telemetry: one network op keeps its real backend; multiple → `operation: "compound"`
+
 ## Done on fix/v0.3-reliability
 
 Two audit rounds (baselines da94d1f and 40a22d2) are complete; checked items
