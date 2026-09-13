@@ -108,7 +108,12 @@ class LocalDirectoryWorkspace extends WorkspaceAdapter {
       await this.stat(path);
       return true;
     } catch (e) {
-      return false;
+      // Only an explicit "not there" answer means false. Permission
+      // failures, type errors and other faults must propagate — silently
+      // returning false would make `echo >>` skip reading the old content
+      // and overwrite the existing file.
+      if (e && e.name === 'NotFoundError') return false;
+      throw e;
     }
   }
 
@@ -116,16 +121,32 @@ class LocalDirectoryWorkspace extends WorkspaceAdapter {
     const { dirParts, base } = this._split(path);
     const dir = await this._dir(dirParts, false);
     if (!base) return { kind: 'directory', size: 0, modified: null };
-    // Try file first, then directory.
+    // Try file first; only a clear NotFoundError / type mismatch falls
+    // through to the directory branch — every other failure propagates.
+    // NOTE: getFileHandle/getDirectoryHandle take an options dictionary;
+    // passing a boolean second argument is a WebIDL TypeError in real
+    // browsers, so the options argument is omitted entirely here.
+    let fh = null;
     try {
-      const fh = await dir.getFileHandle(base, false);
+      fh = await dir.getFileHandle(base);
+    } catch (e) {
+      if (!isNotFoundOrTypeMismatch(e)) throw e;
+    }
+    if (fh) {
       const f = await fh.getFile();
       return { kind: 'file', size: f.size, modified: f.lastModified };
-    } catch (e) {
-      const dh = await dir.getDirectoryHandle(base, false);
-      return { kind: 'directory', size: 0, modified: null };
     }
+    const dh = await dir.getDirectoryHandle(base);
+    return { kind: 'directory', size: 0, modified: null };
   }
+}
+
+// True when a failed get*Handle lookup means "no such entry / wrong kind"
+// rather than a real fault. Browsers report a missing entry as
+// NotFoundError; a kind mismatch (file vs directory) surfaces as
+// TypeMismatchError where implemented, otherwise NotFoundError.
+function isNotFoundOrTypeMismatch(e) {
+  return !!e && (e.name === 'NotFoundError' || e.name === 'TypeMismatchError');
 }
 
 // Request readwrite permission for a picked directory.

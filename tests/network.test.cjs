@@ -178,6 +178,58 @@ async function run() {
   check('N14 non-network bash keeps backend=browser', t14.backend === 'browser' && lastRec().backend === 'browser'
     && !lastRec().operation, JSON.stringify(lastRec()));
 
+  // ---------- 15. direct requests are anonymous by construction (F13) ----------
+  reset();
+  on((u) => u === 'https://example.test/anon', () => jsonResponse('{"ok":1}'));
+  await M.executeTool('bash', 'curl https://example.test/anon', ws);
+  check('N15 direct fetch omits credentials', calls[0].opts.credentials === 'omit', JSON.stringify(calls[0].opts));
+
+  reset();
+  const t15b = await M.executeTool('bash', 'curl https://user:pass@example.test/x', ws);
+  check('N15b URL userinfo rejected', !t15b.success && t15b.output.includes('credentials in URLs')
+    && calls.length === 0, t15b.output);
+
+  // ---------- 16. client deadline: timeout is NOT a CORS failure, never relayed ----------
+  reset();
+  on((u) => u === 'https://slow.test/x', () => new Promise((resolve, reject) => {
+    // hangs until the runtime's own deadline aborts it
+    const sig = calls[calls.length - 1].opts.signal;
+    if (sig) sig.addEventListener('abort', () => {
+      const e = new Error('aborted'); e.name = 'AbortError'; reject(e);
+    });
+  }));
+  on((u) => u.startsWith('/fetch?'), () => { throw new Error('relay must NOT be called on timeout'); });
+  let t16Err = null;
+  try { await M.NetworkRuntime.fetch('https://slow.test/x', { timeoutMs: 30 }); } catch (e) { t16Err = e; }
+  check('N16 timeout reported, not relayed', t16Err && t16Err.timeout === true && t16Err.message.includes('timed out')
+    && calls.length === 1, (t16Err && t16Err.message) + ' | calls=' + calls.length);
+
+  // ---------- 17. oversized response rejected by client cap ----------
+  reset();
+  on((u) => u === 'https://example.test/huge', () =>
+    new Response('x', { status: 200, headers: { 'content-type': 'text/plain', 'content-length': String(20 * 1024 * 1024) } }));
+  on((u) => u.startsWith('/fetch?'), () => { throw new Error('relay must NOT be called on size cap'); });
+  const t17 = await M.executeTool('bash', 'curl https://example.test/huge', ws);
+  check('N17 oversized response rejected, not relayed', !t17.success && t17.output.includes('too large')
+    && calls.length === 1, t17.output + ' | calls=' + calls.length);
+
+  // ---------- 18. curl -o without workspace performs NO network request ----------
+  reset();
+  on((u) => true, () => { throw new Error('no fetch allowed'); });
+  const t18 = await M.executeTool('bash', 'curl -o file.bin https://example.test/x', null);
+  check('N18 curl -o without workspace: no fetch', !t18.success && t18.output.includes('no workspace selected')
+    && calls.length === 0, t18.output + ' | calls=' + calls.length);
+
+  // ---------- 19. pre-aborted cancellation is not misread as CORS ----------
+  reset();
+  const ac = new AbortController();
+  ac.abort();
+  let cancelErr = null;
+  try { await M.NetworkRuntime.fetch('https://example.test/x', { signal: ac.signal }); } catch (e) { cancelErr = e; }
+  check('N19 cancelled request → AbortError, no fetch, no relay',
+    cancelErr && cancelErr.name === 'AbortError' && calls.length === 0,
+    (cancelErr && cancelErr.name) + ' | calls=' + calls.length);
+
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
 }

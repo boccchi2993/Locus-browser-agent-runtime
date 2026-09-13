@@ -17,7 +17,9 @@ Remote sandboxes should be the fallback, not the default, for lightweight agent 
 - **Direct browser fetch with transparent edge relay fallback** (only on genuine CORS/network failure, never on HTTP error statuses)
 - **Binary-safe downloads into the local workspace** (no text decoding anywhere in the network path)
 - Agent tool loop (structured ` ```json ` tool calls, results fed back, max 15 iterations)
-- Local file output written back into the real workspace directory (create / modify / delete / rename)
+- Local file output written back into the real workspace directory (create / modify / delete / rename), with external-edit conflict detection and staged (non-atomic) commit reporting
+- Session boundaries that actually isolate: switching workspace or `reset` cancels the running task, clears history, and rebuilds the Python interpreter
+- Structured model responses (visible content / reasoning / stop reason / usage / provider-native replay state) — HTTP 200 semantic errors never trigger a second paid request
 - In-memory execution telemetry (tool, backend, operation, duration, UTF-8 bytes, success/error) + debug panel
 
 ## Architecture
@@ -67,10 +69,12 @@ curl <https-url>               # text-like responses (text/*, JSON, XML, YAML, J
 curl -o <file> <https-url>     # binary-safe download into the workspace (also: --output)
 ```
 
-- HTTPS URLs only; `http://` is rejected.
+- HTTPS URLs only; `http://` and URLs with embedded credentials (`user:pass@host`) are rejected.
 - No other flags (`-H`, `-X`, `-d`, `-u`, cookies, …) — unsupported options fail with a clear message.
+- Requests are anonymous by construction (`credentials: 'omit'`), carry a client deadline (60s direct / 45s relay, covering headers **and** body), and a 16MB response cap enforced while streaming.
+- Redirects are followed by the browser, which enforces CORS per hop; the runtime does not claim per-hop visibility it does not have — hops the browser cannot validate fail as network errors and may go through the relay (which re-validates HTTPS per hop).
 - Binary responses are never dumped to the terminal as garbage; the command tells the model to re-run with `-o`.
-- Routing is transparent: direct browser fetch first; only a genuine CORS/network failure (and only when the page is hosted over HTTP(S)) falls back to the same-origin `/fetch` relay. An HTTP error status (404/401/500/…) is an authoritative response and is never re-sent through a different backend.
+- Routing is transparent: direct browser fetch first; only a genuine CORS/network failure (and only when the page is hosted over HTTP(S)) falls back to the same-origin `/fetch` relay. An HTTP error status (404/401/500/…) is an authoritative response and is never re-sent through a different backend — and neither are timeouts, size-cap rejections or user cancellations.
 - From `file://` there is no relay; blocked requests fail with a clear error.
 
 ## Run
@@ -93,10 +97,30 @@ Connection behavior: if you configure an explicit proxy URL it is always used. O
 | Credentials | forwards `Authorization` / `x-api-key` to the model API | never forwards any credentials — requests are anonymous |
 | Redirects | never followed (→ 502) | followed up to 5 hops, HTTPS re-validated per hop |
 | Response cap | 8MB (`MAX_PROXY_RESPONSE_BYTES`) | 16MB (`MAX_FETCH_RESPONSE_BYTES`) |
+| Inbound limit | 1MB body (`MAX_PROXY_BODY_BYTES`): Content-Length pre-check + stream counting, 30s inbound deadline (`PROXY_INBOUND_TIMEOUT_MS` → 408) | GET only — no request body |
 | Timeout | 30s (`PROXY_TIMEOUT_MS`), covers headers **and** full body | 30s (`FETCH_TIMEOUT_MS`), covers headers **and** full body |
+| Null-body statuses | 204/205 answered with a null body | 204/205/304 answered with a null body |
 | Payload | JSON text | binary-safe bytes; final URL in `X-Locus-Final-URL` |
+| Markers | every response carries `X-Locus-Relay: 1` (distinguishes a missing function from an authoritative relay answer) | own failures carry `X-Locus-Relay-Error: 1` |
+| Active content | n/a (model API JSON) | `X-Content-Type-Options: nosniff` on everything; `Content-Security-Policy: sandbox` on HTML/XHTML/SVG/JS so a navigated response renders in an opaque origin with scripting disabled |
 
 Both are intentionally provider/site-agnostic for demo and development use, with no domain allowlists. Neither is intended to be deployed as an unrestricted production multi-tenant relay without additional rate limiting / access policy. The `/fetch` relay marks its own failures with `X-Locus-Relay-Error: 1` so clients can distinguish relay errors from authoritative upstream HTTP responses.
+
+## V0.3 reliability, integrity and permission-boundary fixes
+
+- **Real-directory stat fixed (F01)**: `stat()` no longer passes a boolean as the `getFileHandle`/`getDirectoryHandle` options argument (a WebIDL TypeError in real browsers that broke `cat`, Python snapshots and appends on real directories). `exists()` only converts an explicit `NotFoundError` to `false`; permission and other faults propagate — `echo >>` can no longer silently overwrite an existing file.
+- **Write-back failure semantics (F04)**: if any file write-back fails, the delete phase is stopped and sources are preserved (a failed rename never loses the original). Results distinguish compute success, full commit, partial commit and not-persisted; multi-file commits are staged and reported, never claimed atomic. Files generated with no workspace selected are reported as not persisted.
+- **External-edit conflicts (F11)**: before overwriting or deleting a file, the real file is compared against the sync-in snapshot. If it changed on disk during the run (user/editor), the commit is refused, the on-disk version kept, and a recoverable `[conflict: path: reason]` is returned.
+- **Partial snapshots are honest (F10)**: files over the sync limits (200 files / 5 MiB per file / 25 MiB total) are reported by **path and reason**, Python is told they are not visible, and any file Python creates at an unsynced path is refused instead of clobbering the real one.
+- **Workspace switch is a real session boundary (F02/F03)**: a running task binds its workspace and a session generation; switching workspace cancels the task and waits for it to stop before applying, late model responses/tool results are discarded, and the Pyodide worker is rebuilt — Python globals, imported modules and `/tmp` do not leak across sessions. `reset` starts a fresh session (history + Python) without unmounting the workspace; `cancel` aborts the running task.
+- **Cancellation everywhere (F07)**: model requests, tool execution, Python runs, network fetches and write-back all honor one AbortSignal; cancelled work never commits afterwards.
+- **Model protocol envelope (F09)**: `callModel()` returns `{ content, reasoning, stopReason, usage, rawMessage, truncated }`; provider-native messages (incl. reasoning blocks) are replayed unchanged, reasoning is shown (dim) when the provider returns it, and truncated answers are flagged instead of treated as clean completions.
+- **Error taxonomy (F08/F09)**: transport (TypeError) / HTTP status / parse / timeout / cancellation are distinct. Parse errors and timeouts on HTTP 200 never trigger endpoint re-probing or a second paid inference; automatic `/proxy` fallback preserves the relay's authoritative 401/402/429/5xx (marked via `X-Locus-Relay: 1`) instead of masking them with the original CORS error.
+- **Network resource bounds (F07/F13)**: direct and relay fetches carry client deadlines covering headers+body, a 16MB streaming cap, `credentials: 'omit'`, and URL-userinfo rejection; timeouts/caps/cancellations are never misread as CORS and retried.
+- **Python bounds (F07/F18)**: stdout/stderr capped in-worker at 1MB each, output files capped at 200 files / 25 MiB (enforced in the worker before posting results), with explicit truncation notices.
+- **Pyodide init recovery (F14)**: a failed first load no longer poisons the runtime — the loading promise is reset and the next run retries; fatal worker errors destroy the worker so it reboots.
+- **Shell tokenizer (F15)**: quoting is preserved through tokenization — `echo ">" victim.txt` prints text instead of writing a file; unclosed quotes and unsupported syntax (pipes, `;`, `&&`, redirects outside `echo`) fail with clear errors.
+- **Session history budget (F17)**: history is trimmed at a 200k-char session budget on whole-turn boundaries (first surviving message is always a user turn), and `reset` provides an explicit new-session entry point.
 
 ## Demo
 
@@ -156,16 +180,20 @@ Both are intentionally provider/site-agnostic for demo and development use, with
 
 ## Tests
 
-Node unit tests (mocked fetch, no internet required):
+Node unit tests (mocked fetch / stubbed boundaries, no internet required):
 
 ```bash
-node tests/model.test.cjs    # model layer dialects / fallback / error fidelity
-node tests/proxy.test.mjs    # /proxy guardrails, incl. full-body timeout lifecycle
-node tests/fetch.test.mjs    # /fetch guardrails: https-only, no credentials, redirects, timeout, caps
-node tests/network.test.cjs  # curl + NetworkRuntime: routing, binary safety, telemetry, cloud_bash
+node tests/model.test.cjs        # model dialects, fallback, envelope, error taxonomy, cancel/timeout
+node tests/proxy.test.mjs        # /proxy guardrails: null-body statuses, inbound limits, relay marker
+node tests/fetch.test.mjs        # /fetch guardrails: https-only, redirects, caps, null-body, active-content headers
+node tests/network.test.cjs      # curl + NetworkRuntime: routing, anonymity, deadlines, caps, cancellation
+node tests/workspace.test.cjs    # stat options (WebIDL-conforming handles), exists() semantics, append, snapshot skips
+node tests/shell.test.cjs        # quoted tokenizer, write-back failures, external-edit conflicts, skipped-path protection
+node tests/agent.test.cjs        # session binding across model/tool phases, cancellation, history budget
+node tests/worker-init.test.cjs  # Pyodide init-failure recovery (real worker source from index.html)
 ```
 
-A headless browser regression suite exercises the full local chain (shell → Pyodide worker → pandas → write-back, and curl → download → python → report.csv) without an API key:
+A headless browser regression suite exercises the full local chain against the real Pyodide CDN and **native FileSystemDirectoryHandle** (OPFS) — no MemWS substitute for the file layer:
 
 ```bash
 chrome --headless=new --allow-file-access-from-files --remote-debugging-port=9333 \
@@ -173,16 +201,27 @@ chrome --headless=new --allow-file-access-from-files --remote-debugging-port=933
 node tests/run-e2e.cjs
 ```
 
-Covered: path-escape rejection, strict tool parser, UTF-8 telemetry bytes, telemetry array identity, unsupported-command error, `cloud_bash` failure semantics, heredoc Python (mixed quotes / JSON / multi-line), pandas CSV demo, deletion sync, rename semantics, 30s Python timeout + worker recovery, curl download → Pyodide analysis → report.csv, network telemetry backends, binary byte-exactness, relay fallback routing, redirect caps, timeout lifecycle.
+Covered: path-escape rejection, strict tool parser, UTF-8 telemetry bytes, telemetry array identity, unsupported-command error, `cloud_bash` failure semantics, heredoc Python, pandas CSV demo, deletion sync, rename semantics, 30s Python timeout + worker recovery, curl → download → Pyodide → report.csv, binary byte-exactness, **native-handle stat/cat/append/Python sync (OPFS)**, **quoted `>` writing nothing**, **Python globals + /tmp isolation across session reset**, and a capability check that Python's JS bridge exposes `fetch` (see the security note below).
+
+A separate real-browser verification proves the `/fetch` active-content isolation end-to-end (a payload page that beacons `sessionStorage` executes without the new headers and is fully neutralized with them):
+
+```bash
+node tests/verify-active-content.cjs
+```
 
 ## Security boundaries
 
 - Only the user-selected workspace is accessible; paths are normalized and `..` escapes are rejected
 - No native shell, no `child_process`, no localhost server, no remote code execution
 - Workspace files are never uploaded to any execution server (only text the agent explicitly reads is sent to the LLM API)
-- Network access is anonymous HTTPS GET only: no cookies, no auth headers, no custom request headers, no POST
-- Switching workspaces resets the agent context
+- Network access via `curl` is anonymous HTTPS GET only: no cookies (`credentials: 'omit'`), no auth headers, no URL userinfo, no custom request headers, no POST
+- Switching workspaces or `reset` is a full session boundary: the running task is cancelled, history is cleared, and the Python interpreter is rebuilt
 - API keys are never committed; opt-in session persistence uses `sessionStorage` only
+- `/fetch` responses are de-privileged for rendering: `nosniff` everywhere, `Content-Security-Policy: sandbox` on HTML/SVG/JS — a navigated response lands in an opaque origin with scripting disabled (verified in real Chrome by `tests/verify-active-content.cjs`)
+
+### Python capability declaration (read this)
+
+The Pyodide worker has **no DOM and no access to the page's `sessionStorage`/API keys** — but it is **not a network sandbox**. Python code can reach the worker's `fetch` through Pyodide's `js` bridge (verified: `tests/e2e.html` L1), subject to the browser's own CORS/mixed-content rules. The anonymous-GET-only policy is enforced at the `curl` layer; network done directly by Python code is **not** routed through NetworkRuntime and **not** recorded in network telemetry. This is a deliberate declared boundary, not a claim of confinement: do not treat Python output limits or prompts as a security sandbox. Model-generated code still cannot exceed the session's file authority (workspace-only) and its network access is constrained by browser CORS, but if you need a hard network confinement for computation, that requires a future isolated-origin execution design (see TODO).
 
 ## Telemetry
 

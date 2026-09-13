@@ -19,6 +19,10 @@
 //   URL is exposed via X-Locus-Final-URL
 // - the relay's own errors carry X-Locus-Relay-Error: 1 so the client can
 //   distinguish relay failures from authoritative upstream HTTP responses
+// - responses are de-privileged for direct rendering: X-Content-Type-Options:
+//   nosniff on every response, plus Content-Security-Policy: sandbox on active
+//   content types (HTML/XHTML/SVG/JS) so a navigated response lands in an
+//   opaque origin with scripting disabled instead of running same-origin
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -26,7 +30,23 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': '*',
   'Access-Control-Expose-Headers': 'X-Locus-Final-URL, X-Locus-Relay-Error',
   'Access-Control-Max-Age': '86400',
+  'X-Content-Type-Options': 'nosniff',
 };
+
+// MIME main types (parameters stripped, lowercased) that a browser would
+// execute or render as active content when navigated to directly.
+const ACTIVE_CONTENT_TYPES = new Set([
+  'text/html',
+  'application/xhtml+xml',
+  'image/svg+xml',
+  'text/javascript',
+  'application/javascript',
+  'application/x-javascript',
+]);
+
+// Statuses that must carry a null body; the Response constructor throws a
+// TypeError if constructed with a body for any of these.
+const NULL_BODY_STATUSES = new Set([204, 205, 304]);
 
 function getMaxResponseBytes(env) {
   const configured = Number.parseInt(env.MAX_FETCH_RESPONSE_BYTES || '', 10);
@@ -168,14 +188,30 @@ export async function onRequestGet(context) {
 
     if (!upstream) return relayError(502, 'fetch: upstream request failed');
 
-    const { bytes, error: bodyError, timedOut } = await readResponseCapped(upstream, maxBytes, controller);
+    let bytes, bodyError, timedOut;
+    try {
+      ({ bytes, error: bodyError, timedOut } = await readResponseCapped(upstream, maxBytes, controller));
+    } catch (e) {
+      if (controller.signal.aborted) {
+        return relayError(504, 'Upstream timed out after ' + timeoutMs + 'ms');
+      }
+      return relayError(502, 'Upstream body read failed');
+    }
     if (timedOut) return relayError(504, 'Upstream timed out after ' + timeoutMs + 'ms');
     if (bodyError) return bodyError;
 
     const headers = new Headers(CORS_HEADERS);
-    headers.set('Content-Type', upstream.headers.get('content-type') || 'application/octet-stream');
-    headers.set('Content-Length', String(bytes.byteLength));
     headers.set('X-Locus-Final-URL', current);
+    if (NULL_BODY_STATUSES.has(upstream.status)) {
+      return new Response(null, { status: upstream.status, headers });
+    }
+    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+    const mime = contentType.split(';', 1)[0].trim().toLowerCase();
+    if (ACTIVE_CONTENT_TYPES.has(mime)) {
+      headers.set('Content-Security-Policy', 'sandbox');
+    }
+    headers.set('Content-Type', contentType);
+    headers.set('Content-Length', String(bytes.byteLength));
     return new Response(bytes, { status: upstream.status, headers });
   } finally {
     clearTimeout(timer);

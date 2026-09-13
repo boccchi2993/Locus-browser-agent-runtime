@@ -113,25 +113,53 @@ async function selectWorkspace() {
   }
   try {
     const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+
+    // The picker is async: a task may have STARTED (or still be running)
+    // after the picker was opened. Never switch under a live task — cancel
+    // it first and wait until it has actually stopped, so no late model
+    // response, tool result or write-back can land in the new workspace.
+    if (App.busy) {
+      App.term && App.term.echo('[[;var(--text-dim);]正在取消当前任务以切换 Workspace…]');
+      cancelAgentTask();
+      const stopped = await waitFor(() => !App.busy, 10000);
+      if (!stopped) {
+        App.term && App.term.echo('[[;var(--red);]当前任务未能停止，已放弃切换 Workspace（原 Workspace 保持不变）。]');
+        return;
+      }
+    }
+
     const granted = await ensureWorkspacePermission(handle);
     if (!granted) {
       App.term && App.term.echo('[[;var(--red);]未获得目录读写权限。]');
       return;
     }
     App.workspace = new LocalDirectoryWorkspace(handle);
-    // Context isolation: file contents from the previous workspace must
-    // not leak into LLM requests for the new one. Only on success —
-    // picker cancellation and failures never reset.
-    Agent.history = [];
+    // Full session boundary: conversation history, generation, AND the
+    // Python interpreter (globals / modules / /tmp) are all reset, so
+    // nothing from the previous workspace leaks into the new one. Only on
+    // success — picker cancellation and failures never reset.
+    resetAgentSession();
     document.getElementById('sb-workspace').textContent = 'Workspace: ' + App.workspace.name;
     if (App.term) {
       App.term.echo('[[;var(--accent);]Workspace 已挂载: ' + escapeTerm(App.workspace.name) + '/]');
-      App.term.echo('[[;var(--text-dim);]Workspace changed. Agent context has been reset.]');
+      App.term.echo('[[;var(--text-dim);]Workspace changed. Agent context and Python state have been reset.]');
     }
   } catch (e) {
     if (e && e.name === 'AbortError') return; // user cancelled the picker
     App.term && App.term.echo('[[;var(--red);]选择目录失败: ' + escapeTerm(e.message || String(e)) + ']');
   }
+}
+
+function waitFor(cond, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (cond()) return resolve(true);
+      if (Date.now() >= deadline) return resolve(false);
+      setTimeout(tick, 100);
+    };
+    tick();
+  });
 }
 
 // ---------- debug panel ----------
@@ -169,7 +197,9 @@ function printHelp(term) {
   [
     '本地命令（直接由 harness 处理，不经过模型）:',
     '  help        显示本帮助',
-    '  clear       清空终端',
+    '  clear       清空终端（不影响会话历史）',
+    '  reset       开始新会话：清空对话历史并重置 Python 状态（Workspace 保持挂载）',
+    '  cancel      取消当前正在执行的任务',
     '  workspace   显示当前 workspace',
     '  telemetry   打开/关闭 execution log 面板',
     '',
@@ -181,6 +211,22 @@ function printHelp(term) {
 const LOCAL_COMMANDS = {
   help: (args, term) => printHelp(term),
   clear: (args, term) => term.clear(), // fully local, never sent to the model
+  reset: (args, term) => {
+    if (App.busy) {
+      term.echo('[[;var(--text-dim);]正在取消当前任务并重置会话…]');
+      cancelAgentTask();
+    }
+    resetAgentSession();
+    term.echo('[[;var(--accent);]会话已重置：对话历史与 Python 状态已清空。]');
+  },
+  cancel: (args, term) => {
+    if (!App.busy) {
+      term.echo('[[;var(--text-dim);]当前没有正在执行的任务。]');
+      return;
+    }
+    cancelAgentTask();
+    term.echo('[[;var(--text-dim);]已请求取消当前任务。]');
+  },
   telemetry: (args, term) => toggleDebugPanel(),
   workspace: (args, term) => {
     term.echo(App.workspace
@@ -216,9 +262,9 @@ function initTerminal() {
     greetings: false,
     scrollOnEcho: true,
     height: '100%',
-    completion: ['help', 'clear', 'workspace', 'telemetry'],
+    completion: ['help', 'clear', 'reset', 'cancel', 'workspace', 'telemetry'],
     onInit: function () {
-      this.echo('[[;var(--text-dim);]Browser Agent Runtime v0.2.0]');
+      this.echo('[[;var(--text-dim);]Browser Agent Runtime v0.3.0]');
       this.echo('[[;var(--text-dim);]所有文件与 Python 执行均在浏览器本地完成，云端仅用于 LLM 推理。]');
       this.echo('[[;var(--text-dim);]1) 点击右上角 Select Workspace 授权一个本地目录]');
       this.echo('[[;var(--text-dim);]2) 直接用自然语言描述任务，例如: 分析 sales.csv，计算每列平均值，保存到 summary.csv]');

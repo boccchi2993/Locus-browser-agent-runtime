@@ -105,7 +105,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
       </svg>
       <h1>Browser Agent Runtime</h1>
     </div>
-    <div class="setup-ver">v0.2.0 · browser-native agent harness</div>
+    <div class="setup-ver">v0.3.0 · browser-native agent harness</div>
     <p class="setup-desc">在浏览器本地运行的 AI Agent 运行时。文件与 Python 执行全部发生在你的浏览器中，云端只承担 LLM 推理。请输入模型 API 凭证以开始。</p>
     <div class="setup-field">
       <label class="setup-label">API Key</label>
@@ -189,7 +189,15 @@ async function ensurePyodide() {
       return instance;
     })();
   }
-  py = await pyodideLoading;
+  try {
+    py = await pyodideLoading;
+  } catch (e) {
+    // A failed load (CDN unreachable, WASM init error, …) must not be
+    // cached: reset so the next run retries from scratch.
+    pyodideLoading = null;
+    py = null;
+    throw e;
+  }
   return py;
 }
 
@@ -238,15 +246,33 @@ function walkFs(dir, prefix, out) {
   }
 }
 
-function diffOut(manifest) {
+// Output caps, enforced inside the worker BEFORE anything is posted to the
+// main thread — a runaway print loop or huge artifact must not OOM the page.
+const MAX_STDOUT_CHARS = 1024 * 1024;
+const MAX_STDERR_CHARS = 1024 * 1024;
+const MAX_OUT_FILES = 200;
+const MAX_OUT_TOTAL_BYTES = 25 * 1024 * 1024;
+
+function diffOut(manifest, warnings) {
   const entries = [];
   walkFs(WORK_ROOT, '', entries);
   const changed = [];
   const present = new Set();
+  let total = 0;
   for (const e of entries) {
     present.add(e.path);
     const b64 = bytesToB64(py.FS.readFile(e.full));
     if (manifest[e.path] === b64) continue;
+    const size = Math.floor(b64.length / 4) * 3;
+    if (changed.length >= MAX_OUT_FILES) {
+      warnings.push('more than ' + MAX_OUT_FILES + ' output files; "' + e.path + '" and further files were not collected');
+      continue;
+    }
+    if (total + size > MAX_OUT_TOTAL_BYTES) {
+      warnings.push('output exceeds ' + MAX_OUT_TOTAL_BYTES + ' bytes total; "' + e.path + '" and further files were not collected');
+      continue;
+    }
+    total += size;
     changed.push({ path: e.path, b64: b64 });
   }
   // Files that were synced in but no longer exist after the run were
@@ -268,11 +294,28 @@ self.onmessage = async (ev) => {
     self.postMessage({ id: id, type: 'status', status: 'ready' });
 
     const manifest = syncIn(msg.files || []);
+    const warnings = [];
 
     let stdout = '';
     let stderr = '';
-    py.setStdout({ batched: (s) => { stdout += s + '\n'; } });
-    py.setStderr({ batched: (s) => { stderr += s + '\n'; } });
+    py.setStdout({ batched: (s) => {
+      if (stdout.length < MAX_STDOUT_CHARS) stdout += s + '\n';
+      if (stdout.length > MAX_STDOUT_CHARS) {
+        stdout = stdout.slice(0, MAX_STDOUT_CHARS);
+        if (warnings.indexOf('stdout truncated at ' + MAX_STDOUT_CHARS + ' chars') === -1) {
+          warnings.push('stdout truncated at ' + MAX_STDOUT_CHARS + ' chars');
+        }
+      }
+    } });
+    py.setStderr({ batched: (s) => {
+      if (stderr.length < MAX_STDERR_CHARS) stderr += s + '\n';
+      if (stderr.length > MAX_STDERR_CHARS) {
+        stderr = stderr.slice(0, MAX_STDERR_CHARS);
+        if (warnings.indexOf('stderr truncated at ' + MAX_STDERR_CHARS + ' chars') === -1) {
+          warnings.push('stderr truncated at ' + MAX_STDERR_CHARS + ' chars');
+        }
+      }
+    } });
 
     let error = null;
     try {
@@ -285,10 +328,10 @@ self.onmessage = async (ev) => {
       error = String(e && e.message ? e.message : e);
     }
 
-    const diff = diffOut(manifest);
-    self.postMessage({ id: id, type: 'result', stdout: stdout, stderr: stderr, error: error, files: diff.changed, deleted: diff.deleted });
+    const diff = diffOut(manifest, warnings);
+    self.postMessage({ id: id, type: 'result', stdout: stdout, stderr: stderr, error: error, files: diff.changed, deleted: diff.deleted, syncWarnings: warnings });
   } catch (e) {
-    self.postMessage({ id: id, type: 'result', stdout: '', stderr: '', error: String(e && e.message ? e.message : e), files: [], deleted: [] });
+    self.postMessage({ id: id, type: 'result', stdout: '', stderr: '', error: String(e && e.message ? e.message : e), files: [], deleted: [], syncWarnings: [] });
   }
 };
 </script>

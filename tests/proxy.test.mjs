@@ -87,6 +87,97 @@ async function run() {
   const res5 = await onRequestPost({ request: makeRequest(), env: {} });
   check('P5 redirect → 502', res5.status === 502, 'status=' + res5.status);
 
+  // ---------- P6. null-body statuses must not throw ----------
+  for (const [tag, status] of [['P6a', 204], ['P6b', 205]]) {
+    globalThis.fetch = async () => new Response(null, { status });
+    const res = await onRequestPost({ request: makeRequest(), env: {} });
+    const text = await res.text();
+    check(tag + ' upstream ' + status + ' → ' + status + ', empty body', res.status === status && text === '',
+      'status=' + res.status + ' body=' + JSON.stringify(text));
+  }
+
+  // ---------- P7. every response carries X-Locus-Relay: 1 ----------
+  globalThis.fetch = async () =>
+    new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+  const res7 = await onRequestPost({ request: makeRequest(), env: {} });
+  check('P7 passthrough carries X-Locus-Relay: 1', res7.headers.get('x-locus-relay') === '1',
+    'x-locus-relay=' + res7.headers.get('x-locus-relay'));
+  globalThis.fetch = async () => new Response(null, { status: 302, headers: { location: 'https://evil.test/' } });
+  const res7b = await onRequestPost({ request: makeRequest(), env: {} });
+  check('P7b relay error carries X-Locus-Relay: 1', res7b.headers.get('x-locus-relay') === '1',
+    'x-locus-relay=' + res7b.headers.get('x-locus-relay'));
+
+  // ---------- P8. Content-Length over limit → 413 without reading the body ----------
+  let bodyTouched = false;
+  const untouchedReq = {
+    headers: new Headers({
+      'X-Target-URL': 'https://api.upstream.test/v1/messages',
+      'content-length': '1048577',
+    }),
+    get body() { bodyTouched = true; return null; },
+    text() { bodyTouched = true; return Promise.resolve(''); },
+  };
+  const res8 = await onRequestPost({ request: untouchedReq, env: {} });
+  const body8 = await res8.json();
+  check('P8 Content-Length precheck → 413, body never read', res8.status === 413
+    && /too large/.test(body8.error.message) && bodyTouched === false,
+    'status=' + res8.status + ' bodyTouched=' + bodyTouched);
+
+  // ---------- P9. chunked inbound over limit (no Content-Length) → 413 ----------
+  const bigStream = new ReadableStream({
+    start(ctrl) {
+      ctrl.enqueue(new TextEncoder().encode('x'.repeat(32)));
+      ctrl.enqueue(new TextEncoder().encode('y'.repeat(32)));
+      ctrl.close();
+    },
+  });
+  const chunkedReq = new Request('https://pages.test/proxy', {
+    method: 'POST',
+    headers: { 'X-Target-URL': 'https://api.upstream.test/v1/messages' },
+    body: bigStream,
+    duplex: 'half',
+  });
+  const res9 = await onRequestPost({
+    request: chunkedReq,
+    env: { MAX_PROXY_BODY_BYTES: '10' },
+  });
+  const body9 = await res9.json();
+  check('P9 chunked inbound over limit → 413', res9.status === 413 && /too large/.test(body9.error.message),
+    'status=' + res9.status + ' ' + JSON.stringify(body9));
+
+  // ---------- P10. stalled inbound body → 408 ----------
+  const stalledStream = new ReadableStream({ start() {} }); // never enqueues, never closes
+  const stalledReq = new Request('https://pages.test/proxy', {
+    method: 'POST',
+    headers: { 'X-Target-URL': 'https://api.upstream.test/v1/messages' },
+    body: stalledStream,
+    duplex: 'half',
+  });
+  const res10 = await onRequestPost({
+    request: stalledReq,
+    env: { PROXY_INBOUND_TIMEOUT_MS: '200' },
+  });
+  const body10 = await res10.json();
+  check('P10 stalled inbound body → 408', res10.status === 408
+    && /Client body read timed out after 200ms/.test(body10.error.message),
+    'status=' + res10.status + ' ' + JSON.stringify(body10));
+
+  // ---------- P11. mid-body upstream stream error (not timeout) → 502 ----------
+  globalThis.fetch = async () => {
+    const stream = new ReadableStream({
+      start(ctrl) {
+        ctrl.enqueue(new TextEncoder().encode('{"partial":'));
+        ctrl.error(new Error('upstream reset'));
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const res11 = await onRequestPost({ request: makeRequest(), env: { PROXY_TIMEOUT_MS: '5000' } });
+  const body11 = await res11.json();
+  check('P11 mid-body stream error → 502', res11.status === 502
+    && /Upstream body read failed/.test(body11.error.message),
+    'status=' + res11.status + ' ' + JSON.stringify(body11));
+
   globalThis.fetch = realFetch;
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);

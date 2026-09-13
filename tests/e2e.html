@@ -139,6 +139,57 @@
       window.fetch = realFetch;
     }
 
+    // ---------- J. REAL native FileSystemDirectoryHandle via OPFS (F01) ----------
+    // LocalDirectoryWorkspace against a browser-native handle (not a mock):
+    // stat options, exists() semantics, cat, append, python sync.
+    try {
+      const opfsRoot = await navigator.storage.getDirectory();
+      const dirName = 'locus-e2e-' + Date.now();
+      const dir = await opfsRoot.getDirectoryHandle(dirName, { create: true });
+      const realWs = new LocalDirectoryWorkspace(dir);
+      try {
+        check('J1 native exists(missing) === false', (await realWs.exists('none.txt')) === false);
+        await realWs.write('a.txt', 'hello\n');
+        const jst = await realWs.stat('a.txt');
+        check('J2 native stat file', jst.kind === 'file' && jst.size === 6, JSON.stringify(jst));
+        const jcat = await executeTool('bash', 'cat a.txt', realWs);
+        check('J3 native cat', jcat.success && jcat.output.replace(/\n$/, '') === 'hello', JSON.stringify(jcat.output));
+        await executeTool('bash', 'echo first > log.txt', realWs);
+        await executeTool('bash', 'echo second >> log.txt', realWs);
+        check('J4 native append preserves content', (await realWs.read('log.txt')) === 'first\nsecond\n',
+          JSON.stringify(await realWs.read('log.txt')));
+        const jpy = await executeTool('bash', "python <<'PY'\ndata = open('a.txt').read()\nprint('read:' + data.strip())\nopen('py-out.txt', 'w').write(data.upper())\nPY", realWs);
+        check('J5 native python sync in/out', jpy.success && jpy.output.includes('read:hello')
+          && (await realWs.read('py-out.txt')) === 'HELLO\n', JSON.stringify(jpy.output).slice(0, 200));
+
+        // F15 in a real browser: quoted > is text, not a redirect
+        const jq = await executeTool('bash', 'echo ">" victim.txt', realWs);
+        check('J6 quoted > writes nothing', jq.success && jq.output === '> victim.txt'
+          && (await realWs.exists('victim.txt')) === false, JSON.stringify(jq.output));
+      } finally {
+        await opfsRoot.removeEntry(dirName, { recursive: true });
+      }
+    } catch (e) {
+      check('J0 OPFS native handle available', false, String(e && e.message || e));
+    }
+
+    // ---------- K. Python session isolation (F03): reset kills globals AND /tmp ----------
+    await executeTool('bash', "python <<'PY'\nsecret = 'leak'\nopen('/tmp/leak.txt', 'w').write('leak')\nPY", ws);
+    PythonRuntime.reset();
+    const k1 = await executeTool('bash', "python <<'PY'\nimport os\ntry:\n    print('var:' + secret)\nexcept NameError:\n    print('var:gone')\nprint('tmp:' + str(os.path.exists('/tmp/leak.txt')))\nPY", ws);
+    check('K1 python globals isolated after reset', k1.success && k1.output.includes('var:gone'), JSON.stringify(k1.output));
+    check('K2 /tmp isolated after reset', k1.output.includes('tmp:False'), JSON.stringify(k1.output));
+
+    // ---------- L. F06 capability check: Python CAN reach js.fetch ----------
+    // This documents the real capability boundary (declared in README):
+    // the Pyodide worker has network access via the JS bridge; the
+    // anonymous-GET policy is enforced at the curl layer, not by sandboxing
+    // Python. The check must print True — if it ever prints False the
+    // declaration in README needs revisiting.
+    const l1 = await executeTool('bash', "python <<'PY'\nimport js\nprint('js.fetch callable: ' + str(callable(js.fetch)))\nPY", ws);
+    check('L1 python js bridge exposes fetch (capability documented)',
+      l1.success && l1.output.includes('js.fetch callable: True'), JSON.stringify(l1.output));
+
     // ---------- E. python timeout + worker recovery (runs last) ----------
     const t0 = performance.now();
     const to = await executeTool('bash', "python <<'PY'\nwhile True:\n    pass\nPY", ws);
