@@ -111,10 +111,10 @@ Do not over-design the event schema before the first real consumer exists.
 - [ ] Add tests proving visible UI history is not used to reconstruct provider history.
 - [x] Reset/scope provider-native state when switching workspace/session.
 
-### Harder isolation (declared gap, see README security note)
+### Network virtualization (declared gap, see README security note)
 
-- [ ] Evaluate isolated-origin execution (separate opaque origin iframe/worker + explicit RPC bridge) so Python compute loses direct network capability instead of merely declaring it.
-- [ ] Telemetry coverage for Python-originated network once a controlled bridge exists.
+- [ ] Route Python-originated HTTP through the same Locus network capability used by shell networking, using an internal bridge where browser constraints require it.
+- [ ] Preserve routing, bounds, cancellation and telemetry when Python HTTP moves onto the shared network path.
 
 ## V0.4 — Vue presentation layer
 
