@@ -165,7 +165,7 @@ Do not move provider serialization, tool semantics, execution routing, or agent-
 - [ ] Add regression tests for timeout/recovery.
 - [ ] Add regression tests proving application globals are inaccessible.
 
-### Deterministic edit primitive
+### Deterministic edit capability
 
 - [ ] Define minimal semantic edit operations.
 - [ ] Exact read.
