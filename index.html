@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Browser Agent Runtime</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/jquery.terminal/css/jquery.terminal.min.css">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--bg-card:#161b22;--bg-status:#010409;
+  --text:#c9d1d9;--text-dim:#8b949e;--text-bright:#f0f6fc;
+  --accent:#7ee787;--accent-dim:#238636;--border:#30363d;
+  --red:#ff7b72;--orange:#d29922;--blue:#79c0ff;
+  --font:'Cascadia Code','Fira Code','JetBrains Mono','SF Mono','Consolas',monospace;
+  --fs:15px;--lh:1.65;
+}
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--font);font-size:var(--fs);line-height:var(--lh);-webkit-font-smoothing:antialiased}
+
+/* ===== SETUP SCREEN ===== */
+#screen-zero{display:flex;justify-content:center;min-height:100vh;min-height:100dvh;padding:20px;overflow-y:auto;position:fixed;inset:0;z-index:100;background:var(--bg)}
+.setup-card{width:100%;max-width:460px;padding:40px 36px;border:1px solid var(--border);border-radius:12px;background:var(--bg-card);margin:auto}
+.setup-logo{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+.setup-logo h1{font-size:20px;font-weight:600;color:var(--text-bright);letter-spacing:-0.02em}
+.setup-ver{font-size:12px;color:var(--text-dim);margin-bottom:28px}
+.setup-desc{font-size:13px;color:var(--text-dim);margin-bottom:24px;line-height:1.5}
+.setup-label{display:block;font-size:12px;color:var(--text-dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em}
+.setup-input{width:100%;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text-bright);font-family:var(--font);font-size:13px;outline:none;transition:border 0.2s}
+.setup-input:focus{border-color:var(--accent-dim)}
+.setup-input::placeholder{color:var(--text-dim);opacity:0.5}
+.setup-btn{width:100%;padding:10px;background:var(--accent-dim);border:1px solid rgba(255,255,255,0.08);border-radius:6px;color:var(--text-bright);font-family:var(--font);font-size:13px;font-weight:500;cursor:pointer;transition:all 0.3s;margin-top:20px}
+.setup-btn:hover{background:#2ea043}
+.setup-btn.testing{opacity:0.75;pointer-events:none;background:var(--border)}
+.setup-field{margin-bottom:16px}
+.setup-hint{font-size:11px;color:var(--text-dim);opacity:0.6;margin-top:5px;line-height:1.4}
+.setup-check{display:flex;align-items:flex-start;gap:8px;margin:14px 0 0;font-size:12px;color:var(--text-dim);line-height:1.5;cursor:pointer}
+.setup-check input{margin-top:3px;accent-color:var(--accent)}
+.setup-result{font-size:11px;margin-top:8px;line-height:1.5;color:var(--text-dim);opacity:0;transition:opacity 0.4s;min-height:0}
+.setup-result.show{opacity:1}
+.setup-adv-toggle{font-size:12px;color:var(--text-dim);cursor:pointer;margin:12px 0 0;user-select:none;opacity:0.7;transition:opacity 0.2s}
+.setup-adv-toggle:hover{opacity:1}
+.setup-adv{max-height:0;overflow:hidden;transition:max-height 0.35s ease,opacity 0.3s;opacity:0}
+.setup-adv.open{max-height:400px;opacity:1;margin-top:12px}
+
+/* ===== APP LAYOUT ===== */
+#app{display:none;flex-direction:column;height:100vh;height:100dvh}
+#status-bar{display:flex;align-items:center;justify-content:space-between;flex-shrink:0;height:28px;padding:0 14px;background:var(--bg-status);color:var(--text-dim);font-size:11px;border-bottom:1px solid var(--border);user-select:none}
+#status-bar .left{display:flex;align-items:center;gap:16px}
+#status-bar .right{display:flex;align-items:center;gap:12px}
+.sb-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);display:inline-block;margin-right:6px;animation:dot-steady 2s ease-in-out infinite}
+@keyframes dot-steady{0%,100%{opacity:1}50%{opacity:0.3}}
+.sb-btn{padding:1px 8px;border:1px solid var(--border);border-radius:4px;background:transparent;color:var(--text);font-family:var(--font);font-size:11px;cursor:pointer}
+.sb-btn:hover{border-color:var(--text-dim);color:var(--text-bright)}
+#sb-python.cold{color:var(--text-dim)}
+#sb-python.loading{color:var(--orange)}
+#sb-python.ready{color:var(--accent)}
+#terminal-wrapper{flex:1;position:relative;min-height:0;overflow:hidden}
+#terminal{height:100%}
+#runtime-bar{display:flex;align-items:center;justify-content:space-between;flex-shrink:0;height:24px;padding:0 14px;background:var(--bg-status);color:var(--text-dim);font-size:11px;border-top:1px solid var(--border);user-select:none}
+
+/* ===== DEBUG PANEL ===== */
+#debug-panel{display:none;position:absolute;top:12px;right:12px;z-index:20;width:min(420px,calc(100% - 24px));max-height:60%;overflow-y:auto;padding:12px 14px;border:1px solid rgba(126,231,135,0.18);border-radius:6px;background:rgba(13,17,23,0.92);box-shadow:0 12px 34px rgba(0,0,0,0.35);backdrop-filter:blur(4px);font-size:11px;color:var(--text-dim)}
+#debug-panel.open{display:block}
+.dp-title{margin-bottom:8px;color:var(--text-bright);font-weight:600;font-size:12px}
+.dp-item{padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.05);white-space:pre-wrap;overflow-wrap:anywhere}
+.dp-item .ok{color:var(--accent)}
+.dp-item .fail{color:var(--red)}
+.dp-empty{opacity:0.6}
+
+/* ===== TERMINAL THEME ===== */
+.terminal{--color:var(--text);--background:var(--bg);--size:1.08;--font:var(--font);--cursor-color:var(--accent)}
+.terminal .terminal-output>div>div{color:var(--text);line-height:var(--lh)}
+.terminal .cmd .prompt{color:var(--accent)}
+.terminal .cmd .cursor{background:var(--accent)!important}
+.terminal .cmd{color:var(--text)}
+.terminal,.terminal .terminal-output,.terminal .cmd{border:none!important;outline:none!important;box-shadow:none!important}
+.terminal .terminal-output>div>div,
+.terminal .cmd,
+.terminal .cmd *:not(.cursor){
+  white-space:pre-wrap!important;
+  overflow-wrap:anywhere;
+  word-break:break-word;
+}
+.terminal .cmd .prompt{
+  white-space:pre!important;
+  overflow-wrap:normal;
+  word-break:normal;
+}
+.terminal .terminal-scroller::-webkit-scrollbar{width:6px}
+.terminal .terminal-scroller::-webkit-scrollbar-track{background:transparent}
+.terminal .terminal-scroller::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.06);border-radius:3px}
+#debug-panel::-webkit-scrollbar{width:6px}
+#debug-panel::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.06);border-radius:3px}
+</style>
+</head>
+<body>
+
+<!-- ===== SETUP ===== -->
+<div id="screen-zero">
+  <div class="setup-card">
+    <div class="setup-logo">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+        <rect width="28" height="28" rx="6" fill="#238636"/>
+        <text x="14" y="19" text-anchor="middle" fill="white" font-family="monospace" font-size="16" font-weight="bold">&gt;_</text>
+      </svg>
+      <h1>Browser Agent Runtime</h1>
+    </div>
+    <div class="setup-ver">v0.1.0 · browser-native agent harness</div>
+    <p class="setup-desc">在浏览器本地运行的 AI Agent 运行时。文件与 Python 执行全部发生在你的浏览器中，云端只承担 LLM 推理。请输入模型 API 凭证以开始。</p>
+    <div class="setup-field">
+      <label class="setup-label">API Key</label>
+      <input type="password" class="setup-input" id="api-key-input" placeholder="sk-..." spellcheck="false" autocomplete="off">
+    </div>
+    <div class="setup-adv-toggle" id="adv-toggle">▸ 高级设置</div>
+    <div class="setup-adv" id="adv-panel">
+      <div class="setup-field">
+        <label class="setup-label">API 端点</label>
+        <input type="text" class="setup-input" id="api-base-input" placeholder="https://api.deepseek.com/anthropic" value="https://api.deepseek.com/anthropic" spellcheck="false" autocomplete="off">
+      </div>
+      <div class="setup-field">
+        <label class="setup-label">模型</label>
+        <input type="text" class="setup-input" id="model-input" placeholder="deepseek-v4-pro" value="deepseek-v4-pro" spellcheck="false" autocomplete="off">
+      </div>
+      <div class="setup-field">
+        <label class="setup-label">代理地址 <span style="opacity:0.4">可选</span></label>
+        <input type="text" class="setup-input" id="proxy-input" placeholder="https://your-proxy.workers.dev" spellcheck="false" autocomplete="off">
+        <div class="setup-hint">用于解决 CORS 跨域问题。留空则直连。</div>
+      </div>
+    </div>
+    <label class="setup-check">
+      <input type="checkbox" id="remember-session-key-check">
+      记住密钥（仅本次会话，存于 sessionStorage，关闭标签页即清除）
+    </label>
+    <button class="setup-btn" id="setup-go">连接模型</button>
+    <div class="setup-result" id="init-result"></div>
+  </div>
+</div>
+
+<!-- ===== APP ===== -->
+<div id="app">
+  <div id="status-bar">
+    <div class="left"><span class="sb-dot"></span><span>Browser Agent Runtime</span></div>
+    <div class="right">
+      <span id="sb-workspace">Workspace: Not selected</span>
+      <button class="sb-btn" id="btn-workspace" type="button">Select Workspace</button>
+      <span id="sb-python" class="cold">Python: cold</span>
+    </div>
+  </div>
+  <div id="terminal-wrapper">
+    <div id="terminal"></div>
+    <div id="debug-panel">
+      <div class="dp-title">Execution Log</div>
+      <div id="dp-list"><div class="dp-empty">尚无执行记录。输入 telemetry 或点击 log 刷新。</div></div>
+    </div>
+  </div>
+  <div id="runtime-bar">
+    <span>Execution: LOCAL · Cloud fallback: unavailable</span>
+    <button class="sb-btn" id="btn-log" type="button">log</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jquery"></script>
+<script src="https://cdn.jsdelivr.net/npm/jquery.terminal/js/jquery.terminal.min.js"></script>
+
+<!--
+  Pyodide Web Worker source.
+  Kept inline (loaded via Blob URL) so the page also works when opened
+  directly from file:// — browsers block Worker('...js') on file origins.
+-->
+<script type="text/worker" id="py-worker-src">
+// ============================================================
+//  PYODIDE WORKER
+//  Loads Pyodide lazily on first run, executes Python against an
+//  in-memory mirror of the user-authorized workspace, and reports
+//  back stdout / stderr / tracebacks / changed files.
+// ============================================================
+const PYODIDE_BASE = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
+const WORK_ROOT = '/workspace';
+
+let py = null;
+let pyodideLoading = null;
+
+async function ensurePyodide() {
+  if (!pyodideLoading) {
+    pyodideLoading = (async () => {
+      importScripts(PYODIDE_BASE + 'pyodide.js');
+      const instance = await loadPyodide({ indexURL: PYODIDE_BASE });
+      instance.FS.mkdirTree(WORK_ROOT);
+      return instance;
+    })();
+  }
+  py = await pyodideLoading;
+  return py;
+}
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function bytesToB64(bytes) {
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+// Reset the mirror, then write the incoming snapshot. Returns a
+// {path: b64} manifest used to detect new/changed files after the run.
+function syncIn(files) {
+  py.runPython('import shutil; shutil.rmtree("' + WORK_ROOT + '", ignore_errors=True)');
+  py.FS.mkdirTree(WORK_ROOT);
+  const manifest = {};
+  for (const f of files) {
+    const full = WORK_ROOT + '/' + f.path;
+    const dir = full.substring(0, full.lastIndexOf('/'));
+    if (dir) py.FS.mkdirTree(dir);
+    py.FS.writeFile(full, b64ToBytes(f.b64));
+    manifest[f.path] = f.b64;
+  }
+  return manifest;
+}
+
+function walkFs(dir, prefix, out) {
+  for (const entry of py.FS.readdir(dir)) {
+    if (entry === '.' || entry === '..') continue;
+    const full = dir + '/' + entry;
+    const stat = py.FS.stat(full);
+    if (py.FS.isDir(stat.mode)) {
+      walkFs(full, prefix + entry + '/', out);
+    } else {
+      out.push({ path: prefix + entry, full: full });
+    }
+  }
+}
+
+function diffOut(manifest) {
+  const entries = [];
+  walkFs(WORK_ROOT, '', entries);
+  const changed = [];
+  for (const e of entries) {
+    const b64 = bytesToB64(py.FS.readFile(e.full));
+    if (manifest[e.path] === b64) continue;
+    changed.push({ path: e.path, b64: b64 });
+  }
+  return changed;
+}
+
+self.onmessage = async (ev) => {
+  const msg = ev.data || {};
+  if (msg.cmd !== 'run') return;
+  const id = msg.id;
+  try {
+    self.postMessage({ id: id, type: 'status', status: 'loading' });
+    await ensurePyodide();
+    self.postMessage({ id: id, type: 'status', status: 'ready' });
+
+    const manifest = syncIn(msg.files || []);
+
+    let stdout = '';
+    let stderr = '';
+    py.setStdout({ batched: (s) => { stdout += s + '\n'; } });
+    py.setStderr({ batched: (s) => { stderr += s + '\n'; } });
+
+    let error = null;
+    try {
+      // Auto-install pure-python/wheel packages the code imports (e.g. pandas).
+      await py.loadPackagesFromImports(msg.code);
+      await py.runPythonAsync('import os\nos.chdir("' + WORK_ROOT + '")');
+      await py.runPythonAsync(msg.code);
+    } catch (e) {
+      // PythonError messages carry the full traceback.
+      error = String(e && e.message ? e.message : e);
+    }
+
+    const changed = diffOut(manifest);
+    self.postMessage({ id: id, type: 'result', stdout: stdout, stderr: stderr, error: error, files: changed });
+  } catch (e) {
+    self.postMessage({ id: id, type: 'result', stdout: '', stderr: '', error: String(e && e.message ? e.message : e), files: [] });
+  }
+};
+</script>
+
+<script src="src/telemetry.js"></script>
+<script src="src/model.js"></script>
+<script src="src/workspace.js"></script>
+<script src="src/shell.js"></script>
+<script src="src/tools.js"></script>
+<script src="src/agent.js"></script>
+<script src="src/ui.js"></script>
+</body>
+</html>

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>e2e</title></head>
+<body>
+<div id="sb-python"></div>
+<pre id="out">RUNNING</pre>
+<script src="../src/telemetry.js"></script>
+<script src="../src/workspace.js"></script>
+<script src="../src/shell.js"></script>
+<script src="../src/tools.js"></script>
+<script>
+(async () => {
+  const lines = [];
+  const log = (m) => { lines.push(m); document.getElementById('out').textContent = lines.join('\n'); };
+  try {
+    // Pull the real worker source out of index.html so we test the shipped artifact.
+    const html = await (await fetch('../index.html')).text();
+    const m = html.match(/<script type="text\/worker" id="py-worker-src">([\s\S]*?)<\/script>/);
+    if (!m) throw new Error('worker source not found in index.html');
+    const wtag = document.createElement('script');
+    wtag.id = 'py-worker-src';
+    wtag.type = 'text/worker';
+    wtag.textContent = m[1];
+    document.body.appendChild(wtag);
+
+    // Test-only in-memory workspace implementing the adapter interface.
+    class MemWS extends WorkspaceAdapter {
+      constructor(files) { super(); this.files = Object.assign({}, files); this.name = 'mem'; }
+      async list() { return Object.keys(this.files).map((n) => ({ name: n, kind: 'file' })); }
+      async read(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); return this.files[p]; }
+      async readBytes(p) { return new TextEncoder().encode(await this.read(p)); }
+      async write(p, data) { p = normalizeWorkspacePath(p); this.files[p] = typeof data === 'string' ? data : new TextDecoder().decode(data); }
+      async exists(p) { try { normalizeWorkspacePath(p); return p in this.files; } catch (e) { return false; } }
+      async stat(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); return { kind: 'file', size: this.files[p].length, modified: 0 }; }
+    }
+
+    const ws = new MemWS({ 'sales.csv': 'name,revenue,cost\nA,100,40\nB,200,80\nC,300,120\n' });
+
+    log('ls => ' + JSON.stringify((await executeTool('bash', 'ls', ws)).output));
+    log('cat => ' + JSON.stringify((await executeTool('bash', 'cat sales.csv', ws)).output));
+    log('bad => ' + JSON.stringify((await executeTool('bash', 'sudo rm x', ws)).output));
+    log('cloud => ' + JSON.stringify((await executeTool('cloud_bash', 'ls', ws)).output));
+
+    const code = [
+      'import pandas as pd',
+      'df = pd.read_csv("sales.csv")',
+      'means = df[["revenue", "cost"]].mean()',
+      'out = "column,mean\\n" + "\\n".join(f"{k},{v}" for k, v in means.items()) + "\\n"',
+      'open("summary.csv", "w").write(out)',
+      'print(out)',
+    ].join('\n');
+    const r = await executeTool('bash', "python -c '" + code + "'", ws);
+    log('python success => ' + r.success);
+    log('python output => ' + JSON.stringify(r.output));
+    log('summary.csv written back => ' + JSON.stringify(ws.files['summary.csv'] || null));
+    log('telemetry count => ' + Telemetry.records.length);
+    log('telemetry last => ' + JSON.stringify(Telemetry.records[Telemetry.records.length - 1]));
+    log('DONE');
+  } catch (e) {
+    log('E2E-FAIL: ' + (e && e.stack || e));
+  }
+})();
+</script>
+</body>
+</html>
