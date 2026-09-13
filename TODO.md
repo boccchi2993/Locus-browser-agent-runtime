@@ -184,10 +184,13 @@ Do not move provider serialization, tool semantics, execution routing, or agent-
 
 Do not declare core frozen until:
 
-- [ ] Python primitive is isolated and reliable.
-- [ ] JavaScript primitive is isolated and reliable.
+- [ ] Execution substrate is reliable for the supported userland runtimes.
+- [ ] Filesystem/state substrate is reliable and deterministic.
+- [ ] Network is a common runtime capability rather than a curl-only special case.
+- [ ] Python HTTP access can reuse the controlled Locus network path for normal lightweight workflows.
+- [ ] JavaScript userland runtime is isolated and reliable.
 - [ ] Edit/state mutation is deterministic.
-- [x] curl connectivity is bounded and reliable.
+- [x] Current curl connectivity is bounded and reliable.
 - [x] Workspace authority is explicit.
 - [ ] Agent loop is UI-independent.
 - [x] Model protocol preserves provider-native continuation semantics.
@@ -198,8 +201,8 @@ Do not declare core frozen until:
 
 ### Capability registry
 
-- [ ] Define minimal capability descriptor.
-- [ ] Register current core capabilities through the same conceptual interface where practical.
+- [ ] Define minimal capability descriptor around execution / filesystem / network plus higher-level providers.
+- [ ] Register current runtime capabilities through the same conceptual interface where practical.
 - [ ] Support dependency declaration.
 - [ ] Support availability checks.
 - [ ] Support provider/backend metadata.
@@ -243,6 +246,7 @@ Do not declare core frozen until:
 - [ ] Plugin marketplace.
 - [ ] Full POSIX shell.
 - [ ] Full curl implementation.
+- [ ] RAG as a core primitive (local retrieval should compose Plugin + Skill; durable/external retrieval should normally be MCP).
 - [ ] Local model runtime.
 - [ ] Vue migration, MCP, JS runtime primitive, edit primitive (pre-AgentSession).
 - [ ] Domain allowlists (provider/site-agnostic by design).
