@@ -1,14 +1,24 @@
 // ============================================================
 //  MODEL LAYER
-//  Adapted from Whoami_Cli_game: LLM API client supporting two API
-//  dialects (Anthropic-compatible and OpenAI-compatible) over any
-//  HTTPS endpoint, plus an optional CORS proxy.
+//  Adapted from Whoami_Cli_game: LLM API client over any HTTPS
+//  endpoint, plus an optional CORS proxy.
 //
-//  Core distinction: provider identity ≠ API dialect. Dialect is
-//  detected from the endpoint shape, never from a provider name list.
+//  Architecture (docs/MODEL-PROTOCOL.md):
 //
-//  The response is a structured envelope (see docs/MODEL-PROTOCOL.md):
-//    { content, reasoning, stopReason, usage, rawMessage, truncated }
+//    AgentSession → callModel() → ProviderAdapter → transport
+//
+//  This file is the provider-neutral ModelClient: adapter selection,
+//  transport (direct fetch + /proxy relay fallback), deadlines, size
+//  caps and the error taxonomy. ALL provider-specific semantics —
+//  endpoint shape, auth headers, request serialization, response
+//  parsing, replay state — live in src/model-adapters.js behind the
+//  ProviderAdapter interface. Provider identity ≠ API dialect: the
+//  dialect is configured explicitly (auto/openai/anthropic), never
+//  derived from a provider name list.
+//
+//  The response is a structured envelope:
+//    { content, reasoning, reasoningType, toolCalls, rawMessage,
+//      stopReason, usage, providerMetadata, truncated }
 //  visible text is NOT the complete conversation state — rawMessage is
 //  the provider-native assistant message used for replay.
 //
@@ -25,6 +35,7 @@ const Model = {
   apiBase: 'https://api.deepseek.com/anthropic',
   model: 'deepseek-v4-pro',
   proxy: '',
+  dialect: 'auto', // auto | openai | anthropic — see getProviderAdapter()
 };
 
 // Model inference deadline: covers request start → headers → full body.
@@ -35,40 +46,6 @@ const MODEL_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 function sanitizeKey(k) {
   return String(k || '').replace(/[^\x20-\x7E]/g, '').trim();
-}
-
-// API dialect is determined by the endpoint form:
-// - api.anthropic.com            → anthropic
-// - any base ending in /anthropic → anthropic (e.g. api.deepseek.com/anthropic)
-// - everything else               → openai
-function detectDialect(apiBase) {
-  const base = String(apiBase || '').replace(/\/+$/, '');
-  if (/api\.anthropic\.com/i.test(base) || /\/anthropic$/i.test(base)) {
-    return 'anthropic';
-  }
-  return 'openai';
-}
-
-function isOfficialAnthropic(apiBase) {
-  return /api\.anthropic\.com/i.test(String(apiBase || ''));
-}
-
-function anthropicUrl() {
-  return Model.apiBase.replace(/\/+$/, '') + '/v1/messages';
-}
-
-function openaiUrl() {
-  return Model.apiBase.replace(/\/+$/, '').replace(/\/anthropic\/?$/, '') + '/chat/completions';
-}
-
-function openaiUrlV1() {
-  return Model.apiBase.replace(/\/+$/, '').replace(/\/anthropic\/?$/, '') + '/v1/chat/completions';
-}
-
-function toOpenAIBody(body) {
-  const messages = (body.messages || []).slice();
-  if (body.system) messages.unshift({ role: 'system', content: body.system });
-  return { model: body.model, messages, max_tokens: body.max_tokens || 2000 };
 }
 
 // ---------- error types ----------
@@ -117,80 +94,6 @@ function makeModelCancelledError() {
   err.name = 'AbortError';
   err.cancelled = true;
   return err;
-}
-
-// ---------- response envelope parsers ----------
-function parseAnthropicResp(data) {
-  if (!Array.isArray(data.content)) {
-    if (typeof data.content === 'string' && data.content) {
-      return {
-        content: data.content,
-        reasoning: null,
-        stopReason: data.stop_reason || null,
-        usage: data.usage || null,
-        rawMessage: { role: 'assistant', content: data.content },
-        truncated: data.stop_reason === 'max_tokens',
-      };
-    }
-    if (data.error) {
-      throw makeParseError(data.error.message || data.error.type || JSON.stringify(data.error));
-    }
-    throw makeParseError('响应中没有可见文本内容');
-  }
-
-  // content is a block array. Visible text blocks become `content`;
-  // thinking blocks are preserved for display AND replay (rawMessage
-  // keeps the exact block array); redacted/opaque blocks are preserved
-  // for replay but never rendered as fake prose.
-  const text = data.content
-    .filter((part) => part && part.type === 'text' && typeof part.text === 'string')
-    .map((part) => part.text)
-    .join('');
-  const reasoning = data.content
-    .filter((part) => part && part.type === 'thinking' && typeof part.thinking === 'string')
-    .map((part) => part.thinking)
-    .join('\n') || null;
-
-  const envelope = {
-    content: text,
-    reasoning,
-    stopReason: data.stop_reason || null,
-    usage: data.usage || null,
-    rawMessage: { role: 'assistant', content: data.content },
-    truncated: data.stop_reason === 'max_tokens',
-  };
-  if (!text) {
-    if (data.stop_reason === 'max_tokens') {
-      throw makeParseError('模型在生成可见回答前达到 token 上限（stop_reason: max_tokens）');
-    }
-    throw makeParseError('响应中没有可见文本内容（stop_reason: ' + (data.stop_reason || 'unknown') + '）');
-  }
-  return envelope;
-}
-
-function parseOpenAIResp(data) {
-  if (data.choices && data.choices[0]) {
-    const choice = data.choices[0];
-    const msg = choice.message || choice.delta || {};
-    const content = typeof msg.content === 'string' ? msg.content : '';
-    const envelope = {
-      content,
-      reasoning: typeof msg.reasoning_content === 'string' && msg.reasoning_content ? msg.reasoning_content : null,
-      stopReason: choice.finish_reason || null,
-      usage: data.usage || null,
-      // Replay the provider-native message object unchanged (keeps
-      // reasoning_content and any provider-specific continuation fields).
-      rawMessage: msg,
-      truncated: choice.finish_reason === 'length',
-    };
-    if (content) return envelope;
-    if (choice.finish_reason === 'length') {
-      throw makeParseError('模型在生成可见回答前达到 token 上限（finish_reason: length）');
-    }
-    throw makeParseError('响应中没有可见文本内容（finish_reason: ' + (choice.finish_reason || 'unknown') + '）');
-  }
-  if (data.error) throw makeParseError(data.error.message || JSON.stringify(data.error));
-  throw makeParseError('响应格式不符合预期');
 }
 
 // ---------- transport ----------
@@ -395,38 +298,20 @@ function isFallbackableError(e) {
 }
 
 // Structured model call. opts.signal cancels the request.
-// Returns the response envelope { content, reasoning, stopReason, usage,
-// rawMessage, truncated }.
+// The adapter (selected from Model.dialect + Model.apiBase) owns every
+// provider-specific decision: endpoint URLs, auth headers, request
+// serialization and response parsing. This function only orchestrates
+// transport attempts and the fallback/error lifecycle.
+// Returns the response envelope { content, reasoning, reasoningType,
+// toolCalls, rawMessage, stopReason, usage, providerMetadata, truncated }.
 async function callModel(body, opts) {
   const key = sanitizeKey(Model.apiKey);
-  const dialect = detectDialect(Model.apiBase);
-
-  let attempts;
-  if (dialect === 'anthropic') {
-    // Anthropic-compatible: x-api-key + anthropic-version.
-    // anthropic-dangerous-direct-browser-access is only for the official
-    // API's direct browser access; third-party compatible endpoints are
-    // not required to recognize it.
-    const headers = {
-      'Content-Type': 'application/json',
-      'x-api-key': key,
-      'anthropic-version': '2023-06-01',
-    };
-    if (isOfficialAnthropic(Model.apiBase)) {
-      headers['anthropic-dangerous-direct-browser-access'] = 'true';
-    }
-    attempts = [
-      { url: anthropicUrl(), h: headers, b: body, p: parseAnthropicResp },
-    ];
-  } else {
-    // OpenAI-compatible: Bearer auth, tolerate both endpoint layouts.
-    const headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key };
-    const oaiBody = toOpenAIBody(body);
-    attempts = [
-      { url: openaiUrl(), h: headers, b: oaiBody, p: parseOpenAIResp },
-      { url: openaiUrlV1(), h: headers, b: oaiBody, p: parseOpenAIResp },
-    ];
-  }
+  const adapter = getProviderAdapter({ dialect: Model.dialect, apiBase: Model.apiBase });
+  const headers = adapter.buildHeaders({ apiKey: key, apiBase: Model.apiBase });
+  const requestBody = adapter.serializeRequest(body);
+  const attempts = adapter.buildEndpoints(Model.apiBase).map((url) => ({
+    url: url, h: headers, b: requestBody, p: adapter.parseResponse,
+  }));
 
   let firstErr = null;
   for (const attempt of attempts) {

@@ -122,6 +122,15 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
         <input type="text" class="setup-input" id="model-input" placeholder="deepseek-v4-pro" value="deepseek-v4-pro" spellcheck="false" autocomplete="off">
       </div>
       <div class="setup-field">
+        <label class="setup-label">API 协议 <span style="opacity:0.4">dialect</span></label>
+        <select class="setup-input" id="api-dialect-input">
+          <option value="auto" selected>auto（按端点自动识别）</option>
+          <option value="openai">openai（OpenAI 兼容）</option>
+          <option value="anthropic">anthropic（Anthropic 兼容）</option>
+        </select>
+        <div class="setup-hint">第三方网关 / 企业代理无法自动识别时手动指定。</div>
+      </div>
+      <div class="setup-field">
         <label class="setup-label">代理地址 <span style="opacity:0.4">可选</span></label>
         <input type="text" class="setup-input" id="proxy-input" placeholder="https://your-proxy.workers.dev" spellcheck="false" autocomplete="off">
         <div class="setup-hint">用于解决 CORS 跨域问题。留空则直连。</div>
@@ -366,6 +375,7 @@ self.onmessage = async (ev) => {
 </script>
 
 <script src="src/telemetry.js"></script>
+<script src="src/model-adapters.js"></script>
 <script src="src/model.js"></script>
 <script src="src/workspace.js"></script>
 <script src="src/network.js"></script>

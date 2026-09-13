@@ -11,10 +11,11 @@ global.window = { location: { protocol: 'file:' } };
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });
 
-// --- load the real model.js ---
+// --- load the real adapter + model layer ---
 const M = eval(
-  fs.readFileSync(path.join(__dirname, '..', 'src', 'model.js'), 'utf8') +
-  '\n;({ detectDialect, callModel, callModelText, verifyConnection, Model });'
+  fs.readFileSync(path.join(__dirname, '..', 'src', 'model-adapters.js'), 'utf8') +
+  '\n' + fs.readFileSync(path.join(__dirname, '..', 'src', 'model.js'), 'utf8') +
+  '\n;({ detectDialect, getProviderAdapter, callModel, callModelText, verifyConnection, Model });'
 );
 
 // --- fetch mock: records requests, replays queued responses ---

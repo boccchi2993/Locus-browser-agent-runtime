@@ -45,7 +45,7 @@ function loadSessionConfig() {
   let cfg = null;
   try { cfg = JSON.parse(sessionGet(SESSION_CONFIG_KEY) || 'null'); } catch (e) {}
   if (!cfg) return;
-  const map = { apiKey: 'api-key-input', apiBase: 'api-base-input', model: 'model-input', proxy: 'proxy-input' };
+  const map = { apiKey: 'api-key-input', apiBase: 'api-base-input', model: 'model-input', proxy: 'proxy-input', dialect: 'api-dialect-input' };
   for (const k in map) {
     const el = document.getElementById(map[k]);
     if (el && cfg[k]) el.value = cfg[k];
@@ -69,6 +69,7 @@ function saveSessionConfigIfNeeded() {
     apiBase: document.getElementById('api-base-input').value.trim(),
     model: document.getElementById('model-input').value.trim(),
     proxy: document.getElementById('proxy-input').value.trim(),
+    dialect: document.getElementById('api-dialect-input').value,
   };
   sessionSet(REMEMBER_SESSION_KEY, '1');
   sessionSet(SESSION_CONFIG_KEY, JSON.stringify(cfg));
@@ -99,6 +100,7 @@ async function startApp() {
   Model.apiBase = document.getElementById('api-base-input').value.trim() || 'https://api.deepseek.com/anthropic';
   Model.model = document.getElementById('model-input').value.trim() || 'deepseek-v4-pro';
   Model.proxy = document.getElementById('proxy-input').value.trim();
+  Model.dialect = document.getElementById('api-dialect-input').value || 'auto';
 
   if (!Model.apiKey) {
     showInitResult('请输入 API Key。', true);

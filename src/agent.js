@@ -128,8 +128,10 @@ function buildSystemPrompt(opts) {
 //  new AgentSession({
 //    modelClient(body, opts)          — structured model call, returns the
 //                                       response envelope { content, reasoning,
-//                                       stopReason, usage, rawMessage, truncated };
-//                                       opts.signal cancels the request.
+//                                       reasoningType, toolCalls, rawMessage,
+//                                       stopReason, usage, providerMetadata,
+//                                       truncated }; opts.signal cancels the
+//                                       request.
 //    toolExecutor(tool, input, workspace, opts) — runs one tool, resolves to
 //                                       { output, success, backend, operation }.
 //    buildSystemPrompt({ workspace }) — system prompt builder.
@@ -299,8 +301,10 @@ class AgentSession {
         // Provider-visible reasoning is emitted COMPLETE — presentation
         // truncation is a UI concern, not a runtime one. Opaque replay
         // state stays inside rawMessage/history and is never emitted.
+        // reasoningType is the adapter's presentation metadata (raw /
+        // summary / …), passed through untouched.
         if (envelope.reasoning) {
-          emit({ type: 'reasoning', content: envelope.reasoning, presentation: 'raw' });
+          emit({ type: 'reasoning', content: envelope.reasoning, presentation: envelope.reasoningType || 'raw' });
         }
         if (envelope.truncated) {
           emit({
