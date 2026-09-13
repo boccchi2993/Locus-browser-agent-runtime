@@ -5,6 +5,8 @@
 //  worker — no native shell, no server, no cloud execution.
 // ============================================================
 
+const PYTHON_TIMEOUT_MS = 30000;
+
 // ---------- Python runtime bridge (Web Worker + lazy Pyodide) ----------
 const PythonRuntime = {
   worker: null,
@@ -26,13 +28,32 @@ const PythonRuntime = {
       }
       if (msg.type === 'result' && pending) {
         this._pending.delete(msg.id);
+        clearTimeout(pending.timer);
         pending.resolve(msg);
       }
     };
     this.worker.onerror = (e) => {
-      for (const [, p] of this._pending) p.resolve({ stdout: '', stderr: '', error: 'worker error: ' + (e.message || 'unknown'), files: [] });
-      this._pending.clear();
+      this._failAllPending('worker error: ' + (e.message || 'unknown'));
     };
+  },
+
+  // Terminate the worker (e.g. after a timeout), fail every pending
+  // request, and reset so the next call boots a fresh worker.
+  _killWorker() {
+    if (this.worker) {
+      try { this.worker.terminate(); } catch (e) {}
+      this.worker = null;
+    }
+    this._failAllPending('python execution timed out after ' + PYTHON_TIMEOUT_MS + 'ms');
+    this._setStatus('cold');
+  },
+
+  _failAllPending(errorMessage) {
+    for (const [, p] of this._pending) {
+      clearTimeout(p.timer);
+      p.resolve({ stdout: '', stderr: '', error: errorMessage, files: [], deleted: [] });
+    }
+    this._pending.clear();
   },
 
   _setStatus(status) {
@@ -45,7 +66,7 @@ const PythonRuntime = {
   },
 
   // Run Python code with the workspace mirrored in. Returns
-  // {stdout, stderr, error, written: [paths]}.
+  // {stdout, stderr, error, written: [paths], deleted: [paths]}.
   async run(code, workspace) {
     this._ensureWorker();
     this._setStatus('loading');
@@ -60,7 +81,8 @@ const PythonRuntime = {
 
     const id = ++this._reqId;
     const result = await new Promise((resolve) => {
-      this._pending.set(id, { resolve });
+      const timer = setTimeout(() => this._killWorker(), PYTHON_TIMEOUT_MS);
+      this._pending.set(id, { resolve, timer });
       this.worker.postMessage({ id, cmd: 'run', code, files });
     });
 
@@ -78,11 +100,25 @@ const PythonRuntime = {
       result.stderr = (result.stderr || '') + '\n[no workspace selected — generated files were not persisted]';
     }
 
+    // Propagate deletions (and renames = delete + create) to the real workspace.
+    const deleted = [];
+    if (workspace && result.deleted && result.deleted.length) {
+      for (const p of result.deleted) {
+        try {
+          await workspace.remove(p);
+          deleted.push(p);
+        } catch (e) {
+          result.stderr = (result.stderr || '') + '\n[delete failed: ' + p + ': ' + e.message + ']';
+        }
+      }
+    }
+
     return {
       stdout: result.stdout || '',
       stderr: syncNote + (result.stderr || ''),
       error: result.error || null,
       written,
+      deleted,
       inputBytes: files.reduce((n, f) => n + Math.floor(f.b64.length * 0.75), 0),
       outputBytes: (result.files || []).reduce((n, f) => n + Math.floor(f.b64.length * 0.75), 0),
     };
@@ -148,15 +184,36 @@ function shellTokenize(s) {
   });
 }
 
+// Recognize the model-friendly heredoc form and extract the code verbatim:
+//   python <<'PY'
+//   <arbitrary multi-line code, any quotes>
+//   PY
+// Returns { code } or null. This is NOT a POSIX parser — just this one form.
+function extractPythonHeredoc(line) {
+  const m = String(line || '').match(/^python3?\s+<<\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?[ \t]*\r?\n([\s\S]*)$/);
+  if (!m) return null;
+  const marker = m[1];
+  const bodyLines = m[2].split(/\r?\n/);
+  if (!bodyLines.length || bodyLines[bodyLines.length - 1].trim() !== marker) return null;
+  bodyLines.pop();
+  return { code: bodyLines.join('\n') };
+}
+
 function shellError(cmd) {
   return 'bash: ' + cmd + ': command not available in local browser runtime';
 }
 
 // Execute one shell command line against the workspace.
-// Returns { output: string, isError: boolean, io: {in, out} }.
+// Returns { output: string, isError: boolean, io: {in, out} } — io in UTF-8 bytes.
 async function runShellCommand(input, workspace) {
   const line = String(input || '').trim();
   if (!line) return { output: '', isError: false, io: { in: 0, out: 0 } };
+
+  // Heredoc python is recognized before generic tokenizing.
+  const heredoc = extractPythonHeredoc(line);
+  if (heredoc) {
+    return await runPythonCode(heredoc.code, workspace);
+  }
 
   const tokens = shellTokenize(line);
   const cmd = tokens[0];
@@ -220,10 +277,10 @@ async function runShellCommand(input, workspace) {
   }
 
   function ok(output) {
-    return { output, isError: false, io: { in: line.length, out: output.length } };
+    return { output, isError: false, io: { in: utf8ByteLength(line), out: utf8ByteLength(output) } };
   }
   function err(output) {
-    return { output, isError: true, io: { in: line.length, out: output.length } };
+    return { output, isError: true, io: { in: utf8ByteLength(line), out: utf8ByteLength(output) } };
   }
 }
 
@@ -231,24 +288,29 @@ async function runPython(args, workspace) {
   let code = null;
 
   if (!args.length) {
-    return { output: 'usage: python -c "<code>" | python <script.py>', isError: true, io: { in: 6, out: 0 } };
+    return { output: 'usage: python -c "<code>" | python <script.py> | python <<\'PY\' ... PY', isError: true, io: { in: utf8ByteLength('python'), out: 0 } };
   }
   if (args[0] === '--version' || args[0] === '-V') {
-    return { output: 'Python (browser runtime)', isError: false, io: { in: 6, out: 0 } };
+    return { output: 'Python (browser runtime)', isError: false, io: { in: utf8ByteLength('python'), out: 0 } };
   }
   if (args[0] === '-c') {
     code = args.slice(1).join(' ');
   } else {
     const script = args[0];
-    if (!workspace) return { output: 'python: no workspace selected (cannot read ' + script + ')', isError: true, io: { in: 6, out: 0 } };
+    if (!workspace) return { output: 'python: no workspace selected (cannot read ' + script + ')', isError: true, io: { in: utf8ByteLength(script), out: 0 } };
     try {
       code = await workspace.read(script);
     } catch (e) {
-      return { output: 'python: can\'t open file \'' + script + '\': ' + e.message, isError: true, io: { in: 6, out: 0 } };
+      return { output: 'python: can\'t open file \'' + script + '\': ' + e.message, isError: true, io: { in: utf8ByteLength(script), out: 0 } };
     }
   }
+
+  return await runPythonCode(code, workspace);
+}
+
+async function runPythonCode(code, workspace) {
   if (!code || !code.trim()) {
-    return { output: 'python: empty code', isError: true, io: { in: 6, out: 0 } };
+    return { output: 'python: empty code', isError: true, io: { in: 0, out: 0 } };
   }
 
   const res = await PythonRuntime.run(code, workspace);
@@ -260,10 +322,13 @@ async function runPython(args, workspace) {
   if (res.written && res.written.length) {
     output += (output ? '\n' : '') + '[written to workspace: ' + res.written.join(', ') + ']';
   }
+  if (res.deleted && res.deleted.length) {
+    output += (output ? '\n' : '') + '[deleted from workspace: ' + res.deleted.join(', ') + ']';
+  }
 
   return {
     output,
     isError: !!res.error,
-    io: { in: code.length + res.inputBytes, out: output.length + res.outputBytes },
+    io: { in: utf8ByteLength(code) + res.inputBytes, out: utf8ByteLength(output) + res.outputBytes },
   };
 }

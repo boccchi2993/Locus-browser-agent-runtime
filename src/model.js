@@ -48,19 +48,10 @@ function parseOpenAIResp(data) {
   throw new Error('响应格式不符合预期');
 }
 
-function getProxyEndpoint() {
-  if (Model.proxy) return Model.proxy.replace(/\/+$/, '');
-  if (window.location.protocol !== 'file:') return '/proxy';
-  return '';
-}
-
-async function tryFetch(url, headers, body, parser) {
-  const proxy = getProxyEndpoint();
-  const fetchUrl = proxy || url;
-  const fetchHeaders = proxy ? Object.assign({}, headers, { 'X-Target-URL': url }) : headers;
+async function fetchJsonPost(fetchUrl, headers, body) {
   const res = await fetch(fetchUrl, {
     method: 'POST',
-    headers: fetchHeaders,
+    headers: headers,
     body: JSON.stringify(body),
   });
   const text = await res.text();
@@ -71,7 +62,41 @@ async function tryFetch(url, headers, body, parser) {
     throw new Error(msg);
   }
   if (!data) throw new Error('响应不是 JSON');
-  return parser(data);
+  return data;
+}
+
+// fetch() rejects with TypeError only on genuine network/CORS failures.
+// HTTP 4xx/5xx are authoritative provider answers and must NOT be
+// re-sent to another backend.
+function isNetworkError(e) {
+  return e instanceof TypeError;
+}
+
+async function tryFetch(url, headers, body, parser) {
+  // 1. Explicit proxy configured → always use it.
+  if (Model.proxy) {
+    const proxy = Model.proxy.replace(/\/+$/, '');
+    const data = await fetchJsonPost(proxy, Object.assign({}, headers, { 'X-Target-URL': url }), body);
+    return parser(data);
+  }
+
+  // 2. Direct fetch first.
+  try {
+    const data = await fetchJsonPost(url, headers, body);
+    return parser(data);
+  } catch (e) {
+    // 3. Only on genuine network/CORS failure, and only when hosted
+    //    (non-file://), try the same-origin /proxy relay.
+    if (!isNetworkError(e) || window.location.protocol === 'file:') throw e;
+    const directError = e;
+    try {
+      const data = await fetchJsonPost('/proxy', Object.assign({}, headers, { 'X-Target-URL': url }), body);
+      return parser(data);
+    } catch (e2) {
+      // 4. /proxy missing or also failing → report the original error.
+      throw directError;
+    }
+  }
 }
 
 async function callModelText(body) {
@@ -110,9 +135,10 @@ async function callModelText(body) {
 }
 
 async function verifyConnection() {
-  const isDeepSeek = /api\.deepseek\.com/i.test(Model.apiBase || '');
+  // Always test the model the user actually configured — never silently
+  // substitute a different model for the connection check.
   const body = {
-    model: isDeepSeek ? 'deepseek-chat' : (Model.model || 'deepseek-v4-pro'),
+    model: Model.model || 'deepseek-v4-pro',
     max_tokens: 8,
     system: '只回复 OK。',
     messages: [{ role: 'user', content: 'OK' }],

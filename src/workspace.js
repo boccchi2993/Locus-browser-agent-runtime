@@ -34,6 +34,7 @@ class WorkspaceAdapter {
   async read(path) { throw new Error('not implemented'); }        // → string (utf-8)
   async readBytes(path) { throw new Error('not implemented'); }   // → Uint8Array
   async write(path, data) { throw new Error('not implemented'); } // string | Uint8Array
+  async remove(path) { throw new Error('not implemented'); }      // delete a file
   async exists(path) { throw new Error('not implemented'); }
   async stat(path) { throw new Error('not implemented'); }        // → {kind, size, modified}
 }
@@ -93,6 +94,13 @@ class LocalDirectoryWorkspace extends WorkspaceAdapter {
     const w = await fh.createWritable();
     await w.write(typeof data === 'string' ? data : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
     await w.close();
+  }
+
+  async remove(path) {
+    const { dirParts, base } = this._split(path);
+    if (!base) throw new Error('cannot remove workspace root');
+    const dir = await this._dir(dirParts, false);
+    await dir.removeEntry(base);
   }
 
   async exists(path) {

@@ -2,7 +2,7 @@
 // Usage: launch Chrome with --headless=new --remote-debugging-port=9333
 //        --allow-file-access-from-files <path-to>/tests/e2e.html, then `node tests/run-e2e.cjs`.
 const DEBUG_PORT = 9333;
-const DEADLINE = Date.now() + 170000;
+const DEADLINE = Date.now() + 280000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

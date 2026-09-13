@@ -119,9 +119,14 @@ async function selectWorkspace() {
       return;
     }
     App.workspace = new LocalDirectoryWorkspace(handle);
+    // Context isolation: file contents from the previous workspace must
+    // not leak into LLM requests for the new one. Only on success —
+    // picker cancellation and failures never reset.
+    Agent.history = [];
     document.getElementById('sb-workspace').textContent = 'Workspace: ' + App.workspace.name;
     if (App.term) {
       App.term.echo('[[;var(--accent);]Workspace 已挂载: ' + escapeTerm(App.workspace.name) + '/]');
+      App.term.echo('[[;var(--text-dim);]Workspace changed. Agent context has been reset.]');
     }
   } catch (e) {
     if (e && e.name === 'AbortError') return; // user cancelled the picker
@@ -175,6 +180,7 @@ function printHelp(term) {
 
 const LOCAL_COMMANDS = {
   help: (args, term) => printHelp(term),
+  clear: (args, term) => term.clear(), // fully local, never sent to the model
   telemetry: (args, term) => toggleDebugPanel(),
   workspace: (args, term) => {
     term.echo(App.workspace

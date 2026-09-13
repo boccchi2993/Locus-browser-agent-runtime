@@ -8,10 +8,12 @@
 <script src="../src/workspace.js"></script>
 <script src="../src/shell.js"></script>
 <script src="../src/tools.js"></script>
+<script src="../src/agent.js"></script>
 <script>
 (async () => {
   const lines = [];
   const log = (m) => { lines.push(m); document.getElementById('out').textContent = lines.join('\n'); };
+  const check = (name, cond, detail) => log((cond ? 'PASS' : 'FAIL') + ' ' + name + (detail !== undefined ? ' | ' + detail : ''));
   try {
     // Pull the real worker source out of index.html so we test the shipped artifact.
     const html = await (await fetch('../index.html')).text();
@@ -30,32 +32,95 @@
       async read(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); return this.files[p]; }
       async readBytes(p) { return new TextEncoder().encode(await this.read(p)); }
       async write(p, data) { p = normalizeWorkspacePath(p); this.files[p] = typeof data === 'string' ? data : new TextDecoder().decode(data); }
-      async exists(p) { try { normalizeWorkspacePath(p); return p in this.files; } catch (e) { return false; } }
+      async remove(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); delete this.files[p]; }
+      async exists(p) { try { p = normalizeWorkspacePath(p); } catch (e) { return false; } return p in this.files; }
       async stat(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); return { kind: 'file', size: this.files[p].length, modified: 0 }; }
     }
 
+    // ---------- A. workspace path escape ----------
+    check('A1 path ../escape rejected', (() => { try { normalizeWorkspacePath('../escape.txt'); return false; } catch (e) { return true; } })());
+    check('A2 path a/../../x rejected', (() => { try { normalizeWorkspacePath('a/../../x'); return false; } catch (e) { return true; } })());
+    check('A3 path C:/win rejected', (() => { try { normalizeWorkspacePath('C:/win/x'); return false; } catch (e) { return true; } })());
+    check('A4 normal path ok', normalizeWorkspacePath('a/b.txt') === 'a/b.txt');
+
+    // ---------- C. strict tool parser ----------
+    const pure = '```json\n{"tool":"bash","input":"ls"}\n```';
+    const wrapped = '我来看一下目录：\n```json\n{"tool":"bash","input":"ls"}\n```\n以上是调用。';
+    const sayStyle = '```json\n{"say":"hi","actions":[]}\n```';
+    check('C1 pure fenced block parses', (parseToolCall(pure) || {}).input === 'ls');
+    check('C2 prose-wrapped block NOT parsed', parseToolCall(wrapped) === null);
+    check('C3 say-style block NOT a tool call', parseToolCall(sayStyle) === null);
+    check('C4 plain text NOT a tool call', parseToolCall('完成。') === null);
+    check('C5 whitespace-padded pure block parses', (parseToolCall('  \n' + pure + '\n ') || {}).input === 'ls');
+
     const ws = new MemWS({ 'sales.csv': 'name,revenue,cost\nA,100,40\nB,200,80\nC,300,120\n' });
 
-    log('ls => ' + JSON.stringify((await executeTool('bash', 'ls', ws)).output));
-    log('cat => ' + JSON.stringify((await executeTool('bash', 'cat sales.csv', ws)).output));
-    log('bad => ' + JSON.stringify((await executeTool('bash', 'sudo rm x', ws)).output));
-    log('cloud => ' + JSON.stringify((await executeTool('cloud_bash', 'ls', ws)).output));
+    // ---------- existing smoke: ls / cat / unsupported / cloud ----------
+    check('smoke ls', (await executeTool('bash', 'ls', ws)).output === 'sales.csv');
+    check('smoke cat', (await executeTool('bash', 'cat sales.csv', ws)).output.includes('A,100,40'));
+    check('smoke unsupported', (await executeTool('bash', 'sudo rm x', ws)).output === 'bash: sudo: command not available in local browser runtime');
 
-    const code = [
+    // ---------- H. cloud_bash stays a stub ----------
+    const cloud = await executeTool('cloud_bash', 'ls', ws);
+    check('H cloud_bash stub', cloud.output === 'Cloud execution is not configured.');
+
+    // ---------- B. telemetry UTF-8 bytes ----------
+    Telemetry.records.length = 0;
+    await executeTool('bash', 'echo 你好', ws);
+    const rec = Telemetry.records[0];
+    check('B telemetry utf8 bytes', rec.input_bytes === 11 && rec.output_bytes === 6,
+      'in=' + rec.input_bytes + ' out=' + rec.output_bytes);
+    check('B2 window.__telemetry identity', window.__telemetry === Telemetry.records);
+    // force trim past 500 and re-check reference identity
+    for (let i = 0; i < 501; i++) Telemetry.record({ tool: 'x' });
+    check('B3 __telemetry survives trim', window.__telemetry === Telemetry.records && Telemetry.records.length === 500);
+
+    // ---------- D. heredoc python: quotes / JSON / multi-line ----------
+    const hdCode = [
+      'import json',
+      'data = {\'name\': "locus", \'values\': [1, 2, 3]}',
+      'print(json.dumps(data))',
+      'print("single \'q\' and double \\"d\\" ok")',
+      'print("line3")',
+    ].join('\n');
+    const hd = await executeTool('bash', "python <<'PY'\n" + hdCode + '\nPY', ws);
+    check('D heredoc python', hd.success && hd.output.includes('{"name": "locus"') && hd.output.includes('line3'),
+      JSON.stringify(hd.output).slice(0, 160));
+
+    // ---------- pandas demo (V0 acceptance) ----------
+    const pdCode = [
       'import pandas as pd',
       'df = pd.read_csv("sales.csv")',
       'means = df[["revenue", "cost"]].mean()',
       'out = "column,mean\\n" + "\\n".join(f"{k},{v}" for k, v in means.items()) + "\\n"',
       'open("summary.csv", "w").write(out)',
-      'print(out)',
     ].join('\n');
-    const r = await executeTool('bash', "python -c '" + code + "'", ws);
-    log('python success => ' + r.success);
-    log('python output => ' + JSON.stringify(r.output));
-    log('summary.csv written back => ' + JSON.stringify(ws.files['summary.csv'] || null));
-    log('telemetry count => ' + Telemetry.records.length);
-    log('telemetry last => ' + JSON.stringify(Telemetry.records[Telemetry.records.length - 1]));
-    log('DONE');
+    const pdr = await executeTool('bash', "python <<'PY'\n" + pdCode + '\nPY', ws);
+    check('demo pandas summary', pdr.success && ws.files['summary.csv'] === 'column,mean\nrevenue,200.0\ncost,80.0\n',
+      JSON.stringify(ws.files['summary.csv']));
+
+    // ---------- F. deletion sync ----------
+    await executeTool('bash', "python <<'PY'\nimport os\nos.remove('sales.csv')\nPY", ws);
+    check('F deletion sync', !('sales.csv' in ws.files), Object.keys(ws.files).join(','));
+
+    // ---------- G. rename semantics ----------
+    const gr = await executeTool('bash', "python <<'PY'\nimport os\nos.rename('summary.csv', 'renamed.csv')\nPY", ws);
+    check('G rename', !('summary.csv' in ws.files) && ws.files['renamed.csv'] === 'column,mean\nrevenue,200.0\ncost,80.0\n',
+      Object.keys(ws.files).join(','));
+
+    // ---------- E. python timeout + worker recovery (runs last) ----------
+    const t0 = performance.now();
+    const to = await executeTool('bash', "python <<'PY'\nwhile True:\n    pass\nPY", ws);
+    const dur = Math.round(performance.now() - t0);
+    check('E1 timeout error', !to.success && to.output.includes('python execution timed out after 30000ms'),
+      dur + 'ms | ' + JSON.stringify(to.output).slice(0, 120));
+    check('E2 worker reset to cold', PythonRuntime.worker === null && PythonRuntime.status === 'cold');
+    const rec2 = await executeTool('bash', "python <<'PY'\nprint(1 + 1)\nPY", ws);
+    check('E3 recovery print(1+1)=2', rec2.success && rec2.output.trim().startsWith('2'),
+      JSON.stringify(rec2.output).slice(0, 120));
+
+    log('telemetry records: ' + Telemetry.records.length);
+    log(lines.some((l) => l.startsWith('FAIL')) ? 'E2E-FAIL (see above)' : 'DONE');
   } catch (e) {
     log('E2E-FAIL: ' + (e && e.stack || e));
   }

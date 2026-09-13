@@ -14,7 +14,7 @@ async function executeTool(name, input, workspace) {
   let output = '';
   let success = true;
   let error = null;
-  let ioIn = String(input || '').length;
+  let ioIn = utf8ByteLength(input || '');
   let ioOut = 0;
 
   try {
@@ -44,7 +44,7 @@ async function executeTool(name, input, workspace) {
     duration_ms: Math.round(performance.now() - started),
     success,
     input_bytes: ioIn,
-    output_bytes: ioOut || output.length,
+    output_bytes: ioOut || utf8ByteLength(output),
     error,
   });
 

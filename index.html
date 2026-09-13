@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Browser Agent Runtime</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/jquery.terminal/css/jquery.terminal.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/jquery.terminal@2.47.0/css/jquery.terminal.min.css">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -159,8 +159,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/jquery"></script>
-<script src="https://cdn.jsdelivr.net/npm/jquery.terminal/js/jquery.terminal.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jquery.terminal@2.47.0/js/jquery.terminal.min.js"></script>
 
 <!--
   Pyodide Web Worker source.
@@ -242,12 +242,20 @@ function diffOut(manifest) {
   const entries = [];
   walkFs(WORK_ROOT, '', entries);
   const changed = [];
+  const present = new Set();
   for (const e of entries) {
+    present.add(e.path);
     const b64 = bytesToB64(py.FS.readFile(e.full));
     if (manifest[e.path] === b64) continue;
     changed.push({ path: e.path, b64: b64 });
   }
-  return changed;
+  // Files that were synced in but no longer exist after the run were
+  // deleted (or renamed away) by the Python code.
+  const deleted = [];
+  for (const path of Object.keys(manifest)) {
+    if (!present.has(path)) deleted.push(path);
+  }
+  return { changed: changed, deleted: deleted };
 }
 
 self.onmessage = async (ev) => {
@@ -277,10 +285,10 @@ self.onmessage = async (ev) => {
       error = String(e && e.message ? e.message : e);
     }
 
-    const changed = diffOut(manifest);
-    self.postMessage({ id: id, type: 'result', stdout: stdout, stderr: stderr, error: error, files: changed });
+    const diff = diffOut(manifest);
+    self.postMessage({ id: id, type: 'result', stdout: stdout, stderr: stderr, error: error, files: diff.changed, deleted: diff.deleted });
   } catch (e) {
-    self.postMessage({ id: id, type: 'result', stdout: '', stderr: '', error: String(e && e.message ? e.message : e), files: [] });
+    self.postMessage({ id: id, type: 'result', stdout: '', stderr: '', error: String(e && e.message ? e.message : e), files: [], deleted: [] });
   }
 };
 </script>
