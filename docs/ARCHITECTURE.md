@@ -69,50 +69,51 @@ Execution placement may change transparently, but authority must not.
 
 Moving work from browser-local execution to an external service or cloud backend must not silently grant access to data, credentials, or side effects that the original capability did not have.
 
-## 3. Target core primitives
+## 3. Runtime substrate and Unix-like interface
 
-The target core capability surface is intentionally small.
+The runtime layer exists to make three machine capabilities reliable inside a browser tab:
 
-### Compute
+### Execution
 
-- **Python** — currently implemented with Pyodide in a dedicated Web Worker.
-- **JavaScript** — target primitive; should run in an isolated Worker, not via model-controlled eval in the application UI context.
+Execution runs local userland computation.
 
-### State
+Current and target environments include Python through Pyodide, JavaScript through an isolated Worker, WebAssembly modules, and future WASM ports of useful command-line programs.
 
-- **Workspace** — user-authorized local filesystem boundary.
-- **Edit** — deterministic file mutation primitive. It should support precise operations such as read, write, replace-exact, and insert without requiring a heavyweight compute runtime.
+Python and JavaScript are execution environments, not independent architectural primitives.
 
-### Connectivity
+### Filesystem
 
-- **curl** — public HTTPS connectivity exposed through the local shell abstraction.
-  - direct browser fetch first,
-  - edge relay only when browser networking prevents the request,
-  - binary-safe downloads,
-  - no hidden escalation to remote execution.
+Filesystem provides state and local authority.
 
-### Escalation
+It includes the user-authorized workspace, path confinement, reads and writes, synchronization, conflict detection, resource bounds, and deterministic mutation.
 
-- **cloud_bash** — reserved future fallback for workloads that cannot be completed by the local/browser capability set.
-- It is not part of the current execution path and must fail explicitly while unconfigured.
+The model-facing `edit` capability is a reliable interface to this same filesystem authority.
 
-The intended end state is roughly:
+### Network
+
+Network provides Internet connectivity.
+
+The current implementation exposes this primarily through `curl`, but `curl` is a Unix-facing consumer of the network capability, not the network primitive itself.
+
+The target is for `curl`, Python HTTP libraries, and JavaScript networking to reuse the same Locus network boundary where practical.
+
+The model-facing machine should remain small:
 
 ```
 Agent
   |
   +-- bash
-  |    +-- js      -> isolated JS runtime
-  |    +-- python  -> Pyodide
-  |    +-- curl    -> NetworkRuntime
-  |    +-- file commands -> Workspace
+  |    +-- python
+  |    +-- js
+  |    +-- curl
+  |    +-- file/userland commands
   |
-  +-- edit         -> deterministic workspace mutation
+  +-- edit
   |
-  +-- cloud_bash   -> future escalation backend
+  +-- cloud_bash   (future escalation provider)
 ```
 
-Whether `edit` remains a shell command or becomes a structured model-facing tool is an implementation decision to be validated with real model behavior. The semantic capability is the important part.
+`bash` is the Unix-like execution facade. `edit` exists because deterministic structured mutation is particularly useful for agents. `cloud_bash` is a future escalation provider, not another local primitive.
 
 ## 4. Current execution layers
 
