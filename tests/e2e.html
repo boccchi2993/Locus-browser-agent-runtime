@@ -210,9 +210,10 @@
 
     // ---------- M. cancel reachable while busy — REAL UI event path (Finding 3) ----------
     // The in-flight task is cancelled by dispatching genuine UI events
-    // (button click / Escape keydown), not by calling cancelAgentTask().
+    // (button click / Escape keydown), not by calling App.session.cancel().
+    // The session's modelClient delegates to the global callModel, so
+    // stubbing window.callModel here reaches the running task.
     {
-      const termStub = { echo: () => {}, pause: () => {}, resume: () => {}, update: () => {} };
       const origCallModel = window.callModel;
       let modelAborted = 0;
       window.callModel = (req, opts) => new Promise((resolve, reject) => {
@@ -227,18 +228,18 @@
 
         // start a task that hangs inside the model request
         App.busy = true; updateCancelButton();
-        const task1 = runAgentTask(termStub, 'hang on model');
+        const task1 = App.session.run('hang on model', { workspace: null });
         check('M2 cancel button enabled while busy', btnCancel.disabled === false);
         btnCancel.click(); // real UI event
         await task1;
         check('M3 button click aborts the in-flight model request', modelAborted === 1, 'aborts=' + modelAborted);
-        check('M4 task object cleared after cancel', Agent.task === null);
+        check('M4 task object cleared after cancel', App.session.task === null);
         App.busy = false; updateCancelButton();
         check('M5 button disabled again after task ends', btnCancel.disabled === true);
 
         // Escape keydown path
         App.busy = true; updateCancelButton();
-        const task2 = runAgentTask(termStub, 'hang on model 2');
+        const task2 = App.session.run('hang on model 2', { workspace: null });
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
         await task2;
         check('M6 Escape aborts the in-flight request', modelAborted === 2, 'aborts=' + modelAborted);
@@ -246,20 +247,20 @@
 
         // idle click must be harmless (no throw, no state change)
         btnCancel.click();
-        check('M7 idle click is harmless', Agent.task === null && App.busy === false);
+        check('M7 idle click is harmless', App.session.task === null && App.busy === false);
 
         // double cancel while already cancelling must not throw or re-abort
         App.busy = true; updateCancelButton();
-        const task3 = runAgentTask(termStub, 'hang on model 3');
+        const task3 = App.session.run('hang on model 3', { workspace: null });
         btnCancel.click();
         btnCancel.click();
         await task3;
-        check('M8 double cancel is safe', modelAborted === 3 && Agent.task === null, 'aborts=' + modelAborted);
+        check('M8 double cancel is safe', modelAborted === 3 && App.session.task === null, 'aborts=' + modelAborted);
         App.busy = false; updateCancelButton();
       } finally {
         window.callModel = origCallModel;
         App.busy = false; updateCancelButton();
-        Agent.history = [];
+        App.session.history = [];
       }
     }
 
