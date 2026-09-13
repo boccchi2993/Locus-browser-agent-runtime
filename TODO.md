@@ -149,7 +149,7 @@ The Vue layer consumes runtime events.
 
 Do not move provider serialization, tool semantics, execution routing, or agent-loop decisions into Vue stores/components.
 
-## V0.4 — Core primitive completion
+## V0.4 — Runtime substrate completion
 
 ### JavaScript runtime
 
