@@ -68,7 +68,7 @@ See docs/MODEL-PROTOCOL.md.
 
 ## V0.4 — UI rebuild and runtime substrate completion
 
-Goal: make the UI reflect an execution harness rather than a terminal-only demo, while finishing the target core primitive set.
+Goal: make the UI reflect an execution harness rather than a terminal-only demo, while finishing the target runtime substrate.
 
 ### Vue UI
 
@@ -100,7 +100,7 @@ Requirements:
 - explicit bridge for permitted inputs/outputs,
 - lifecycle timeout and recovery semantics comparable to Python.
 
-### Edit primitive
+### Deterministic edit capability
 
 Add deterministic file editing/state mutation.
 
@@ -165,7 +165,7 @@ Introduce a provider-neutral registry describing available capabilities and depe
 The registry should support:
 
 - availability,
-- required primitives,
+- required substrate capabilities,
 - runtime/provider,
 - authority level,
 - optional dependencies,
