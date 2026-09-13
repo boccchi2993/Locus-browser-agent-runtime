@@ -186,6 +186,56 @@ async function run() {
     captured && captured.messages.every((m) => !Object.keys(m).some((k) => k.startsWith('_'))),
     JSON.stringify(captured && captured.messages[0] && Object.keys(captured.messages[0])));
 
+  // ---------- G11. cancel mid-tool: completed commit report is shown, loop stops ----------
+  // The tool is cancelled mid-run but still finishes with a REAL partial
+  // commit report. That report must reach the user (and history), and no
+  // further model call may happen. Cancellation is not a rollback.
+  resetState();
+  modelCalls = 0;
+  global.callModel = async () => { modelCalls++; return modelCalls === 1 ? TOOL_CALL : FINAL; };
+  global.executeTool = () => new Promise((r) => setTimeout(() =>
+    r({ output: '[written to workspace: a.txt]\n[not persisted: b.txt (cancelled before write)]',
+      success: false }), 40));
+  task = M.runAgentTask(term, 'make two files');
+  await new Promise((r) => setTimeout(r, 10)); // tool started
+  M.cancelAgentTask();
+  await task;
+  check('G11 no second model call after cancel', modelCalls === 1, 'modelCalls=' + modelCalls);
+  check('G11b commit report shown to the user',
+    term.lines.some((l) => l.includes('written to workspace: a.txt'))
+    && term.lines.some((l) => l.includes('not persisted: b.txt (cancelled before write)')),
+    term.lines.join(' | '));
+  check('G11c cancel note does not claim rollback',
+    term.lines.some((l) => l.includes('任务已取消') && l.includes('不会回滚'))
+    && !term.lines.some((l) => l.includes('丢弃后续结果')),
+    term.lines.join(' | '));
+  check('G11d commit report recorded in history (same session continues)',
+    M.Agent.history.length === 3
+    && M.Agent.history[2].content.includes('<tool_result>')
+    && M.Agent.history[2].content.includes('[written to workspace: a.txt]'),
+    JSON.stringify(M.Agent.history.map((h) => h.role)));
+
+  // ---------- G12. session switch mid-tool: report never leaks into the new session ----------
+  resetState();
+  modelCalls = 0;
+  global.callModel = async () => { modelCalls++; return modelCalls === 1 ? TOOL_CALL : FINAL; };
+  let resolveToolG12;
+  global.executeTool = () => new Promise((r) => { resolveToolG12 = () =>
+    r({ output: '[written to workspace: secret.txt]', success: true }); });
+  task = M.runAgentTask(term, 'task in A');
+  await new Promise((r) => setTimeout(r, 10)); // tool started
+  global.App.workspace = { name: 'B' };
+  M.resetAgentSession();
+  resolveToolG12();
+  await task;
+  check('G12 switch discards the old result entirely',
+    !term.lines.some((l) => l.includes('secret.txt'))
+    && term.lines.some((l) => l.includes('会话已切换')),
+    term.lines.join(' | '));
+  check('G12b new session history stays clean, no extra model call',
+    M.Agent.history.length === 0 && modelCalls === 1,
+    'history=' + M.Agent.history.length + ' modelCalls=' + modelCalls);
+
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
 }

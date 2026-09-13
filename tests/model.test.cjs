@@ -7,6 +7,10 @@ const path = require('path');
 // --- browser stubs (model.js touches window only for the /proxy fallback) ---
 global.window = { location: { protocol: 'file:' } };
 
+// Cleanup rejections must never surface as unhandled rejections (P6/P10).
+const unhandled = [];
+process.on('unhandledRejection', (e) => { unhandled.push(e); });
+
 // --- load the real model.js ---
 const M = eval(
   fs.readFileSync(path.join(__dirname, '..', 'src', 'model.js'), 'utf8') +
@@ -46,6 +50,17 @@ global.fetch = async (url, opts) => {
         },
       }),
       text: async () => { throw new TypeError('Failed to fetch'); },
+    };
+  }
+  if (next.bodyStream) {
+    // Native ReadableStream body with caller-defined behavior — used to
+    // exercise stalled reads and hanging/rejecting cleanup (cancel()).
+    return {
+      ok: next.status >= 200 && next.status < 300,
+      status: next.status,
+      headers: { get: (n) => (next.headers || {})[String(n).toLowerCase()] || null },
+      body: next.bodyStream(),
+      text: async () => { throw new Error('text() not available in bodyStream mock'); },
     };
   }
   return {
@@ -348,6 +363,78 @@ async function run() {
     && calls[1].url === '/proxy', calls.map((c) => c.url).join(','));
 
   global.window.location.protocol = 'file:';
+
+  // ---------- R. stream cleanup never blocks timeout/cancel/size-cap exits ----------
+  // Native ReadableStream bodies whose cancel() hangs / rejects / resolves.
+  const stallStream = (cancelImpl) => () => new ReadableStream({
+    start() { /* read stalls forever */ },
+    cancel: cancelImpl,
+  });
+
+  // R1: body stall + hanging cancel() → timeout exit must not be blocked
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, bodyStream: stallStream(() => new Promise(() => {})) });
+  let r1Err = null;
+  const r1start = Date.now();
+  try { await M.callModel(body, { timeoutMs: 40 }); } catch (e) { r1Err = e; }
+  const r1elapsed = Date.now() - r1start;
+  check('R1 hanging reader.cancel() does not block the timeout exit',
+    r1Err && r1Err.timeout === true && r1Err.message.includes('body incomplete') && r1elapsed < 5000,
+    (r1Err && r1Err.name + '/' + r1Err.message) + ' after ' + r1elapsed + 'ms');
+  check('R1b no endpoint retry (single paid request)', calls.length === 1, 'calls=' + calls.length);
+
+  // R2: rejecting cancel() keeps the timeout classification
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, bodyStream: stallStream(() => Promise.reject(new Error('cleanup blew up'))) });
+  let r2Err = null;
+  try { await M.callModel(body, { timeoutMs: 40 }); } catch (e) { r2Err = e; }
+  check('R2 rejecting reader.cancel() keeps the timeout classification',
+    r2Err && r2Err.timeout === true, r2Err && r2Err.message);
+
+  // R3: normal cancel() still runs and resolves
+  reset('https://api.deepseek.com');
+  let r3cancelled = false;
+  queue.push({ status: 200, bodyStream: stallStream(() => { r3cancelled = true; return Promise.resolve(); }) });
+  let r3Err = null;
+  try { await M.callModel(body, { timeoutMs: 40 }); } catch (e) { r3Err = e; }
+  check('R3 resolving reader.cancel() → timeout error, cleanup ran',
+    r3Err && r3Err.timeout === true && r3cancelled === true,
+    (r3Err && r3Err.message) + ' cancelled=' + r3cancelled);
+
+  // R4: streamed body over the size cap + hanging cancel() → parse error promptly
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, bodyStream: () => new ReadableStream({
+    start(c) {
+      const mb = new Uint8Array(1024 * 1024);
+      for (let i = 0; i < 17; i++) c.enqueue(mb); // 17 MiB > 16 MiB cap
+    },
+    cancel() { return new Promise(() => {}); },
+  }) });
+  let r4Err = null;
+  const r4start = Date.now();
+  try { await M.callModel(body, { timeoutMs: 30000 }); } catch (e) { r4Err = e; }
+  const r4elapsed = Date.now() - r4start;
+  check('R4 size-cap exit not blocked by hanging cleanup (ParseError, no retry)',
+    r4Err && r4Err.name === 'ParseError' && r4Err.noFallback === true
+    && r4Err.message.includes('too large') && r4elapsed < 5000 && calls.length === 1,
+    (r4Err && r4Err.name + '/' + r4Err.message) + ' after ' + r4elapsed + 'ms calls=' + calls.length);
+
+  // R5: external cancel during stalled body + hanging cleanup → AbortError promptly
+  reset('https://api.deepseek.com');
+  queue.push({ status: 200, bodyStream: stallStream(() => new Promise(() => {})) });
+  const ac5 = new AbortController();
+  setTimeout(() => ac5.abort(), 30);
+  let r5Err = null;
+  const r5start = Date.now();
+  try { await M.callModel(body, { signal: ac5.signal, timeoutMs: 60000 }); } catch (e) { r5Err = e; }
+  const r5elapsed = Date.now() - r5start;
+  check('R5 external cancel + hanging cleanup → AbortError, not blocked',
+    r5Err && r5Err.name === 'AbortError' && r5elapsed < 5000 && calls.length === 1,
+    (r5Err && r5Err.name) + ' after ' + r5elapsed + 'ms calls=' + calls.length);
+
+  await new Promise((r) => setTimeout(r, 50)); // let any stray rejection surface
+  check('R6 no unhandled rejections from stream cleanup', unhandled.length === 0,
+    unhandled.map((e) => String(e)).join(' | '));
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);

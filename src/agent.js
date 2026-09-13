@@ -35,8 +35,10 @@ function resetAgentSession() {
 }
 
 // Cancel the running task: aborts the in-flight model request and any
-// pending Python execution; late results are discarded by the staleness
-// checks in runAgentTask.
+// pending Python execution. Results arriving after a SESSION switch are
+// discarded by the staleness checks in runAgentTask; a tool result that
+// completed before a current-session cancel is still reported to the
+// user (cancellation is not a rollback — committed changes stay).
 function cancelAgentTask() {
   if (Agent.task) Agent.task.controller.abort();
 }
@@ -170,9 +172,17 @@ async function runAgentTask(term, userText) {
   const workspace = App.workspace; // immutable reference for this task
   const controller = new AbortController();
   Agent.task = { controller };
-  const isStale = () => generation !== Agent.generation || controller.signal.aborted;
-  const noteCancelled = () => {
-    term.echo('[[;var(--text-dim);][任务已取消或会话已切换，丢弃后续结果。]]');
+  // Session switch (workspace change / reset) and current-session cancel
+  // are DIFFERENT events: the former makes every late result foreign to
+  // the new session (discard silently), the latter stops the loop but
+  // tool results that already completed are still real and must be
+  // reported.
+  const sessionChanged = () => generation !== Agent.generation;
+  const isStale = () => sessionChanged() || controller.signal.aborted;
+  const noteDiscarded = () => {
+    term.echo(sessionChanged()
+      ? '[[;var(--text-dim);][会话已切换，丢弃本次任务的后续结果。]]'
+      : '[[;var(--text-dim);][任务已取消，丢弃后续结果。]]');
   };
 
   try {
@@ -192,7 +202,7 @@ async function runAgentTask(term, userText) {
       } catch (e) {
         stopThinking(thinking);
         if (isStale() || (e && (e.cancelled || e.name === 'AbortError'))) {
-          noteCancelled();
+          noteDiscarded();
           return;
         }
         term.echo('[[;var(--red);][模型调用失败: ' + escapeTerm(e.message) + ']]');
@@ -203,7 +213,7 @@ async function runAgentTask(term, userText) {
       // A response that arrives after a session switch belongs to the OLD
       // session: never execute it and never write it into the new history.
       if (isStale()) {
-        noteCancelled();
+        noteDiscarded();
         return;
       }
 
@@ -238,10 +248,11 @@ async function runAgentTask(term, userText) {
 
       const result = await executeTool(call.tool, call.input, workspace, { signal: controller.signal });
 
-      // The tool finished after a session switch/cancel: its result (and
-      // any side effects it reports) belongs to the old session.
-      if (isStale()) {
-        noteCancelled();
+      // The tool finished after a SESSION SWITCH: its result (and any
+      // side effects it reports) belongs to the old session — never show
+      // it or record it in the new one.
+      if (sessionChanged()) {
+        noteDiscarded();
         return;
       }
 
@@ -264,6 +275,19 @@ async function runAgentTask(term, userText) {
         truncateFor(result.output, TOOL_RESULT_MAX_CHARS) + '\n' +
         '</tool_result>';
       Agent.history.push({ role: 'user', content: feedback });
+
+      // CURRENT-SESSION cancel: the tool already ran to completion, so
+      // the report echoed above (and recorded in history) is real — it
+      // states exactly what committed, what failed and what was not
+      // persisted. Stop the loop WITHOUT another model call. Cancellation
+      // is NOT a rollback: committed changes stay committed, and an
+      // incomplete result is surfaced as the tool reported it, never
+      // rewritten as "not executed".
+      if (controller.signal.aborted) {
+        term.echo('[[;var(--orange);][任务已取消，停止后续模型调用。以上是取消前已完成的工具执行结果' +
+          '（含已写入/已删除/未持久化信息）；取消不会回滚已提交的更改。]]');
+        return;
+      }
     }
 
     renderAgent(term, '已达到最大工具调用次数（' + MAX_TOOL_ITERATIONS + '），任务中止。请细化需求后重试。');

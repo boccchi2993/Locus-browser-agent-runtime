@@ -35,6 +35,12 @@ below are reflected in the roadmap sections.
 - [x] Model body-read failures after headers classified as BodyReadError (no relay fallback, no double-billed inference)
 - [x] verify-active-content serves the real functions/fetch.js handler response
 
+### Round 3 (V0.3.2)
+
+- [x] Cancel vs session switch distinguished in the agent loop: a current-session cancel after a completed tool call shows the tool's real commit report (written/deleted/not-persisted), records it in history and stops the model loop — cancellation is never presented as a rollback; a session switch still discards late results without leaking them
+- [x] Stream cleanup (reader.cancel()) on timeout/cancel/size-cap exits is best-effort and never awaited in network.js and model.js — a hanging or rejecting cancel() can no longer block the caller or cause unhandled rejections; error classification preserved
+- [x] relayTimeoutMs is a real NetworkRuntime.fetch option, plumbed fetch → _relay; N23 now proves the passed deadline is actually used (elapsed-time assertion) and that the 45s default is retained
+
 ## Immediate — V0.2.1
 
 ### Network consistency

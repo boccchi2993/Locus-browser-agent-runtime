@@ -12,7 +12,12 @@ global.window = { location: { protocol: 'https:' } }; // hosted page → relay a
 const src = ['telemetry.js', 'workspace.js', 'network.js', 'shell.js', 'tools.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
-const M = eval(src + '\n;({ Telemetry, WorkspaceAdapter, normalizeWorkspacePath, NetworkRuntime, runShellCommand, executeTool });');
+const M = eval(src + '\n;({ Telemetry, WorkspaceAdapter, normalizeWorkspacePath, NetworkRuntime, runShellCommand, executeTool, RELAY_CLIENT_TIMEOUT_MS });');
+
+// Any unhandled rejection during the run is a test failure (cleanup paths
+// must attach rejection handlers — see N25/N29).
+const unhandled = [];
+process.on('unhandledRejection', (e) => { unhandled.push(e); });
 
 // --- byte-exact in-memory workspace ---
 class MemWS extends M.WorkspaceAdapter {
@@ -275,16 +280,111 @@ async function run() {
   check('N22 slow body within deadline completes', new TextDecoder().decode(t22.bytes) === 'c0c1c2c3c4'
     && t22.backend === 'browser-direct', new TextDecoder().decode(t22.bytes));
 
-  // ---------- 23. relay body stall also times out (as timeout, not 'unreachable') ----------
+  // ---------- 23. relay body stall times out at the PASSED relay deadline ----------
+  // relayTimeoutMs is a supported fetch() option: it must actually reach
+  // the relay attempt. Proof is the elapsed time (40ms deadline vs the
+  // 45000ms default), not merely that some timeout is eventually thrown.
   reset();
   on((u) => u === 'https://blocked2.test/x', () => { throw new TypeError('Failed to fetch'); });
   on((u) => u.startsWith('/fetch?'), () => new Response(
     new ReadableStream({ start() { /* stalls */ } }),
     { status: 200, headers: { 'content-type': 'text/plain' } }));
   let t23Err = null;
+  const t23start = Date.now();
   try { await M.NetworkRuntime.fetch('https://blocked2.test/x', { timeoutMs: 40, relayTimeoutMs: 40 }); } catch (e) { t23Err = e; }
+  const t23elapsed = Date.now() - t23start;
   check('N23 relay body stall → timeout error (not unreachable, not retry loop)',
-    t23Err && t23Err.timeout === true, t23Err && t23Err.message);
+    t23Err && t23Err.timeout === true && !t23Err.message.includes('unreachable'),
+    t23Err && t23Err.message);
+  check('N23b the PASSED 40ms deadline was actually used (not the 45s default)',
+    t23elapsed < 5000, 'elapsed=' + t23elapsed + 'ms');
+  check('N23c default relay deadline retained', M.RELAY_CLIENT_TIMEOUT_MS === 45000,
+    'RELAY_CLIENT_TIMEOUT_MS=' + M.RELAY_CLIENT_TIMEOUT_MS);
+
+  // ---------- 24. stream cleanup must not block the timeout exit (cancel never settles) ----------
+  reset();
+  on((u) => u === 'https://hangcancel.test/x', () => new Response(
+    new ReadableStream({
+      start() { /* read stalls */ },
+      cancel() { return new Promise(() => {}); }, // cleanup hangs forever
+    }),
+    { status: 200, headers: { 'content-type': 'text/plain' } }));
+  let t24Err = null;
+  const t24start = Date.now();
+  try { await M.NetworkRuntime.fetch('https://hangcancel.test/x', { timeoutMs: 40 }); } catch (e) { t24Err = e; }
+  const t24elapsed = Date.now() - t24start;
+  check('N24 hanging reader.cancel() does not block the timeout exit',
+    t24Err && t24Err.timeout === true && t24elapsed < 5000,
+    (t24Err && t24Err.message) + ' after ' + t24elapsed + 'ms');
+
+  // ---------- 25. stream cleanup rejection is swallowed (no unhandled rejection) ----------
+  reset();
+  on((u) => u === 'https://rejectcancel.test/x', () => new Response(
+    new ReadableStream({
+      start() { /* read stalls */ },
+      cancel() { return Promise.reject(new Error('cleanup blew up')); },
+    }),
+    { status: 200, headers: { 'content-type': 'text/plain' } }));
+  let t25Err = null;
+  try { await M.NetworkRuntime.fetch('https://rejectcancel.test/x', { timeoutMs: 40 }); } catch (e) { t25Err = e; }
+  check('N25 rejecting reader.cancel() keeps the timeout classification',
+    t25Err && t25Err.timeout === true, t25Err && t25Err.message);
+
+  // ---------- 26. normal cleanup still works (cancel resolves) ----------
+  reset();
+  let t26cancelled = false;
+  on((u) => u === 'https://okcancel.test/x', () => new Response(
+    new ReadableStream({
+      start() { /* read stalls */ },
+      cancel() { t26cancelled = true; return Promise.resolve(); },
+    }),
+    { status: 200, headers: { 'content-type': 'text/plain' } }));
+  let t26Err = null;
+  try { await M.NetworkRuntime.fetch('https://okcancel.test/x', { timeoutMs: 40 }); } catch (e) { t26Err = e; }
+  check('N26 resolving reader.cancel() → timeout error, cleanup ran',
+    t26Err && t26Err.timeout === true && t26cancelled === true,
+    (t26Err && t26Err.message) + ' cancelled=' + t26cancelled);
+
+  // ---------- 27. size-cap exit is also not blocked by hanging cleanup ----------
+  reset();
+  on((u) => u === 'https://bigcancel.test/x', () => new Response(
+    new ReadableStream({
+      start(ctrl) {
+        const mb = new Uint8Array(1024 * 1024);
+        for (let i = 0; i < 17; i++) ctrl.enqueue(mb); // 17 MiB > 16 MiB cap
+      },
+      cancel() { return new Promise(() => {}); }, // cleanup hangs forever
+    }),
+    { status: 200, headers: { 'content-type': 'application/octet-stream' } }));
+  let t27Err = null;
+  const t27start = Date.now();
+  try { await M.NetworkRuntime.fetch('https://bigcancel.test/x', { timeoutMs: 5000 }); } catch (e) { t27Err = e; }
+  const t27elapsed = Date.now() - t27start;
+  check('N27 too-large exit not blocked by hanging reader.cancel()',
+    t27Err && t27Err.tooLarge === true && t27elapsed < 5000,
+    (t27Err && t27Err.message) + ' after ' + t27elapsed + 'ms');
+
+  // ---------- 28. external cancel + hanging cleanup → AbortError promptly ----------
+  reset();
+  on((u) => u === 'https://extcancel.test/x', () => new Response(
+    new ReadableStream({
+      start() { /* read stalls */ },
+      cancel() { return new Promise(() => {}); },
+    }),
+    { status: 200, headers: { 'content-type': 'text/plain' } }));
+  const ac28 = new AbortController();
+  setTimeout(() => ac28.abort(), 30);
+  let t28Err = null;
+  const t28start = Date.now();
+  try { await M.NetworkRuntime.fetch('https://extcancel.test/x', { signal: ac28.signal, timeoutMs: 60000 }); } catch (e) { t28Err = e; }
+  const t28elapsed = Date.now() - t28start;
+  check('N28 external cancel + hanging cleanup → AbortError, not blocked',
+    t28Err && t28Err.name === 'AbortError' && t28elapsed < 5000,
+    (t28Err && t28Err.name) + ' after ' + t28elapsed + 'ms');
+
+  await new Promise((r) => setTimeout(r, 50)); // let any stray rejection surface
+  check('N29 no unhandled rejections from stream cleanup', unhandled.length === 0,
+    unhandled.map((e) => String(e)).join(' | '));
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);

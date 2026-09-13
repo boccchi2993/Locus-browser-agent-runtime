@@ -35,11 +35,14 @@ const NETWORK_MAX_BYTES = 16 * 1024 * 1024;
 const NetworkRuntime = {
   relayPath: '/fetch',
 
-  // fetch(url, {signal, timeoutMs}) → {
+  // fetch(url, {signal, timeoutMs, relayTimeoutMs}) → {
   //   status, statusText, headers: {lowercase: value},
   //   bytes: Uint8Array, finalUrl, backend: 'browser-direct' | 'edge-relay'
   // }
-  // Throws Error with a clear message when the request cannot complete.
+  // timeoutMs covers the direct attempt (default DIRECT_TIMEOUT_MS);
+  // relayTimeoutMs covers the relay attempt (default
+  // RELAY_CLIENT_TIMEOUT_MS). Throws Error with a clear message when the
+  // request cannot complete.
   async fetch(url, options) {
     const opts = options || {};
     const parsed = parseHttpsUrl(url); // throws on non-HTTPS / userinfo
@@ -53,7 +56,7 @@ const NetworkRuntime = {
           'network access blocked by the browser (CORS) and no edge relay is available ' +
           'when the page is opened from ' + pageProtocol() + ' — host the app over HTTP(S) to enable the relay');
       }
-      return await this._relay(parsed.href, opts.signal);
+      return await this._relay(parsed.href, opts.signal, opts.relayTimeoutMs);
     }
   },
 
@@ -162,7 +165,7 @@ async function readBytesCapped(res, maxBytes, signal) {
       if (done) break;
       received += value.byteLength;
       if (received > maxBytes) {
-        await reader.cancel().catch(() => {});
+        cancelReaderQuietly(reader);
         throw makeNetTooLargeError(maxBytes);
       }
       chunks.push(value);
@@ -170,7 +173,7 @@ async function readBytesCapped(res, maxBytes, signal) {
   } catch (e) {
     if (e && e.tooLarge) throw e;
     if (e && (e.cancelled || e.name === 'AbortError')) {
-      await reader.cancel().catch(() => {});
+      cancelReaderQuietly(reader);
       throw makeNetCancelledError();
     }
     throw e; // genuine mid-body network failure (TypeError) or stream error
@@ -184,6 +187,20 @@ async function readBytesCapped(res, maxBytes, signal) {
     offset += chunk.byteLength;
   }
   return merged;
+}
+
+// Best-effort stream cleanup on the way out (timeout / cancel / size
+// cap). NEVER awaited: the underlying source's cancel() may return a
+// promise that never settles (a stalled stream need not react to
+// cancellation), and awaiting it would block the caller's exit path
+// indefinitely — after the race was already lost. The rejection handler
+// is attached immediately so a failed cleanup never surfaces as an
+// unhandled rejection.
+function cancelReaderQuietly(reader) {
+  try {
+    const p = reader.cancel();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch (e) { /* synchronous cancel failure: ignore */ }
 }
 
 // Race a promise against an abort signal. Rejects with the standard
