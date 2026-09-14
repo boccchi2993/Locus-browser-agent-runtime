@@ -25,7 +25,17 @@ async function run() {
     loadPyodide: async () => {
       attempts++;
       if (attempts === 1) throw new Error('temporary CDN failure');
-      return { FS: { mkdirTree() {} } };
+      // Full FS call surface used by syncIn/diffOut (protocol v2), so the
+      // mock matches the worker's real needs even though init only loads.
+      return {
+        FS: {
+          mkdirTree() {}, writeFile() {}, readFile() { return new Uint8Array(); },
+          readdir() { return []; }, stat() { return { mode: 0, size: 0 }; },
+          unlink() {}, chmod() {}, isDir() { return false; },
+        },
+        runPython() {}, // subtree-delete shim (shutil.rmtree of managed roots)
+        setStdout() {}, setStderr() {},
+      };
     },
   });
   vm.runInContext(m[1], c);

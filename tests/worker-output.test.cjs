@@ -1,11 +1,15 @@
-// Worker output-collection tests (Finding 1): drives the REAL worker
-// source from index.html with a fake Pyodide FS, and the REAL shell.js
-// commit logic with the worker boundary stubbed.
+// Worker output-collection tests (Finding 1, protocol v2): drives the REAL
+// worker source from index.html with a fake Pyodide FS, and the REAL
+// shell.js commit logic with the worker boundary stubbed.
 //
 // Scenarios:
 //  - >200 output files: the 201st (a rename target) must be reported as a
 //    STRUCTURED uncollected path, and the shell commit must refuse deletions.
-//  - output volume cap: same structured reporting.
+//  - output volume cap: same structured reporting; caps are GLOBAL across mounts.
+//  - multi-mount diff: changes under different roots keep ABSOLUTE paths.
+//  - read-only mounts: the worker echoes changes; the main-thread commit
+//    rejects them and the provider bytes are never touched.
+//  - /tmp is Pyodide-owned: syncIn deletes exactly the files IT wrote.
 //  - size is checked BEFORE reading/base64-encoding a huge file.
 //  - normal rename and plain delete still work.
 // Run: node tests/worker-output.test.cjs
@@ -25,11 +29,19 @@ const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
 const workerSrc = html.match(/<script type="text\/worker" id="py-worker-src">([\s\S]*?)<\/script>/)[1];
 
 function makeFakePy(mutate) {
-  const files = new Map(); // full path -> Uint8Array | 'DIR' | any raw value
+  // Pyodide's real FS always has / and /tmp.
+  const files = new Map([['/', 'DIR'], ['/tmp', 'DIR']]); // full ABS path -> Uint8Array | 'DIR' | any raw value
   const reads = [];
+  const chmods = [];
+  const rmtrees = [];
   const api = {
     FS: {
-      mkdirTree(p) { files.set(p, 'DIR'); },
+      mkdirTree(p) {
+        // record every component as a directory so readdir/stat agree
+        const parts = String(p).split('/').filter(Boolean);
+        let cur = '';
+        for (const part of parts) { cur += '/' + part; files.set(cur, 'DIR'); }
+      },
       writeFile(p, data) { files.set(p, data); },
       readFile(p) {
         const v = files.get(p);
@@ -54,10 +66,27 @@ function makeFakePy(mutate) {
       },
       isDir(mode) { return mode === 1; },
       unlink(p) { files.delete(p); },
+      chmod(p, mode) { chmods.push(p + ':' + (mode).toString(8)); },
     },
     _reads: reads,
-    runPython() {},
-    async runPythonAsync(code) { if (mutate) mutate(api.FS, files); },
+    _chmods: chmods,
+    _rmtrees: rmtrees,
+    _files: files,
+    // subtree-delete shim: only ever invoked for the managed roots
+    runPython(code) {
+      const m = /shutil\.rmtree\(("(?:[^"\\]|\\.)*")/.exec(String(code));
+      if (m) {
+        const root = JSON.parse(m[1]);
+        rmtrees.push(root);
+        for (const k of [...files.keys()]) {
+          if (k === root || k.startsWith(root + '/')) files.delete(k);
+        }
+      }
+    },
+    async runPythonAsync(code) {
+      // called for the os.chdir shim AND the user code; mutate is idempotent
+      if (mutate && String(code).indexOf('os.chdir') === -1) mutate(api.FS, files);
+    },
     async loadPackagesFromImports() {},
     setStdout() {},
     setStderr() {},
@@ -65,32 +94,54 @@ function makeFakePy(mutate) {
   return api;
 }
 
-// Run one worker job; returns { result, reads } — reads records every file
-// the worker actually readFile()'d (proves size checks happen BEFORE reads).
-async function runWorkerJob(mutate, inputFiles) {
+// Run worker jobs (protocol v2 messages) in one shared worker context.
+// Returns { results, py } — py._reads records every readFile (proves size
+// checks happen BEFORE reads), py._chmods / py._rmtrees record FS calls.
+async function runWorkerJobs(jobs) {
   const posted = [];
   let py = null;
   const c = vm.createContext({
     self: { postMessage(msg) { if (msg.type === 'result') posted.push(msg); } },
     importScripts() {},
-    loadPyodide: async () => { py = makeFakePy(mutate); return py; },
+    loadPyodide: async () => { if (!py) py = makeFakePy(jobs[posted.length] && jobs[posted.length].mutate); return py; },
     atob, btoa, TextEncoder, TextDecoder,
   });
   vm.runInContext(workerSrc, c);
-  await vm.runInContext(`self.onmessage({ data: ${JSON.stringify({ id: 7, cmd: 'run', code: 'x', files: inputFiles || [] })} })`, Object.assign(c, { inputFiles }));
-  // onmessage is async; wait until the result is posted
-  for (let i = 0; i < 100 && !posted.length; i++) await new Promise((r) => setTimeout(r, 5));
-  if (!posted.length) throw new Error('worker posted no result');
-  return { result: posted[0], reads: py._reads };
+  const results = [];
+  for (const job of jobs) {
+    const msg = {
+      id: 100 + results.length,
+      cmd: 'run',
+      code: job.code || 'x',
+      cwd: job.cwd || '/mnt/workspace',
+      mounts: job.mounts || [],
+    };
+    await vm.runInContext(`self.onmessage({ data: ${JSON.stringify(msg)} })`, c);
+    for (let i = 0; i < 200 && results.length === posted.length && !posted[results.length]; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    if (!posted[results.length]) throw new Error('worker posted no result');
+    results.push(posted[results.length]);
+  }
+  return { results, py };
 }
+const runWorkerJob = async (mutate, mounts) => (await runWorkerJobs([{ mutate, mounts }])).results[0];
+
+const wsMount = (files) => [{ root: '/mnt/workspace', readOnly: false, files: files || [] }];
 
 // ---------- real shell.js commit path (worker boundary stubbed) ----------
 global.window = { location: { protocol: 'https:' } };
 global.document = { getElementById: () => null };
-const src = ['telemetry.js', 'workspace.js', 'network.js', 'shell.js', 'tools.js']
+const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js', 'tools.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
-const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, PythonRuntime, executeTool });');
+const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, VirtualWorkspace, SHELL_COMMANDS, PythonRuntime, executeTool });');
+
+function bareVfs(adapter) {
+  const vfs = new M.VirtualWorkspace({ listCommands: () => Object.keys(M.SHELL_COMMANDS) });
+  if (adapter) vfs.mount('/mnt/workspace', adapter, 'external-read-write');
+  return vfs;
+}
 
 class MemWS extends M.WorkspaceAdapter {
   constructor(files) {
@@ -109,8 +160,13 @@ class MemWS extends M.WorkspaceAdapter {
   async write(p, data) { p = M.normalizeWorkspacePath(p); this.files[p] = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data); }
   async remove(p) { p = M.normalizeWorkspacePath(p); delete this.files[p]; }
   async mkdir(p) { p = M.normalizeWorkspacePath(p); if (p && p in this.files) { const e = new Error('type mismatch'); e.name = 'TypeMismatchError'; throw e; } }
-  async exists(p) { try { p = M.normalizeWorkspacePath(p); } catch (e) { return false; } return p in this.files; }
-  async stat(p) { p = M.normalizeWorkspacePath(p); if (!(p in this.files)) { const e = new Error('No such file: ' + p); e.name = 'NotFoundError'; throw e; } return { kind: 'file', size: this.files[p].byteLength, modified: 0 }; }
+  async exists(p) { try { p = M.normalizeWorkspacePath(p); } catch (e) { return false; } return p === '' || p in this.files; }
+  async stat(p) {
+    p = M.normalizeWorkspacePath(p);
+    if (p === '') return { kind: 'directory', size: 0, modified: 0 };
+    if (!(p in this.files)) { const e = new Error('No such file: ' + p); e.name = 'NotFoundError'; throw e; }
+    return { kind: 'file', size: this.files[p].byteLength, modified: 0 };
+  }
 }
 
 function mockWorkerResult(result) {
@@ -129,41 +185,47 @@ function mockWorkerResult(result) {
 
 async function run() {
   // ---------- O1. >200 outputs: rename target becomes the 201st → structured uncollected ----------
-  const o1 = (await runWorkerJob((FS) => {
-    FS.unlink('/workspace/old.txt'); // python renamed old.txt → renamed
-    for (let i = 1; i <= 200; i++) {
-      FS.writeFile('/workspace/f' + String(i).padStart(3, '0') + '.txt', new TextEncoder().encode('x'));
-    }
-    FS.writeFile('/workspace/renamed', new TextEncoder().encode('original'));
-  }, [{ path: 'old.txt', b64: btoa('original') }])).result;
-  check('O1 rename target reported as STRUCTURED uncollected path',
-    Array.isArray(o1.uncollectedFiles) && o1.uncollectedFiles.indexOf('renamed') !== -1,
-    'uncollectedFiles=' + JSON.stringify(o1.uncollectedFiles) + ' warnings=' + JSON.stringify(o1.syncWarnings));
-  check('O1b deletion list still returned (shell must decide, not worker)',
-    Array.isArray(o1.deleted) && o1.deleted.indexOf('old.txt') !== -1, JSON.stringify(o1.deleted));
+  const o1job = await runWorkerJobs([{
+    mutate: (FS) => {
+      FS.unlink('/mnt/workspace/old.txt'); // python renamed old.txt → renamed
+      for (let i = 1; i <= 200; i++) {
+        FS.writeFile('/mnt/workspace/f' + String(i).padStart(3, '0') + '.txt', new TextEncoder().encode('x'));
+      }
+      FS.writeFile('/mnt/workspace/renamed', new TextEncoder().encode('original'));
+    },
+    mounts: wsMount([{ path: '/mnt/workspace/old.txt', b64: btoa('original') }]),
+  }]);
+  const o1 = o1job.results[0];
+  check('O1 rename target reported as STRUCTURED uncollected ABS path',
+    Array.isArray(o1.uncollectedFiles) && o1.uncollectedFiles.indexOf('/mnt/workspace/renamed') !== -1,
+    'uncollectedFiles=' + JSON.stringify(o1.uncollectedFiles));
+  check('O1b deletion list still returned with ABS paths (shell decides, not worker)',
+    Array.isArray(o1.deleted) && o1.deleted.indexOf('/mnt/workspace/old.txt') !== -1, JSON.stringify(o1.deleted));
+  check('O1c managed root was rmtree-ed by syncIn, never / or /tmp',
+    o1job.py._rmtrees.join(',') === '/mnt/workspace', JSON.stringify(o1job.py._rmtrees));
 
   // shell commit: with an incomplete changeset, the source must survive and the run must FAIL
   const ws1 = new MemWS({ 'old.txt': 'original' });
   mockWorkerResult({
     stdout: '', stderr: '', error: null,
     files: [], // the rename target was never collected
-    deleted: ['old.txt'],
-    uncollectedFiles: ['renamed'],
+    deleted: ['/mnt/workspace/old.txt'],
+    uncollectedFiles: ['/mnt/workspace/renamed'],
     stdoutTruncated: false, stderrTruncated: false,
   });
   const r1 = await M.executeTool('bash', "python -c 'x'", ws1);
-  check('O1c incomplete changeset → source preserved',
+  check('O1d incomplete changeset → source preserved',
     !!ws1.files['old.txt'] && new TextDecoder().decode(ws1.files['old.txt']) === 'original');
-  check('O1d incomplete changeset → tool reports failure', r1.success === false, JSON.stringify(r1.output));
-  check('O1e uncollected path surfaced', r1.output.includes('renamed'), JSON.stringify(r1.output));
+  check('O1e incomplete changeset → tool reports failure', r1.success === false, JSON.stringify(r1.output));
+  check('O1f uncollected path surfaced (ABS)', r1.output.includes('/mnt/workspace/renamed'), JSON.stringify(r1.output));
 
   // ---------- O2. volume cap: uncollected files block deletes too ----------
   const ws2 = new MemWS({ 'old.txt': 'original' });
   mockWorkerResult({
     stdout: '', stderr: '', error: null,
-    files: [{ path: 'part1.bin', b64: btoa('part') }],
-    deleted: ['old.txt'],
-    uncollectedFiles: ['part2.bin', 'part3.bin'],
+    files: [{ path: '/mnt/workspace/part1.bin', b64: btoa('part') }],
+    deleted: ['/mnt/workspace/old.txt'],
+    uncollectedFiles: ['/mnt/workspace/part2.bin', '/mnt/workspace/part3.bin'],
   });
   const r2 = await M.executeTool('bash', "python -c 'x'", ws2);
   check('O2 volume-cap uncollected → source preserved + failure',
@@ -172,28 +234,28 @@ async function run() {
     JSON.stringify(r2.output));
 
   // ---------- O3. huge file: size checked BEFORE read/base64 ----------
-  const o3job = await runWorkerJob((FS) => {
-    const big = {
-      get byteLength() { return 30 * 1024 * 1024; },
-    };
-    FS.writeFile('/workspace/huge.bin', big);
-    // normal small file still collected
-    FS.writeFile('/workspace/small.txt', new TextEncoder().encode('ok'));
-  }, []);
-  const o3 = o3job.result;
+  const o3job = await runWorkerJobs([{
+    mutate: (FS) => {
+      const big = { get byteLength() { return 30 * 1024 * 1024; } };
+      FS.writeFile('/mnt/workspace/huge.bin', big);
+      FS.writeFile('/mnt/workspace/small.txt', new TextEncoder().encode('ok'));
+    },
+    mounts: wsMount([]),
+  }]);
+  const o3 = o3job.results[0];
   check('O3 huge file uncollected without reading it',
-    Array.isArray(o3.uncollectedFiles) && o3.uncollectedFiles.indexOf('huge.bin') !== -1
-    && o3job.reads.indexOf('/workspace/huge.bin') === -1,
-    JSON.stringify(o3.uncollectedFiles) + ' reads=' + JSON.stringify(o3job.reads));
-  check('O3b small file still collected',
-    (o3.files || []).some((f) => f.path === 'small.txt'), JSON.stringify((o3.files || []).map((f) => f.path)));
+    Array.isArray(o3.uncollectedFiles) && o3.uncollectedFiles.indexOf('/mnt/workspace/huge.bin') !== -1
+    && o3job.py._reads.indexOf('/mnt/workspace/huge.bin') === -1,
+    JSON.stringify(o3.uncollectedFiles) + ' reads=' + JSON.stringify(o3job.py._reads));
+  check('O3b small file still collected with ABS path',
+    (o3.files || []).some((f) => f.path === '/mnt/workspace/small.txt'), JSON.stringify((o3.files || []).map((f) => f.path)));
 
   // ---------- O4. stdout truncation is NOT a changeset failure ----------
   const ws4 = new MemWS({ 'old.txt': 'original' });
   mockWorkerResult({
     stdout: 'lots', stderr: '', error: null,
-    files: [{ path: 'new.txt', b64: btoa('n') }],
-    deleted: ['old.txt'],
+    files: [{ path: '/mnt/workspace/new.txt', b64: btoa('n') }],
+    deleted: ['/mnt/workspace/old.txt'],
     uncollectedFiles: [],
     stdoutTruncated: true,
   });
@@ -204,20 +266,114 @@ async function run() {
 
   // ---------- O5. plain delete and normal rename unaffected ----------
   const ws5 = new MemWS({ 'gone.txt': 'x' });
-  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [], deleted: ['gone.txt'], uncollectedFiles: [] });
+  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [], deleted: ['/mnt/workspace/gone.txt'], uncollectedFiles: [] });
   const r5 = await M.executeTool('bash', "python -c 'x'", ws5);
   check('O5 plain delete still works', r5.success === true && !('gone.txt' in ws5.files));
 
   const ws6 = new MemWS({ 'old.txt': 'original' });
   mockWorkerResult({
     stdout: '', stderr: '', error: null,
-    files: [{ path: 'renamed', b64: btoa('original') }],
-    deleted: ['old.txt'],
+    files: [{ path: '/mnt/workspace/renamed', b64: btoa('original') }],
+    deleted: ['/mnt/workspace/old.txt'],
     uncollectedFiles: [],
   });
   const r6 = await M.executeTool('bash', "python -c 'x'", ws6);
   check('O6 normal rename still works', r6.success === true && !('old.txt' in ws6.files)
     && new TextDecoder().decode(ws6.files['renamed']) === 'original');
+
+  // ---------- O7. multi-mount diff: every mount root is walked, ABS paths ----------
+  const o7job = await runWorkerJobs([{
+    mutate: (FS) => {
+      FS.writeFile('/mnt/workspace/w.txt', new TextEncoder().encode('w'));
+      FS.writeFile('/mnt/download/d.txt', new TextEncoder().encode('d'));
+      FS.writeFile('/tmp/t.txt', new TextEncoder().encode('t'));
+    },
+    mounts: [
+      { root: '/mnt/workspace', readOnly: false, files: [{ path: '/mnt/workspace/old.txt', b64: btoa('o') }] },
+      { root: '/mnt/download', readOnly: false, files: [] },
+      { root: '/tmp', readOnly: false, files: [] },
+    ],
+  }]);
+  const o7 = o7job.results[0];
+  const o7paths = (o7.files || []).map((f) => f.path).sort();
+  check('O7 diff walks every mount root with ABS paths',
+    o7paths.join(',') === '/mnt/download/d.txt,/mnt/workspace/w.txt,/tmp/t.txt',
+    JSON.stringify(o7paths));
+  check('O7c unchanged synced file is NOT re-reported', !o7paths.includes('/mnt/workspace/old.txt'), JSON.stringify(o7paths));
+  check('O7b managed roots rmtree-ed, /tmp NOT rmtree-ed',
+    o7job.py._rmtrees.indexOf('/mnt/workspace') !== -1
+    && o7job.py._rmtrees.indexOf('/mnt/download') !== -1
+    && o7job.py._rmtrees.indexOf('/tmp') === -1
+    && o7job.py._rmtrees.indexOf('/') === -1, JSON.stringify(o7job.py._rmtrees));
+
+  // ---------- O8. global caps are shared across mounts ----------
+  const o8job = await runWorkerJobs([{
+    mutate: (FS) => {
+      for (let i = 1; i <= 200; i++) FS.writeFile('/mnt/workspace/g' + String(i).padStart(3, '0') + '.txt', new TextEncoder().encode('x'));
+      FS.writeFile('/mnt/download/overflow.txt', new TextEncoder().encode('y'));
+    },
+    mounts: [
+      { root: '/mnt/workspace', readOnly: false, files: [] },
+      { root: '/mnt/download', readOnly: false, files: [] },
+    ],
+  }]);
+  const o8 = o8job.results[0];
+  check('O8 file cap is global across mounts (201st uncollected)',
+    (o8.files || []).length === 200
+    && (o8.uncollectedFiles || []).indexOf('/mnt/download/overflow.txt') !== -1,
+    'files=' + (o8.files || []).length + ' uncollected=' + JSON.stringify(o8.uncollectedFiles));
+
+  // ---------- O9. read-only mount: worker echoes, main thread refuses ----------
+  const o9job = await runWorkerJobs([{
+    mutate: (FS) => { FS.writeFile('/mnt/upload/input.txt', new TextEncoder().encode('hacked')); },
+    mounts: [
+      { root: '/mnt/upload', readOnly: true, files: [{ path: '/mnt/upload/input.txt', b64: btoa('original') }] },
+    ],
+  }]);
+  const o9 = o9job.results[0];
+  const o9entry = (o9.files || []).find((f) => f.path === '/mnt/upload/input.txt');
+  check('O9 worker echoes read-only-mount change (ABS path, new bytes)',
+    !!o9entry && atob(o9entry.b64) === 'hacked', JSON.stringify(o9.files));
+  check('O9b read-only mount files chmod 0o444 on sync-in (best effort)',
+    o9job.py._chmods.some((c) => c === '/mnt/upload/input.txt:444'), JSON.stringify(o9job.py._chmods));
+
+  // main-thread commit rejects it and never touches provider bytes
+  const vfs9 = bareVfs(null);
+  const up9 = vfs9.resolveMount('/mnt/upload').provider;
+  const upBytes = new TextEncoder().encode('original');
+  up9.addFile({ name: 'input.txt', size: upBytes.byteLength, arrayBuffer: async () => upBytes.slice().buffer });
+  mockWorkerResult({
+    stdout: '', stderr: '', error: null,
+    files: [{ path: '/mnt/upload/input.txt', b64: btoa('hacked') }],
+    deleted: [], uncollectedFiles: [],
+  });
+  const r9 = await M.executeTool('bash', "python -c 'x'", vfs9);
+  check('O9c read-only change rejected at commit with clear conflict',
+    r9.success === false
+    && r9.output.includes('conflict: /mnt/upload/input.txt')
+    && r9.output.includes('read-only filesystem: changes under /mnt/upload are never committed'),
+    JSON.stringify(r9.output));
+  check('O9d provider bytes never touched',
+    new TextDecoder().decode(await vfs9.readBytes('/mnt/upload/input.txt')) === 'original');
+
+  // read-only DELETE attempt is likewise refused
+  mockWorkerResult({
+    stdout: '', stderr: '', error: null,
+    files: [], deleted: ['/mnt/upload/input.txt'], uncollectedFiles: [],
+  });
+  const r9b = await M.executeTool('bash', "python -c 'x'", vfs9);
+  check('O9e read-only delete rejected at commit', r9b.success === false
+    && r9b.output.includes('read-only filesystem')
+    && (await vfs9.exists('/mnt/upload/input.txt')), JSON.stringify(r9b.output));
+
+  // ---------- O10. /tmp cleanup: only the files syncIn wrote are removed ----------
+  const o10job = await runWorkerJobs([
+    { mounts: [{ root: '/tmp', readOnly: false, files: [{ path: '/tmp/synced.txt', b64: btoa('a') }] }] },
+    { mounts: [{ root: '/tmp', readOnly: false, files: [] }] },
+  ]);
+  check('O10 second syncIn unlinks exactly the previous /tmp files',
+    !o10job.py._files.has('/tmp/synced.txt') && o10job.py._rmtrees.indexOf('/tmp') === -1,
+    'files=' + JSON.stringify([...o10job.py._files.keys()]) + ' rmtrees=' + JSON.stringify(o10job.py._rmtrees));
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);

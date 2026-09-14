@@ -11,7 +11,7 @@ const path = require('path');
 
 global.window = { location: { protocol: 'https:' } };
 
-const src = ['telemetry.js', 'workspace.js', 'network.js', 'shell.js', 'tools.js']
+const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js', 'tools.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
 const M = eval(src + '\n;({ LocalDirectoryWorkspace, normalizeWorkspacePath, runShellCommand, collectWorkspaceFiles });');
