@@ -14,15 +14,26 @@
 //
 //  Runtime globals (AgentSession, Model, callModel, executeTool,
 //  LocalDirectoryWorkspace, ensureWorkspacePermission, PythonRuntime,
-//  Telemetry, LocusProjector) come from the classic scripts loaded by
-//  index.html before this module — same as the old ui.js wiring.
+//  Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS) come from
+//  the classic scripts loaded by index.html before this module — same as
+//  the old ui.js wiring.
 // ============================================================
 
 import { reactive, computed } from 'vue';
 
 /* global AgentSession, Model, callModel, executeTool, buildSystemPrompt,
    LocalDirectoryWorkspace, ensureWorkspacePermission, PythonRuntime,
-   Telemetry, LocusProjector */
+   Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS */
+
+// ONE persistent VFS for the whole page lifetime. All static mounts
+// (home/tmp/upload/download/bin/usrbin) are wired inside the constructor;
+// /mnt/workspace is added/replaced by mountFolder(). The command list is
+// injected lazily so this module never depends on script load order.
+const vfs = new VirtualWorkspace({ listCommands: () => Object.keys(SHELL_COMMANDS) });
+export { vfs };
+
+const UPLOAD_ROOT = '/mnt/upload';
+const ARTIFACTS_ROOT = '/mnt/download';
 
 const REMEMBER_SESSION_KEY = 'bar.v0.rememberSessionKey.v1';
 const SESSION_CONFIG_KEY = 'bar.v0.sessionConfig.v1';
@@ -87,10 +98,15 @@ export const store = reactive({
   terminalOpen: false,
   sidebarSearch: '',
 
-  // Upload seam: pending attachments are presentation-only metadata.
-  // No attachment runtime pipeline exists yet — the UI says so.
+  // Uploads are real browser File objects held by the VFS at
+  // /mnt/upload (read-only to the agent). attachments is UI metadata
+  // mirroring what the user put there: { name, path, size, type }.
   attachments: [],
-  attachmentsWired: false,
+  attachmentsWired: true,
+
+  // Downloadable artifacts: files the agent wrote under /mnt/download.
+  // Refreshed on boot and after every tool_result (telemetryVersion).
+  artifacts: [],
 
   pythonStatus: 'cold',
   telemetryVersion: 0, // bumped on tool_result so rails re-read Telemetry.records
@@ -148,7 +164,10 @@ export const session = new AgentSession({
   onSessionReset: () => { if (typeof PythonRuntime !== 'undefined') PythonRuntime.reset(); },
 });
 
-let workspace = null; // LocalDirectoryWorkspace | null — bound per task
+// The VFS (declared at module scope above) replaces the raw adapter in
+// the workspace slot: buildSystemPrompt and the tool executor both
+// receive it (buildSystemPrompt reads workspace.workspaceName; tools
+// route every path through the mounts).
 
 // ---------- settings ----------
 
@@ -213,7 +232,7 @@ export function newTask() {
   // guard is never bypassed by flipping UI flags early.
   if (store.busy) session.cancel();
   session.reset();
-  store.attachments = [];
+  clearAttachments();
   startConversation();
 }
 
@@ -243,7 +262,7 @@ export async function submit(text) {
     // run() resolves only AFTER task_end has been emitted (the binding is
     // released by handleRuntimeEvent at that point) — so by the time this
     // await returns, no late event of this task can still be in flight.
-    await session.run(input, { workspace: workspace });
+    await session.run(input, { workspace: vfs });
   } catch (e) {
     // run() threw without a normal task lifecycle (e.g. the concurrent-run
     // guard): no task_end will arrive, so release the binding here instead
@@ -324,11 +343,13 @@ export async function mountFolder() {
   const granted = await ensureWorkspacePermission(handle);
   if (!granted) return;
 
-  workspace = new LocalDirectoryWorkspace(handle);
-  store.workspaceName = workspace.name;
+  // Re-mounting a different folder replaces the provider at /mnt/workspace.
+  const provider = new LocalDirectoryWorkspace(handle);
+  vfs.mount('/mnt/workspace', provider, 'external-read-write');
+  store.workspaceName = provider.name;
   // Full session boundary, only on success.
   session.reset();
-  store.attachments = [];
+  clearAttachments();
   startConversation();
 }
 
@@ -338,24 +359,114 @@ export function togglePlusMenu() {
   store.plusMenuOpen = !store.plusMenuOpen;
 }
 
-// Upload files: the UI seam exists and collects real File metadata, but
-// no attachment runtime pipeline is wired into AgentSession yet — the
-// chips say so instead of faking success.
+// ---------- uploads (/mnt/upload, real File objects) ----------
+
+function uploadProvider() {
+  return vfs.resolveMount(UPLOAD_ROOT).provider; // UploadWorkspace, always mounted
+}
+
+// Surface a warning in the LIVE conversation via the same projector path
+// the runtime uses (e.g. the workspace-picker warning in mountFolder).
+function projectUploadWarning(message) {
+  const conv = store.conversations.find((c) => c.id === store.liveConversationId);
+  if (conv) {
+    LocusProjector.projectEvent(conv, {
+      type: 'warning', code: 'upload_skipped', message: message,
+    });
+  }
+}
+
+// Add browser File objects to /mnt/upload. The provider assigns the final
+// (collision-safe) name; quota overflows skip that file and surface a
+// conversation warning instead of failing the whole batch.
+export function addUploadFiles(fileList) {
+  const provider = uploadProvider();
+  const skipped = [];
+  for (const f of fileList || []) {
+    try {
+      const finalName = provider.addFile(f);
+      store.attachments.push({
+        name: finalName,
+        path: UPLOAD_ROOT + '/' + finalName,
+        size: f.size || 0,
+        type: f.type || 'file',
+      });
+    } catch (e) {
+      skipped.push((f && f.name ? f.name : 'file')
+        + ' (' + (e && e.message ? e.message : String(e)) + ')');
+    }
+  }
+  if (skipped.length) {
+    projectUploadWarning('Not uploaded — ' + skipped.join('; '));
+  }
+}
+
+// File picker → addUploadFiles. Uploads never leave the browser.
 export function uploadFiles() {
   store.plusMenuOpen = false;
   const input = document.createElement('input');
   input.type = 'file';
   input.multiple = true;
-  input.addEventListener('change', () => {
-    for (const f of input.files || []) {
-      store.attachments.push({ name: f.name, size: f.size, type: f.type || 'file' });
-    }
-  });
+  input.addEventListener('change', () => { addUploadFiles(input.files); });
   input.click();
 }
 
 export function removeAttachment(index) {
+  const a = store.attachments[index];
+  if (!a) return;
+  try { uploadProvider().removeFile(a.name); } catch (e) { /* already gone */ }
   store.attachments.splice(index, 1);
+}
+
+// Session boundaries (new task / folder change) drop the user's uploads
+// from BOTH the UI metadata and the VFS — the two never drift apart.
+function clearAttachments() {
+  const provider = uploadProvider();
+  for (const a of store.attachments) {
+    try { provider.removeFile(a.name); } catch (e) { /* already gone */ }
+  }
+  store.attachments = [];
+}
+
+// ---------- artifacts (/mnt/download, explicit Download UI) ----------
+
+// Recursively walk /mnt/download → [{ path (relative), size }], sorted.
+// Errors (transient provider faults) keep the previous list — artifacts
+// are a display surface, never a source of truth.
+export async function refreshArtifacts() {
+  const found = [];
+  async function walk(rel) {
+    const entries = await vfs.list(rel ? ARTIFACTS_ROOT + '/' + rel : ARTIFACTS_ROOT);
+    for (const e of entries) {
+      const child = rel ? rel + '/' + e.name : e.name;
+      if (e.kind === 'directory') {
+        await walk(child);
+      } else {
+        const st = await vfs.stat(ARTIFACTS_ROOT + '/' + child);
+        found.push({ path: child, size: st.size || 0 });
+      }
+    }
+  }
+  try {
+    await walk('');
+  } catch (e) {
+    return;
+  }
+  found.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  store.artifacts = found;
+}
+
+// Explicit user action only: read bytes from the VFS, hand them to the
+// browser as a blob download. Never automatic, never the network.
+export async function downloadArtifact(path) {
+  const bytes = await vfs.readBytes(ARTIFACTS_ROOT + '/' + path);
+  const blob = new Blob([bytes]);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = String(path).split('/').pop() || 'artifact';
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 export function openTerminal() {
@@ -367,3 +478,4 @@ export function openTerminal() {
 
 applySettings();
 startConversation();
+refreshArtifacts(); // initial artifacts listing (fire-and-forget, self-guarded)
