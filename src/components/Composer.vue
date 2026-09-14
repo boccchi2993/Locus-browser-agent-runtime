@@ -5,8 +5,8 @@
          final VFS path -->
     <div v-if="store.attachments.length" class="attach-row">
       <span v-for="(a, i) in store.attachments" :key="i" class="attach-chip" :title="a.path">
-        {{ a.name }}
-        <button type="button" class="attach-x" @click="removeAttachment(i)">×</button>
+        <span class="attach-name">{{ a.name }}</span>
+        <button type="button" class="attach-x" :aria-label="'Remove ' + a.name" @click="removeAttachment(i)">×</button>
       </span>
     </div>
 
@@ -23,7 +23,7 @@
 
       <div class="composer-bar">
         <div class="composer-left">
-          <button class="icon-btn plus-btn" type="button" title="Add context" @click.stop="togglePlusMenu">
+          <button class="icon-btn plus-btn" type="button" title="Add context" aria-label="Add context" @click.stop="togglePlusMenu">
             <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6">
               <path d="M8 3v10M3 8h10"/>
             </svg>
@@ -52,6 +52,7 @@
             type="button"
             :disabled="!draft.trim()"
             title="Send (Enter)"
+            aria-label="Send"
             @click="send"
           >
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8">

@@ -4,9 +4,15 @@
       <span class="brand-mark">L</span>
       <span class="brand-name">Locus</span>
       <span class="brand-ver">v0.4</span>
+      <button
+        class="icon-btn drawer-close"
+        type="button"
+        aria-label="Close navigation"
+        @click="store.sidebarDrawerOpen = false"
+      >×</button>
     </div>
 
-    <button class="new-task-btn" type="button" @click="newTask">
+    <button class="new-task-btn" type="button" @click="onNewTask">
       <span class="plus-glyph">+</span> New task
     </button>
 
@@ -27,7 +33,7 @@
         class="recent-item"
         :class="{ active: conv.id === store.activeConversationId }"
         type="button"
-        @click="openConversation(conv.id)"
+        @click="onOpenConversation(conv.id)"
       >
         <span class="recent-title">{{ conv.title }}</span>
         <span class="recent-status" :data-status="conv.status">{{ statusLabel(conv.status) }}</span>
@@ -46,7 +52,7 @@
       </button>
       <div class="footer-status">
         <span class="dot" :class="store.workspaceName ? 'on' : 'off'"></span>
-        {{ store.workspaceName ? store.workspaceName : 'No folder mounted' }}
+        {{ store.workspaceName ? store.workspaceName : 'No external folder mounted' }}
       </div>
     </div>
   </aside>
@@ -55,6 +61,18 @@
 <script setup>
 import { computed } from 'vue';
 import { store, newTask, openConversation } from '../ui/store.js';
+
+// Choosing a destination from the sidebar also closes the mobile drawer;
+// on desktop the flag is meaningless (the sidebar is statically in flow).
+function onNewTask() {
+  newTask();
+  store.sidebarDrawerOpen = false;
+}
+
+function onOpenConversation(id) {
+  openConversation(id);
+  store.sidebarDrawerOpen = false;
+}
 
 const filteredRecents = computed(() => {
   const q = store.sidebarSearch.trim().toLowerCase();

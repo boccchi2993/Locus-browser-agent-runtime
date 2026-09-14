@@ -2,7 +2,7 @@
   <div class="terminal-drawer">
     <div class="terminal-head">
       <span>Terminal</span>
-      <button class="icon-btn" type="button" @click="store.terminalOpen = false">×</button>
+      <button class="icon-btn" type="button" aria-label="Close terminal" @click="store.terminalOpen = false">×</button>
     </div>
     <div class="terminal-body">
       <p class="terminal-note">

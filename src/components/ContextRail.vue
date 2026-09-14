@@ -1,5 +1,17 @@
 <template>
-  <aside class="context-rail">
+  <aside class="context-rail" aria-label="Context panel">
+    <!-- Drawer header: only rendered as a visible bar <1100px, where the
+         rail leaves the flex row and becomes an overlay drawer. -->
+    <div class="rail-drawer-head">
+      <span class="rail-drawer-title">Context</span>
+      <button
+        class="icon-btn drawer-close"
+        type="button"
+        aria-label="Close context"
+        @click="store.contextDrawerOpen = false"
+      >×</button>
+    </div>
+
     <section class="rail-section">
       <button class="rail-head" type="button" @click="collapse.progress = !collapse.progress">
         Progress <span class="rail-chev" :class="{ closed: collapse.progress }">▾</span>
@@ -41,7 +53,10 @@
           </div>
           <div class="rail-hint">mounted at /mnt/workspace</div>
         </template>
-        <div v-else class="rail-hint">No external folder mounted</div>
+        <template v-else>
+          <div class="rail-hint">No external folder mounted</div>
+          <div class="rail-hint">Local files can still use /mnt/upload and /mnt/download.</div>
+        </template>
         <button class="rail-btn" type="button" @click="mountFolder">
           {{ store.workspaceName ? 'Change folder' : 'Mount folder' }}
         </button>

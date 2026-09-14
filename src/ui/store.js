@@ -95,6 +95,10 @@ export const store = reactive({
 
   plusMenuOpen: false,
   rightRailCollapsed: false,
+  // Drawer open/close is PURE presentation state: it never enters
+  // AgentSession, provider history, or any runtime structure.
+  sidebarDrawerOpen: false,  // <700px: sidebar as left overlay drawer
+  contextDrawerOpen: false,  // <1100px: context rail as right overlay drawer
   terminalOpen: false,
   sidebarSearch: '',
 
@@ -368,6 +372,37 @@ export async function mountFolder() {
 
 export function togglePlusMenu() {
   store.plusMenuOpen = !store.plusMenuOpen;
+}
+
+// Canonical narrow-layout boundary for JS: the ONLY breakpoint JS knows.
+// Layout itself is owned by CSS media queries in theme.css (700px / 1100px);
+// this matchMedia exists solely so the rail toggle can pick between the
+// desktop static collapse and the <1100px drawer. Never derive layout
+// decisions from window.innerWidth elsewhere.
+const narrowMq = (typeof window !== 'undefined' && typeof window.matchMedia === 'function')
+  ? window.matchMedia('(max-width: 1099px)')
+  : null;
+
+// One trigger, two presentations: desktop toggles the static rail in/out
+// of the flex row; tablet/mobile open the same ContextRail as a drawer.
+export function toggleContextPanel() {
+  store.plusMenuOpen = false;
+  if (narrowMq && narrowMq.matches) {
+    if (store.rightRailCollapsed) store.rightRailCollapsed = false; // rail must be mounted to open as a drawer
+    store.contextDrawerOpen = !store.contextDrawerOpen;
+  } else {
+    store.rightRailCollapsed = !store.rightRailCollapsed;
+  }
+}
+
+export function openSidebarDrawer() {
+  store.plusMenuOpen = false;
+  store.sidebarDrawerOpen = true;
+}
+
+export function closeDrawers() {
+  store.sidebarDrawerOpen = false;
+  store.contextDrawerOpen = false;
 }
 
 // ---------- uploads (/mnt/upload, real File objects) ----------

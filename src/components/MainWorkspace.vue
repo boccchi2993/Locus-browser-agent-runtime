@@ -1,12 +1,26 @@
 <template>
   <main class="main-workspace">
     <header class="main-header">
+      <!-- Mobile top bar: ☰ / title / context. The nav trigger is only
+           visible <700px (CSS); the rail trigger opens a drawer <1100px
+           and toggles the static rail on desktop. -->
+      <button
+        class="icon-btn nav-toggle"
+        type="button"
+        aria-label="Open navigation"
+        @click="openSidebarDrawer"
+      >
+        <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4">
+          <path d="M2 4h12M2 8h12M2 12h12"/>
+        </svg>
+      </button>
       <div class="main-title">{{ conversation ? conversation.title : 'Locus' }}</div>
       <button
         class="rail-toggle"
         type="button"
+        aria-label="Open context"
         :title="store.rightRailCollapsed ? 'Show context panel' : 'Hide context panel'"
-        @click="store.rightRailCollapsed = !store.rightRailCollapsed"
+        @click="toggleContextPanel"
       >
         <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4">
           <rect x="1.5" y="2.5" width="13" height="11" rx="2"/>
@@ -50,7 +64,7 @@
 
 <script setup>
 import { computed, ref, watch, nextTick } from 'vue';
-import { store, activeConversation } from '../ui/store.js';
+import { store, activeConversation, toggleContextPanel, openSidebarDrawer } from '../ui/store.js';
 import Timeline from './Timeline.vue';
 import Composer from './Composer.vue';
 
