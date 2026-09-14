@@ -6,6 +6,7 @@
 <pre id="out">RUNNING</pre>
 <script src="../src/telemetry.js"></script>
 <script src="../src/workspace.js"></script>
+<script src="../src/vfs.js"></script>
 <script src="../src/network.js"></script>
 <script src="../src/shell.js"></script>
 <script src="../src/tools.js"></script>
@@ -40,8 +41,20 @@
       async write(p, data) { p = normalizeWorkspacePath(p); this.files[p] = typeof data === 'string' ? data : new TextDecoder().decode(data); }
       async remove(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); delete this.files[p]; }
       async mkdir(p) { p = normalizeWorkspacePath(p); if (p && p in this.files) { const e = new Error('type mismatch'); e.name = 'TypeMismatchError'; throw e; } }
-      async exists(p) { try { p = normalizeWorkspacePath(p); } catch (e) { return false; } return p in this.files; }
-      async stat(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); return { kind: 'file', size: this.files[p].length, modified: 0 }; }
+      async exists(p) { try { p = normalizeWorkspacePath(p); } catch (e) { return false; } return p === '' || p in this.files; }
+      async stat(p) {
+        p = normalizeWorkspacePath(p);
+        if (p === '') return { kind: 'directory', size: 0, modified: null };
+        if (!(p in this.files)) throw new Error('No such file: ' + p);
+        return { kind: 'file', size: this.files[p].length, modified: 0 };
+      }
+    }
+
+    // Wrap a legacy adapter the way asVfs does, keeping a handle on the VFS.
+    function mkVfs(adapter) {
+      const vfs = new VirtualWorkspace({ listCommands: () => Object.keys(SHELL_COMMANDS) });
+      if (adapter) vfs.mount('/mnt/workspace', adapter, 'external-read-write');
+      return vfs;
     }
 
     // ---------- A. workspace path escape ----------
@@ -60,7 +73,8 @@
     check('C4 plain text NOT a tool call', parseToolCall('完成。') === null);
     check('C5 whitespace-padded pure block parses', (parseToolCall('  \n' + pure + '\n ') || {}).input === 'ls');
 
-    const ws = new MemWS({ 'sales.csv': 'name,revenue,cost\nA,100,40\nB,200,80\nC,300,120\n' });
+    const wsRaw = new MemWS({ 'sales.csv': 'name,revenue,cost\nA,100,40\nB,200,80\nC,300,120\n' });
+    const ws = mkVfs(wsRaw);
 
     // ---------- existing smoke: ls / cat / unsupported / cloud ----------
     check('smoke ls', (await executeTool('bash', 'ls', ws)).output === 'sales.csv');
@@ -110,17 +124,17 @@
       'open("summary.csv", "w").write(out)',
     ].join('\n');
     const pdr = await executeTool('bash', "python <<'PY'\n" + pdCode + '\nPY', ws);
-    check('demo pandas summary', pdr.success && ws.files['summary.csv'] === 'column,mean\nrevenue,200.0\ncost,80.0\n',
-      JSON.stringify(ws.files['summary.csv']));
+    check('demo pandas summary', pdr.success && wsRaw.files['summary.csv'] === 'column,mean\nrevenue,200.0\ncost,80.0\n',
+      JSON.stringify(wsRaw.files['summary.csv']));
 
     // ---------- F. deletion sync ----------
     await executeTool('bash', "python <<'PY'\nimport os\nos.remove('sales.csv')\nPY", ws);
-    check('F deletion sync', !('sales.csv' in ws.files), Object.keys(ws.files).join(','));
+    check('F deletion sync', !('sales.csv' in wsRaw.files), Object.keys(wsRaw.files).join(','));
 
     // ---------- G. rename semantics ----------
     const gr = await executeTool('bash', "python <<'PY'\nimport os\nos.rename('summary.csv', 'renamed.csv')\nPY", ws);
-    check('G rename', !('summary.csv' in ws.files) && ws.files['renamed.csv'] === 'column,mean\nrevenue,200.0\ncost,80.0\n',
-      Object.keys(ws.files).join(','));
+    check('G rename', !('summary.csv' in wsRaw.files) && wsRaw.files['renamed.csv'] === 'column,mean\nrevenue,200.0\ncost,80.0\n',
+      Object.keys(wsRaw.files).join(','));
 
     // ---------- I. V0.2 acceptance chain: curl → local python → report.csv ----------
     const realFetch = window.fetch;
@@ -134,14 +148,15 @@
     try {
       const dl = await executeTool('bash', 'curl -o raw.json https://api.example.test/metrics.json', ws);
       check('I1 curl download into workspace', dl.success && dl.backend === 'browser-direct'
-        && ws.files['raw.json'] === '{"values":[10,20,30]}', JSON.stringify(dl.output) + ' | backend=' + dl.backend);
+        && dl.output.includes('[written to /mnt/workspace/raw.json,')
+        && wsRaw.files['raw.json'] === '{"values":[10,20,30]}', JSON.stringify(dl.output) + ' | backend=' + dl.backend);
       const dlRec = Telemetry.records[Telemetry.records.length - 1];
       check('I1b telemetry network backend', dlRec.operation === 'network' && dlRec.backend === 'browser-direct'
         && dlRec.success === true, JSON.stringify(dlRec));
       const ana = await executeTool('bash', "python <<'PY'\nimport json\nvals = json.load(open('raw.json'))['values']\nopen('report.csv', 'w').write('metric,value\\ncount,%d\\nsum,%d\\nmean,%.1f\\n' % (len(vals), sum(vals), sum(vals)/len(vals)))\nPY", ws);
       check('I2 downloaded data processed by local Pyodide', ana.success
-        && ws.files['report.csv'] === 'metric,value\ncount,3\nsum,60\nmean,20.0\n',
-        JSON.stringify(ws.files['report.csv']));
+        && wsRaw.files['report.csv'] === 'metric,value\ncount,3\nsum,60\nmean,20.0\n',
+        JSON.stringify(wsRaw.files['report.csv']));
     } finally {
       window.fetch = realFetch;
     }
@@ -180,12 +195,15 @@
       check('J0 OPFS native handle available', false, String(e && e.message || e));
     }
 
-    // ---------- K. Python session isolation (F03): reset kills globals AND /tmp ----------
+    // ---------- K. Python session isolation (F03): reset kills globals ----------
+    // The VFS is the machine: /tmp lives in the VFS, not in the worker, so it
+    // survives an interpreter reset (session isolation covers globals; the
+    // filesystem persists like a real machine's would).
     await executeTool('bash', "python <<'PY'\nsecret = 'leak'\nopen('/tmp/leak.txt', 'w').write('leak')\nPY", ws);
     PythonRuntime.reset();
     const k1 = await executeTool('bash', "python <<'PY'\nimport os\ntry:\n    print('var:' + secret)\nexcept NameError:\n    print('var:gone')\nprint('tmp:' + str(os.path.exists('/tmp/leak.txt')))\nPY", ws);
     check('K1 python globals isolated after reset', k1.success && k1.output.includes('var:gone'), JSON.stringify(k1.output));
-    check('K2 /tmp isolated after reset', k1.output.includes('tmp:False'), JSON.stringify(k1.output));
+    check('K2 VFS /tmp persists across interpreter reset', k1.output.includes('tmp:True'), JSON.stringify(k1.output));
 
     // ---------- L. F06 capability check: Python CAN reach js.fetch ----------
     // This documents the real capability boundary (declared in README):
@@ -246,9 +264,9 @@
           && n1.output.includes('./a.md') && n1.output.includes('./sub/c.js'), JSON.stringify(n1.output));
 
         const n2 = await executeTool('bash', 'cd sub && pwd && ls', shWs);
-        check('N2 cd invocation-local', n2.success && n2.output === '/sub\nc.js', JSON.stringify(n2.output));
+        check('N2 cd invocation-local', n2.success && n2.output === '/mnt/workspace/sub\nc.js', JSON.stringify(n2.output));
         const n3 = await executeTool('bash', 'pwd', shWs);
-        check('N3 next invocation back at root', n3.success && n3.output === '/', JSON.stringify(n3.output));
+        check('N3 next invocation back at the default cwd', n3.success && n3.output === '/mnt/workspace', JSON.stringify(n3.output));
 
         const n4 = await executeTool('bash', 'echo "a;b" && echo "x|y"', shWs);
         check('N4 quoted operators are text', n4.success && n4.output === 'a;b\nx|y', JSON.stringify(n4.output));
@@ -256,8 +274,10 @@
         const n5 = await executeTool('bash', 'grep -n two b.txt | wc -l', shWs);
         check('N5 grep|wc pipeline', n5.success && n5.output === '1', JSON.stringify(n5.output));
 
-        const n6 = await executeTool('bash', 'cd ../../.. && pwd', shWs);
-        check('N6 cd escape rejected', !n6.success && n6.output.includes('escapes workspace'), JSON.stringify(n6.output));
+        const n6 = await executeTool('bash', 'cd ../../../.. && pwd', shWs);
+        check('N6 cd above filesystem root rejected', !n6.success && n6.output.includes('escapes filesystem root'), JSON.stringify(n6.output));
+        const n6b = await executeTool('bash', 'cd ../.. && pwd', shWs);
+        check('N6b cd up to the real filesystem root works', n6b.success && n6b.output === '/', JSON.stringify(n6b.output));
 
         const n7 = await executeTool('bash', 'help', shWs);
         check('N7 help lists the contract', n7.success && n7.output.includes('Unix-like compatibility shell')
@@ -321,9 +341,13 @@
           JSON.stringify(o8b.output));
         const o9 = await executeTool('bash', 'rm -rf /', sh2Ws);
         const o9b = await executeTool('bash', 'ls', sh2Ws);
-        check('O9 rm -rf / refused, workspace intact', !o9.success
-          && o9.output.includes('refusing to recursively remove workspace root')
+        check('O9 rm -rf / refused (protected root), workspace intact', !o9.success
+          && o9.output.includes('rm: refusing to recursively remove protected path: /')
           && o9b.success && o9b.output.includes('err.txt'), JSON.stringify(o9.output));
+        const o9c = await executeTool('bash', 'rm -rf /mnt/workspace', sh2Ws);
+        check('O9c rm -rf /mnt/workspace refused (protected mount root)', !o9c.success
+          && o9c.output.includes('rm: refusing to recursively remove protected path: /mnt/workspace'),
+          JSON.stringify(o9c.output));
 
         const o10 = await executeTool('bash', 'help', sh2Ws);
         check('O10 help lists round-2 surface', o10.success && o10.output.includes('mv') && o10.output.includes('rm')
@@ -354,6 +378,84 @@
       }
     } catch (e) {
       check('O0 OPFS round-2 workspace available', false, String(e && e.message || e));
+    }
+
+    // ---------- V. the machine always has a filesystem (VFS acceptance) ----------
+    {
+      const bare = mkVfs(null);
+
+      // bare-VFS shell: fixed userland view, /usr/bin is the command registry
+      const v1 = await executeTool('bash', 'pwd', bare);
+      check('V1 bare-VFS pwd is /home/locus', v1.success && v1.output === '/home/locus', JSON.stringify(v1.output));
+      const v2 = await executeTool('bash', 'ls /', bare);
+      check('V2 ls / shows the machine layout', v2.success
+        && v2.output.split('\n').map((s) => s.replace(/\/$/, '')).join(' ') === 'bin home mnt tmp usr',
+        JSON.stringify(v2.output));
+      const v3 = await executeTool('bash', 'ls /usr/bin', bare);
+      check('V3 /usr/bin is the command registry (grep present)', v3.success
+        && v3.output.split('\n').includes('grep') && v3.output.split('\n').includes('python'),
+        JSON.stringify(v3.output).slice(0, 120));
+      const v4 = await executeTool('bash', 'ls /mnt/workspace', bare);
+      check('V4 unmounted /mnt/workspace → not mounted', !v4.success && v4.output.includes('not mounted'),
+        JSON.stringify(v4.output));
+
+      // /tmp persistence across two bash calls sharing one vfs
+      await executeTool('bash', 'echo persist > /tmp/v5.txt', bare);
+      const v5 = await executeTool('bash', 'cat /tmp/v5.txt', bare);
+      check('V5 /tmp persists across bash calls', v5.success && v5.output === 'persist\n', JSON.stringify(v5.output));
+
+      // upload: a real browser File is readable; writes/removals refused
+      const upload = bare.resolveMount('/mnt/upload').provider;
+      upload.addFile(new File(['uploaded-by-user'], 'input.txt'));
+      const v6 = await executeTool('bash', 'cat /mnt/upload/input.txt', bare);
+      check('V6 upload File readable via cat', v6.success && v6.output === 'uploaded-by-user', JSON.stringify(v6.output));
+      const v7 = await executeTool('bash', 'echo x > /mnt/upload/out.txt', bare);
+      check('V7 write into upload refused', !v7.success && v7.output.includes('read-only filesystem'), JSON.stringify(v7.output));
+      const v8 = await executeTool('bash', 'rm /mnt/upload/input.txt', bare);
+      check('V8 rm from upload refused, file intact', !v8.success && v8.output.includes('read-only filesystem')
+        && (await bare.exists('/mnt/upload/input.txt')), JSON.stringify(v8.output));
+
+      // python os.getcwd() follows the shell default cwd in both states
+      const v9 = await executeTool('bash', "python <<'PY'\nimport os\nprint(os.getcwd())\nPY", bare);
+      check('V9 python cwd without workspace is /home/locus', v9.success
+        && v9.output.split('\n')[0] === '/home/locus', JSON.stringify(v9.output).slice(0, 200));
+      const wsV = mkVfs(new MemWS({ 'w.txt': 'in workspace' }));
+      const v10 = await executeTool('bash', "python <<'PY'\nimport os\nprint(os.getcwd())\nprint(open('w.txt').read())\nPY", wsV);
+      check('V10 python cwd with workspace is /mnt/workspace', v10.success
+        && v10.output.split('\n')[0] === '/mnt/workspace' && v10.output.includes('in workspace'),
+        JSON.stringify(v10.output).slice(0, 200));
+
+      // python reads /mnt/upload; writes /mnt/download + /tmp + /home/locus
+      const v11code = [
+        "data = open('/mnt/upload/input.txt').read()",
+        "print('saw:' + data)",
+        "open('/mnt/download/from-python.txt', 'w').write('py:' + data)",
+        "open('/tmp/py-tmp.txt', 'w').write('scratch')",
+        "open('/home/locus/py-home.txt', 'w').write('home')",
+      ].join('\n');
+      const v11 = await executeTool('bash', "python <<'PY'\n" + v11code + "\nPY", bare);
+      check('V11 python reads /mnt/upload and writes /mnt/download + /tmp + /home/locus', v11.success
+        && v11.output.includes('saw:uploaded-by-user') && v11.output.includes('[written: /mnt/download/from-python.txt'),
+        JSON.stringify(v11.output).slice(0, 300));
+      const v12 = await executeTool('bash', 'cat /mnt/download/from-python.txt /tmp/py-tmp.txt /home/locus/py-home.txt', bare);
+      check('V12 bash sees every python write', v12.success && v12.output.includes('py:uploaded-by-user')
+        && v12.output.includes('scratch') && v12.output.includes('home'), JSON.stringify(v12.output));
+
+      // python overwrite attempt of a read-only upload is reported; provider bytes unchanged
+      const v13 = await executeTool('bash', "python <<'PY'\nopen('/mnt/upload/input.txt', 'w').write('hacked')\nPY", bare);
+      check('V13 python write to /mnt/upload reported as failure', !v13.success, JSON.stringify(v13.output).slice(0, 300));
+      const v14 = await executeTool('bash', 'cat /mnt/upload/input.txt', bare);
+      check('V14 upload bytes unchanged after python write attempt', v14.success && v14.output === 'uploaded-by-user',
+        JSON.stringify(v14.output));
+
+      // bash <-> python roundtrip through /mnt/download in BOTH directions
+      await executeTool('bash', 'echo shell-side > /mnt/download/from-shell.txt', bare);
+      const v15 = await executeTool('bash', "python <<'PY'\nprint('py-reads:' + open('/mnt/download/from-shell.txt').read().strip())\nPY", bare);
+      check('V15 python reads bash-written /mnt/download file', v15.success
+        && v15.output.includes('py-reads:shell-side'), JSON.stringify(v15.output).slice(0, 200));
+      const v16 = await executeTool('bash', 'cat /mnt/download/from-python.txt', bare);
+      check('V16 bash reads python-written /mnt/download file', v16.success
+        && v16.output === 'py:uploaded-by-user', JSON.stringify(v16.output));
     }
 
     // ---------- E. python timeout + worker recovery (runs last) ----------

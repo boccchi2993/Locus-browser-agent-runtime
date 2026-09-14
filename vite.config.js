@@ -17,6 +17,7 @@ const RUNTIME_SCRIPTS = [
   'src/model-adapters.js',
   'src/model.js',
   'src/workspace.js',
+  'src/vfs.js',
   'src/network.js',
   'src/shell.js',
   'src/tools.js',
