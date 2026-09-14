@@ -17,15 +17,22 @@
 -->
 <script type="text/worker" id="py-worker-src">
 // ============================================================
-//  PYODIDE WORKER  (protocol v2)
+//  PYODIDE WORKER  (protocol v2.1 — adds directory semantics)
 //  Loads Pyodide lazily on first run, executes Python against an
 //  in-memory mirror of the VFS data mounts, and reports back
-//  stdout / stderr / tracebacks / changed files (ABSOLUTE paths).
+//  stdout / stderr / tracebacks / changed files+dirs (ABSOLUTE paths).
 //
-//  Message in:  { id, cmd: 'run', code, cwd, mounts: [{ root, readOnly, files: [{ path(ABS), b64 }] }] }
+//  Message in:  { id, cmd: 'run', code, cwd,
+//                 mounts: [{ root, readOnly,
+//                            files: [{ path(ABS), b64 }],
+//                            directories: [ABS] }] }
 //  Result out:  { id, type: 'result', stdout, stderr, error,
-//                 files: [{ path(ABS), b64 }], deleted: [ABS], uncollectedFiles: [ABS],
+//                 files: [{ path(ABS), b64 }], deleted: [ABS files],
+//                 createdDirs: [ABS], deletedDirs: [ABS],
+//                 uncollectedFiles: [ABS],
 //                 stdoutTruncated, stderrTruncated }
+//  `deleted` is FILES ONLY; directory creates/removals are reported in
+//  their own fields (createdDirs parent-first, deletedDirs child-first).
 // ============================================================
 const PYODIDE_BASE = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
 
@@ -72,18 +79,21 @@ function bytesToB64(bytes) {
 // wholesale on every run. NEVER rmtree anything else — /, /usr, /home,
 // /tmp and Pyodide's own paths are strictly off-limits.
 const MANAGED_ROOTS = ['/mnt/workspace', '/mnt/upload', '/mnt/download', '/home/locus'];
-// /tmp belongs to Pyodide: syncIn deletes exactly the files IT wrote on the
-// previous run (tracked module-level), never the directory itself.
+// /tmp belongs to Pyodide: syncIn deletes exactly the files AND directories
+// IT wrote on the previous run (tracked module-level), never the directory
+// itself.
 let tmpManagedFiles = [];
+let tmpManagedDirs = [];
 
 function rmTree(root) {
   if (MANAGED_ROOTS.indexOf(root) === -1) throw new Error('refusing to rmtree unmanaged root: ' + root);
   py.runPython('import shutil; shutil.rmtree(' + JSON.stringify(root) + ', ignore_errors=True)');
 }
 
-// Reset each managed mirror root, then write the incoming snapshot.
-// Returns a {ABS path: b64} manifest used to detect new/changed/deleted
-// files after the run.
+// Reset each managed mirror root, then write the incoming snapshot:
+// directories FIRST (empty dirs are real filesystem state — the shell cwd
+// may point at one), then files. Returns a {ABS path: b64} manifest used
+// to detect new/changed/deleted files after the run.
 function syncIn(mounts) {
   const manifest = {};
   for (const m of mounts || []) {
@@ -94,8 +104,15 @@ function syncIn(mounts) {
     } else if (root === '/tmp') {
       for (const p of tmpManagedFiles) { try { py.FS.unlink(p); } catch (e) {} }
       tmpManagedFiles = [];
+      // Deepest first; best-effort (a dir with untracked content stays).
+      for (const d of tmpManagedDirs.slice().sort().reverse()) { try { py.FS.rmdir(d); } catch (e) {} }
+      tmpManagedDirs = [];
     } else {
       continue; // unknown root: never touched
+    }
+    for (const d of (m.directories || []).slice().sort()) {
+      py.FS.mkdirTree(d);
+      if (root === '/tmp') tmpManagedDirs.push(d);
     }
     for (const f of m.files || []) {
       const full = f.path; // absolute VFS path
@@ -117,6 +134,28 @@ function syncIn(mounts) {
   return manifest;
 }
 
+// Directory manifest at sync-in time: every mount root, every synced
+// directory and every parent of a synced file. Compared against the
+// post-run walk to surface created/deleted directories — empty dirs
+// included (a file-only diff silently drops them).
+function dirManifest(mounts) {
+  const dirs = new Set();
+  for (const m of mounts || []) {
+    const root = m.root;
+    dirs.add(root);
+    const addWithParents = (p) => {
+      let cur = p;
+      while (cur && cur !== root && cur.indexOf(root + '/') === 0) {
+        dirs.add(cur);
+        cur = cur.substring(0, cur.lastIndexOf('/'));
+      }
+    };
+    for (const d of m.directories || []) addWithParents(d);
+    for (const f of m.files || []) addWithParents(f.path.substring(0, f.path.lastIndexOf('/')));
+  }
+  return dirs;
+}
+
 // Output caps, enforced inside the worker BEFORE anything is posted to the
 // main thread — a runaway print loop or huge artifact must not OOM the page.
 const MAX_STDOUT_CHARS = 1024 * 1024;
@@ -124,13 +163,14 @@ const MAX_STDERR_CHARS = 1024 * 1024;
 const MAX_OUT_FILES = 200;
 const MAX_OUT_TOTAL_BYTES = 25 * 1024 * 1024;
 
-function walkFs(dir, prefix, out) {
+function walkFs(dir, prefix, out, dirs) {
   for (const entry of py.FS.readdir(dir)) {
     if (entry === '.' || entry === '..') continue;
     const full = dir + '/' + entry;
     const stat = py.FS.stat(full);
     if (py.FS.isDir(stat.mode)) {
-      walkFs(full, prefix + entry + '/', out);
+      if (dirs) dirs.push(prefix + entry);
+      walkFs(full, prefix + entry + '/', out, dirs);
     } else {
       out.push({ path: prefix + entry, full: full, size: stat.size });
     }
@@ -152,18 +192,24 @@ function b64Size(b64) {
 // (a rename target among the uncollected files would lose the source).
 // Sizes are checked via stat BEFORE reading/base64-encoding a file.
 // All paths in the result are absolute.
-function diffOut(manifest, mounts) {
+// Directories have no content and no caps: created/deleted dirs are
+// diffed against the sync-in directory manifest (empty dirs included).
+function diffOut(manifest, beforeDirs, mounts) {
   const changed = [];
   const uncollected = [];
   const present = new Set();
+  const afterDirs = new Set();
   let total = 0;
   for (const m of mounts || []) {
     const root = m.root;
     let rootStat = null;
     try { rootStat = py.FS.stat(root); } catch (e) { rootStat = null; }
     if (!rootStat || !py.FS.isDir(rootStat.mode)) continue; // mirror root absent — its files read as deleted
+    afterDirs.add(root);
     const entries = [];
-    walkFs(root, root + '/', entries);
+    const dirList = [];
+    walkFs(root, root + '/', entries, dirList);
+    for (const d of dirList) afterDirs.add(d);
     for (const e of entries) {
       present.add(e.path);
       const snapB64 = manifest[e.path];
@@ -197,7 +243,23 @@ function diffOut(manifest, mounts) {
   for (const path of Object.keys(manifest)) {
     if (!present.has(path)) deleted.push(path);
   }
-  return { changed: changed, deleted: deleted, uncollected: uncollected };
+  // Directory diff against the sync-in manifest. Mount roots themselves are
+  // protocol-managed, never reported. Deterministic order: creates are
+  // parent-first (lexicographic order guarantees it), deletes child-first.
+  const roots = new Set();
+  for (const m of mounts || []) roots.add(m.root);
+  const createdDirs = [];
+  for (const d of afterDirs) {
+    if (!beforeDirs.has(d) && !roots.has(d)) createdDirs.push(d);
+  }
+  createdDirs.sort();
+  const deletedDirs = [];
+  for (const d of beforeDirs) {
+    if (!afterDirs.has(d) && !roots.has(d)) deletedDirs.push(d);
+  }
+  deletedDirs.sort().reverse();
+  return { changed: changed, deleted: deleted, uncollected: uncollected,
+    createdDirs: createdDirs, deletedDirs: deletedDirs };
 }
 
 self.onmessage = async (ev) => {
@@ -210,6 +272,7 @@ self.onmessage = async (ev) => {
     self.postMessage({ id: id, type: 'status', status: 'ready' });
 
     const manifest = syncIn(msg.mounts || []);
+    const beforeDirs = dirManifest(msg.mounts || []);
 
     let stdout = '';
     let stderr = '';
@@ -244,15 +307,16 @@ self.onmessage = async (ev) => {
       error = String(e && e.message ? e.message : e);
     }
 
-    const diff = diffOut(manifest, msg.mounts || []);
+    const diff = diffOut(manifest, beforeDirs, msg.mounts || []);
     self.postMessage({
       id: id, type: 'result', stdout: stdout, stderr: stderr, error: error,
       files: diff.changed, deleted: diff.deleted,
+      createdDirs: diff.createdDirs, deletedDirs: diff.deletedDirs,
       uncollectedFiles: diff.uncollected,
       stdoutTruncated: stdoutTruncated, stderrTruncated: stderrTruncated,
     });
   } catch (e) {
-    self.postMessage({ id: id, type: 'result', stdout: '', stderr: '', error: String(e && e.message ? e.message : e), files: [], deleted: [], uncollectedFiles: [], stdoutTruncated: false, stderrTruncated: false });
+    self.postMessage({ id: id, type: 'result', stdout: '', stderr: '', error: String(e && e.message ? e.message : e), files: [], deleted: [], createdDirs: [], deletedDirs: [], uncollectedFiles: [], stdoutTruncated: false, stderrTruncated: false });
   }
 };
 </script>

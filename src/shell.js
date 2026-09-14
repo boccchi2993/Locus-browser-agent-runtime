@@ -95,7 +95,7 @@ const PythonRuntime = {
   _failAllPending(errorMessage) {
     for (const [, p] of this._pending) {
       clearTimeout(p.timer);
-      p.resolve({ stdout: '', stderr: '', error: errorMessage, files: [], deleted: [] });
+      p.resolve({ stdout: '', stderr: '', error: errorMessage, files: [], deleted: [], createdDirs: [], deletedDirs: [] });
     }
     this._pending.clear();
   },
@@ -120,10 +120,11 @@ const PythonRuntime = {
   // exactly what committed and what never ran.
   // Returns {
   //   stdout, stderr, error,            — compute outcome
-  //   written, deleted,                 — ABS paths actually committed
-  //   conflicts: [{path, reason}],      — commits refused (read-only mount / external change / unsynced path)
+  //   written, deleted,                 — ABS paths actually committed (deleted covers files AND directories)
+  //   mkdirs,                           — ABS directory paths actually created
+  //   conflicts: [{path, reason}],      — commits refused (read-only mount / external change / unsynced path / type change)
   //   writeFailed: [description],       — commits attempted but failed
-  //   notPersisted: [paths],            — generated files never written (cancelled / incomplete changeset)
+  //   notPersisted: [paths],            — generated changes never written (cancelled / incomplete changeset)
   //   skipped: [{path, reason}],        — files NOT mirrored into Python (ABS paths)
   //   uncollected: [paths],             — python outputs over the worker caps (changeset incomplete)
   //   stdoutTruncated, stderrTruncated, — output notice flags (NOT commit failures)
@@ -146,6 +147,9 @@ const PythonRuntime = {
       for (const dm of vfs.dataMounts()) {
         const collected = await collectWorkspaceFiles(dm.provider, signal);
         const files = collected.files.map((f) => ({ path: dm.root + '/' + f.path, b64: f.b64 }));
+        // Every real VFS directory (empty ones included) is mirrored in, so
+        // Python sees the same directory tree the shell does.
+        const directories = collected.dirs.map((d) => dm.root + '/' + d);
         skipped = skipped.concat(collected.skipped.map((s) => ({ path: dm.root + '/' + s.path, reason: s.reason })));
         for (const f of files) snapshot[f.path] = f.b64;
         inputBytes += files.reduce((n, f) => n + b64ByteLength(f.b64), 0);
@@ -153,8 +157,22 @@ const PythonRuntime = {
           root: dm.root,
           readOnly: dm.authority === 'read-only' || dm.authority === 'system-read-only',
           files: files,
+          directories: directories,
         });
       }
+    }
+    // The shell cwd must exist in the Python mirror — but it is only ever
+    // CREATED there when the VFS itself confirms it is a real directory.
+    // A bogus cwd must still fail in Python, never be fabricated.
+    const cwdAbs = (opts && opts.cwd) || (vfs && typeof vfs.defaultCwd === 'function' ? vfs.defaultCwd() : '/');
+    for (const m of mounts) {
+      if (cwdAbs === m.root || !cwdAbs.startsWith(m.root + '/')) continue;
+      if (m.directories.indexOf(cwdAbs) === -1) {
+        let st = null;
+        try { st = await vfs.stat(cwdAbs); } catch (e) { st = null; }
+        if (st && st.kind === 'directory') m.directories.push(cwdAbs);
+      }
+      break;
     }
     // The abort may have landed DURING collection (no listener was attached
     // yet) — never start the worker run on a cancelled task.
@@ -172,7 +190,7 @@ const PythonRuntime = {
         this._pending.set(id, { resolve, timer });
         this.worker.postMessage({
           id: id, cmd: 'run', code: code,
-          cwd: (opts && opts.cwd) || (vfs && typeof vfs.defaultCwd === 'function' ? vfs.defaultCwd() : '/'),
+          cwd: cwdAbs,
           mounts: mounts,
         });
       });
@@ -183,7 +201,10 @@ const PythonRuntime = {
 
     const skippedSet = new Set(skipped.map((s) => s.path));
     const uncollected = result.uncollectedFiles || [];
+    const createdDirs = result.createdDirs || []; // worker emits parent-first
+    const deletedDirs = result.deletedDirs || []; // worker emits child-first
     const written = [];
+    const mkdirs = [];
     const conflicts = [];
     const writeFailed = [];
     const notPersisted = [];
@@ -191,6 +212,55 @@ const PythonRuntime = {
 
     for (const p of uncollected) {
       notPersisted.push(p + ' (over python output limit; changeset incomplete)');
+    }
+
+    // ---- commit phase 0: created directories (parent before child) ----
+    // Directory creations route through the same mount-authority checks as
+    // file writes: read-only mounts reject with a conflict, and a path
+    // already occupied by a FILE is a loud refusal — file↔directory type
+    // changes are never half-applied.
+    for (const d of createdDirs) {
+      if (signal && signal.aborted) {
+        notPersisted.push('mkdir ' + d + ' (cancelled before commit)');
+        continue;
+      }
+      const mount = vfs && typeof vfs.resolveMount === 'function' ? vfs.resolveMount(d) : null;
+      if (!mount) {
+        conflicts.push({ path: d, reason: 'not under any writable mount; mkdir skipped' });
+        continue;
+      }
+      if (mount.authority === 'read-only' || mount.authority === 'system-read-only') {
+        conflicts.push({
+          path: d,
+          reason: 'read-only filesystem: changes under ' + mount.path + ' are never committed',
+        });
+        continue;
+      }
+      let st = null;
+      try {
+        st = await vfs.stat(d);
+      } catch (e) {
+        if (!e || e.name !== 'NotFoundError') {
+          conflicts.push({ path: d, reason: 'could not verify current on-disk state (' + e.message + '); mkdir skipped' });
+          continue;
+        }
+      }
+      if (st && st.kind === 'directory') continue; // appeared externally — already satisfied
+      if (st) {
+        conflicts.push({ path: d, reason: 'a file exists at this path; file→directory type changes are not committed' });
+        continue;
+      }
+      // The stat above awaited: re-check cancellation BEFORE the side effect.
+      if (signal && signal.aborted) {
+        notPersisted.push('mkdir ' + d + ' (cancelled before commit)');
+        continue;
+      }
+      try {
+        await vfs.mkdir(d);
+        mkdirs.push(d);
+      } catch (e) {
+        writeFailed.push('mkdir ' + d + ': ' + (e && e.message ? e.message : String(e)));
+      }
     }
 
     // ---- commit phase 1: create/modify ----
@@ -315,11 +385,56 @@ const PythonRuntime = {
       notPersisted.push('deletions skipped (' + result.deleted.join(', ') + '): ' + why);
     }
 
+    // ---- commit phase 3: deleted directories (child before parent) ----
+    // Same honesty rule as file deletions, re-evaluated AFTER phase 2: any
+    // failed/refused/incomplete commit so far means the run's new state is
+    // incomplete — removing directories could destroy data, so stop.
+    const dirDeletesBlocked = deletesBlocked || writeFailed.length > 0 || conflicts.length > 0;
+    if (deletedDirs.length && !dirDeletesBlocked) {
+      for (const p of deletedDirs) {
+        if (signal && signal.aborted) {
+          notPersisted.push('rmdir ' + p + ' (cancelled before commit)');
+          continue;
+        }
+        if (vfs && typeof vfs.isProtectedRoot === 'function' && vfs.isProtectedRoot(p)) {
+          conflicts.push({ path: p, reason: 'protected path; refusing to remove directory' });
+          continue;
+        }
+        const mount = vfs && typeof vfs.resolveMount === 'function' ? vfs.resolveMount(p) : null;
+        if (!mount) {
+          conflicts.push({ path: p, reason: 'not under any writable mount; rmdir skipped' });
+          continue;
+        }
+        if (mount.authority === 'read-only' || mount.authority === 'system-read-only') {
+          conflicts.push({
+            path: p,
+            reason: 'read-only filesystem: changes under ' + mount.path + ' are never committed',
+          });
+          continue;
+        }
+        // A directory that still holds unsynced files is not empty — the
+        // provider refuses the removal and the failure is reported below.
+        try {
+          await vfs.remove(p);
+          deleted.push(p);
+        } catch (e) {
+          if (e && e.name === 'NotFoundError') continue; // already gone
+          writeFailed.push('rmdir ' + p + ': ' + (e && e.message ? e.message : String(e)));
+        }
+      }
+    } else if (deletedDirs.length && dirDeletesBlocked) {
+      const why = uncollected.length > 0
+        ? 'output changeset incomplete (' + uncollected.length + ' file(s) not collected), sources preserved'
+        : 'earlier commits failed, sources preserved';
+      notPersisted.push('directory deletions skipped (' + deletedDirs.join(', ') + '): ' + why);
+    }
+
     return {
       stdout: result.stdout || '',
       stderr: result.stderr || '',
       error: result.error || null,
       written,
+      mkdirs,
       deleted,
       conflicts,
       writeFailed,
@@ -409,6 +524,7 @@ const SYNC_MAX_TOTAL_BYTES = 25 * 1024 * 1024;
 
 async function collectWorkspaceFiles(workspace, signal) {
   const files = [];
+  const dirs = []; // RELATIVE paths of every directory (empty ones included)
   const skipped = [];
   let total = 0;
 
@@ -419,6 +535,10 @@ async function collectWorkspaceFiles(workspace, signal) {
     for (const e of entries) {
       const childRel = rel ? rel + '/' + e.name : e.name;
       if (e.kind === 'directory') {
+        // Directories are real filesystem state: an empty dir must exist in
+        // the Python mirror (the shell cwd may point at it) and must survive
+        // a round trip. Content caps below apply to files only.
+        dirs.push(childRel);
         await walk(childRel);
         continue;
       }
@@ -443,7 +563,7 @@ async function collectWorkspaceFiles(workspace, signal) {
   }
 
   await walk('');
-  return { files, skipped };
+  return { files, skipped, dirs };
 }
 
 // ---------- shell ----------
@@ -2035,6 +2155,9 @@ async function runPythonCode(code, vfs, opts) {
   }
   if (res.written && res.written.length) {
     outParts.push('[written: ' + res.written.join(', ') + ']');
+  }
+  if (res.mkdirs && res.mkdirs.length) {
+    outParts.push('[mkdir: ' + res.mkdirs.join(', ') + ']');
   }
   if (res.deleted && res.deleted.length) {
     outParts.push('[deleted: ' + res.deleted.join(', ') + ']');
