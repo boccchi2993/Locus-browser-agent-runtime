@@ -11,10 +11,18 @@ const path = require('path');
 global.window = { location: { protocol: 'https:' } };
 global.document = { getElementById: () => null }; // PythonRuntime._setStatus touches the status bar
 
-const src = ['telemetry.js', 'workspace.js', 'network.js', 'shell.js', 'tools.js']
+const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js', 'tools.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
-const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, PythonRuntime, runShellCommand, executeTool, Telemetry });');
+const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, normalizeVfsPath, VirtualWorkspace, SHELL_COMMANDS, PythonRuntime, runShellCommand, executeTool, shellSystemPromptSection, shellHelpText, Telemetry });');
+
+// Wrap a legacy adapter the way asVfs does internally, but keep a handle on
+// the VFS so tests can assert through absolute paths.
+function wrapVfs(adapter, opts) {
+  const vfs = new M.VirtualWorkspace(Object.assign({ listCommands: () => Object.keys(M.SHELL_COMMANDS) }, opts || {}));
+  if (adapter) vfs.mount('/mnt/workspace', adapter, 'external-read-write');
+  return vfs;
+}
 
 // --- byte-exact in-memory workspace ---
 class MemWS extends M.WorkspaceAdapter {
@@ -39,8 +47,13 @@ class MemWS extends M.WorkspaceAdapter {
   }
   async remove(p) { p = M.normalizeWorkspacePath(p); delete this.files[p]; }
   async mkdir(p) { p = M.normalizeWorkspacePath(p); if (p && p in this.files) { const e = new Error('type mismatch'); e.name = 'TypeMismatchError'; throw e; } }
-  async exists(p) { try { p = M.normalizeWorkspacePath(p); } catch (e) { return false; } return p in this.files; }
-  async stat(p) { p = M.normalizeWorkspacePath(p); if (!(p in this.files)) { const e = new Error('No such file: ' + p); e.name = 'NotFoundError'; throw e; } return { kind: 'file', size: this.files[p].byteLength, modified: 0 }; }
+  async exists(p) { try { p = M.normalizeWorkspacePath(p); } catch (e) { return false; } return p === '' || p in this.files; }
+  async stat(p) {
+    p = M.normalizeWorkspacePath(p);
+    if (p === '') return { kind: 'directory', size: 0, modified: 0 };
+    if (!(p in this.files)) { const e = new Error('No such file: ' + p); e.name = 'NotFoundError'; throw e; }
+    return { kind: 'file', size: this.files[p].byteLength, modified: 0 };
+  }
 }
 
 function b64(s) { return Buffer.from(s, 'utf8').toString('base64'); }
@@ -107,16 +120,16 @@ async function run() {
   // ---------- P. python write-back: failed target stops deletions (F04) ----------
   const wsP = new MemWS({ 'old.txt': 'original' });
   wsP.writeFail.add('new.txt');
-  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: 'new.txt', b64: b64('renamed') }], deleted: ['old.txt'] });
+  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: '/mnt/workspace/new.txt', b64: b64('renamed') }], deleted: ['/mnt/workspace/old.txt'] });
   const p1 = await M.executeTool('bash', "python -c 'print(1)'", wsP);
   check('P1 failed write → tool reports failure', p1.success === false, JSON.stringify(p1.output));
   check('P1b source file preserved', new TextDecoder().decode(wsP.files['old.txt'] || []) === 'original');
   check('P1c deletions explicitly skipped', p1.output.includes('deletions skipped'), p1.output);
-  check('P1d write failure reported', p1.output.includes('write-back failed: new.txt'), p1.output);
+  check('P1d write failure reported (ABS path)', p1.output.includes('write-back failed: /mnt/workspace/new.txt'), p1.output);
 
   // successful rename still commits both sides
   const wsP2 = new MemWS({ 'old.txt': 'original' });
-  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: 'new.txt', b64: b64('original') }], deleted: ['old.txt'] });
+  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: '/mnt/workspace/new.txt', b64: b64('original') }], deleted: ['/mnt/workspace/old.txt'] });
   const p2 = await M.executeTool('bash', "python -c 'print(1)'", wsP2);
   check('P2 rename commits both sides', p2.success === true && !('old.txt' in wsP2.files)
     && new TextDecoder().decode(wsP2.files['new.txt']) === 'original', JSON.stringify(p2.output));
@@ -124,18 +137,18 @@ async function run() {
   // ---------- C. external edits during the run are never overwritten (F11) ----------
   const wsC = new MemWS({ 'a.txt': 'before' });
   mockWorkerResult(
-    { stdout: '', stderr: '', error: null, files: [{ path: 'a.txt', b64: b64('python version') }], deleted: [] },
+    { stdout: '', stderr: '', error: null, files: [{ path: '/mnt/workspace/a.txt', b64: b64('python version') }], deleted: [] },
     () => { wsC.files['a.txt'] = new TextEncoder().encode('user edit'); }, // external edit mid-run
   );
   const c1 = await M.executeTool('bash', "python -c 'print(1)'", wsC);
-  check('C1 external edit conflict reported', c1.success === false && c1.output.includes('conflict: a.txt'),
+  check('C1 external edit conflict reported', c1.success === false && c1.output.includes('conflict: /mnt/workspace/a.txt'),
     JSON.stringify(c1.output));
   check('C1b user content preserved', new TextDecoder().decode(wsC.files['a.txt']) === 'user edit');
 
   // deletion of an externally modified file is refused
   const wsC2 = new MemWS({ 'a.txt': 'before' });
   mockWorkerResult(
-    { stdout: '', stderr: '', error: null, files: [], deleted: ['a.txt'] },
+    { stdout: '', stderr: '', error: null, files: [], deleted: ['/mnt/workspace/a.txt'] },
     () => { wsC2.files['a.txt'] = new TextEncoder().encode('user edit'); },
   );
   const c2 = await M.executeTool('bash', "python -c 'print(1)'", wsC2);
@@ -144,7 +157,7 @@ async function run() {
 
   // unchanged file: python edit commits cleanly
   const wsC3 = new MemWS({ 'a.txt': 'before' });
-  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: 'a.txt', b64: b64('after') }], deleted: [] });
+  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: '/mnt/workspace/a.txt', b64: b64('after') }], deleted: [] });
   const c3 = await M.executeTool('bash', "python -c 'print(1)'", wsC3);
   check('C3 clean modify commits', c3.success === true && new TextDecoder().decode(wsC3.files['a.txt']) === 'after');
 
@@ -152,20 +165,31 @@ async function run() {
   const bigFile = new Uint8Array(6 * 1024 * 1024).fill(7); // over the 5 MiB per-file sync limit
   const wsS = new MemWS();
   wsS.files['big.bin'] = bigFile;
-  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: 'big.bin', b64: b64('python created') }], deleted: [] });
+  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: '/mnt/workspace/big.bin', b64: b64('python created') }], deleted: [] });
   const s1 = await M.executeTool('bash', "python -c 'print(1)'", wsS);
-  check('S1 python file at skipped path refused', s1.success === false && s1.output.includes('conflict: big.bin')
+  check('S1 python file at skipped path refused', s1.success === false && s1.output.includes('conflict: /mnt/workspace/big.bin')
     && s1.output.includes('not synced into Python'), JSON.stringify(s1.output));
   check('S1b real file untouched', wsS.files['big.bin'].byteLength === bigFile.byteLength
     && wsS.files['big.bin'][0] === 7);
   check('S1c skip reported with path', s1.output.includes('NOT visible to Python') && s1.output.includes('big.bin'),
     JSON.stringify(s1.output).slice(0, 200));
 
-  // ---------- N. generated files without a workspace are reported, not faked ----------
-  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: 'out.txt', b64: b64('x') }], deleted: [] });
-  const n1 = await M.executeTool('bash', "python -c 'print(1)'", null);
-  check('N1 no workspace → not persisted + failure', n1.success === false && n1.output.includes('not persisted'),
+  // ---------- N. no workspace: the bare machine still persists into /home/locus ----------
+  const nVfs = wrapVfs(null);
+  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: '/home/locus/out.txt', b64: b64('x') }], deleted: [] });
+  const n1 = await M.executeTool('bash', "python -c 'print(1)'", nVfs);
+  check('N1 no workspace → output commits to /home/locus (ABS)', n1.success === true
+    && new TextDecoder().decode(await nVfs.readBytes('/home/locus/out.txt')) === 'x'
+    && n1.output.includes('[written: /home/locus/out.txt]'),
     JSON.stringify(n1.output));
+
+  // a python output outside every writable mount is refused with a conflict
+  const nVfs2 = wrapVfs(null);
+  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: '/usr/evil.txt', b64: b64('x') }], deleted: [] });
+  const n2 = await M.executeTool('bash', "python -c 'print(1)'", nVfs2);
+  check('N2 python output on structural path → conflict, not written', n2.success === false
+    && n2.output.includes('conflict: /usr/evil.txt') && !(await nVfs2.exists('/usr/evil.txt')),
+    JSON.stringify(n2.output));
 
   // ---------- X. cancellation before the run ----------
   const ac = new AbortController();
@@ -186,7 +210,7 @@ async function run() {
     if (p === 'a.txt' && readsY1 === 2) acY1.abort(); // 1st read = snapshot, 2nd = conflict check
     return data;
   };
-  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: 'a.txt', b64: b64('python') }], deleted: [], uncollectedFiles: [] });
+  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [{ path: '/mnt/workspace/a.txt', b64: b64('python') }], deleted: [], uncollectedFiles: [] });
   const y1 = await M.executeTool('bash', "python -c 'x'", wsY1, { signal: acY1.signal });
   check('Y1 cancel during write pre-check → no write starts',
     new TextDecoder().decode(wsY1.files['a.txt']) === 'before', new TextDecoder().decode(wsY1.files['a.txt']));
@@ -204,7 +228,7 @@ async function run() {
     if (p === 'b.txt' && readsY2 === 2) acY2.abort();
     return data;
   };
-  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [], deleted: ['b.txt'], uncollectedFiles: [] });
+  mockWorkerResult({ stdout: '', stderr: '', error: null, files: [], deleted: ['/mnt/workspace/b.txt'], uncollectedFiles: [] });
   const y2 = await M.executeTool('bash', "python -c 'x'", wsY2, { signal: acY2.signal });
   check('Y2 cancel during delete verification → file preserved',
     !!wsY2.files['b.txt'] && new TextDecoder().decode(wsY2.files['b.txt']) === 'keep');

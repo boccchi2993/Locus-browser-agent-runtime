@@ -17,13 +17,17 @@
 -->
 <script type="text/worker" id="py-worker-src">
 // ============================================================
-//  PYODIDE WORKER
+//  PYODIDE WORKER  (protocol v2)
 //  Loads Pyodide lazily on first run, executes Python against an
-//  in-memory mirror of the user-authorized workspace, and reports
-//  back stdout / stderr / tracebacks / changed files.
+//  in-memory mirror of the VFS data mounts, and reports back
+//  stdout / stderr / tracebacks / changed files (ABSOLUTE paths).
+//
+//  Message in:  { id, cmd: 'run', code, cwd, mounts: [{ root, readOnly, files: [{ path(ABS), b64 }] }] }
+//  Result out:  { id, type: 'result', stdout, stderr, error,
+//                 files: [{ path(ABS), b64 }], deleted: [ABS], uncollectedFiles: [ABS],
+//                 stdoutTruncated, stderrTruncated }
 // ============================================================
 const PYODIDE_BASE = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
-const WORK_ROOT = '/workspace';
 
 let py = null;
 let pyodideLoading = null;
@@ -33,7 +37,6 @@ async function ensurePyodide() {
     pyodideLoading = (async () => {
       importScripts(PYODIDE_BASE + 'pyodide.js');
       const instance = await loadPyodide({ indexURL: PYODIDE_BASE });
-      instance.FS.mkdirTree(WORK_ROOT);
       return instance;
     })();
   }
@@ -65,18 +68,51 @@ function bytesToB64(bytes) {
   return btoa(bin);
 }
 
-// Reset the mirror, then write the incoming snapshot. Returns a
-// {path: b64} manifest used to detect new/changed files after the run.
-function syncIn(files) {
-  py.runPython('import shutil; shutil.rmtree("' + WORK_ROOT + '", ignore_errors=True)');
-  py.FS.mkdirTree(WORK_ROOT);
+// Roots whose ENTIRE subtree is owned by the sync protocol and replaced
+// wholesale on every run. NEVER rmtree anything else — /, /usr, /home,
+// /tmp and Pyodide's own paths are strictly off-limits.
+const MANAGED_ROOTS = ['/mnt/workspace', '/mnt/upload', '/mnt/download', '/home/locus'];
+// /tmp belongs to Pyodide: syncIn deletes exactly the files IT wrote on the
+// previous run (tracked module-level), never the directory itself.
+let tmpManagedFiles = [];
+
+function rmTree(root) {
+  if (MANAGED_ROOTS.indexOf(root) === -1) throw new Error('refusing to rmtree unmanaged root: ' + root);
+  py.runPython('import shutil; shutil.rmtree(' + JSON.stringify(root) + ', ignore_errors=True)');
+}
+
+// Reset each managed mirror root, then write the incoming snapshot.
+// Returns a {ABS path: b64} manifest used to detect new/changed/deleted
+// files after the run.
+function syncIn(mounts) {
   const manifest = {};
-  for (const f of files) {
-    const full = WORK_ROOT + '/' + f.path;
-    const dir = full.substring(0, full.lastIndexOf('/'));
-    if (dir) py.FS.mkdirTree(dir);
-    py.FS.writeFile(full, b64ToBytes(f.b64));
-    manifest[f.path] = f.b64;
+  for (const m of mounts || []) {
+    const root = m.root;
+    if (MANAGED_ROOTS.indexOf(root) !== -1) {
+      rmTree(root);
+      py.FS.mkdirTree(root);
+    } else if (root === '/tmp') {
+      for (const p of tmpManagedFiles) { try { py.FS.unlink(p); } catch (e) {} }
+      tmpManagedFiles = [];
+    } else {
+      continue; // unknown root: never touched
+    }
+    for (const f of m.files || []) {
+      const full = f.path; // absolute VFS path
+      const dir = full.substring(0, full.lastIndexOf('/'));
+      if (dir) py.FS.mkdirTree(dir);
+      py.FS.writeFile(full, b64ToBytes(f.b64));
+      manifest[full] = f.b64;
+      if (root === '/tmp') tmpManagedFiles.push(full);
+    }
+    if (m.readOnly) {
+      // Best-effort read-only mirror: the authoritative enforcement is the
+      // main-thread commit phase (changes under read-only roots are never
+      // committed), chmod is defence in depth.
+      for (const f of m.files || []) {
+        try { py.FS.chmod(f.path, 0o444); } catch (e) {}
+      }
+    }
   }
   return manifest;
 }
@@ -109,43 +145,51 @@ function b64Size(b64) {
   return Math.floor(len / 4) * 3 - pad;
 }
 
-// Collect the output changeset. Files that cannot be collected within the
-// caps are reported as STRUCTURED uncollected paths — the changeset is then
+// Collect the output changeset across ALL mount roots; caps are global
+// (shared across mounts). Files that cannot be collected within the caps
+// are reported as STRUCTURED uncollected paths — the changeset is then
 // incomplete and the main thread must not treat deletions as committable
 // (a rename target among the uncollected files would lose the source).
 // Sizes are checked via stat BEFORE reading/base64-encoding a file.
-function diffOut(manifest) {
-  const entries = [];
-  walkFs(WORK_ROOT, '', entries);
+// All paths in the result are absolute.
+function diffOut(manifest, mounts) {
   const changed = [];
   const uncollected = [];
   const present = new Set();
   let total = 0;
-  for (const e of entries) {
-    present.add(e.path);
-    const snapB64 = manifest[e.path];
-    const snapSize = snapB64 !== undefined ? b64Size(snapB64) : -1;
-    if (snapSize >= 0 && e.size === snapSize) {
-      // Possibly unchanged (same size as the sync-in snapshot, which is
-      // bounded by the sync-in caps): read and compare to be sure.
-      const b64 = bytesToB64(py.FS.readFile(e.full));
-      if (snapB64 === b64) continue;
+  for (const m of mounts || []) {
+    const root = m.root;
+    let rootStat = null;
+    try { rootStat = py.FS.stat(root); } catch (e) { rootStat = null; }
+    if (!rootStat || !py.FS.isDir(rootStat.mode)) continue; // mirror root absent — its files read as deleted
+    const entries = [];
+    walkFs(root, root + '/', entries);
+    for (const e of entries) {
+      present.add(e.path);
+      const snapB64 = manifest[e.path];
+      const snapSize = snapB64 !== undefined ? b64Size(snapB64) : -1;
+      if (snapSize >= 0 && e.size === snapSize) {
+        // Possibly unchanged (same size as the sync-in snapshot, which is
+        // bounded by the sync-in caps): read and compare to be sure.
+        const b64 = bytesToB64(py.FS.readFile(e.full));
+        if (snapB64 === b64) continue;
+        if (changed.length >= MAX_OUT_FILES || total + e.size > MAX_OUT_TOTAL_BYTES) {
+          uncollected.push(e.path);
+          continue;
+        }
+        total += e.size;
+        changed.push({ path: e.path, b64: b64 });
+        continue;
+      }
+      // Definitely new or changed (no snapshot, or size differs): check the
+      // budget from stat.size BEFORE reading the file into memory.
       if (changed.length >= MAX_OUT_FILES || total + e.size > MAX_OUT_TOTAL_BYTES) {
         uncollected.push(e.path);
         continue;
       }
       total += e.size;
-      changed.push({ path: e.path, b64: b64 });
-      continue;
+      changed.push({ path: e.path, b64: bytesToB64(py.FS.readFile(e.full)) });
     }
-    // Definitely new or changed (no snapshot, or size differs): check the
-    // budget from stat.size BEFORE reading the file into memory.
-    if (changed.length >= MAX_OUT_FILES || total + e.size > MAX_OUT_TOTAL_BYTES) {
-      uncollected.push(e.path);
-      continue;
-    }
-    total += e.size;
-    changed.push({ path: e.path, b64: bytesToB64(py.FS.readFile(e.full)) });
   }
   // Files that were synced in but no longer exist after the run were
   // deleted (or renamed away) by the Python code.
@@ -165,7 +209,7 @@ self.onmessage = async (ev) => {
     await ensurePyodide();
     self.postMessage({ id: id, type: 'status', status: 'ready' });
 
-    const manifest = syncIn(msg.files || []);
+    const manifest = syncIn(msg.mounts || []);
 
     let stdout = '';
     let stderr = '';
@@ -192,14 +236,15 @@ self.onmessage = async (ev) => {
     try {
       // Auto-install pure-python/wheel packages the code imports (e.g. pandas).
       await py.loadPackagesFromImports(msg.code);
-      await py.runPythonAsync('import os\nos.chdir("' + WORK_ROOT + '")');
+      // Python runs with the SAME absolute cwd as the shell invocation.
+      await py.runPythonAsync('import os\nos.chdir(' + JSON.stringify(msg.cwd || '/home/locus') + ')');
       await py.runPythonAsync(msg.code);
     } catch (e) {
       // PythonError messages carry the full traceback.
       error = String(e && e.message ? e.message : e);
     }
 
-    const diff = diffOut(manifest);
+    const diff = diffOut(manifest, msg.mounts || []);
     self.postMessage({
       id: id, type: 'result', stdout: stdout, stderr: stderr, error: error,
       files: diff.changed, deleted: diff.deleted,
@@ -217,6 +262,7 @@ self.onmessage = async (ev) => {
 <script src="./src/model-adapters.js"></script>
 <script src="./src/model.js"></script>
 <script src="./src/workspace.js"></script>
+<script src="./src/vfs.js"></script>
 <script src="./src/network.js"></script>
 <script src="./src/shell.js"></script>
 <script src="./src/tools.js"></script>
