@@ -8,7 +8,7 @@ Architecture-level decisions belong in docs/ARCHITECTURE.md and docs/MODEL-PROTO
 
 Unix compatibility baseline (so future telemetry records unknown gaps, not known ones):
 
-- [x] Shell parser/executor: `;`, `&&`, `|` composition; quoted operators stay data; unsupported syntax (`||`, `&`, `<`, `2>`, trailing `|`/`&&`) fails with the supported alternative
+- [x] Shell parser/executor: `;`, `&&`, `|` composition; quoted operators stay data; unsupported syntax (`&`, `<`, trailing `|`/`&&`) fails with the supported alternative
 - [x] Invocation-local virtual cwd (`cd`, `pwd`); every bash call starts at workspace root; `..` escape rejected; relative paths resolve against cwd in ls/cat/echo redirect/find/grep/head/tail/wc/python script/curl -o
 - [x] `ls -a/-l/-h` (combined flags, dotfile semantics, human sizes)
 - [x] `find` subset (`-name` `*?` glob, `-type f|d`, `-maxdepth N`), bounded + deterministic + cancellation-aware
@@ -18,6 +18,16 @@ Unix compatibility baseline (so future telemetry records unknown gaps, not known
 - [x] `SHELL_COMMANDS` registry = single source for runtime dispatch, `help`, and the system prompt
 - [x] MAX_TOOL_ITERATIONS 15 → 32 (S14/S14c cover both sides of the cap)
 - [x] Compound telemetry: one network op keeps its real backend; multiple → `operation: "compound"`
+
+### Shell compatibility round 2
+
+- [x] Executor-internal stdout/stderr separation (`{success, stdout, stderr}` per simple command; merged only at the tool boundary for presentation)
+- [x] Pipeline forwards stdout only; a failed left stage no longer stops right stages; pipeline status = last stage
+- [x] `||` fallback operator; `&&`/`||` chains are left-associative
+- [x] Generalized redirection at the execution layer (no longer echo-only): `>` `>>` `2>` `2>>` `2>&1`, applied left to right (`> all.txt 2>&1` ≠ `2>&1 > out.txt`); other fds (`1>&2`, `3>`, `&>`) rejected
+- [x] `mv` (file→file, file→dir, bounded recursive directory move, multi-source into dir; destination-exists fails loudly, no `-f`); copy-verify-then-delete: source is never removed before the destination landed
+- [x] `rm` (`-f` `-r`/`-R` combined flags); `rm -rf /` (any spelling of the workspace root) hard-refused; recursive delete checks cancellation before every removal and reports committed deletions without fake rollback
+- [x] Telemetry: mutating shell commands report `operation: "filesystem"` (backend `browser`)
 
 ## Done on fix/v0.3-reliability
 

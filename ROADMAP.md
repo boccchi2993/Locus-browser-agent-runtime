@@ -78,14 +78,16 @@ Status: implemented (`src/shell.js` parser/executor + `SHELL_COMMANDS` registry;
 
 Goal: accept the small Unix vocabulary capable models already speak, so telemetry records genuinely unknown capability gaps instead of known low-level compatibility gaps.
 
-- [x] bounded command composition parsed by Locus itself (`;`, `&&`, `|`; no eval, no system shell),
+- [x] bounded command composition parsed by Locus itself (`;`, `&&`, `||`, `|`; no eval, no system shell),
 - [x] invocation-local virtual cwd (`cd`), every bash call starts at the workspace root, confinement preserved,
 - [x] `ls -a/-l/-h` incl. combined flags; `find`/`grep`/`head`/`tail`/`wc` subsets with explicit bounds and cancellation,
-- [x] pipeline stdin consumers (`cat`/`grep`/`head`/`tail`/`wc`); piping into non-consumers fails loudly; 1 MiB inter-stage cap fails loudly,
+- [x] pipeline stdin consumers (`cat`/`grep`/`head`/`tail`/`wc`); piping into non-consumers fails loudly; 1 MiB inter-stage cap fails loudly; pipelines forward stdout only,
+- [x] stdout/stderr separated inside the executor; generalized redirection (`>`, `>>`, `2>`, `2>>`, `2>&1`) applied left to right,
+- [x] `mv` / `rm` as workspace-confined, cancellation-aware filesystem commands (`rm -rf /` hard-refused),
 - [x] one canonical capability registry drives runtime dispatch, `help`, and the system prompt,
 - [x] tool iteration budget raised 15 → 32.
 
-Explicitly deferred: `||`, `&`, `$()`, backticks, subshells, variables/export, glob expansion, full/input/stderr redirects, `sed`/`awk`/`xargs`/`jq`/`sort` and friends.
+Explicitly deferred: `&`, `$()`, backticks, subshells, variables/export, glob expansion, input redirects, arbitrary file descriptors, `sed`/`awk`/`xargs`/`jq`/`sort` and friends.
 
 ## V0.4 — UI rebuild and runtime substrate completion
 
