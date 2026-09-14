@@ -35,17 +35,18 @@
     // Test-only in-memory workspace implementing the adapter interface.
     class MemWS extends WorkspaceAdapter {
       constructor(files) { super(); this.files = Object.assign({}, files); this.name = 'mem'; }
+      _nfe(p) { const e = new Error('No such file: ' + p); e.name = 'NotFoundError'; return e; }
       async list() { return Object.keys(this.files).map((n) => ({ name: n, kind: 'file' })); }
-      async read(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); return this.files[p]; }
+      async read(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw this._nfe(p); return this.files[p]; }
       async readBytes(p) { return new TextEncoder().encode(await this.read(p)); }
       async write(p, data) { p = normalizeWorkspacePath(p); this.files[p] = typeof data === 'string' ? data : new TextDecoder().decode(data); }
-      async remove(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); delete this.files[p]; }
+      async remove(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw this._nfe(p); delete this.files[p]; }
       async mkdir(p) { p = normalizeWorkspacePath(p); if (p && p in this.files) { const e = new Error('type mismatch'); e.name = 'TypeMismatchError'; throw e; } }
       async exists(p) { try { p = normalizeWorkspacePath(p); } catch (e) { return false; } return p === '' || p in this.files; }
       async stat(p) {
         p = normalizeWorkspacePath(p);
         if (p === '') return { kind: 'directory', size: 0, modified: null };
-        if (!(p in this.files)) throw new Error('No such file: ' + p);
+        if (!(p in this.files)) throw this._nfe(p);
         return { kind: 'file', size: this.files[p].length, modified: 0 };
       }
     }
@@ -188,6 +189,13 @@
         const jq = await executeTool('bash', 'echo ">" victim.txt', realWs);
         check('J6 quoted > writes nothing', jq.success && jq.output === '> victim.txt'
           && (await realWs.exists('victim.txt')) === false, JSON.stringify(jq.output));
+
+        // F-01 on native handles: binary append preserves bytes exactly
+        await realWs.write('bin.dat', new Uint8Array([0x00, 0xFF, 0xFE, 0x80, 0x41]));
+        await executeTool('bash', 'echo X >> bin.dat', realWs);
+        const jb = await realWs.readBytes('bin.dat');
+        check('J7 native binary append byte-exact', Array.from(jb).join(',') === '0,255,254,128,65,88,10',
+          Array.from(jb).join(','));
       } finally {
         await opfsRoot.removeEntry(dirName, { recursive: true });
       }
@@ -456,6 +464,70 @@
       const v16 = await executeTool('bash', 'cat /mnt/download/from-python.txt', bare);
       check('V16 bash reads python-written /mnt/download file', v16.success
         && v16.output === 'py:uploaded-by-user', JSON.stringify(v16.output));
+    }
+
+    // ---------- W. VFS audit remediation (real browser, REAL Pyodide worker) ----------
+    // Adversarial reproductions for findings F-01/F-02/F-03/F-05 — the unit
+    // suite uses a fake Pyodide; here the real worker proves the mirror
+    // actually materializes empty dirs and the commits really land.
+    {
+      const bare2 = mkVfs(null);
+
+      // F-01: binary >> and 2>> are byte-preserving
+      await bare2.write('/tmp/bin.dat', new Uint8Array([0x00, 0xFF, 0xFE, 0x80, 0x41]));
+      const w1 = await executeTool('bash', 'echo X >> /tmp/bin.dat', bare2);
+      const w1b = await bare2.readBytes('/tmp/bin.dat');
+      check('W1 binary >> preserves original bytes exactly', w1.success
+        && Array.from(w1b).join(',') === '0,255,254,128,65,88,10', Array.from(w1b).join(','));
+      await bare2.write('/tmp/err.dat', new Uint8Array([0x89, 0x50, 0x4E, 0x47]));
+      const w2 = await executeTool('bash', 'cat /definitely-missing 2>> /tmp/err.dat', bare2);
+      const w2b = await bare2.readBytes('/tmp/err.dat');
+      check('W2 binary 2>> preserves original bytes exactly', !w2.success
+        && w2b[0] === 0x89 && w2b[1] === 0x50 && w2b[2] === 0x4E && w2b[3] === 0x47 && w2b.byteLength > 4,
+        Array.from(w2b.slice(0, 4)).join(','));
+
+      // F-02: a REAL empty VFS directory is a valid Python cwd
+      await bare2.mkdir('/tmp/emptydir');
+      const w3 = await executeTool('bash', 'cd /tmp/emptydir && python -c "import os; print(os.getcwd())"', bare2);
+      check('W3 python cwd in an empty /tmp dir', w3.success
+        && w3.output.split('\n')[0] === '/tmp/emptydir', JSON.stringify(w3.output).slice(0, 200));
+      const w3b = await executeTool('bash', 'cd /home/locus/.skills && python -c "import os; print(os.getcwd())"', bare2);
+      check('W3b python cwd in empty ~/.skills', w3b.success
+        && w3b.output.split('\n')[0] === '/home/locus/.skills', JSON.stringify(w3b.output).slice(0, 200));
+      await bare2.mkdir('/mnt/download/empty');
+      const w3c = await executeTool('bash', 'cd /mnt/download/empty && python -c "import os; print(os.getcwd())"', bare2);
+      check('W3c python cwd in an empty /mnt/download dir', w3c.success
+        && w3c.output.split('\n')[0] === '/mnt/download/empty', JSON.stringify(w3c.output).slice(0, 200));
+
+      // F-03: python-created (nested) empty directories persist to the VFS
+      const w4 = await executeTool('bash', "python -c \"import os; os.makedirs('/mnt/download/pya/b/c')\"", bare2);
+      const w4ls = await executeTool('bash', 'ls /mnt/download/pya/b', bare2);
+      check('W4 python makedirs persists, visible to the shell', w4.success
+        && w4.output.includes('[mkdir: /mnt/download/pya, /mnt/download/pya/b, /mnt/download/pya/b/c]')
+        && w4ls.success && w4ls.output === 'c/', JSON.stringify(w4.output).slice(0, 300));
+
+      // F-03: python rmdir persists too
+      const w5 = await executeTool('bash', "python -c \"import os; os.rmdir('/mnt/download/empty')\"", bare2);
+      check('W5 python rmdir persists', w5.success && !(await bare2.exists('/mnt/download/empty')),
+        JSON.stringify(w5.output).slice(0, 200));
+
+      // F-03: read-only mounts reject directory creation — provider untouched
+      const w6 = await executeTool('bash', "python -c \"import os; os.mkdir('/mnt/upload/nope')\"", bare2);
+      check('W6 python mkdir on /mnt/upload refused (read-only)', !w6.success
+        && w6.output.includes('read-only filesystem')
+        && (await bare2.list('/mnt/upload')).length === 0, JSON.stringify(w6.output).slice(0, 300));
+
+      // F-05: curl -o onto a DIRECTORY performs ZERO network requests
+      let w7calls = 0;
+      const realFetch2 = window.fetch;
+      window.fetch = async () => { w7calls++; throw new TypeError('Failed to fetch'); };
+      try {
+        const w7 = await executeTool('bash', 'curl -o /mnt/download https://example.test/x', bare2);
+        check('W7 curl -o directory target: fails before network (0 fetches)', !w7.success
+          && w7.output.includes('is a directory') && w7calls === 0, w7.output + ' | fetches=' + w7calls);
+      } finally {
+        window.fetch = realFetch2;
+      }
     }
 
     // ---------- E. python timeout + worker recovery (runs last) ----------

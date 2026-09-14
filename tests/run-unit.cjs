@@ -20,6 +20,7 @@ const SUITES = [
   'conversation-routing.test.mjs',
   'worker-init.test.cjs',
   'worker-output.test.cjs',
+  'vfs-audit.test.cjs',
 ];
 
 let failed = 0;

@@ -11,6 +11,14 @@ Architecture-level decisions belong in docs/ARCHITECTURE.md and docs/MODEL-PROTO
 - [x] Python worker protocol v2: per-mount sync with absolute paths, managed subtree cleanup (never rmtree of Pyodide `/usr` `/home` `/tmp`), os.chdir to the shell cwd, read-only mount write-back rejected at commit with source bytes untouched
 - [x] UI: real File uploads with deterministic `name (2).ext` collision naming and real VFS paths in the composer; Artifacts section in the Context Rail listing `/mnt/download` recursively with explicit local Download (Blob + object URL, no auto-trigger, no network)
 
+### Audit remediation round (F-01..F-05)
+
+- [x] F-01 byte-preserving append: `>>` / `2>>` read the existing target as raw bytes and write old+new in ONE write — binary files survive an append byte-exactly; existing content bounded by `APPEND_MAX_EXISTING_BYTES` (16 MiB, loud failure above it); read/quota/cancel failures leave the source untouched
+- [x] F-02 empty directories are synced into the Python mirror (directory manifest per mount), so a real empty VFS dir is a valid Python cwd; a cwd is only ever mirrored when the VFS itself confirms it exists
+- [x] F-03 Python directory semantics persist: worker protocol v2.1 reports `createdDirs` (parent-first) / `deletedDirs` (child-first); commit order mkdir → file writes → file deletes → dir deletes; read-only mounts reject directory mutations at commit; file↔directory type changes fail loudly (never a half-applied state); `/tmp` mirror dirs are tracked and cleaned like `/tmp` files
+- [x] F-04 task-bound VFS: `VirtualWorkspace.fork()` gives every task an independent mount table over shared providers — a workspace switch can never rebind an in-flight task; mountFolder re-checks the busy gate AFTER the picker/permission awaits
+- [x] F-05 `curl -o` onto an existing directory fails before any network request
+
 ## Done on feat/shell-compat-baseline
 
 Unix compatibility baseline (so future telemetry records unknown gaps, not known ones):
@@ -92,7 +100,7 @@ Not blocking AgentSession / provider architecture work.
 
 - [ ] Bound the workspace collection phase (huge directory traversal has no deadline yet).
 - [ ] On-demand file bridging or incremental sync instead of full snapshot per python call.
-- [ ] Empty-directory preservation and file↔directory type-change semantics in snapshot/diff.
+- [ ] file↔directory type-change commit semantics in snapshot/diff (currently a loud refusal, never a half-applied state; empty-directory preservation itself is done — see F-03 above).
 - [ ] `lstat`-style handling for special entries in the Pyodide MEMFS walk.
 - [ ] API base URL normalization hints (e.g. base already ending in `/v1` → avoid `/v1/v1/...`).
 
