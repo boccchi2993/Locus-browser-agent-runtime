@@ -109,36 +109,52 @@ const PythonRuntime = {
     }
   },
 
-  // Run Python code with the workspace mirrored in.
+  // Run Python code with every VFS data mount mirrored in.
+  // `vfs` is always a VirtualWorkspace (asVfs guarantees it); opts carries
+  // { signal, cwd } — cwd is the ABSOLUTE VFS path of the shell invocation
+  // and becomes Python's working directory.
   // opts.signal (optional AbortSignal) cancels the run: cancellation is
-  // checked before starting, during workspace collection, after the worker
+  // checked before starting, during mount collection, after the worker
   // reply, after EVERY async pre-check and before EVERY commit side effect.
   // Commits already finished are not rolled back — the result reports
   // exactly what committed and what never ran.
   // Returns {
   //   stdout, stderr, error,            — compute outcome
-  //   written, deleted,                 — paths actually committed
-  //   conflicts: [{path, reason}],      — commits refused (external change / unsynced path)
+  //   written, deleted,                 — ABS paths actually committed
+  //   conflicts: [{path, reason}],      — commits refused (read-only mount / external change / unsynced path)
   //   writeFailed: [description],       — commits attempted but failed
-  //   notPersisted: [paths],            — generated files never written (no workspace / cancelled)
-  //   skipped: [{path, reason}],        — workspace files NOT mirrored into Python
+  //   notPersisted: [paths],            — generated files never written (cancelled / incomplete changeset)
+  //   skipped: [{path, reason}],        — files NOT mirrored into Python (ABS paths)
   //   uncollected: [paths],             — python outputs over the worker caps (changeset incomplete)
   //   stdoutTruncated, stderrTruncated, — output notice flags (NOT commit failures)
   // }
-  async run(code, workspace, opts) {
+  async run(code, vfs, opts) {
     const signal = opts && opts.signal;
     this._ensureWorker();
     this._setStatus('loading');
     throwIfCancelled(signal, 'python execution');
 
-    let files = [];
+    // Mirror every data mount: files are collected from each provider with
+    // RELATIVE paths and rebased onto the mount root, so the worker mirror,
+    // the snapshot keys and every commit/conflict message all use absolute
+    // VFS paths.
+    const mounts = [];
     let skipped = [];
-    const snapshot = {}; // path → b64 at sync-in time (optimistic concurrency base)
-    if (workspace) {
-      const collected = await collectWorkspaceFiles(workspace, signal);
-      files = collected.files;
-      skipped = collected.skipped;
-      for (const f of files) snapshot[f.path] = f.b64;
+    let inputBytes = 0;
+    const snapshot = {}; // ABS path → b64 at sync-in time (optimistic concurrency base)
+    if (vfs && typeof vfs.dataMounts === 'function') {
+      for (const dm of vfs.dataMounts()) {
+        const collected = await collectWorkspaceFiles(dm.provider, signal);
+        const files = collected.files.map((f) => ({ path: dm.root + '/' + f.path, b64: f.b64 }));
+        skipped = skipped.concat(collected.skipped.map((s) => ({ path: dm.root + '/' + s.path, reason: s.reason })));
+        for (const f of files) snapshot[f.path] = f.b64;
+        inputBytes += files.reduce((n, f) => n + b64ByteLength(f.b64), 0);
+        mounts.push({
+          root: dm.root,
+          readOnly: dm.authority === 'read-only' || dm.authority === 'system-read-only',
+          files: files,
+        });
+      }
     }
     // The abort may have landed DURING collection (no listener was attached
     // yet) — never start the worker run on a cancelled task.
@@ -154,7 +170,11 @@ const PythonRuntime = {
           () => this._killWorker('python execution timed out after ' + PYTHON_TIMEOUT_MS + 'ms'),
           PYTHON_TIMEOUT_MS);
         this._pending.set(id, { resolve, timer });
-        this.worker.postMessage({ id, cmd: 'run', code, files });
+        this.worker.postMessage({
+          id: id, cmd: 'run', code: code,
+          cwd: (opts && opts.cwd) || (vfs && typeof vfs.defaultCwd === 'function' ? vfs.defaultCwd() : '/'),
+          mounts: mounts,
+        });
       });
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort);
@@ -173,32 +193,44 @@ const PythonRuntime = {
       notPersisted.push(p + ' (over python output limit; changeset incomplete)');
     }
 
-    if (!workspace && outFiles.length) {
-      // Files were generated but there is nowhere to persist them — say so.
-      for (const f of outFiles) notPersisted.push(f.path);
-    }
-
     // ---- commit phase 1: create/modify ----
-    if (workspace && outFiles.length) {
-      for (const f of outFiles) {
-        if (signal && signal.aborted) {
-          notPersisted.push(f.path + ' (cancelled before write)');
-          continue;
-        }
-        if (skippedSet.has(f.path)) {
-          // The real file exists but was never mirrored in (over the size
-          // or count limit). Python saw this path as absent; whatever it
-          // created there must NOT clobber the real file.
-          conflicts.push({
-            path: f.path,
-            reason: 'exists in workspace but was not synced into Python (over snapshot limits); refusing to overwrite',
-          });
-          continue;
-        }
-        const bytes = b64ToBytes(f.b64);
+    // EVERY changed ABS path is routed through the mount table: read-only
+    // mounts reject with a conflict (the worker mirror is writable, so
+    // authority is enforced HERE, at commit time — the provider bytes are
+    // never touched), external mounts keep the optimistic-concurrency
+    // check, internal mounts write straight through.
+    for (const f of outFiles) {
+      if (signal && signal.aborted) {
+        notPersisted.push(f.path + ' (cancelled before write)');
+        continue;
+      }
+      const mount = vfs && typeof vfs.resolveMount === 'function' ? vfs.resolveMount(f.path) : null;
+      if (!mount) {
+        conflicts.push({ path: f.path, reason: 'not under any writable mount; refusing to write' });
+        continue;
+      }
+      if (mount.authority === 'read-only' || mount.authority === 'system-read-only') {
+        conflicts.push({
+          path: f.path,
+          reason: 'read-only filesystem: changes under ' + mount.path + ' are never committed',
+        });
+        continue;
+      }
+      if (skippedSet.has(f.path)) {
+        // The real file exists but was never mirrored in (over the size
+        // or count limit). Python saw this path as absent; whatever it
+        // created there must NOT clobber the real file.
+        conflicts.push({
+          path: f.path,
+          reason: 'exists in workspace but was not synced into Python (over snapshot limits); refusing to overwrite',
+        });
+        continue;
+      }
+      const bytes = b64ToBytes(f.b64);
+      if (mount.authority === 'external-read-write') {
         let conflict = null;
         try {
-          conflict = await detectExternalChange(workspace, f.path, snapshot, bytes);
+          conflict = await detectExternalChange(vfs, f.path, snapshot, bytes);
         } catch (e) {
           conflict = { path: f.path, reason: 'could not verify current on-disk state (' + e.message + '); refusing to overwrite' };
         }
@@ -206,18 +238,18 @@ const PythonRuntime = {
           conflicts.push(conflict);
           continue;
         }
-        // The pre-check awaited: cancellation may have landed meanwhile.
-        // Re-check BEFORE the side effect, not just at the loop top.
-        if (signal && signal.aborted) {
-          notPersisted.push(f.path + ' (cancelled before write)');
-          continue;
-        }
-        try {
-          await workspace.write(f.path, bytes);
-          written.push(f.path);
-        } catch (e) {
-          writeFailed.push(f.path + ': ' + (e && e.message ? e.message : String(e)));
-        }
+      }
+      // The pre-check awaited: cancellation may have landed meanwhile.
+      // Re-check BEFORE the side effect, not just at the loop top.
+      if (signal && signal.aborted) {
+        notPersisted.push(f.path + ' (cancelled before write)');
+        continue;
+      }
+      try {
+        await vfs.write(f.path, bytes);
+        written.push(f.path);
+      } catch (e) {
+        writeFailed.push(f.path + ': ' + (e && e.message ? e.message : String(e)));
       }
     }
 
@@ -228,19 +260,31 @@ const PythonRuntime = {
     // landed). Stop the delete phase.
     const deleted = [];
     const deletesBlocked = writeFailed.length > 0 || conflicts.length > 0 || uncollected.length > 0;
-    if (workspace && result.deleted && result.deleted.length && !deletesBlocked) {
+    if (result.deleted && result.deleted.length && !deletesBlocked) {
       for (const p of result.deleted) {
         if (signal && signal.aborted) {
           notPersisted.push('delete ' + p + ' (cancelled before commit)');
           continue;
         }
-        // Only delete the exact content we mirrored: re-read and compare
-        // against the snapshot so an externally modified/replaced file is
-        // never removed from under the user.
-        if (snapshot[p] !== undefined) {
+        const mount = vfs && typeof vfs.resolveMount === 'function' ? vfs.resolveMount(p) : null;
+        if (!mount) {
+          conflicts.push({ path: p, reason: 'not under any writable mount; deletion skipped' });
+          continue;
+        }
+        if (mount.authority === 'read-only' || mount.authority === 'system-read-only') {
+          conflicts.push({
+            path: p,
+            reason: 'read-only filesystem: changes under ' + mount.path + ' are never committed',
+          });
+          continue;
+        }
+        if (mount.authority === 'external-read-write' && snapshot[p] !== undefined) {
+          // Only delete the exact content we mirrored: re-read and compare
+          // against the snapshot so an externally modified/replaced file is
+          // never removed from under the user.
           let currentB64 = null;
           try {
-            currentB64 = bytesToB64(await workspace.readBytes(p));
+            currentB64 = bytesToB64(await vfs.readBytes(p));
           } catch (e) {
             if (e && e.name === 'NotFoundError') continue; // already gone externally
             conflicts.push({ path: p, reason: 'could not verify current on-disk state (' + e.message + '); deletion skipped' });
@@ -257,13 +301,14 @@ const PythonRuntime = {
           continue;
         }
         try {
-          await workspace.remove(p);
+          await vfs.remove(p);
           deleted.push(p);
         } catch (e) {
+          if (e && e.name === 'NotFoundError') continue; // already gone
           writeFailed.push('delete ' + p + ': ' + (e && e.message ? e.message : String(e)));
         }
       }
-    } else if (workspace && result.deleted && result.deleted.length && deletesBlocked) {
+    } else if (result.deleted && result.deleted.length && deletesBlocked) {
       const why = uncollected.length > 0
         ? 'output changeset incomplete (' + uncollected.length + ' file(s) not collected), sources preserved'
         : 'earlier commits failed, sources preserved';
@@ -283,7 +328,7 @@ const PythonRuntime = {
       uncollected,
       stdoutTruncated: !!result.stdoutTruncated,
       stderrTruncated: !!result.stderrTruncated,
-      inputBytes: files.reduce((n, f) => n + b64ByteLength(f.b64), 0),
+      inputBytes: inputBytes,
       outputBytes: outFiles.reduce((n, f) => n + b64ByteLength(f.b64), 0),
     };
   },
@@ -520,7 +565,7 @@ const SHELL_COMMANDS = {
   },
   cd: {
     usage: 'cd <path>',
-    summary: 'change the virtual cwd for THIS invocation only (bare cd → workspace root)',
+    summary: 'change the cwd for THIS invocation only (bare cd → the default cwd)',
     stdin: false, run: shCd,
   },
   ls: {
@@ -575,7 +620,7 @@ const SHELL_COMMANDS = {
   },
   python: {
     usage: 'python -c "<code>" | python <script.py> | python <<\'PY\' ... PY',
-    summary: 'run Python (Pyodide); script paths resolve against the shell cwd, Python\'s own root stays the workspace root',
+    summary: 'run Python (Pyodide); script paths resolve against the shell cwd and Python runs in that same directory',
     stdin: false, run: shPython,
   },
   curl: {
@@ -609,13 +654,16 @@ const SHELL_UNSUPPORTED_NOTE =
   'Not supported: &, $(...), backticks, subshells, variables/export, '
   + 'glob expansion (* stays literal — use find -name instead), input redirect (<), '
   + 'heredocs other than python, file descriptors other than 2>&1 (no 1>&2 / 3> / &>). '
-  + 'rm -rf / (the workspace root) is always refused.';
+  + 'rm -rf / (and every protected mount root: /usr /home /home/locus /mnt /mnt/workspace '
+  + '/mnt/upload /mnt/download /mnt/plugins) is always refused.';
 
 function shellHelpText() {
   return [
-    'Locus shell — a Unix-like compatibility shell, NOT full POSIX bash.',
-    'Every bash invocation starts at the mounted workspace root (virtual cwd "/").',
-    '`cd` changes the working directory only within the current invocation; the next bash call starts at the root again.',
+    'Locus shell — a Unix-like compatibility shell, NOT full POSIX bash, on a small Linux-like browser machine.',
+    'Every bash invocation starts at the default cwd: /mnt/workspace when a workspace folder is mounted, otherwise /home/locus (HOME).',
+    '`cd` changes the working directory only within the current invocation; the next bash call starts at the default cwd again.',
+    'Filesystem layout: /mnt/workspace (mounted working folder), /mnt/upload (read-only inputs),',
+    '/mnt/download (downloadable artifacts), /tmp (scratch), /home/locus (home), /usr/bin + /bin (commands).',
     'Paths containing spaces must be quoted ("my file.txt").',
     '',
     'Commands:',
@@ -639,8 +687,16 @@ function shellHelpText() {
 // registry as the runtime and `help`.
 function shellSystemPromptSection() {
   const head = [
-    '  This is a Unix-like compatibility shell, NOT full POSIX bash.',
-    '  Every bash invocation starts at the mounted workspace root (virtual cwd "/"); `cd` affects only the current invocation.',
+    '  This is a Unix-like compatibility shell, NOT full POSIX bash, on a small Linux-like browser machine.',
+    '  HOME=/home/locus. Every bash invocation starts at the default cwd: /mnt/workspace when a workspace',
+    '  folder is mounted, otherwise /home/locus. `cd` affects only the current invocation.',
+    '  Filesystem layout:',
+    '    /mnt/workspace  user-authorized working folder (only present when mounted)',
+    '    /mnt/upload     user-uploaded input files, READ-ONLY',
+    '    /mnt/download   writable; files here are offered to the user as downloadable artifacts',
+    '    /tmp            writable scratch space',
+    '    /home/locus     your writable home',
+    '    /usr/bin, /bin  available commands (virtual userland view)',
     '  Paths containing spaces must be quoted ("my file.txt"). Unquoted paths must not contain spaces.',
     '  Supported commands:',
   ];
@@ -659,14 +715,14 @@ function shellSystemPromptSection() {
     '    cmd 2>> file    append stderr to file',
     '    cmd 2>&1        merge stderr into stdout\'s current destination',
     '  Redirection never turns a failed command into a successful one.',
-    '  rm -rf / (the workspace root) is always refused. Shell glob expansion is not supported:',
+    '  rm -rf / (and every protected mount root) is always refused. Shell glob expansion is not supported:',
     '  * in command arguments stays literal — use find -name "*.tmp" to locate files.',
     '  ' + SHELL_UNSUPPORTED_NOTE,
     '  Run `help` at runtime to see this contract again.',
     '  curl usage (public HTTPS resources only):',
     '    curl <https-url>                  fetches a URL; text/JSON/XML responses are printed directly.',
-    '    curl -o <file> <https-url>        downloads binary-safe into the workspace file (use this for images,',
-    '                                    PDFs, archives, or any data you want to keep or process).',
+    '    curl -o <file> <https-url>        downloads binary-safe into a writable file (use this for images,',
+    '                                    PDFs, archives, or any data you want to keep or process, e.g. under /mnt/download).',
     '  curl supports NO other flags (no -H/-X/-d/-u/cookies). URLs must be https://.',
     '  Network access may be served by a direct browser fetch or a transparent relay — you do not need to',
     '  know or care which. If curl fails, report the error; do NOT switch to cloud_bash for network access.',
@@ -676,9 +732,9 @@ function shellSystemPromptSection() {
     '    import pandas as pd',
     '    print(pd.DataFrame({"a": [1]}).to_json())',
     '    PY',
-    '  python has the standard library and pandas available. Python\'s filesystem root is always the workspace',
-    '  root; the shell cwd does not change Python\'s working directory (only the script path of `python script.py`',
-    '  is resolved against the shell cwd). python and curl do not read pipeline stdin.',
+    '  python has the standard library and pandas available. Python sees the SAME filesystem as the shell',
+    '  (/mnt/workspace, /mnt/upload, /mnt/download, /tmp, /home/locus) and runs with the shell cwd as its',
+    '  working directory. /mnt/upload is read-only, also from Python. python and curl do not read pipeline stdin.',
   ];
   return head.concat(cmds, tail).join('\n');
 }
@@ -760,27 +816,69 @@ function parseShellLine(tokens) {
   return steps;
 }
 
-// Resolve a (possibly relative) shell path against the invocation-local
-// virtual cwd, reusing the workspace path normalization (workspace escape
-// is rejected there). Absolute-looking paths (/x) are workspace-root relative.
-function resolveShellPath(ctx, p) {
-  const raw = String(p || '');
-  const joined = raw.charAt(0) === '/' ? raw : (ctx.cwd ? ctx.cwd + '/' + raw : raw);
-  return normalizeWorkspacePath(joined);
+// ---------- VFS bridge ----------
+// The shell ALWAYS runs against a VirtualWorkspace: a real VFS is used
+// as-is, a legacy WorkspaceAdapter is mounted at /mnt/workspace
+// (external-read-write), and a missing argument yields a fresh internal
+// machine (test isolation). The filesystem therefore always exists — there
+// is no "no workspace selected" state anywhere in the shell.
+function asVfs(x) {
+  if (x && x.isLocusVFS) return x;
+  const vfs = new VirtualWorkspace({ listCommands: () => Object.keys(SHELL_COMMANDS) });
+  if (x) vfs.mount('/mnt/workspace', x, 'external-read-write');
+  return vfs;
 }
 
-// Resolve for the filesystem, and report a uniform "no such file or
-// directory" for plain missing entries (browser handle errors carry no
-// useful message of their own). The workspace root ('') always exists once
-// a workspace is selected.
-async function statShellPath(ctx, display, rel) {
-  if (!rel) return { kind: 'directory', size: 0, modified: null };
+// Resolve a (possibly relative) shell path against the invocation-local
+// cwd to an ABSOLUTE VFS path. `..` above the filesystem root is rejected
+// by normalizeVfsPath.
+function resolveShellPath(ctx, p) {
+  return normalizeVfsPath(String(p || ''), ctx.cwd);
+}
+
+// Join a child name onto an absolute directory path.
+function joinAbs(abs, name) {
+  return abs === '/' ? '/' + name : abs + '/' + name;
+}
+
+// Stat for the filesystem, and report a uniform "no such file or
+// directory" for plain missing entries; NotMountedError passes its clear
+// message through unchanged.
+async function statShellPath(ctx, display, abs) {
   try {
-    return await ctx.workspace.stat(rel);
+    return await ctx.vfs.stat(abs);
   } catch (e) {
     if (e && e.name === 'NotFoundError') throw new Error(display + ': no such file or directory');
+    if (e && e.name === 'NotMountedError') throw new Error(e.message);
     throw e;
   }
+}
+
+// Compact writability-failure wording shared by mv/curl/redirects.
+function writableErrMsg(e) {
+  if (e && e.name === 'NotMountedError') return 'not mounted';
+  if (e && e.name === 'ReadOnlyError') return 'read-only filesystem';
+  return e && e.message ? e.message : String(e);
+}
+
+// The parent of an absolute target must be an existing directory. Mount
+// roots and structural directories always exist; only real intermediate
+// directories are statted (legacy providers may not answer stat('') for
+// their own root).
+async function checkParentDir(vfs, abs) {
+  const i = abs.lastIndexOf('/');
+  const parent = i <= 0 ? '/' : abs.slice(0, i);
+  const m = vfs.resolveMount(parent);
+  if (m && m.rel === '') return null; // the parent IS a mount root
+  let pst;
+  try {
+    pst = await vfs.stat(parent);
+  } catch (e) {
+    if (e && e.name === 'NotFoundError') return 'no such directory';
+    return writableErrMsg(e);
+  }
+  if (pst.kind !== 'directory') return 'parent is not a directory';
+  return null;
 }
 
 function splitLines(text) {
@@ -822,36 +920,31 @@ function shErrAt(stderr, stdout) { return { success: false, stdout: stdout || ''
 // ---------- command handlers ----------
 
 async function shPwd(ctx) {
-  if (!ctx.workspace) return shOk('/ (no workspace selected)');
-  return shOk(ctx.cwd ? '/' + ctx.cwd : '/');
+  return shOk(ctx.cwd);
 }
 
 async function shCd(ctx, args) {
   if (args.length > 1) return shErr('cd: too many arguments');
-  if (!ctx.workspace) return shErr('cd: no workspace selected');
   const target = args.length ? args[0].text : '';
-  if (!target) { ctx.cwd = ''; return shOk(''); }
-  let rel;
+  if (!target) { ctx.cwd = ctx.vfs.defaultCwd(); return shOk(''); }
+  let abs;
   try {
-    rel = resolveShellPath(ctx, target);
+    abs = resolveShellPath(ctx, target);
   } catch (e) {
     return shErr('cd: ' + target + ': ' + e.message);
   }
-  if (rel) {
-    let st;
-    try {
-      st = await ctx.workspace.stat(rel);
-    } catch (e) {
-      return shErr('cd: ' + target + ': ' + (e && e.name === 'NotFoundError' ? 'no such directory' : e.message));
-    }
-    if (st.kind !== 'directory') return shErr('cd: ' + target + ': not a directory');
+  let st;
+  try {
+    st = await ctx.vfs.stat(abs);
+  } catch (e) {
+    return shErr('cd: ' + target + ': ' + (e && e.name === 'NotFoundError' ? 'no such directory' : writableErrMsg(e)));
   }
-  ctx.cwd = rel;
+  if (st.kind !== 'directory') return shErr('cd: ' + target + ': not a directory');
+  ctx.cwd = abs;
   return shOk('');
 }
 
 async function shLs(ctx, args) {
-  if (!ctx.workspace) return shErr('ls: no workspace selected');
   let flagA = false, flagL = false, flagH = false;
   const paths = [];
   for (const t of args) {
@@ -870,25 +963,25 @@ async function shLs(ctx, args) {
   const showHeader = paths.length > 1;
   const sections = [];
   for (const p of paths) {
-    let rel;
+    let abs;
     try {
-      rel = resolveShellPath(ctx, p);
+      abs = resolveShellPath(ctx, p);
     } catch (e) {
       return shErr('ls: ' + e.message);
     }
-    const st = await statShellPath(ctx, p, rel);
+    const st = await statShellPath(ctx, p, abs);
     throwIfCancelled(ctx.opts && ctx.opts.signal, 'ls');
     if (st.kind !== 'directory') {
       sections.push(lsFormatEntry(p, st, flagL, flagH));
       continue;
     }
-    const entries = await ctx.workspace.list(rel);
+    const entries = await ctx.vfs.list(abs);
     throwIfCancelled(ctx.opts && ctx.opts.signal, 'ls');
     const lines = [];
     for (const e of entries) {
       if (!flagA && e.name.charAt(0) === '.') continue;
       let est = null;
-      if (flagL) est = await ctx.workspace.stat(rel ? rel + '/' + e.name : e.name);
+      if (flagL) est = await ctx.vfs.stat(joinAbs(abs, e.name));
       lines.push(lsFormatEntry(e.name, est || { kind: e.kind, size: 0, modified: null }, flagL, flagH));
     }
     sections.push((showHeader ? p + ':\n' : '') + lines.join('\n'));
@@ -910,14 +1003,13 @@ async function shCat(ctx, args, stdin) {
     if (stdin !== null && stdin !== undefined) return shOk(stdin);
     return shErr('cat: missing file operand (or pipe input into cat)');
   }
-  if (!ctx.workspace) return shErr('cat: no workspace selected');
   const chunks = [];
   for (const a of args) {
-    const rel = resolveShellPath(ctx, a.text);
-    const st = await statShellPath(ctx, a.text, rel);
+    const abs = resolveShellPath(ctx, a.text);
+    const st = await statShellPath(ctx, a.text, abs);
     if (st.kind !== 'file') return shErr('cat: ' + a.text + ': is a directory');
     if (st.size > CAT_MAX_FILE_BYTES) return shErr('cat: ' + a.text + ': file too large for terminal output (use python)');
-    chunks.push(await ctx.workspace.read(rel));
+    chunks.push(await ctx.vfs.read(abs));
   }
   return shOk(chunks.join('\n'));
 }
@@ -928,7 +1020,6 @@ async function shEcho(ctx, args) {
 }
 
 async function shFind(ctx, args) {
-  if (!ctx.workspace) return shErr('find: no workspace selected');
   const paths = [];
   let name = null, type = null, maxdepth = null;
   for (let i = 0; i < args.length; i++) {
@@ -960,7 +1051,7 @@ async function shFind(ctx, args) {
   const results = [];
   const state = { visited: 0, truncated: false };
 
-  async function walk(rel, disp, depth, kind) {
+  async function walk(abs, disp, depth, kind) {
     if (state.truncated) return;
     throwIfCancelled(signal, 'find');
     if (state.visited >= FIND_MAX_VISITED || results.length >= FIND_MAX_RESULTS) {
@@ -973,22 +1064,22 @@ async function shFind(ctx, args) {
     if (typeOk && (!name || globMatch(name, base))) results.push(disp);
     if (kind !== 'directory') return;
     if (maxdepth !== null && depth >= maxdepth) return;
-    const entries = await ctx.workspace.list(rel);
+    const entries = await ctx.vfs.list(abs);
     for (const e of entries) {
-      await walk(rel ? rel + '/' + e.name : e.name, joinDisplay(disp, e.name), depth + 1, e.kind);
+      await walk(joinAbs(abs, e.name), joinDisplay(disp, e.name), depth + 1, e.kind);
       if (state.truncated) return;
     }
   }
 
   for (const p of paths) {
-    let rel;
+    let abs;
     try {
-      rel = resolveShellPath(ctx, p);
+      abs = resolveShellPath(ctx, p);
     } catch (e) {
       return shErr('find: ' + e.message);
     }
-    const st = await statShellPath(ctx, p, rel);
-    await walk(rel, p.replace(/\/+$/, '') || '.', 0, st.kind);
+    const st = await statShellPath(ctx, p, abs);
+    await walk(abs, p.replace(/\/+$/, '') || '.', 0, st.kind);
   }
 
   let output = results.join('\n');
@@ -1027,8 +1118,6 @@ async function shGrep(ctx, args, stdin) {
   if (!paths.length && (stdin === null || stdin === undefined)) {
     return shErr('grep: missing file operand (or pipe input into grep)');
   }
-  if (paths.length && !ctx.workspace) return shErr('grep: no workspace selected');
-
   const signal = ctx.opts && ctx.opts.signal;
   const matches = [];
   const skipped = [];
@@ -1045,15 +1134,15 @@ async function shGrep(ctx, args, stdin) {
     }
   }
 
-  async function grepFile(rel, disp, showPath) {
-    const st = await ctx.workspace.stat(rel);
+  async function grepFile(abs, disp, showPath) {
+    const st = await ctx.vfs.stat(abs);
     if (st.size > GREP_MAX_FILE_BYTES) {
       skipped.push(disp + ' (over ' + GREP_MAX_FILE_BYTES + '-byte grep limit)');
       return;
     }
     let text;
     try {
-      text = new TextDecoder('utf-8', { fatal: true }).decode(await ctx.workspace.readBytes(rel));
+      text = new TextDecoder('utf-8', { fatal: true }).decode(await ctx.vfs.readBytes(abs));
     } catch (e) {
       skipped.push(disp + ' (not UTF-8 text)');
       return;
@@ -1061,21 +1150,21 @@ async function shGrep(ctx, args, stdin) {
     grepText(text, disp, showPath);
   }
 
-  async function grepDir(rel, disp) {
+  async function grepDir(abs, disp) {
     if (state.truncated) return;
     throwIfCancelled(signal, 'grep');
-    const entries = await ctx.workspace.list(rel);
+    const entries = await ctx.vfs.list(abs);
     for (const e of entries) {
       if (state.truncated) return;
       throwIfCancelled(signal, 'grep');
-      const childRel = rel ? rel + '/' + e.name : e.name;
+      const childAbs = joinAbs(abs, e.name);
       const childDisp = joinDisplay(disp, e.name);
       if (e.kind === 'directory') {
-        await grepDir(childRel, childDisp);
+        await grepDir(childAbs, childDisp);
       } else {
         state.filesSeen++;
         if (state.filesSeen > GREP_MAX_FILES) { state.truncated = true; return; }
-        await grepFile(childRel, childDisp, true);
+        await grepFile(childAbs, childDisp, true);
       }
     }
   }
@@ -1085,18 +1174,18 @@ async function shGrep(ctx, args, stdin) {
   } else {
     for (const p of paths) {
       if (state.truncated) break;
-      let rel;
+      let abs;
       try {
-        rel = resolveShellPath(ctx, p);
+        abs = resolveShellPath(ctx, p);
       } catch (e) {
         return shErr('grep: ' + e.message);
       }
-      const st = await statShellPath(ctx, p, rel);
+      const st = await statShellPath(ctx, p, abs);
       if (st.kind === 'directory') {
         if (!flagR) return shErr('grep: ' + p + ': is a directory (use -r to search recursively)');
-        await grepDir(rel, p.replace(/\/+$/, '') || '.');
+        await grepDir(abs, p.replace(/\/+$/, '') || '.');
       } else {
-        await grepFile(rel, p, showPathDefault);
+        await grepFile(abs, p, showPathDefault);
       }
     }
   }
@@ -1172,12 +1261,11 @@ async function readHeadTailInput(ctx, cmd, paths, stdin) {
     return null;
   }
   if (paths.length > 1) return { error: cmd + ': exactly one file operand is supported' };
-  if (!ctx.workspace) return { error: cmd + ': no workspace selected' };
-  const rel = resolveShellPath(ctx, paths[0]);
-  const st = await statShellPath(ctx, paths[0], rel);
+  const abs = resolveShellPath(ctx, paths[0]);
+  const st = await statShellPath(ctx, paths[0], abs);
   if (st.kind !== 'file') return { error: cmd + ': ' + paths[0] + ': is a directory' };
   if (st.size > CAT_MAX_FILE_BYTES) return { error: cmd + ': ' + paths[0] + ': file too large for terminal output (use python)' };
-  return { text: await ctx.workspace.read(rel) };
+  return { text: await ctx.vfs.read(abs) };
 }
 
 async function shWc(ctx, args, stdin) {
@@ -1199,7 +1287,7 @@ async function shWc(ctx, args, stdin) {
   if (!paths.length && (stdin === null || stdin === undefined)) {
     return shErr('wc: missing file operand (or pipe input into wc)');
   }
-  if (paths.length && !ctx.workspace) return shErr('wc: no workspace selected');
+
 
   // -l counts LINES (newline-terminated or not): our pipeline producers emit
   // unterminated final lines, and `grep x f | wc -l` must answer the number
@@ -1223,10 +1311,10 @@ async function shWc(ctx, args, stdin) {
   const lines = [];
   const total = { l: 0, w: 0, c: 0 };
   for (const p of paths) {
-    const rel = resolveShellPath(ctx, p);
-    const st = await statShellPath(ctx, p, rel);
+    const abs = resolveShellPath(ctx, p);
+    const st = await statShellPath(ctx, p, abs);
     if (st.kind !== 'file') return shErr('wc: ' + p + ': is a directory');
-    const bytes = await ctx.workspace.readBytes(rel); // -c is real UTF-8 bytes, not JS string length
+    const bytes = await ctx.vfs.readBytes(abs); // -c is real UTF-8 bytes, not JS string length
     const c = counts(new TextDecoder('utf-8').decode(bytes), bytes.byteLength);
     total.l += c.l; total.w += c.w; total.c += c.c;
     lines.push(format(c, p));
@@ -1249,11 +1337,6 @@ function baseName(rel) {
   return rel.slice(rel.lastIndexOf('/') + 1);
 }
 
-function parentRel(rel) {
-  const i = rel.lastIndexOf('/');
-  return i === -1 ? '' : rel.slice(0, i);
-}
-
 // Cancellation inside a mutating traversal: the thrown error carries exactly
 // what already committed so the outer report never pretends a rollback.
 function throwMutationCancelled(signal, what, done) {
@@ -1266,7 +1349,6 @@ function throwMutationCancelled(signal, what, done) {
 }
 
 async function shMv(ctx, args) {
-  if (!ctx.workspace) return shErr('mv: no workspace selected');
   const signal = ctx.opts && ctx.opts.signal;
   const operands = [];
   for (const t of args) {
@@ -1279,76 +1361,85 @@ async function shMv(ctx, args) {
   if (operands.length < 2) return shErr('usage: mv <src>... <dest>');
 
   const destDisplay = operands[operands.length - 1];
-  let destRel;
+  let destAbs;
   try {
-    destRel = resolveShellPath(ctx, destDisplay);
+    destAbs = resolveShellPath(ctx, destDisplay);
   } catch (e) {
     return shErr('mv: ' + destDisplay + ': ' + e.message);
   }
   const sources = operands.slice(0, -1);
   let destStat = null;
   try {
-    destStat = await ctx.workspace.stat(destRel);
+    destStat = await ctx.vfs.stat(destAbs);
   } catch (e) {
-    if (!e || e.name !== 'NotFoundError') return shErr('mv: ' + destDisplay + ': ' + e.message);
+    if (!e || e.name !== 'NotFoundError') return shErr('mv: ' + destDisplay + ': ' + writableErrMsg(e));
   }
   if (sources.length > 1 && (!destStat || destStat.kind !== 'directory')) {
     return shErr('mv: target ' + destDisplay + ': not a directory (required with multiple sources)');
   }
 
-  const moved = [];
+  // ---- preflight: validate EVERY source and BOTH mount authorities before
+  // ANY mutation — a cross-mount move must never create a partial
+  // destination only to discover the source is read-only afterwards. ----
+  const plan = [];
   for (const srcDisplay of sources) {
     throwIfCancelled(signal, 'mv');
-    let srcRel;
+    let srcAbs;
     try {
-      srcRel = resolveShellPath(ctx, srcDisplay);
+      srcAbs = resolveShellPath(ctx, srcDisplay);
     } catch (e) {
       return shErr('mv: ' + srcDisplay + ': ' + e.message);
     }
-    if (!srcRel) return shErr('mv: ' + srcDisplay + ': refusing to move the workspace root');
+    if (ctx.vfs.isProtectedRoot(srcAbs)) {
+      return shErr('mv: ' + srcDisplay + ': refusing to move protected path: ' + srcAbs);
+    }
     let srcStat;
     try {
-      srcStat = await ctx.workspace.stat(srcRel);
+      srcStat = await ctx.vfs.stat(srcAbs);
     } catch (e) {
-      return shErr('mv: ' + srcDisplay + ': ' + (e && e.name === 'NotFoundError' ? 'no such file or directory' : e.message));
+      return shErr('mv: ' + srcDisplay + ': ' + (e && e.name === 'NotFoundError' ? 'no such file or directory' : writableErrMsg(e)));
+    }
+    const srcMount = ctx.vfs.resolveMount(srcAbs);
+    if (!srcMount || srcMount.authority === 'read-only' || srcMount.authority === 'system-read-only') {
+      return shErr('mv: ' + srcDisplay + ': source is on a read-only filesystem; move cannot remove source');
     }
 
     // An existing destination directory means "move INTO it"; any other
     // existing destination is a loud failure (no implicit overwrite, no -f).
-    let finalRel = destRel;
+    let finalAbs = destAbs;
     if (destStat && destStat.kind === 'directory') {
-      finalRel = destRel ? destRel + '/' + baseName(srcRel) : baseName(srcRel);
+      finalAbs = joinAbs(destAbs, baseName(srcAbs));
     }
-    if (finalRel === srcRel) return shErr('mv: ' + srcDisplay + ' and ' + destDisplay + ' are the same file');
+    if (finalAbs === srcAbs) return shErr('mv: ' + srcDisplay + ' and ' + destDisplay + ' are the same file');
     if (destStat && destStat.kind !== 'directory') {
       return shErr('mv: ' + destDisplay + ': destination exists');
     }
-    if (srcStat.kind === 'directory' && (finalRel === srcRel || finalRel.startsWith(srcRel + '/'))) {
+    if (srcStat.kind === 'directory' && finalAbs.startsWith(srcAbs + '/')) {
       return shErr('mv: cannot move a directory into itself: ' + srcDisplay);
     }
-    if (await ctx.workspace.exists(finalRel)) {
-      return shErr('mv: destination exists: ' + (destStat && destStat.kind === 'directory' ? finalRel : destDisplay));
+    if (await ctx.vfs.exists(finalAbs)) {
+      return shErr('mv: destination exists: ' + (destStat && destStat.kind !== 'directory' ? finalAbs : destDisplay));
     }
     // The destination parent must be an existing directory.
-    const parent = parentRel(finalRel);
-    if (parent) {
-      let pst;
-      try {
-        pst = await ctx.workspace.stat(parent);
-      } catch (e) {
-        return shErr('mv: ' + destDisplay + ': ' + (e && e.name === 'NotFoundError' ? 'no such directory' : e.message));
-      }
-      if (pst.kind !== 'directory') return shErr('mv: ' + destDisplay + ': parent is not a directory');
+    const parentErr = await checkParentDir(ctx.vfs, finalAbs);
+    if (parentErr) return shErr('mv: ' + destDisplay + ': ' + parentErr);
+    // The destination mount must be writable BEFORE anything is created.
+    try {
+      ctx.vfs.assertWritable(finalAbs);
+    } catch (e) {
+      return shErr('mv: ' + destDisplay + ': ' + writableErrMsg(e));
     }
+    plan.push({ srcAbs: srcAbs, srcStat: srcStat, finalAbs: finalAbs });
+  }
 
-    if (srcStat.kind === 'directory') {
-      const err = await mvDirectory(ctx, srcRel, finalRel, signal);
-      if (err) return shErr(err);
-    } else {
-      const err = await mvFile(ctx, srcRel, finalRel, signal);
-      if (err) return shErr(err);
-    }
-    moved.push(srcRel + ' -> ' + finalRel);
+  const moved = [];
+  for (const step of plan) {
+    throwIfCancelled(signal, 'mv');
+    const err = step.srcStat.kind === 'directory'
+      ? await mvDirectory(ctx, step.srcAbs, step.finalAbs, signal)
+      : await mvFile(ctx, step.srcAbs, step.finalAbs, signal);
+    if (err) return shErr(err);
+    moved.push(step.srcAbs + ' -> ' + step.finalAbs);
   }
   const r = shOk('');
   r.fs = true;
@@ -1357,18 +1448,18 @@ async function shMv(ctx, args) {
 
 // file → new path: copy, VERIFY the destination landed, only then remove
 // the source. A failed/short destination write leaves the source untouched.
-async function mvFile(ctx, srcRel, finalRel, signal) {
+async function mvFile(ctx, srcAbs, finalAbs, signal) {
   throwIfCancelled(signal, 'mv');
-  const bytes = await ctx.workspace.readBytes(srcRel);
+  const bytes = await ctx.vfs.readBytes(srcAbs);
   throwIfCancelled(signal, 'mv');
-  await ctx.workspace.write(finalRel, bytes);
+  await ctx.vfs.write(finalAbs, bytes);
   throwIfCancelled(signal, 'mv');
-  const check = await ctx.workspace.readBytes(finalRel);
+  const check = await ctx.vfs.readBytes(finalAbs);
   if (check.byteLength !== bytes.byteLength || bytesToB64(check) !== bytesToB64(bytes)) {
-    return 'mv: write verification failed for ' + finalRel + '; source preserved';
+    return 'mv: write verification failed for ' + finalAbs + '; source preserved';
   }
   throwIfCancelled(signal, 'mv');
-  await ctx.workspace.remove(srcRel);
+  await ctx.vfs.remove(srcAbs);
   return null;
 }
 
@@ -1378,27 +1469,27 @@ async function mvFile(ctx, srcRel, finalRel, signal) {
 // a separate recursive delete of the source. Any failure or cancellation in
 // the creation/copy/verify phase leaves the source tree fully intact; the
 // partial destination is reported, never silently cleaned up.
-async function mvDirectory(ctx, srcRel, finalRel, signal) {
+async function mvDirectory(ctx, srcAbs, finalAbs, signal) {
   // ---- pre-scan: complete tree description; every bound is enforced BEFORE
   // the destination starts to exist ----
   const files = [];
   const dirs = []; // pre-order: parents always precede their children
   let totalBytes = 0;
-  async function scan(rel) {
+  async function scan(abs) {
     throwIfCancelled(signal, 'mv');
-    const entries = await ctx.workspace.list(rel);
+    const entries = await ctx.vfs.list(abs);
     for (const e of entries) {
       // The entry bound is enforced per entry — a single flat directory can
       // exceed it without any nested scan() call ever re-checking.
       if (files.length + dirs.length >= MV_MAX_ENTRIES) {
         throw new Error('mv: directory exceeds the ' + MV_MAX_ENTRIES + '-entry move limit');
       }
-      const child = rel + '/' + e.name;
+      const child = joinAbs(abs, e.name);
       if (e.kind === 'directory') {
         dirs.push(child);
         await scan(child);
       } else {
-        const st = await ctx.workspace.stat(child);
+        const st = await ctx.vfs.stat(child);
         totalBytes += st.size;
         if (totalBytes > MV_MAX_TOTAL_BYTES) {
           throw new Error('mv: directory exceeds the ' + MV_MAX_TOTAL_BYTES + '-byte move limit');
@@ -1408,7 +1499,7 @@ async function mvDirectory(ctx, srcRel, finalRel, signal) {
     }
   }
   try {
-    await scan(srcRel);
+    await scan(srcAbs);
   } catch (e) {
     if (isCancelledError(e)) throw e;
     return e.message;
@@ -1430,25 +1521,25 @@ async function mvDirectory(ctx, srcRel, finalRel, signal) {
     // The destination root itself is created explicitly — even a completely
     // empty source directory must materialize as an empty destination.
     throwCopyCancelled();
-    await ctx.workspace.mkdir(finalRel);
-    createdDirs.push(finalRel);
+    await ctx.vfs.mkdir(finalAbs);
+    createdDirs.push(finalAbs);
     // Child directories shallow-to-deep (pre-order scan already guarantees
     // parents first; mkdir itself is recursive as a second safety net).
     for (const d of dirs) {
       throwCopyCancelled();
-      const target = finalRel + '/' + d.slice(srcRel.length + 1);
-      await ctx.workspace.mkdir(target);
+      const target = finalAbs + '/' + d.slice(srcAbs.length + 1);
+      await ctx.vfs.mkdir(target);
       createdDirs.push(target);
     }
     // Copy every file and verify the copy byte-for-byte before it counts.
     for (const f of files) {
       throwCopyCancelled();
-      const bytes = await ctx.workspace.readBytes(f);
+      const bytes = await ctx.vfs.readBytes(f);
       throwCopyCancelled();
-      const destPath = finalRel + '/' + f.slice(srcRel.length + 1);
-      await ctx.workspace.write(destPath, bytes);
+      const destPath = finalAbs + '/' + f.slice(srcAbs.length + 1);
+      await ctx.vfs.write(destPath, bytes);
       throwCopyCancelled();
-      const check = await ctx.workspace.readBytes(destPath);
+      const check = await ctx.vfs.readBytes(destPath);
       if (check.byteLength !== bytes.byteLength || bytesToB64(check) !== bytesToB64(bytes)) {
         return 'mv: write verification failed for ' + destPath
           + '; source preserved (partial destination may exist)';
@@ -1470,22 +1561,21 @@ async function mvDirectory(ctx, srcRel, finalRel, signal) {
   try {
     for (const p of all) {
       throwMutationCancelled(signal, 'mv', deleted.map((d) => 'delete ' + d));
-      await ctx.workspace.remove(p);
+      await ctx.vfs.remove(p);
       deleted.push(p);
     }
     throwMutationCancelled(signal, 'mv', deleted.map((d) => 'delete ' + d));
-    await ctx.workspace.remove(srcRel);
-    deleted.push(srcRel);
+    await ctx.vfs.remove(srcAbs);
+    deleted.push(srcAbs);
   } catch (e) {
     if (isCancelledError(e)) throw e;
-    return 'mv: delete failed at ' + (deleted.length ? 'entry after ' + deleted[deleted.length - 1] : srcRel)
+    return 'mv: delete failed at ' + (deleted.length ? 'entry after ' + deleted[deleted.length - 1] : srcAbs)
       + ' (' + (e && e.message ? e.message : String(e)) + '); destination is complete, source may be partially removed';
   }
   return null;
 }
 
 async function shRm(ctx, args) {
-  if (!ctx.workspace) return shErr('rm: no workspace selected');
   const signal = ctx.opts && ctx.opts.signal;
   let force = false, recursive = false;
   const operands = [];
@@ -1506,31 +1596,31 @@ async function shRm(ctx, args) {
   const deleted = [];
   for (const op of operands) {
     throwMutationCancelled(signal, 'rm', deleted);
-    let rel;
+    let abs;
     try {
-      rel = resolveShellPath(ctx, op);
+      abs = resolveShellPath(ctx, op);
     } catch (e) {
       errors.push('rm: ' + op + ': ' + e.message);
       continue;
     }
-    // Hard stop: nothing may recursively remove the workspace root, however
-    // spelled (/, /., /x/.., ...). This is disaster prevention, not a
-    // permission system.
-    if (!rel) {
+    // Hard stop: nothing may recursively remove a protected structural or
+    // mount root, however spelled (/, /., /mnt/workspace, /x/.., ...).
+    // This is disaster prevention, not a permission system.
+    if (ctx.vfs.isProtectedRoot(abs)) {
       errors.push(recursive
-        ? 'rm: refusing to recursively remove workspace root'
+        ? 'rm: refusing to recursively remove protected path: ' + abs
         : 'rm: ' + op + ': is a directory');
       continue;
     }
     let st;
     try {
-      st = await ctx.workspace.stat(rel);
+      st = await ctx.vfs.stat(abs);
     } catch (e) {
       if (e && e.name === 'NotFoundError') {
         if (!force) errors.push('rm: ' + op + ': no such file or directory');
         continue;
       }
-      errors.push('rm: ' + op + ': ' + e.message);
+      errors.push('rm: ' + op + ': ' + writableErrMsg(e));
       continue;
     }
     if (st.kind === 'directory') {
@@ -1538,11 +1628,22 @@ async function shRm(ctx, args) {
         errors.push('rm: ' + op + ': is a directory');
         continue;
       }
-      await rmRecursive(ctx, rel, signal, deleted);
+      try {
+        await rmRecursive(ctx, abs, signal, deleted);
+      } catch (e) {
+        if (isCancelledError(e)) throw e;
+        // A mid-recursion failure (e.g. a read-only mount) is reported
+        // per operand; already-committed deletions stay in `deleted`.
+        errors.push('rm: ' + op + ': ' + writableErrMsg(e));
+      }
     } else {
       throwMutationCancelled(signal, 'rm', deleted);
-      await ctx.workspace.remove(rel);
-      deleted.push(rel);
+      try {
+        await ctx.vfs.remove(abs);
+        deleted.push(abs);
+      } catch (e) {
+        errors.push('rm: ' + op + ': ' + writableErrMsg(e));
+      }
     }
   }
   if (errors.length) {
@@ -1558,22 +1659,22 @@ async function shRm(ctx, args) {
 // Depth-first recursive delete: children (deepest first) before the
 // directory itself, with a cancellation check before EVERY removal. Already
 // committed deletions are reported on the cancellation error, never hidden.
-async function rmRecursive(ctx, rel, signal, deleted) {
+async function rmRecursive(ctx, abs, signal, deleted) {
   throwMutationCancelled(signal, 'rm', deleted);
-  const entries = await ctx.workspace.list(rel);
+  const entries = await ctx.vfs.list(abs);
   for (const e of entries) {
-    const child = rel + '/' + e.name;
+    const child = joinAbs(abs, e.name);
     if (e.kind === 'directory') {
       await rmRecursive(ctx, child, signal, deleted);
     } else {
       throwMutationCancelled(signal, 'rm', deleted);
-      await ctx.workspace.remove(child);
+      await ctx.vfs.remove(child);
       deleted.push(child);
     }
   }
   throwMutationCancelled(signal, 'rm', deleted);
-  await ctx.workspace.remove(rel);
-  deleted.push(rel);
+  await ctx.vfs.remove(abs);
+  deleted.push(abs);
 }
 
 async function shPython(ctx, args) {
@@ -1594,17 +1695,25 @@ async function shHelp() {
 // Returns { output: string, isError: boolean, io: {in, out} } for the tool
 // layer — stdout/stderr are separated INSIDE the executor and merged only
 // here, for presentation. io in UTF-8 bytes.
-// The virtual cwd starts at the workspace root on EVERY invocation and never
-// persists across tool calls.
+// The cwd starts at the VFS default on EVERY invocation and never persists
+// across tool calls.
 async function runShellCommand(input, workspace, opts) {
   const line = String(input || '').trim();
   const ioOf = (output) => ({ in: utf8ByteLength(line), out: utf8ByteLength(output) });
   if (!line) return { output: '', isError: false, io: { in: 0, out: 0 } };
 
+  // The shell always has a filesystem: real VFS as-is, legacy adapter
+  // mounted at /mnt/workspace, missing argument → fresh internal machine.
+  const vfs = asVfs(workspace);
+  // The cwd is VFS-ABSOLUTE and starts at the VFS default on EVERY
+  // invocation: /mnt/workspace when mounted, otherwise /home/locus.
+  // `cd` never leaks across bash calls.
+  const ctx = { vfs: vfs, opts: opts, cwd: vfs.defaultCwd() };
+
   // Heredoc python is recognized before generic tokenizing.
   const heredoc = extractPythonHeredoc(line);
   if (heredoc) {
-    const r = await runPythonCode(heredoc.code, workspace, opts);
+    const r = await runPythonCode(heredoc.code, ctx.vfs, pythonOpts(ctx));
     const output = [r.stdout, r.stderr].filter(Boolean).join('\n');
     return { output: output, isError: !r.success, io: r.io };
   }
@@ -1617,7 +1726,6 @@ async function runShellCommand(input, workspace, opts) {
   }
   if (!steps.length) return { output: '', isError: false, io: ioOf('') };
 
-  const ctx = { workspace: workspace, opts: opts, cwd: '' };
   const outParts = [];
   const networkOps = [];
   let fsOps = 0;
@@ -1737,15 +1845,22 @@ async function runSimpleCommand(cmd, ctx, stdin) {
     }
     const target = argv[++i];
     if (!target || target.op) return shErr('bash: missing redirect target after "' + t.text + '"');
-    if (!ctx.workspace) return shErr('bash: no workspace selected (cannot redirect to a file)');
-    let rel;
+    let abs;
     try {
-      rel = resolveShellPath(ctx, target.text);
+      abs = resolveShellPath(ctx, target.text);
     } catch (e) {
       return shErr('bash: ' + e.message);
     }
-    if (!rel) return shErr('bash: redirect target must be a file path, not the workspace root');
-    const dest = { kind: 'file', path: rel, append: t.text === '>>' || t.text === '2>>' };
+    if (abs === '/') return shErr('bash: redirect target must be a file path, not the filesystem root');
+    // Unwritable targets (read-only mounts, structural paths, unmounted
+    // folders) are rejected BEFORE the command runs — before ANY side
+    // effect, not just before the write itself.
+    try {
+      ctx.vfs.assertWritable(abs);
+    } catch (e) {
+      return shErr('bash: ' + name + ': cannot write ' + abs + ': ' + writableErrMsg(e));
+    }
+    const dest = { kind: 'file', path: abs, append: t.text === '>>' || t.text === '2>>' };
     if (t.text.charAt(0) === '2') route.stderr = dest;
     else route.stdout = dest;
   }
@@ -1795,12 +1910,12 @@ async function runSimpleCommand(cmd, ctx, stdin) {
     // what the first write just landed (stdout first, then stderr).
     const append = w.dest.append || writtenPaths.has(w.dest.path);
     try {
-      if (append && (await ctx.workspace.exists(w.dest.path))) {
-        text = (await ctx.workspace.read(w.dest.path)) + text;
+      if (append && (await ctx.vfs.exists(w.dest.path))) {
+        text = (await ctx.vfs.read(w.dest.path)) + text;
       }
       // reads above awaited: re-check cancellation before writing
       throwIfCancelled(signal, name);
-      await ctx.workspace.write(w.dest.path, text);
+      await ctx.vfs.write(w.dest.path, text);
       writtenPaths.add(w.dest.path);
     } catch (e) {
       if (isCancelledError(e)) throw e;
@@ -1827,33 +1942,36 @@ async function runPython(args, ctx, opts) {
     code = args.slice(1).join(' ');
   } else {
     const script = args[0];
-    if (!ctx.workspace) return shErr('python: no workspace selected (cannot read ' + script + ')');
-    // The script path resolves against the shell's virtual cwd; Python's own
-    // filesystem root remains the workspace root (documented divergence).
-    let rel;
+    let abs;
     try {
-      rel = resolveShellPath(ctx, script);
+      abs = resolveShellPath(ctx, script);
     } catch (e) {
       return shErr('python: ' + e.message);
     }
     try {
-      code = await ctx.workspace.read(rel);
+      code = await ctx.vfs.read(abs);
     } catch (e) {
-      return shErr('python: can\'t open file \'' + script + '\': ' + e.message);
+      return shErr('python: can\'t open file \'' + script + '\': ' + writableErrMsg(e));
     }
   }
 
-  return await runPythonCode(code, ctx.workspace, opts);
+  return await runPythonCode(code, ctx.vfs, pythonOpts(ctx));
 }
 
-async function runPythonCode(code, workspace, opts) {
+// Options handed to PythonRuntime: the caller's opts plus the ABSOLUTE VFS
+// cwd of this invocation (Python's os.chdir target).
+function pythonOpts(ctx) {
+  return Object.assign({}, ctx.opts, { cwd: ctx.cwd });
+}
+
+async function runPythonCode(code, vfs, opts) {
   if (!code || !code.trim()) {
     return { success: false, stdout: '', stderr: 'python: empty code', io: { in: 0, out: 0 } };
   }
 
   let res;
   try {
-    res = await PythonRuntime.run(code, workspace, opts);
+    res = await PythonRuntime.run(code, vfs, opts);
   } catch (e) {
     if (isCancelledError(e)) {
       return { success: false, stdout: '', stderr: 'python: execution cancelled', cancelled: true, io: { in: utf8ByteLength(code), out: 0 } };
@@ -1880,10 +1998,10 @@ async function runPythonCode(code, workspace, opts) {
       + (res.skipped.length > shown.length ? '; …' : '') + ']');
   }
   if (res.written && res.written.length) {
-    outParts.push('[written to workspace: ' + res.written.join(', ') + ']');
+    outParts.push('[written: ' + res.written.join(', ') + ']');
   }
   if (res.deleted && res.deleted.length) {
-    outParts.push('[deleted from workspace: ' + res.deleted.join(', ') + ']');
+    outParts.push('[deleted: ' + res.deleted.join(', ') + ']');
   }
   for (const c of res.conflicts || []) {
     errParts.push('[conflict: ' + c.path + ': ' + c.reason + ']');
@@ -1944,7 +2062,7 @@ function isTextLikeMime(contentType) {
 }
 
 async function runCurl(args, ctx, opts) {
-  const workspace = ctx.workspace;
+  const vfs = ctx.vfs;
   const netResult = (text, success, net) => ({
     success,
     stdout: success ? text : '',
@@ -1971,14 +2089,23 @@ async function runCurl(args, ctx, opts) {
   }
   if (!url) return netResult('usage: curl <https-url> | curl -o <file> <https-url>', false);
 
-  // A download with nowhere to write must fail BEFORE any network request.
-  if (outFile && !workspace) return netResult('curl: no workspace selected', false);
+  // A download with an unwritable target must fail BEFORE any network
+  // request: resolve the absolute path, enforce mount authority and check
+  // the parent directory first.
   if (outFile) {
+    const display = outFile;
     try {
       outFile = resolveShellPath(ctx, outFile);
     } catch (e) {
       return netResult('curl: ' + e.message, false);
     }
+    try {
+      vfs.assertWritable(outFile);
+    } catch (e) {
+      return netResult('curl: cannot write ' + display + ': ' + writableErrMsg(e), false);
+    }
+    const parentErr = await checkParentDir(vfs, outFile);
+    if (parentErr) return netResult('curl: cannot write ' + display + ': ' + parentErr, false);
   }
 
   let res;
@@ -2003,10 +2130,10 @@ async function runCurl(args, ctx, opts) {
   if (outFile) {
     // The fetch awaited: re-check cancellation before writing the file.
     throwIfCancelled(opts && opts.signal, 'curl');
-    // Binary-safe: raw bytes go straight into the workspace, no decoding.
-    await workspace.write(outFile, res.bytes);
+    // Binary-safe: raw bytes go straight into the VFS, no decoding.
+    await vfs.write(outFile, res.bytes);
     // Telemetry stays `network`: the download IS the network operation.
-    return netResult('[written to workspace: ' + outFile + ', ' + res.bytes.byteLength + ' bytes]', true, res);
+    return netResult('[written to ' + outFile + ', ' + res.bytes.byteLength + ' bytes]', true, res);
   }
 
   if (isTextLikeMime(res.headers['content-type'])) {
