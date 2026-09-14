@@ -10,6 +10,7 @@ const SUITES = [
   'fetch.test.mjs',
   'network.test.cjs',
   'workspace.test.cjs',
+  'vfs.test.cjs',
   'shell.test.cjs',
   'shell-compat.test.cjs',
   'shell-compat2.test.cjs',
