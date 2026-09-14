@@ -35,6 +35,7 @@ class WorkspaceAdapter {
   async readBytes(path) { throw new Error('not implemented'); }   // → Uint8Array
   async write(path, data) { throw new Error('not implemented'); } // string | Uint8Array
   async remove(path) { throw new Error('not implemented'); }      // delete a file
+  async mkdir(path) { throw new Error('not implemented'); }       // create a directory (recursive)
   async exists(path) { throw new Error('not implemented'); }
   async stat(path) { throw new Error('not implemented'); }        // → {kind, size, modified}
 }
@@ -101,6 +102,15 @@ class LocalDirectoryWorkspace extends WorkspaceAdapter {
     if (!base) throw new Error('cannot remove workspace root');
     const dir = await this._dir(dirParts, false);
     await dir.removeEntry(base);
+  }
+
+  // Create a directory (recursively). An existing directory is a no-op
+  // success; a FILE already occupying any path segment surfaces the
+  // browser's TypeMismatchError — real faults are never swallowed.
+  async mkdir(path) {
+    const rel = normalizeWorkspacePath(path);
+    if (!rel) return; // the workspace root always exists
+    await this._dir(rel.split('/'), true);
   }
 
   async exists(path) {
