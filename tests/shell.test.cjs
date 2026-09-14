@@ -96,10 +96,12 @@ async function run() {
   const t8 = await M.executeTool('bash', 'ls; pwd', ws);
   check('T8 semicolon sequence works', t8.success && t8.output.includes('out.txt') && t8.output.includes('/'), t8.output);
   const t7b = await M.executeTool('bash', 'ls || pwd', ws);
-  check('T7b || rejected with guidance', !t7b.success && t7b.output.includes("unsupported operator: '||'")
-    && t7b.output.includes('; && |'), t7b.output);
+  check('T7b || skips rhs on success', t7b.success && t7b.output.includes('out.txt')
+    && !t7b.output.includes('\n/'), t7b.output);
   const t9 = await M.executeTool('bash', 'cat out.txt > other.txt', ws);
-  check('T9 redirect only for echo', !t9.success && t9.output.includes('only supported for echo'), t9.output);
+  check('T9 redirect is generic (not echo-only)', t9.success
+    && new TextDecoder().decode(ws.files['other.txt'] || []) === new TextDecoder().decode(ws.files['out.txt']),
+    JSON.stringify(t9.output));
 
   // ---------- P. python write-back: failed target stops deletions (F04) ----------
   const wsP = new MemWS({ 'old.txt': 'original' });

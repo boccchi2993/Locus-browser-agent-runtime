@@ -11,6 +11,8 @@ const SUITES = [
   'network.test.cjs',
   'workspace.test.cjs',
   'shell.test.cjs',
+  'shell-compat.test.cjs',
+  'shell-compat2.test.cjs',
   'agent.test.cjs',
   'presentation.test.cjs',
   'conversation-routing.test.mjs',

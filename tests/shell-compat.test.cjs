@@ -378,13 +378,15 @@ async function run() {
   {
     const ws = fixture();
     const x1 = await M.executeTool('bash', 'ls || pwd', ws);
-    check('X1 || unsupported', !x1.success && x1.output.includes("unsupported operator: '||'"), x1.output);
+    check('X1 || supported: rhs skipped on success', x1.success && x1.output.includes('a.txt')
+      && !x1.output.split('\n').includes('/'), x1.output);
     const x2 = await M.executeTool('bash', 'ls & pwd', ws);
     check('X2 background & unsupported', !x2.success && x2.output.includes("unsupported operator: '&'"), x2.output);
     const x3 = await M.executeTool('bash', 'cat < a.txt', ws);
     check('X3 input redirect unsupported', !x3.success && x3.output.includes("unsupported operator: '<'"), x3.output);
     const x4 = await M.executeTool('bash', 'echo hi 2> err.txt', ws);
-    check('X4 2> unsupported', !x4.success && x4.output.includes("unsupported redirect: '2>'") && !('err.txt' in ws.files), x4.output);
+    check('X4 2> supported: empty stderr creates empty file', x4.success && x4.output === 'hi'
+      && ('err.txt' in ws.files) && dec(ws.files['err.txt']) === '', x4.output);
     const x5 = await M.executeTool('bash', 'ls |', ws);
     check('X5 trailing pipe syntax error', !x5.success && x5.output.includes("empty command after '|'"), x5.output);
     const x6 = await M.executeTool('bash', 'ls &&', ws);

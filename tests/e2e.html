@@ -268,6 +268,72 @@
       check('N0 OPFS shell-compat workspace available', false, String(e && e.message || e));
     }
 
+    // ---------- O. shell compatibility round 2 (real browser runtime, real FS handles) ----------
+    // || fallback, mv, rm and stdout/stderr redirection against native OPFS handles.
+    try {
+      const opfsRoot3 = await navigator.storage.getDirectory();
+      const dirName3 = 'locus-e2e-sh2-' + Date.now();
+      const dir3 = await opfsRoot3.getDirectoryHandle(dirName3, { create: true });
+      const sh2Ws = new LocalDirectoryWorkspace(dir3);
+      try {
+        const o1 = await executeTool('bash',
+          'echo hello > a.txt; mv a.txt b.txt; cat missing.txt 2> err.txt || echo fallback; cat err.txt | head -n 2; rm b.txt; ls -la',
+          sh2Ws);
+        check('O1 composite: redirect + mv + stderr 2> + || + rm + ls', o1.success
+          && o1.output.includes('fallback') && o1.output.includes('err.txt')
+          && !o1.output.includes('a.txt') && !o1.output.includes('b.txt'), JSON.stringify(o1.output));
+        const o1b = await executeTool('bash', 'cat err.txt', sh2Ws);
+        check('O1b stderr redirect really landed on disk', o1b.success && o1b.output.includes('cat:')
+          && o1b.output.includes('missing.txt'), JSON.stringify(o1b.output));
+        const o1c = await executeTool('bash', 'ls', sh2Ws);
+        check('O1c mv + rm really mutated the filesystem', o1c.success && o1c.output === 'err.txt',
+          JSON.stringify(o1c.output));
+
+        const o2 = await executeTool('bash', 'cat missing.txt > all.txt 2>&1', sh2Ws);
+        const o2b = await executeTool('bash', 'cat all.txt', sh2Ws);
+        check('O2 > f 2>&1 merges both streams into the file', !o2.success && o2.output === ''
+          && o2b.output.includes('cat:'), JSON.stringify(o2.output) + ' | ' + JSON.stringify(o2b.output));
+        const o3 = await executeTool('bash', 'cat missing.txt 2>&1 > out.txt', sh2Ws);
+        const o3b = await executeTool('bash', 'cat out.txt', sh2Ws);
+        check('O3 2>&1 > f keeps stderr captured, stdout to file', !o3.success && o3.output.includes('cat:')
+          && o3b.success && o3b.output === '', JSON.stringify(o3.output) + ' | ' + JSON.stringify(o3b.output));
+
+        const o4 = await executeTool('bash', 'cat missing.txt 2>&1 | wc -l', sh2Ws);
+        check('O4 2>&1 merges stderr into the pipeline', o4.success && o4.output === '1', JSON.stringify(o4.output));
+        const o5 = await executeTool('bash', 'cat missing.txt 2> e2.txt | wc -l', sh2Ws);
+        check('O5 2> file keeps stderr out of the pipeline', o5.success && o5.output === '0', JSON.stringify(o5.output));
+
+        const o6 = await executeTool('bash', 'mv err.txt sub2/err.txt', sh2Ws);
+        check('O6 mv into missing directory fails, source kept', !o6.success && o6.output.includes('no such'),
+          JSON.stringify(o6.output));
+        await executeTool('bash', 'echo x > d1/f1.txt; echo y > d1/f2.txt; echo z > d1/nested/f3.txt', sh2Ws);
+        const o7 = await executeTool('bash', 'mv d1 d2', sh2Ws);
+        const o7b = await executeTool('bash', 'find d2 -type f', sh2Ws);
+        check('O7 recursive directory move', o7.success && o7b.success && o7b.output.includes('d2/f1.txt')
+          && o7b.output.includes('d2/nested/f3.txt'), JSON.stringify(o7b.output));
+        const o7c = await executeTool('bash', 'ls d1', sh2Ws);
+        check('O7b source directory gone after move', !o7c.success, JSON.stringify(o7c.output));
+
+        const o8 = await executeTool('bash', 'rm -rf d2', sh2Ws);
+        const o8b = await executeTool('bash', 'find . -type f', sh2Ws);
+        check('O8 rm -rf recursive delete', o8.success && o8b.success && !o8b.output.includes('d2'),
+          JSON.stringify(o8b.output));
+        const o9 = await executeTool('bash', 'rm -rf /', sh2Ws);
+        const o9b = await executeTool('bash', 'ls', sh2Ws);
+        check('O9 rm -rf / refused, workspace intact', !o9.success
+          && o9.output.includes('refusing to recursively remove workspace root')
+          && o9b.success && o9b.output.includes('err.txt'), JSON.stringify(o9.output));
+
+        const o10 = await executeTool('bash', 'help', sh2Ws);
+        check('O10 help lists round-2 surface', o10.success && o10.output.includes('mv') && o10.output.includes('rm')
+          && o10.output.includes('||') && o10.output.includes('2>&1'), JSON.stringify(o10.output).slice(0, 100));
+      } finally {
+        await opfsRoot3.removeEntry(dirName3, { recursive: true });
+      }
+    } catch (e) {
+      check('O0 OPFS round-2 workspace available', false, String(e && e.message || e));
+    }
+
     // ---------- E. python timeout + worker recovery (runs last) ----------
     const t0 = performance.now();
     const to = await executeTool('bash', "python <<'PY'\nwhile True:\n    pass\nPY", ws);
