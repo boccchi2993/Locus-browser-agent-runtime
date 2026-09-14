@@ -2,7 +2,7 @@
 
 This file is for concrete implementation work.
 
-Architecture-level decisions belong in docs/ARCHITECTURE.md, docs/MODEL-PROTOCOL.md and docs/LINUX-LIKE-VFS.md. Milestones belong in ROADMAP.md.
+Architecture-level decisions belong in docs/ARCHITECTURE.md and docs/MODEL-PROTOCOL.md. Milestones belong in ROADMAP.md.
 
 ## Done on feat/linux-like-vfs-v1
 
@@ -178,9 +178,9 @@ Prerequisite: AgentSession must already run without UI dependencies.
 - [x] Clear error presentation.
 - [x] Busy/cancel state where supported (composer Cancel + Escape; AgentSession remains the real guard).
 - [x] Conversation history sidebar (New task / search / recents; page-lifetime only, no durable persistence).
-- [x] Composer `+` context menu: Upload files (wired to /mnt/upload) / Mount folder (working) / Open terminal (reserved drawer).
+- [x] Composer `+` context menu: Upload files (seam, marked not-wired) / Mount folder (working) / Open terminal (reserved drawer).
 - [ ] Durable conversation persistence across reloads (recents are page-lifetime by design for now).
-- [ ] Attachment runtime pipeline (uploads live in the VFS at /mnt/upload; the agent can read them via shell/python, but no automatic context injection yet).
+- [ ] Attachment runtime pipeline (upload UI seam exists; files are never sent to the agent yet).
 - [ ] Direct user terminal over the shared workspace authority (drawer reserved; no shell semantics added).
 
 ### UI rule
