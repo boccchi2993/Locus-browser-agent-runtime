@@ -2,14 +2,21 @@
 
 This file is for concrete implementation work.
 
-Architecture-level decisions belong in docs/ARCHITECTURE.md and docs/MODEL-PROTOCOL.md. Milestones belong in ROADMAP.md.
+Architecture-level decisions belong in docs/ARCHITECTURE.md, docs/MODEL-PROTOCOL.md and docs/LINUX-LIKE-VFS.md. Milestones belong in ROADMAP.md.
+
+## Done on feat/linux-like-vfs-v1
+
+- [x] Linux-like VFS v1 (docs/LINUX-LIKE-VFS.md): always-on `VirtualWorkspace` mount table with longest-prefix routing; skeleton `/bin /usr /home /tmp /mnt`; `/home/locus` + `/tmp` + `/mnt/download` (MemoryWorkspace, quota-bounded), `/mnt/upload` (read-only UploadWorkspace holding real File objects), `/usr/bin`+`/bin` reflecting the live SHELL_COMMANDS registry, `/mnt/plugins` reserved; optional `/mnt/workspace` (LocalDirectoryWorkspace) with mount = session boundary
+- [x] Shell + Python converge on one model-visible namespace: VFS-absolute paths everywhere, invocation-local cwd (default `/mnt/workspace` else `/home/locus`), `HOME`/`PATH`/`TMPDIR`, protected-root rm refusals, read-only mount preflight for mv/redirects/curl -o before any side effect
+- [x] Python worker protocol v2: per-mount sync with absolute paths, managed subtree cleanup (never rmtree of Pyodide `/usr` `/home` `/tmp`), os.chdir to the shell cwd, read-only mount write-back rejected at commit with source bytes untouched
+- [x] UI: real File uploads with deterministic `name (2).ext` collision naming and real VFS paths in the composer; Artifacts section in the Context Rail listing `/mnt/download` recursively with explicit local Download (Blob + object URL, no auto-trigger, no network)
 
 ## Done on feat/shell-compat-baseline
 
 Unix compatibility baseline (so future telemetry records unknown gaps, not known ones):
 
 - [x] Shell parser/executor: `;`, `&&`, `|` composition; quoted operators stay data; unsupported syntax (`&`, `<`, trailing `|`/`&&`) fails with the supported alternative
-- [x] Invocation-local virtual cwd (`cd`, `pwd`); every bash call starts at workspace root; `..` escape rejected; relative paths resolve against cwd in ls/cat/echo redirect/find/grep/head/tail/wc/python script/curl -o
+- [x] Invocation-local virtual cwd (`cd`, `pwd`); every bash call starts at the VFS default cwd (`/mnt/workspace` when mounted, else `/home/locus`); escaping the filesystem root is rejected; relative paths resolve against cwd in ls/cat/echo redirect/find/grep/head/tail/wc/python script/curl -o
 - [x] `ls -a/-l/-h` (combined flags, dotfile semantics, human sizes)
 - [x] `find` subset (`-name` `*?` glob, `-type f|d`, `-maxdepth N`), bounded + deterministic + cancellation-aware
 - [x] `grep` subset (`-n -i -r -R -E`, JS regex semantics), bounded, binary-safe skip, cancellation-aware
@@ -26,7 +33,7 @@ Unix compatibility baseline (so future telemetry records unknown gaps, not known
 - [x] `||` fallback operator; `&&`/`||` chains are left-associative
 - [x] Generalized redirection at the execution layer (no longer echo-only): `>` `>>` `2>` `2>>` `2>&1`, applied left to right (`> all.txt 2>&1` ≠ `2>&1 > out.txt`); other fds (`1>&2`, `3>`, `&>`) rejected
 - [x] `mv` (file→file, file→dir, bounded recursive directory move, multi-source into dir; destination-exists fails loudly, no `-f`); copy-verify-then-delete: source is never removed before the destination landed
-- [x] `rm` (`-f` `-r`/`-R` combined flags); `rm -rf /` (any spelling of the workspace root) hard-refused; recursive delete checks cancellation before every removal and reports committed deletions without fake rollback
+- [x] `rm` (`-f` `-r`/`-R` combined flags); protected VFS roots (`/`, `/usr`, `/home`, `/home/locus`, `/mnt`, `/mnt/workspace`, `/mnt/upload`, `/mnt/download`, `/mnt/plugins`) hard-refused for recursive delete; recursive delete checks cancellation before every removal and reports committed deletions without fake rollback
 - [x] Telemetry: mutating shell commands report `operation: "filesystem"` (backend `browser`)
 
 ## Done on fix/v0.3-reliability
@@ -74,10 +81,10 @@ below are reflected in the roadmap sections.
 - [x] Add browser-direct response-size cap.
 - [x] Avoid unbounded arrayBuffer() reads for large direct responses.
 - [x] Keep browser-direct and edge-relay timeout/error semantics aligned.
-- [x] Check workspace before starting curl -o downloads.
+- [x] Check target authority before starting curl -o downloads (writable mount + parent dir, before any network request).
 - [x] Add regression tests for direct-fetch timeout.
 - [x] Add regression tests for direct-fetch response-size cap.
-- [x] Add regression test proving curl -o without a workspace performs no network request.
+- [x] Add regression test proving curl -o to a non-writable path (unmounted /mnt/workspace, read-only /mnt/upload) performs no network request — while /mnt/download works with no workspace mounted.
 
 ## Deferred runtime reliability improvements
 
@@ -171,9 +178,9 @@ Prerequisite: AgentSession must already run without UI dependencies.
 - [x] Clear error presentation.
 - [x] Busy/cancel state where supported (composer Cancel + Escape; AgentSession remains the real guard).
 - [x] Conversation history sidebar (New task / search / recents; page-lifetime only, no durable persistence).
-- [x] Composer `+` context menu: Upload files (seam, marked not-wired) / Mount folder (working) / Open terminal (reserved drawer).
+- [x] Composer `+` context menu: Upload files (wired to /mnt/upload) / Mount folder (working) / Open terminal (reserved drawer).
 - [ ] Durable conversation persistence across reloads (recents are page-lifetime by design for now).
-- [ ] Attachment runtime pipeline (upload UI seam exists; files are never sent to the agent yet).
+- [ ] Attachment runtime pipeline (uploads live in the VFS at /mnt/upload; the agent can read them via shell/python, but no automatic context injection yet).
 - [ ] Direct user terminal over the shared workspace authority (drawer reserved; no shell semantics added).
 
 ### UI rule

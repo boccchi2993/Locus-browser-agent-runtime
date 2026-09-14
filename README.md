@@ -1,125 +1,64 @@
-# Browser Agent Runtime (Locus)
+# Locus — Browser Agent Runtime
 
-A Unix-like execution substrate for AI agents, implemented inside a browser tab. Locus aims to handle lightweight computation, files and Internet access locally without requiring a remote sandbox, Docker, local daemon, CLI, or localhost server.
+> An AI agent with shell access — the shell is a small Linux-like machine that runs entirely in your browser. Your files never leave the page unless you say so.
 
-Forked from the terminal UI / model-interaction skeleton of [Whoami_Cli_game](https://github.com/boccchi2993/Whoami_Cli_game). All game content has been removed; this is not a game.
+## What is this?
 
+Locus is a browser-native agent runtime. The model's `bash` tool is a Unix-like **compatibility** shell whose entire filesystem — the commands it runs, the Python it executes, every byte it reads or writes — lives in a Linux-like **virtual filesystem inside your browser tab**. There is no server-side execution anywhere in the loop.
 
-## Design principles
+- **The filesystem is a machine.** `/bin` and `/usr/bin` are the agent's userland view (the available commands); `/home/locus` is its home; `/tmp` is scratch; `/mnt` holds every outside connection (see [The machine](#the-machine)).
+- **Python is local.** `python` runs in [Pyodide](https://pyodide.org) (WASM) in a Web Worker — the same filesystem, the same cwd, pandas included, and everything it writes stays local unless it lands in `/mnt/download` for you.
+- **Network is explicit.** `curl` is an anonymous HTTPS-GET-only capability — no cookies, no auth headers, no POST. Your data is never silently uploaded; the only thing that leaves the page by default is the model API call itself.
+- **The agent is a small loop.** A strict ` ```json{"tool":"bash","input":...}``` ` protocol drives the loop; the model API is pluggable (DeepSeek by default, Anthropic- and OpenAI-compatible endpoints work).
 
-> **Model decides WHAT. Harness decides WHERE.**
+## The machine
 
-> **Normalize capabilities. Preserve model semantics.**
-
-> **If a lightweight task can be expressed as computation + files + network, it should not require a cloud computer.**
-
-Locus keeps the model-facing machine surface small and Unix-like. The browser runtime provides execution, filesystem and network substrate; the harness composes those capabilities and decides when an extension or heavier provider is required. Domain-specific features should normally grow through Plugins, Skills and MCP rather than by expanding the runtime core.
-
-Architecture and planning docs:
-
-- [Architecture](docs/ARCHITECTURE.md)
-- [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md)
-- [Model protocol and reasoning replay](docs/MODEL-PROTOCOL.md)
-- [Roadmap](ROADMAP.md)
-- [Implementation TODO](TODO.md)
-
-## Why
-
-Remote computers should be escalation providers, not the default, for lightweight agent workloads. The cheapest, most private place to run ordinary computation is usually the environment closest to the data: the user's own browser, on files the user explicitly granted access to. Model inference, external authority, relays, authenticated services and genuinely heavyweight execution may remain remote; lightweight execution should not become cloud work merely because the caller is an agent.
-
-## Current capabilities
-
-- Local workspace access via the File System Access API (user-picked directory, read/write)
-- Unix-like compatibility shell (`bash` tool): `pwd`, `cd` (invocation-local), `ls` (`-a`/`-l`/`-h`), `cat`, `echo`, `find`, `grep`, `head`, `tail`, `wc`, `mv`, `rm`, `python`, `curl`, `help`, with `;`, `&&`, `||` and `|` command composition and `>`, `>>`, `2>`, `2>>`, `2>&1` redirection — see "The Unix compatibility shell" below
-- Python execution via Pyodide in a Web Worker (lazy-loaded, stdout/stderr/traceback returned, pandas auto-loaded on import)
-- **Browser-native network capability currently exposed through `curl`** (HTTPS GET: `curl <url>` prints text, `curl -o <file> <url>` downloads); long term, Python/JS networking should reuse the same runtime boundary
-- **Direct browser fetch with transparent edge relay fallback** (only on genuine CORS/network failure, never on HTTP error statuses)
-- **Binary-safe downloads into the local workspace** (no text decoding anywhere in the network path)
-- Agent tool loop (structured ` ```json ` tool calls, results fed back, max 32 iterations)
-- Local file output written back into the real workspace directory (create / modify / delete / rename), with external-edit conflict detection and staged (non-atomic) commit reporting
-- Session boundaries that actually isolate: switching workspace or `reset` cancels the running task, clears history, and rebuilds the Python interpreter
-- Structured model responses (visible content / reasoning / stop reason / usage / provider-native replay state) — HTTP 200 semantic errors never trigger a second paid request
-- In-memory execution telemetry (tool, backend, operation, duration, UTF-8 bytes, success/error) + debug panel
-
-## Architecture
-
-Locus separates the Unix-like interface the model sees from the browser-native substrate that implements it:
+Every page session boots one persistent virtual filesystem — even before you mount or upload anything:
 
 ```
-                    Agent
-                      |
-               +------+------+
-               |             |
-             bash           edit
-               |
-       python / js / curl / Unix utilities
-               |
-        Runtime Substrate
-     execution / filesystem / network
-               |
-             Browser
+/
+├── bin → /usr/bin        # same command registry
+├── usr/bin, usr/local/…  # userland (read-only): the shell commands themselves
+├── home/locus            # agent home, writable
+├── tmp                   # scratch, writable
+└── mnt
+    ├── workspace/        # a real folder you mount (File System Access API)
+    ├── upload/           # files you picked, read-only to the agent
+    ├── download/         # agent outputs you can download
+    └── plugins/          # reserved
 ```
 
-The current V0.3 implementation is a partial realization of that target:
+Authority is per mount: `/mnt/upload` and the userland are read-only to the agent; `/mnt/workspace` (when mounted), `/mnt/download`, `/tmp` and `/home/locus` are writable. Protected roots (`/`, `/usr`, `/home`, `/home/locus`, `/mnt`, all mount roots) can never be recursively deleted or moved. Structural paths (e.g. `/etc`) don't exist — writes there fail with `read-only filesystem`.
+
+The agent and you share this namespace: uploads you add in the composer appear at `/mnt/upload/...`, artifacts the agent writes to `/mnt/download` appear in the context rail with an explicit **Download** button (local Blob URL, never network), and a mounted folder is read and written **byte-exactly on your real disk**.
+
+## How the agent works
+
+1. You describe a task in the composer (optionally mounting a folder or uploading files).
+2. The model plans and emits tool calls — one per reply.
+3. Each call runs **locally** against the virtual filesystem: shell commands, pipelines, redirects, Python.
+4. Results feed back into the model (explicitly marked as untrusted data) until the task is done.
+5. Reasoning, tool calls, results and warnings stream into the timeline; cancel anytime with the button or `Esc`.
 
 ```
-Agent
-  |
-bash
-  |
-Browser Runtime
-  +-- Workspace ------> File System Access API
-  +-- Python ---------> Pyodide Worker
-  +-- curl -----------> NetworkRuntime
-                         +-- browser-direct
-                         +-- edge /fetch relay
+user: 分析 sales.csv，计算平均值并保存到 summary.csv
+  → bash: ls
+  → bash: cat sales.csv
+  → bash: python <<'PY' … PY          # pandas, in-browser, writes summary.csv
+  → assistant: 完成，summary.csv 已写入 /mnt/workspace。
 ```
 
-The model should not need to care whether Python is Pyodide, a command is backed by WASM, or HTTP required a relay. `bash` is the Unix-like execution facade; `edit` is the target deterministic mutation interface; execution/filesystem/network are the runtime substrate beneath them.
+## The shell contract
 
-Plugins add code, Skills add knowledge, and MCP adds external authority. Capabilities such as Excel editing, RAG, ffmpeg, LibreOffice or compilers should normally be composed above the runtime rather than becoming new core tools.
+A bounded Unix-like surface — big enough for real work, honest about what it is not:
 
-A `cloud_bash` tool exists in the current interface but is not configured and always returns `success: false` with `Cloud execution is not configured.` It represents a future escalation provider for workloads that genuinely need a remote computer.
-
-See [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md) for the detailed layer model.
-
-```
-index.html            Vite entry page + inline Pyodide worker source; loads runtime classic scripts, then the Vue app
-package.json          npm run dev / build / test / test:e2e
-vite.config.js        Vue plugin + copies the un-bundled runtime scripts into dist/
-src/
-  model.js            LLM API client (Anthropic/OpenAI dialect fallback, optional CORS proxy)
-  agent.js            AgentSession: UI-independent agent tool loop (runtime events, DI) + system prompt + strict tool-call parser
-  tools.js            tool router (bash / cloud_bash) + telemetry hooks
-  shell.js            browser shell compat layer (incl. curl + python heredoc) + Python runtime bridge
-  network.js          NetworkRuntime: direct fetch with transparent /fetch relay fallback
-  workspace.js        WorkspaceAdapter + LocalDirectoryWorkspace
-  telemetry.js        in-memory execution log
-  main.js             Vue bootstrap (+ ?e2e=1 / ?demo=… QA hooks)
-  App.vue             three-region workspace shell
-  components/         Sidebar (task history), Timeline + item renderers, Composer (+ context menu), ContextRail, SettingsPanel, TerminalPanel
-  ui/store.js         presentation store: owns UI state, wires AgentSession events into the projector
-  ui/projector.js     pure runtime-event → timeline projection (framework-independent, Node-tested)
-  ui/markdown.js      markdown-lite renderer for assistant text (escape-first, XSS-safe)
-  ui/theme.css        Cowork-style neutral theme (light + dark via prefers-color-scheme)
-functions/proxy.js    optional Cloudflare Pages Function (CORS relay for the LLM API)
-functions/fetch.js    optional Cloudflare Pages Function (anonymous public-HTTPS resource relay)
-examples/demo-workspace/sales.csv
-tests/                node unit tests + headless browser regression suites (runtime + presentation)
-```
-
-Note: the Pyodide worker source is embedded in `index.html` (loaded via a Blob URL that is revoked immediately after worker construction) so the page also works when opened directly from `file://`, where browsers block `new Worker('...js')`.
-
-## The Unix compatibility shell
-
-The `bash` tool is a **Unix-like compatibility shell, not full POSIX bash**. It exists so the small Unix vocabulary models already speak (`ls -la`, `find src -name '*.java' | grep builder`, `cd foo && cat foo.txt`) works locally. Everything is parsed by Locus itself — no `eval`, no system shell — and every simple command lands in an explicit, controlled handler.
-
-- **Grammar**: `pipeline ((';' | '&&' | '||') pipeline)*` where `pipeline := simple_command ('|' simple_command)*`, left-associative. `;` always runs the next command, `&&` runs it only on success, `||` runs it only on failure, `|` feeds **stdout only** into the next command's stdin (`cat`/`grep`/`head`/`tail`/`wc` consume stdin; piping into anything else fails loudly). stderr is never piped unless explicitly merged with `2>&1`. Pipeline status is the last stage's status. Quoted operators are always data: `echo "a;b"` prints text.
+- **Commands**: `pwd`, `cd`, `ls -a/-l/-h`, `cat`, `echo`, `find`, `grep`, `head`, `tail`, `wc`, `mv`, `rm`, `python`, `curl`, `help`.
+- **Composition**: `;`, `&&`, `||`, `|` (stdout-only pipelines into `cat`/`grep`/`head`/`tail`/`wc`).
 - **stdout/stderr**: the executor keeps the two streams separated per command (`{success, stdout, stderr}`) and merges them only at the tool boundary for presentation. A failing `cat missing.txt` produces empty stdout and a `cat: ...` stderr — never one mixed bag.
 - **Redirection** (generic execution-layer feature, applied left to right — order matters): `cmd > file` / `>> file` (stdout truncate / append), `cmd 2> file` / `2>> file` (stderr truncate / append), `cmd 2>&1` (stderr inherits stdout's *current* destination — so `cmd > all.txt 2>&1` merges both into the file, while `cmd 2>&1 > out.txt` keeps stderr captured and sends only stdout to the file). Redirection never changes a command's success: `cat missing 2> err.txt || echo fallback` still runs the fallback. Other file descriptors (`1>&2`, `3>`, `&>`, `<`, heredocs other than python's) are rejected with clear errors.
-- **mv**: `mv <src>... <dest>` — file→file, file→directory, bounded recursive directory move, multiple sources into a directory. An existing destination is a loud failure (no implicit overwrite, no `-f`). Implemented as copy → verify → delete on WorkspaceAdapter primitives: the source is never removed before the destination write has landed. Workspace-confined; `/foo` is workspace-root absolute.
-- **rm**: `rm [-f] [-r|-R] <path>...` — files, multiple operands, `-f` ignores missing paths, `-r` for recursive directory removal. `rm -rf /` (any spelling of the workspace root) is hard-refused. Recursive deletion checks cancellation before every removal and reports exactly what was already deleted — a cancel is never a fake rollback. There is no permission-prompt layer yet by design.
-- **Virtual cwd**: every bash invocation starts at the mounted workspace root (`/`). `cd` changes the cwd only within that one invocation and can never escape the workspace (`cd ../../..` is rejected). Relative paths in all commands resolve against the virtual cwd; Python's own filesystem root stays the workspace root (only the script path of `python script.py` resolves against the shell cwd).
+- **mv**: `mv <src>... <dest>` — file→file, file→directory, bounded recursive directory move, multiple sources into a directory, cross-mount moves included. An existing destination is a loud failure (no implicit overwrite, no `-f`). Implemented as copy → verify → delete: the source is never removed before the destination write has landed, and a read-only source mount (e.g. `/mnt/upload`) fails the move *before* the destination is touched, since the source could not be removed. Paths are ordinary VFS-absolute paths (`/foo` resolves against the virtual cwd's filesystem root).
+- **rm**: `rm [-f] [-r|-R] <path>...` — files, multiple operands, `-f` ignores missing paths, `-r` for recursive directory removal. Protected roots (`/`, `/usr`, `/home`, `/home/locus`, `/mnt`, `/mnt/workspace`, `/mnt/upload`, `/mnt/download`, `/mnt/plugins`) are hard-refused for recursive delete; children obey their mount's authority (`/mnt/upload/*` is read-only). Recursive deletion checks cancellation before every removal and reports exactly what was already deleted — a cancel is never a fake rollback. There is no permission-prompt layer yet by design.
+- **Virtual cwd**: every bash invocation starts at the default cwd — `/mnt/workspace` when a folder is mounted, otherwise `/home/locus`. `cd` changes the cwd only within that one invocation, and `cd` above the filesystem root is rejected. Relative paths in all commands resolve against the virtual cwd, and `python script.py` runs with Python's cwd equal to the shell cwd. Environment: `HOME=/home/locus`, `TMPDIR=/tmp`, `PATH=/usr/local/bin:/usr/bin:/bin`.
 - **ls**: `-a` (show dotfiles; `.`/`..` are never synthesized — the File System Access API has no such entries), `-l` (type/size/modified — no fake uid/gid/permissions/inodes), `-h` (deterministic human sizes: `421 B`, `12.4 KiB`, `3.1 MiB`), combined short flags, multiple paths. Compatibility semantics, not bit-perfect GNU ls.
 - **find** (bounded subset): `find [path...] [-name glob] [-type f|d] [-maxdepth N]`, glob supports `*`/`?` only. Deterministic order, workspace-confined, cancellation-aware, capped at 5000 visited entries / 1000 results with an explicit truncation note. No `-exec`/`-delete`/`-size`/boolean expressions.
 - **grep** (bounded subset): `grep [-n] [-i] [-r|-R] [-E] <pattern> [path...]` — patterns are **JavaScript regexes** (invalid patterns fail with a clear error). Recursive search is capped (500 files / 2 MiB per file / 500 matches), skips non-UTF-8 files with a note, and is cancellation-aware. Zero matches are a successful empty answer, not an error.
@@ -135,7 +74,7 @@ The `bash` tool is a **Unix-like compatibility shell, not full POSIX bash**. It 
 
 ```bash
 curl <https-url>               # text-like responses (text/*, JSON, XML, YAML, JS) print to stdout
-curl -o <file> <https-url>     # binary-safe download into the workspace (also: --output)
+curl -o <file> <https-url>     # binary-safe download to any writable VFS path (e.g. /mnt/download) (also: --output)
 ```
 
 - HTTPS URLs only; `http://` and URLs with embedded credentials (`user:pass@host`) are rejected.
@@ -204,7 +143,7 @@ Both are intentionally provider/site-agnostic for demo and development use, with
 ### Local data demo (no network)
 
 1. `npm run dev`, open the page, set your API key in **Settings**.
-2. Use the composer's **+ → Mount folder** and choose `examples/demo-workspace/` (contains `sales.csv`).
+2. Use the composer's **+ → Mount folder** and choose `examples/demo-workspace/` (contains `sales.csv`) — the folder is mounted at `/mnt/workspace`, which becomes the shell's default cwd.
 3. Type in the composer:
 
    ```
@@ -215,23 +154,24 @@ Both are intentionally provider/site-agnostic for demo and development use, with
 
 ### V0.2 network demo (internet → workspace → Pyodide → artifact)
 
-1. Same setup; select any workspace directory.
+1. Same setup (a mounted folder is optional — `/mnt/download` is always writable).
 2. Type:
 
    ```
-   下载 https://jsonplaceholder.typicode.com/users 的 JSON 数据，统计用户数量和公司数量，把结果保存成 report.csv。
+   下载 https://jsonplaceholder.typicode.com/users 的 JSON 数据，统计用户数量和公司数量，把结果保存成 report.csv 放到 /mnt/download。
    ```
 
 3. Expected agent flow:
 
    ```
-   bash("curl -o raw.json https://jsonplaceholder.typicode.com/users")
-     → [written to workspace: raw.json, ... bytes]
+   bash("curl -o /mnt/download/raw.json https://jsonplaceholder.typicode.com/users")
+     → [written to /mnt/download/raw.json, ... bytes]
    bash("python <<'PY' ... PY")
-     → report.csv written into the real workspace
+     → report.csv written to /mnt/download, listed in the Context Rail
+       Artifacts section with an explicit Download button
    ```
 
-   The download goes through a direct browser fetch (jsonplaceholder allows CORS); against a CORS-blocked host the same command transparently uses the `/fetch` relay when the app is hosted. No remote execution sandbox is involved — the Python analysis runs locally in Pyodide.
+   The download goes through a direct browser fetch (jsonplaceholder allows CORS); against a CORS-blocked host the same command transparently uses the `/fetch` relay when the app is hosted. No remote execution sandbox is involved — the Python analysis runs locally in Pyodide, and artifact download stays local (Blob + object URL, no cloud upload).
 
    (Any stable public HTTPS JSON endpoint works; no API key required. If you have no internet access, the e2e suite demonstrates the identical chain against a mocked response.)
 
@@ -269,6 +209,7 @@ node tests/proxy.test.mjs        # /proxy guardrails: null-body statuses, inboun
 node tests/fetch.test.mjs        # /fetch guardrails: https-only, redirects, caps, null-body, active-content headers
 node tests/network.test.cjs      # curl + NetworkRuntime: routing, anonymity, full-lifecycle deadlines (incl. relayTimeoutMs), caps, cancellation, non-blocking stream cleanup
 node tests/workspace.test.cjs    # stat options (WebIDL-conforming handles), exists() semantics, append, snapshot skips
+node tests/vfs.test.cjs          # VFS: topology, longest-prefix mount routing, Memory/Upload/SystemBin providers, read-only authority, protected roots, quotas, traversal rejection
 node tests/shell.test.cjs        # quoted tokenizer, write-back failures, external-edit conflicts, pre-commit cancel checks
 node tests/shell-compat.test.cjs # Unix compatibility baseline: ; && |, cd/virtual cwd, ls flags, find, grep, head, tail, wc, help, bounds, cancellation
 node tests/shell-compat2.test.cjs # round 2: stdout/stderr separation, ||, mv, rm, > >> 2> 2>> 2>&1 (order), pipe+stderr, fs telemetry
@@ -300,7 +241,7 @@ node tests/verify-active-content.cjs
 
 ## Security boundaries
 
-- Only the user-selected workspace is accessible; paths are normalized and `..` escapes are rejected
+- Only user-granted mounts are accessible beyond the built-in virtual filesystem: the external folder appears only at `/mnt/workspace`, `/mnt/upload` holds user-picked files read-only, and paths are normalized with `..` escapes rejected
 - No native shell, no `child_process`, no localhost server, no remote code execution
 - Locus does not automatically upload workspace files to any execution server; only content explicitly surfaced through the agent conversation (tool results the model chose to read) is sent to the model API
 - The Pyodide runtime is **not** a network sandbox: model-generated Python can reach `fetch` through the Worker JS bridge and transmit workspace data it can read, subject to browser networking rules (CORS, mixed content). That traffic bypasses NetworkRuntime, the curl anonymous-GET-only policy, and network telemetry — see the Python capability declaration below
