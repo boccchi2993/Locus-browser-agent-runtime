@@ -59,6 +59,10 @@ function makeDirHandle(name, tree) {
     async getDirectoryHandle(n, opts) {
       assertOptions(opts);
       if (tree.dirs && n in tree.dirs) return makeDirHandle(n, tree.dirs[n]);
+      // Real browsers throw TypeMismatchError when a FILE occupies the name.
+      if (tree.files && n in tree.files) {
+        const e = new Error('type mismatch'); e.name = 'TypeMismatchError'; throw e;
+      }
       if (opts && opts.create) {
         tree.dirs[n] = { files: {}, dirs: {} };
         return makeDirHandle(n, tree.dirs[n]);
@@ -144,6 +148,27 @@ async function run() {
   check('W15 write creates file', tree.files['new.txt'] === 'data');
   await ws.remove('new.txt');
   check('W16 remove deletes file', !('new.txt' in tree.files));
+
+  // ---------- W7. mkdir primitive ----------
+  const mkTree = { files: { 'f.txt': 'x' }, dirs: {} };
+  const mkWs = new M.LocalDirectoryWorkspace(makeDirHandle('mk', mkTree));
+  await mkWs.mkdir('a');
+  check('W17 mkdir creates a directory', 'a' in mkTree.dirs);
+  await mkWs.mkdir('a/b');
+  check('W18 mkdir creates nested directories', 'b' in mkTree.dirs.a.dirs);
+  await mkWs.mkdir('c/d/e');
+  check('W19 mkdir creates missing parents', !!(mkTree.dirs.c && mkTree.dirs.c.dirs.d && mkTree.dirs.c.dirs.d.dirs.e));
+  await mkWs.mkdir('a'); // existing directory → deterministic no-op
+  check('W20 mkdir existing directory is a no-op success', 'a' in mkTree.dirs);
+  let fileClash = null;
+  try { await mkWs.mkdir('f.txt'); } catch (e) { fileClash = e; }
+  check('W21 mkdir over an existing file fails', !!fileClash, 'no error');
+  let escapeErr = null;
+  try { await mkWs.mkdir('../escape'); } catch (e) { escapeErr = e; }
+  check('W22 mkdir escape rejected by confinement', escapeErr && escapeErr.message.includes('escapes workspace'),
+    escapeErr && escapeErr.message);
+  await mkWs.mkdir('/'); // workspace root: already exists → no-op
+  check('W23 mkdir workspace root is a no-op', true);
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);

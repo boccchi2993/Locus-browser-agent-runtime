@@ -108,6 +108,7 @@ class MemWS extends M.WorkspaceAdapter {
   }
   async write(p, data) { p = M.normalizeWorkspacePath(p); this.files[p] = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data); }
   async remove(p) { p = M.normalizeWorkspacePath(p); delete this.files[p]; }
+  async mkdir(p) { p = M.normalizeWorkspacePath(p); if (p && p in this.files) { const e = new Error('type mismatch'); e.name = 'TypeMismatchError'; throw e; } }
   async exists(p) { try { p = M.normalizeWorkspacePath(p); } catch (e) { return false; } return p in this.files; }
   async stat(p) { p = M.normalizeWorkspacePath(p); if (!(p in this.files)) { const e = new Error('No such file: ' + p); e.name = 'NotFoundError'; throw e; } return { kind: 'file', size: this.files[p].byteLength, modified: 0 }; }
 }

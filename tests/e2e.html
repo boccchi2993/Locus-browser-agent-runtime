@@ -39,6 +39,7 @@
       async readBytes(p) { return new TextEncoder().encode(await this.read(p)); }
       async write(p, data) { p = normalizeWorkspacePath(p); this.files[p] = typeof data === 'string' ? data : new TextDecoder().decode(data); }
       async remove(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); delete this.files[p]; }
+      async mkdir(p) { p = normalizeWorkspacePath(p); if (p && p in this.files) { const e = new Error('type mismatch'); e.name = 'TypeMismatchError'; throw e; } }
       async exists(p) { try { p = normalizeWorkspacePath(p); } catch (e) { return false; } return p in this.files; }
       async stat(p) { p = normalizeWorkspacePath(p); if (!(p in this.files)) throw new Error('No such file: ' + p); return { kind: 'file', size: this.files[p].length, modified: 0 }; }
     }
@@ -327,6 +328,27 @@
         const o10 = await executeTool('bash', 'help', sh2Ws);
         check('O10 help lists round-2 surface', o10.success && o10.output.includes('mv') && o10.output.includes('rm')
           && o10.output.includes('||') && o10.output.includes('2>&1'), JSON.stringify(o10.output).slice(0, 100));
+
+        // Directory mv: the destination TREE itself is part of the data,
+        // verified against real native handles (empty dirs included).
+        await sh2Ws.mkdir('empty');
+        const o11 = await executeTool('bash', 'mv empty moved-empty', sh2Ws);
+        let o11gone = false;
+        try { await sh2Ws.stat('empty'); } catch (e) { o11gone = true; }
+        check('O11 empty dir move on native handles', o11.success && o11gone
+          && (await sh2Ws.stat('moved-empty')).kind === 'directory'
+          && (await sh2Ws.list('moved-empty')).length === 0, JSON.stringify(o11.output));
+
+        await sh2Ws.mkdir('tree/empty');
+        await sh2Ws.mkdir('tree/nested/also-empty');
+        await sh2Ws.write('tree/file.txt', 'f\n');
+        const o12 = await executeTool('bash', 'mv tree moved-tree', sh2Ws);
+        let o12gone = false;
+        try { await sh2Ws.stat('tree'); } catch (e) { o12gone = true; }
+        check('O12 nested empty dirs survive on native handles', o12.success && o12gone
+          && (await sh2Ws.stat('moved-tree/empty')).kind === 'directory'
+          && (await sh2Ws.stat('moved-tree/nested/also-empty')).kind === 'directory'
+          && (await sh2Ws.read('moved-tree/file.txt')) === 'f\n', JSON.stringify(o12.output));
       } finally {
         await opfsRoot3.removeEntry(dirName3, { recursive: true });
       }

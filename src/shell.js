@@ -1372,20 +1372,27 @@ async function mvFile(ctx, srcRel, finalRel, signal) {
   return null;
 }
 
-// directory → new path: bounded pre-scan, full recursive copy, THEN a
-// separate recursive delete of the source. The copy phase completing is the
-// commit point — a cancel during copy leaves the source fully intact.
+// directory → new path: bounded pre-scan, EXPLICIT destination tree
+// creation (the tree itself is part of the data — empty directories must
+// survive a move), per-file copy with read-back verification, and ONLY THEN
+// a separate recursive delete of the source. Any failure or cancellation in
+// the creation/copy/verify phase leaves the source tree fully intact; the
+// partial destination is reported, never silently cleaned up.
 async function mvDirectory(ctx, srcRel, finalRel, signal) {
+  // ---- pre-scan: complete tree description; every bound is enforced BEFORE
+  // the destination starts to exist ----
   const files = [];
-  const dirs = [];
+  const dirs = []; // pre-order: parents always precede their children
   let totalBytes = 0;
   async function scan(rel) {
     throwIfCancelled(signal, 'mv');
-    if (files.length + dirs.length >= MV_MAX_ENTRIES) {
-      throw new Error('mv: directory exceeds the ' + MV_MAX_ENTRIES + '-entry move limit');
-    }
     const entries = await ctx.workspace.list(rel);
     for (const e of entries) {
+      // The entry bound is enforced per entry — a single flat directory can
+      // exceed it without any nested scan() call ever re-checking.
+      if (files.length + dirs.length >= MV_MAX_ENTRIES) {
+        throw new Error('mv: directory exceeds the ' + MV_MAX_ENTRIES + '-entry move limit');
+      }
       const child = rel + '/' + e.name;
       if (e.kind === 'directory') {
         dirs.push(child);
@@ -1407,20 +1414,57 @@ async function mvDirectory(ctx, srcRel, finalRel, signal) {
     return e.message;
   }
 
-  // copy phase — source stays untouched until every file landed
-  for (const f of files) {
-    throwIfCancelled(signal, 'mv');
-    const bytes = await ctx.workspace.readBytes(f);
-    throwIfCancelled(signal, 'mv');
-    try {
-      await ctx.workspace.write(finalRel + '/' + f.slice(srcRel.length + 1), bytes);
-    } catch (e) {
-      return 'mv: copy failed at ' + f + ' (' + (e && e.message ? e.message : String(e))
-        + '); source preserved, partial destination may exist';
+  // ---- destination tree creation + copy + verify ----
+  const createdDirs = [];
+  const copiedFiles = [];
+  const throwCopyCancelled = () => {
+    if (signal && signal.aborted) {
+      const e = makeCancelledError('mv');
+      e.detail = 'mv: cancelled during copy; source preserved; partial destination may exist'
+        + ' (created ' + createdDirs.length + ' director(y/ies), copied '
+        + copiedFiles.length + '/' + files.length + ' file(s))';
+      throw e;
     }
+  };
+  try {
+    // The destination root itself is created explicitly — even a completely
+    // empty source directory must materialize as an empty destination.
+    throwCopyCancelled();
+    await ctx.workspace.mkdir(finalRel);
+    createdDirs.push(finalRel);
+    // Child directories shallow-to-deep (pre-order scan already guarantees
+    // parents first; mkdir itself is recursive as a second safety net).
+    for (const d of dirs) {
+      throwCopyCancelled();
+      const target = finalRel + '/' + d.slice(srcRel.length + 1);
+      await ctx.workspace.mkdir(target);
+      createdDirs.push(target);
+    }
+    // Copy every file and verify the copy byte-for-byte before it counts.
+    for (const f of files) {
+      throwCopyCancelled();
+      const bytes = await ctx.workspace.readBytes(f);
+      throwCopyCancelled();
+      const destPath = finalRel + '/' + f.slice(srcRel.length + 1);
+      await ctx.workspace.write(destPath, bytes);
+      throwCopyCancelled();
+      const check = await ctx.workspace.readBytes(destPath);
+      if (check.byteLength !== bytes.byteLength || bytesToB64(check) !== bytesToB64(bytes)) {
+        return 'mv: write verification failed for ' + destPath
+          + '; source preserved (partial destination may exist)';
+      }
+      copiedFiles.push(f);
+    }
+  } catch (e) {
+    if (isCancelledError(e)) throw e;
+    return 'mv: destination creation/copy failed (' + (e && e.message ? e.message : String(e))
+      + '); source preserved, partial destination may exist';
   }
 
-  // delete phase — deepest first so directories are empty when removed
+  // ---- delete phase — deepest first so directories are empty when removed.
+  // Only starts after the entire destination tree exists and every copied
+  // file verified. A cancel here is a partial commit: reported, not rolled
+  // back. ----
   const deleted = [];
   const all = files.concat(dirs.slice().reverse());
   try {

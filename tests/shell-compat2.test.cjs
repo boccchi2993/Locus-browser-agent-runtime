@@ -21,6 +21,7 @@ class TreeWS extends M.WorkspaceAdapter {
     super();
     this.name = 'tree';
     this.files = {};
+    this.dirs = new Set(); // explicit (possibly empty) directories
     for (const k in (files || {})) {
       this.files[k] = typeof files[k] === 'string' ? new TextEncoder().encode(files[k]) : files[k];
     }
@@ -30,6 +31,10 @@ class TreeWS extends M.WorkspaceAdapter {
     for (const p in this.files) {
       const parts = p.split('/');
       for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/'));
+    }
+    for (const d of this.dirs) {
+      const parts = d.split('/');
+      for (let i = 1; i <= parts.length; i++) dirs.add(parts.slice(0, i).join('/'));
     }
     return dirs;
   }
@@ -44,6 +49,12 @@ class TreeWS extends M.WorkspaceAdapter {
       const seg = rest.split('/')[0];
       const kind = rest.includes('/') ? 'directory' : 'file';
       if (!seen.has(seg) || kind === 'directory') seen.set(seg, { name: seg, kind: seen.has(seg) && seen.get(seg).kind === 'directory' ? 'directory' : kind });
+    }
+    for (const d of this.dirs) {
+      if (!d.startsWith(prefix)) continue;
+      const rest = d.slice(prefix.length);
+      if (rest.includes('/')) continue; // not a direct child
+      seen.set(rest, { name: rest, kind: 'directory' });
     }
     const entries = [...seen.values()];
     entries.sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'directory' ? -1 : 1));
@@ -61,10 +72,18 @@ class TreeWS extends M.WorkspaceAdapter {
   }
   async remove(p) {
     p = M.normalizeWorkspacePath(p);
-    // Directories are implicit (derived from file paths): removing one is a
-    // no-op once its files are gone, matching how the real adapter removes
-    // an emptied directory.
+    // Directories may be implicit (derived from file paths) or explicit
+    // (created via mkdir); removing either form is a no-op once empty,
+    // matching how the real adapter removes an emptied directory.
+    this.dirs.delete(p);
     delete this.files[p];
+  }
+  async mkdir(p) {
+    p = M.normalizeWorkspacePath(p);
+    if (!p) return;
+    if (p in this.files) { const e = new Error('type mismatch'); e.name = 'TypeMismatchError'; throw e; }
+    const parts = p.split('/');
+    for (let i = 1; i <= parts.length; i++) this.dirs.add(parts.slice(0, i).join('/'));
   }
   async exists(p) {
     try { p = M.normalizeWorkspacePath(p); } catch (e) { return false; }
@@ -414,6 +433,139 @@ async function run() {
       && prompt.includes('mv') && prompt.includes('rm'), '');
     check('HELP9 unsupported note no longer bans || or 2>', !prompt.includes('Not supported: ||')
       && M.shellHelpText().includes('Redirects:'), '');
+  }
+
+  // ---------- MD. directory mv correctness (empty dirs, verify-before-delete) ----------
+  {
+    // MD1: a completely empty directory must materialize at the destination
+    const ws = fixture();
+    await ws.mkdir('empty');
+    const md1 = await M.executeTool('bash', 'mv empty moved', ws);
+    const md1st = await ws.stat('moved');
+    check('MD1 empty directory moves as a directory', md1.success && !(await ws.exists('empty'))
+      && md1st.kind === 'directory' && (await ws.list('moved')).length === 0, md1.output);
+
+    // MD2: nested empty subdirectories are preserved
+    const ws2 = fixture();
+    await ws2.mkdir('tree/empty1');
+    await ws2.mkdir('tree/nested/empty2');
+    ws2.files['tree/file.txt'] = new TextEncoder().encode('content\n');
+    const md2 = await M.executeTool('bash', 'mv tree moved-tree', ws2);
+    check('MD2 nested empty directories preserved', md2.success && !(await ws2.exists('tree'))
+      && (await ws2.stat('moved-tree/empty1')).kind === 'directory'
+      && (await ws2.stat('moved-tree/nested/empty2')).kind === 'directory'
+      && dec(ws2.files['moved-tree/file.txt']) === 'content\n', md2.output);
+
+    // MD3: mixed text + binary tree verified byte-for-byte
+    const binBytes = new Uint8Array([0, 255, 1, 254, 65, 0, 128]);
+    const ws3 = fixture();
+    ws3.files['src/a.txt'] = new TextEncoder().encode('你好\ntext\n');
+    ws3.files['src/nested/b.bin'] = binBytes;
+    await ws3.mkdir('src/nested/empty');
+    const md3 = await M.executeTool('bash', 'mv src dst', ws3);
+    const sameBytes = (a, b) => a && b && a.byteLength === b.byteLength && a.every((v, i) => v === b[i]);
+    check('MD3 mixed tree moved byte-exact, empty dir kept', md3.success
+      && dec(ws3.files['dst/a.txt']) === '你好\ntext\n'
+      && sameBytes(ws3.files['dst/nested/b.bin'], binBytes)
+      && (await ws3.stat('dst/nested/empty')).kind === 'directory'
+      && !(await ws3.exists('src')), md3.output);
+
+    // MD4: simulated write corruption → move fails, source fully preserved
+    const ws4 = fixture();
+    ws4.files['src/a.txt'] = new TextEncoder().encode('original\n');
+    ws4.files['src/deep/b.txt'] = new TextEncoder().encode('deep\n');
+    const origWrite4 = ws4.write.bind(ws4);
+    ws4.write = async (p, d) => {
+      if (p.startsWith('dst/')) return origWrite4(p, 'corrupted'); // wrong bytes land
+      return origWrite4(p, d);
+    };
+    const md4 = await M.executeTool('bash', 'mv src dst', ws4);
+    check('MD4 write corruption → fail, source intact', !md4.success && md4.output.includes('verification failed')
+      && md4.output.includes('source preserved')
+      && dec(ws4.files['src/a.txt']) === 'original\n' && dec(ws4.files['src/deep/b.txt']) === 'deep\n',
+      md4.output);
+
+    // MD5: destination read-back failure → delete phase never starts
+    const ws5 = fixture();
+    ws5.files['src/a.txt'] = new TextEncoder().encode('original\n');
+    const origRead5 = ws5.readBytes.bind(ws5);
+    ws5.readBytes = async (p) => {
+      if (p.startsWith('dst/')) throw new Error('simulated read-back failure');
+      return origRead5(p);
+    };
+    const md5 = await M.executeTool('bash', 'mv src dst', ws5);
+    check('MD5 read-back failure → source preserved, no delete', !md5.success
+      && md5.output.includes('source preserved')
+      && dec(ws5.files['src/a.txt']) === 'original\n', md5.output);
+
+    // MD6: copy-phase cancellation → source intact, partial destination reported
+    const ws6 = fixture();
+    for (const n of ['1.bin', '2.bin', '3.bin']) ws6.files['src/' + n] = new TextEncoder().encode(n);
+    const ac6 = new AbortController();
+    const origWrite6 = ws6.write.bind(ws6);
+    let writes6 = 0;
+    ws6.write = async (p, d) => { await origWrite6(p, d); if (p.startsWith('dst/') && ++writes6 >= 2) ac6.abort(); };
+    const md6 = await M.executeTool('bash', 'mv src dst', ws6, { signal: ac6.signal });
+    check('MD6 copy-phase cancel → source fully preserved', !md6.success && md6.output.includes('cancelled during copy')
+      && md6.output.includes('source preserved') && md6.output.includes('partial destination may exist')
+      && ('src/1.bin' in ws6.files) && ('src/2.bin' in ws6.files) && ('src/3.bin' in ws6.files),
+      md6.output + ' | ' + JSON.stringify(Object.keys(ws6.files)));
+
+    // MD7: delete-phase cancellation → partial commit, honestly not rolled back
+    const ws7 = fixture();
+    ws7.files['src/1.txt'] = new TextEncoder().encode('1');
+    ws7.files['src/2.txt'] = new TextEncoder().encode('2');
+    const ac7 = new AbortController();
+    const origRemove7 = ws7.remove.bind(ws7);
+    let removes7 = 0;
+    ws7.remove = async (p) => { await origRemove7(p); if (++removes7 >= 1) ac7.abort(); };
+    const md7 = await M.executeTool('bash', 'mv src dst', ws7, { signal: ac7.signal });
+    check('MD7 delete-phase cancel → destination complete, partial source reported', !md7.success
+      && md7.output.includes('not rolled back')
+      && dec(ws7.files['dst/1.txt']) === '1' && dec(ws7.files['dst/2.txt']) === '2', md7.output);
+
+    // MD8: destination root mkdir failure → source untouched
+    const ws8 = fixture();
+    ws8.files['src/a.txt'] = new TextEncoder().encode('x');
+    const origMkdir8 = ws8.mkdir.bind(ws8);
+    ws8.mkdir = async (p) => { if (p === 'dst') throw new Error('simulated mkdir failure'); return origMkdir8(p); };
+    const md8 = await M.executeTool('bash', 'mv src dst', ws8);
+    check('MD8 destination root mkdir failure → source untouched', !md8.success
+      && md8.output.includes('source preserved') && ('src/a.txt' in ws8.files) && !(await ws8.exists('dst')),
+      md8.output);
+
+    // MD9: child directory mkdir failure → source untouched, copy stops
+    const ws9 = fixture();
+    ws9.files['src/a/file.txt'] = new TextEncoder().encode('x');
+    const origMkdir9 = ws9.mkdir.bind(ws9);
+    ws9.mkdir = async (p) => { if (p === 'dst/a') throw new Error('simulated child mkdir failure'); return origMkdir9(p); };
+    const md9 = await M.executeTool('bash', 'mv src dst', ws9);
+    check('MD9 child mkdir failure → source untouched', !md9.success && md9.output.includes('source preserved')
+      && ('src/a/file.txt' in ws9.files) && !('dst/a/file.txt' in ws9.files), md9.output);
+
+    // MD10: empty directory moved INTO an existing directory
+    const ws10 = fixture();
+    await ws10.mkdir('empty');
+    const md10 = await M.executeTool('bash', 'mv empty sub', ws10);
+    check('MD10 empty dir → existing directory', md10.success && !(await ws10.exists('empty'))
+      && (await ws10.stat('sub/empty')).kind === 'directory', md10.output);
+
+    // MD11: multi-source mv with an empty directory source
+    const ws11 = fixture();
+    await ws11.mkdir('edir');
+    const md11 = await M.executeTool('bash', 'mv a.txt edir sub', ws11);
+    check('MD11 multi-source with empty dir source', md11.success && dec(ws11.files['sub/a.txt']).includes('foo')
+      && (await ws11.stat('sub/edir')).kind === 'directory' && !(await ws11.exists('edir')), md11.output);
+
+    // MD12: entry bound is enforced BEFORE any destination creation
+    const ws12 = fixture();
+    const bigFiles = {};
+    for (let i = 0; i < 1001; i++) bigFiles['big/f' + i + '.txt'] = 'x';
+    const wsBig = new TreeWS(bigFiles);
+    const md12 = await M.executeTool('bash', 'mv big dst', wsBig);
+    check('MD12 entry limit enforced before destination creation', !md12.success
+      && md12.output.includes('entry move limit') && !(await wsBig.exists('dst'))
+      && ('big/f0.txt' in wsBig.files) && ('big/f1000.txt' in wsBig.files), md12.output);
   }
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
