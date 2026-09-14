@@ -4,6 +4,36 @@ This file is for concrete implementation work.
 
 Architecture-level decisions belong in docs/ARCHITECTURE.md and docs/MODEL-PROTOCOL.md. Milestones belong in ROADMAP.md.
 
+## V0.4.1 — Observation-blocking reliability / UX issues
+
+These three issues were exposed by the first real mobile benchmark runs. Resolve them before starting the next observation baseline / telemetry dataset.
+
+### Native tool-call / fallback protocol reliability
+
+- [ ] Consume provider-native tool calls through the provider-neutral response envelope instead of relying only on strict fenced-JSON text parsing.
+- [ ] Preserve the current strict fenced-JSON parser as a compatibility fallback; do not execute arbitrary JSON embedded in prose.
+- [ ] Normalize Anthropic `tool_use` and OpenAI-style `tool_calls` into one provider-neutral tool-call representation.
+- [ ] Preserve provider-native replay state / tool results correctly across turns.
+- [ ] Add regression coverage for prose + native tool call, strict textual fallback, quoted/example JSON that must NOT execute, cancellation, and tool-result replay.
+- [ ] Treat this as behavior-changing reliability work: freeze a new observation baseline rather than mutating `v0.4-observation.1`.
+
+### Mobile responsive presentation
+
+- [ ] Remove horizontal page overflow on narrow/mobile viewports.
+- [ ] Replace permanently visible desktop sidebars/rails with mobile drawers or overlays below the chosen breakpoint.
+- [ ] Keep the conversation timeline and composer readable at phone widths; composer must remain fully reachable while the keyboard is open.
+- [ ] Verify long reasoning/tool blocks wrap/scroll internally without widening the page.
+- [ ] Add real browser viewport tests for representative mobile widths and screenshots after the fix.
+
+### Upload / download virtual mounts
+
+- [ ] Design a real Locus virtual mount namespace rather than wiring uploads as presentation-only attachment metadata.
+- [ ] Preserve the current compatibility contract where a mounted external folder appears as shell root `/` unless evidence justifies a breaking namespace change.
+- [ ] Add a reserved `/mnt` namespace with at least `/mnt/upload` (user-provided input, preferably read-only) and `/mnt/download` (agent-generated artifacts, writable/exportable).
+- [ ] Allow Locus to remain useful without an externally mounted directory: upload → local execution → download should form a complete lightweight workflow.
+- [ ] Define mount routing, path normalization, collision/reserved-name behavior, permissions, cancellation, Python visibility, and artifact export semantics before implementation.
+- [ ] Keep upload/download data local by default; no automatic remote upload.
+
 ## Done on feat/shell-compat-baseline
 
 Unix compatibility baseline (so future telemetry records unknown gaps, not known ones):
