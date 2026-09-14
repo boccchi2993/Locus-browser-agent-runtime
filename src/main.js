@@ -5,7 +5,7 @@
 //  event stream. Query-param hooks exist ONLY for automated tests and
 //  visual QA screenshots:
 //
-//    ?e2e=1       expose window.__locus { store, actions, session },
+//    ?e2e=1       expose window.__locus { store, actions, session, vfs },
 //                 honor window.__e2eReplies / __e2eToolExecutor fakes,
 //                 collect console errors into window.__e2eErrors
 //    ?demo=task   scripted fake model + tool, auto-mount an OPFS demo
@@ -106,7 +106,7 @@ const app = createApp(App);
 app.mount('#app');
 
 if (e2eMode || demoMode) {
-  window.__locus = { store: ui.store, actions: ui, session: ui.session };
+  window.__locus = { store: ui.store, actions: ui, session: ui.session, vfs: ui.vfs };
 }
 
 // Python worker status is owned by the runtime (plain object); mirror it

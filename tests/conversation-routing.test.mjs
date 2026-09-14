@@ -62,6 +62,12 @@ globalThis.verifyConnection = async () => {};
 globalThis.LocalDirectoryWorkspace = class {};
 globalThis.ensureWorkspacePermission = async () => true;
 // PythonRuntime intentionally left undefined — store guards with typeof.
+// store.js boots ONE persistent VFS at module scope: provide the REAL
+// vfs.js (plus workspace.js it extends from) exactly like index.html does.
+globalThis.SHELL_COMMANDS = {};
+globalThis.VirtualWorkspace = (0, eval)(
+  readFileSync(join(root, 'src', 'workspace.js'), 'utf8') + '\n'
+  + readFileSync(join(root, 'src', 'vfs.js'), 'utf8') + '\n;VirtualWorkspace');
 
 const ui = await import('../src/ui/store.js');
 const { store, session, submit, newTask, openConversation } = ui;

@@ -1,10 +1,11 @@
 <template>
   <div class="composer-wrap" :class="{ centered }">
-    <!-- pending attachments: real File metadata, honestly marked as
-         presentation-only until the attachment runtime exists -->
+    <!-- pending uploads: real File objects already in the VFS at
+         /mnt/upload (read-only to the agent); the title shows the real
+         final VFS path -->
     <div v-if="store.attachments.length" class="attach-row">
-      <span v-for="(a, i) in store.attachments" :key="i" class="attach-chip" :title="'Attachment runtime not wired yet — this file is NOT sent to the agent'">
-        {{ a.name }} <em>not wired</em>
+      <span v-for="(a, i) in store.attachments" :key="i" class="attach-chip" :title="a.path">
+        {{ a.name }}
         <button type="button" class="attach-x" @click="removeAttachment(i)">×</button>
       </span>
     </div>
@@ -69,7 +70,6 @@
             <path d="M8 10.5v-7M5 6l3-3 3 3M2.5 10.5v2a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-2"/>
           </svg>
           <span>Upload files</span>
-          <em class="plus-note">not wired yet</em>
         </button>
         <button class="plus-item" type="button" @click="mountFolder">
           <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3">

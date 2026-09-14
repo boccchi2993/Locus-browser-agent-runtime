@@ -12,6 +12,12 @@ const path = require('path');
 
 const root = path.join(__dirname, '..');
 const src = fs.readFileSync(path.join(root, 'src', 'ui', 'store.js'), 'utf8');
+// The store module now boots the real VFS at module scope — load the REAL
+// classic scripts it depends on (workspace.js defines WorkspaceAdapter /
+// normalizeWorkspacePath used by vfs.js) plus a tiny SHELL_COMMANDS stub,
+// exactly like index.html's script order.
+const workspaceSrc = fs.readFileSync(path.join(root, 'src', 'workspace.js'), 'utf8');
+const vfsSrc = fs.readFileSync(path.join(root, 'src', 'vfs.js'), 'utf8');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -48,7 +54,10 @@ function loadStore(sessionData) {
   return eval(
     'const reactive = (o) => o;\n' +
     'const computed = (fn) => ({ get value() { return fn(); } });\n' +
-    code + '\n;({ store, applySettings, persistSettingsIfNeeded, testConnection });'
+    workspaceSrc + '\n' +
+    vfsSrc + '\n' +
+    'const SHELL_COMMANDS = {};\n' +
+    code + '\n;({ store, vfs, applySettings, persistSettingsIfNeeded, testConnection, addUploadFiles, removeAttachment, refreshArtifacts, downloadArtifact });'
   );
 }
 
@@ -105,6 +114,17 @@ function loadStore(sessionData) {
         && m.store.settingsResult.message.includes('user-picked-model'),
       m.store.settingsResult && m.store.settingsResult.message);
     delete globalThis.verifyConnection;
+  }
+
+  // ---------- D5. store boots ONE persistent VFS ----------
+  {
+    const m = loadStore(null);
+    check('D5 store exposes the VFS', !!m.vfs && m.vfs.isLocusVFS === true);
+    check('D5 unmounted defaultCwd is /home/locus', m.vfs.defaultCwd() === '/home/locus',
+      m.vfs.defaultCwd());
+    check('D5 uploads wired', m.store.attachmentsWired === true);
+    check('D5 artifacts start empty', Array.isArray(m.store.artifacts)
+      && m.store.artifacts.length === 0);
   }
 
   console.log('---');

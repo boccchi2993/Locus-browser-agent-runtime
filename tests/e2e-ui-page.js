@@ -34,11 +34,19 @@
     check('U06 composer present', !!$('.composer .composer-input'));
     check('U07 empty state visible before first task', !!$('.empty-state'));
 
+    // ---------- workspace status wording (unmounted) ----------
+    const railTextUnmounted = $('.context-rail').textContent;
+    check('U48 unmounted rail: No external folder mounted',
+      /No external folder mounted/.test(railTextUnmounted)
+      && !/File tasks need one/.test(railTextUnmounted), railTextUnmounted.slice(0, 200));
+
     // ---------- plus menu ----------
     $('.plus-btn').click();
     await sleep(60);
     const plusTexts = $$('.plus-menu .plus-item').map((b) => b.textContent);
-    check('U08 plus menu: Upload files', plusTexts.some((t) => /Upload files/.test(t)), plusTexts.join('/'));
+    check('U08 plus menu: Upload files (wired, no "not wired yet" copy)',
+      plusTexts.some((t) => /Upload files/.test(t))
+      && !plusTexts.some((t) => /Upload files/.test(t) && /not wired/.test(t)), plusTexts.join('/'));
     check('U09 plus menu: Mount folder', plusTexts.some((t) => /Mount folder/.test(t)));
     check('U10 plus menu: Open terminal', plusTexts.some((t) => /Open terminal/.test(t)));
     // Open terminal → reserved drawer, honestly marked
@@ -133,6 +141,12 @@
     await sleep(80);
     check('U26 mount folder sets workspace name', L.store.workspaceName === 'e2e-workspace', L.store.workspaceName);
     check('U27 workspace chip in composer', ($('.ws-chip') || { textContent: '' }).textContent.includes('e2e-workspace'));
+    check('U49 mounted rail: name + mounted at /mnt/workspace',
+      (() => {
+        const t = $('.context-rail').textContent;
+        return /e2e-workspace/.test(t) && /mounted at \/mnt\/workspace/.test(t)
+          && !/No external folder mounted/.test(t);
+      })(), $('.context-rail').textContent.slice(0, 200));
     check('U28 mount = session boundary (generation bumped, history cleared)',
       L.session.generation === genBefore + 1 && L.session.history.length === 0);
     check('U29 mount starts new conversation (timeline separation)',
@@ -161,6 +175,81 @@
     const teleBadge = $('.tele-item .backend-badge');
     check('U33 telemetry backend badge', !!teleBadge && teleBadge.textContent.trim() === 'browser',
       teleBadge && teleBadge.textContent);
+
+    // ---------- upload flow: real File objects land in /mnt/upload ----------
+    L.actions.addUploadFiles([
+      new File(['hello'], 'x.txt', { type: 'text/plain' }),
+      new File(['again'], 'x.txt'),
+    ]);
+    check('U50 upload collision naming + VFS paths in attachments',
+      L.store.attachments.length === 2
+      && L.store.attachments[0].path === '/mnt/upload/x.txt'
+      && L.store.attachments[1].path === '/mnt/upload/x (2).txt',
+      JSON.stringify(L.store.attachments));
+    check('U51 uploaded file readable via __locus.vfs',
+      (await L.vfs.read('/mnt/upload/x.txt')) === 'hello'
+      && (await L.vfs.read('/mnt/upload/x (2).txt')) === 'again');
+    await sleep(60);
+    const chip = $('.attach-chip');
+    check('U51b attachment chip shows name, title is the real VFS path',
+      !!chip && chip.textContent.includes('x.txt') && !/not wired/.test(chip.textContent)
+      && chip.getAttribute('title') === '/mnt/upload/x.txt',
+      chip && chip.getAttribute('title'));
+
+    // ---------- artifact flow: /mnt/download listing + explicit download ----------
+    await L.vfs.write('/mnt/download/result.txt', 'artifact-bytes');
+    await L.actions.refreshArtifacts();
+    await waitFor(() => {
+      const s = $$('.context-rail .rail-section').find((el) => /Artifacts/.test(el.textContent));
+      return s && /result\.txt/.test(s.textContent);
+    }, 3000);
+    const artifactsSection = $$('.context-rail .rail-section').find((el) => /Artifacts/.test(el.textContent));
+    check('U52 artifacts section lists seeded file',
+      !!artifactsSection && /result\.txt/.test(artifactsSection.textContent)
+      && !!artifactsSection.querySelector('.artifact-download'),
+      artifactsSection && artifactsSection.textContent.slice(0, 200));
+
+    // capture the download without performing it; spy on network APIs
+    const blobsByUrl = new Map();
+    const anchorClicks = [];
+    const revoked = [];
+    const origCreateObjectURL = URL.createObjectURL;
+    const origRevokeObjectURL = URL.revokeObjectURL;
+    const origAnchorClick = HTMLAnchorElement.prototype.click;
+    const origFetch = window.fetch;
+    const origXhrOpen = XMLHttpRequest.prototype.open;
+    let fetchCount = 0, xhrCount = 0;
+    URL.createObjectURL = (blob) => {
+      const u = 'blob:e2e-stub-' + blobsByUrl.size;
+      blobsByUrl.set(u, blob);
+      return u;
+    };
+    URL.revokeObjectURL = (u) => { revoked.push(u); };
+    HTMLAnchorElement.prototype.click = function () {
+      anchorClicks.push({ download: this.download, href: this.href });
+    };
+    window.fetch = (...args) => { fetchCount++; return origFetch(...args); };
+    XMLHttpRequest.prototype.open = function (...args) { xhrCount++; return origXhrOpen.apply(this, args); };
+    try {
+      artifactsSection.querySelector('.artifact-download').click();
+      await waitFor(() => anchorClicks.length > 0, 3000);
+      check('U53 download click carries the artifact basename',
+        anchorClicks.length === 1 && anchorClicks[0].download === 'result.txt'
+        && revoked.includes(anchorClicks[0].href),
+        JSON.stringify(anchorClicks));
+      const blobText = blobsByUrl.has(anchorClicks[0].href)
+        ? await blobsByUrl.get(anchorClicks[0].href).text() : null;
+      check('U54 downloaded blob bytes match the VFS file',
+        blobText === 'artifact-bytes', String(blobText));
+      check('U55 download never touches the network', fetchCount === 0 && xhrCount === 0,
+        'fetch=' + fetchCount + ' xhr=' + xhrCount);
+    } finally {
+      URL.createObjectURL = origCreateObjectURL;
+      URL.revokeObjectURL = origRevokeObjectURL;
+      HTMLAnchorElement.prototype.click = origAnchorClick;
+      window.fetch = origFetch;
+      XMLHttpRequest.prototype.open = origXhrOpen;
+    }
 
     // ---------- settings / dialect wiring ----------
     L.store.settings.dialect = 'anthropic';
