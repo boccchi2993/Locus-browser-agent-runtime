@@ -10,11 +10,17 @@ const path = require('path');
 global.window = { location: { protocol: 'https:' } };
 global.document = { getElementById: () => null };
 
-const src = ['telemetry.js', 'workspace.js', 'network.js', 'shell.js', 'tools.js']
+const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js', 'tools.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
-const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, PythonRuntime, runShellCommand, executeTool,'
+const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, normalizeVfsPath, VirtualWorkspace, UploadWorkspace,'
+  + ' PythonRuntime, runShellCommand, executeTool,'
   + ' Telemetry, SHELL_COMMANDS, shellHelpText, shellSystemPromptSection, SHELL_PIPE_MAX_BYTES });');
+
+// A bare VFS (no /mnt/workspace) or one wrapping a legacy adapter.
+function bareVfs() {
+  return new M.VirtualWorkspace({ listCommands: () => Object.keys(M.SHELL_COMMANDS) });
+}
 
 // --- hierarchical in-memory workspace (byte-exact, deterministic order) ---
 class TreeWS extends M.WorkspaceAdapter {
@@ -208,37 +214,61 @@ async function run() {
   {
     const ws = fixture();
     const c1 = await M.executeTool('bash', 'pwd', ws);
-    check('C1 pwd starts at /', c1.success && c1.output === '/', c1.output);
+    check('C1 pwd starts at the mounted workspace', c1.success && c1.output === '/mnt/workspace', c1.output);
     const c2 = await M.executeTool('bash', 'cd sub && pwd', ws);
-    check('C2 cd && pwd', c2.success && c2.output === '/sub', c2.output);
+    check('C2 cd && pwd (absolute)', c2.success && c2.output === '/mnt/workspace/sub', c2.output);
     const c3 = await M.executeTool('bash', 'cd sub && cat b.js', ws);
     check('C3 relative file resolves against cwd', c3.success && c3.output.includes('console.log(1)'), c3.output);
     const c4 = await M.executeTool('bash', 'cd sub; ls', ws);
     check('C4 cd ; ls', c4.success && c4.output.includes('b.js') && !c4.output.includes('a.txt'), c4.output);
     const c5 = await M.executeTool('bash', 'pwd', ws);
-    check('C5 next invocation starts at root again', c5.success && c5.output === '/', c5.output);
-    const c6 = await M.executeTool('bash', 'cd ../..', ws);
-    check('C6 cd above root rejected (confinement)', !c6.success && c6.output.includes('escapes workspace'), c6.output);
-    const c7 = await M.executeTool('bash', 'cd sub && cd ../../.. && pwd', ws);
-    check('C7 nested escape rejected', !c7.success && c7.output.includes('escapes workspace'), c7.output);
+    check('C5 next invocation starts at the default cwd again', c5.success && c5.output === '/mnt/workspace', c5.output);
+    const c6 = await M.executeTool('bash', 'cd ../../../..', ws);
+    check('C6 cd above the filesystem root rejected', !c6.success && c6.output.includes('escapes filesystem root'), c6.output);
+    const c7 = await M.executeTool('bash', 'cd sub && cd ../../../.. && pwd', ws);
+    check('C7 nested escape rejected', !c7.success && c7.output.includes('escapes filesystem root'), c7.output);
     const c8 = await M.executeTool('bash', 'cd sub && cd .. && pwd', ws);
-    check('C8 cd .. back to root', c8.success && c8.output === '/', c8.output);
+    check('C8 cd .. back to the mount root', c8.success && c8.output === '/mnt/workspace', c8.output);
     const c9 = await M.executeTool('bash', 'cd "dir with space" && pwd', ws);
-    check('C9 quoted dir with spaces', c9.success && c9.output === '/dir with space', c9.output);
+    check('C9 quoted dir with spaces', c9.success && c9.output === '/mnt/workspace/dir with space', c9.output);
     const c10 = await M.executeTool('bash', 'cd missing', ws);
     check('C10 cd missing', !c10.success && c10.output.includes('no such directory'), c10.output);
     const c11 = await M.executeTool('bash', 'cd a.txt', ws);
     check('C11 cd onto file', !c11.success && c11.output.includes('not a directory'), c11.output);
     const c12 = await M.executeTool('bash', 'cd sub && echo hi > n.txt', ws);
     check('C12 redirect writes under cwd', c12.success && dec(ws.files['sub/n.txt']) === 'hi\n', JSON.stringify(Object.keys(ws.files)));
-    const c13 = await M.executeTool('bash', 'cd sub && cat /a.txt', ws);
-    check('C13 absolute path is workspace-root relative', c13.success && c13.output.includes('foo again'), c13.output);
+    const c13 = await M.executeTool('bash', 'cd sub && cat /mnt/workspace/a.txt', ws);
+    check('C13 absolute path is filesystem-root absolute', c13.success && c13.output.includes('foo again'), c13.output);
+    // bare cd returns to the VFS default cwd
+    const c16 = await M.executeTool('bash', 'cd sub && cd && pwd', ws);
+    check('C16 bare cd returns to the default cwd', c16.success && c16.output === '/mnt/workspace', c16.output);
+    const c17 = await M.executeTool('bash', 'cd && pwd', null);
+    check('C17 bare cd without workspace lands in /home/locus', c17.success && c17.output === '/home/locus', c17.output);
 
-    // python script path resolves against the shell cwd (Python root unchanged)
+    // python script path resolves against the shell cwd; the shell cwd is
+    // passed through to the worker as Python's cwd (protocol v2)
     const wsP = new TreeWS({ 'sub/script.py': 'print(1)\n' });
-    mockWorkerResult({ stdout: 'ok', stderr: '', error: null, files: [], deleted: [] });
+    let lastMsg = null;
+    M.PythonRuntime._ensureWorker = () => {};
+    M.PythonRuntime.worker = {
+      postMessage(msg) {
+        lastMsg = msg;
+        const p = M.PythonRuntime._pending.get(msg.id);
+        queueMicrotask(() => {
+          clearTimeout(p.timer);
+          M.PythonRuntime._pending.delete(msg.id);
+          p.resolve({ stdout: 'ok', stderr: '', error: null, files: [], deleted: [] });
+        });
+      },
+    };
     const c14 = await M.executeTool('bash', 'cd sub && python script.py', wsP);
     check('C14 cd && python script.py resolves script under cwd', c14.success && c14.output.includes('ok'), c14.output);
+    check('C14b worker receives the shell cwd (ABS) and a mounts array',
+      !!lastMsg && lastMsg.cwd === '/mnt/workspace/sub'
+      && Array.isArray(lastMsg.mounts)
+      && lastMsg.mounts.some((m) => m.root === '/mnt/workspace'
+        && m.files.some((f) => f.path === '/mnt/workspace/sub/script.py')),
+      JSON.stringify(lastMsg && { cwd: lastMsg.cwd, roots: lastMsg.mounts && lastMsg.mounts.map((m) => m.root) }));
     const c15 = await M.executeTool('bash', 'cd sub && python missing.py', wsP);
     check('C15 missing script error', !c15.success && c15.output.includes("can't open file"), c15.output);
   }
@@ -410,7 +440,8 @@ async function run() {
       names.every((n) => prompt.includes(M.SHELL_COMMANDS[n].usage)), names.join(','));
     check('HELP4 prompt states the contract', prompt.includes('NOT full POSIX bash')
       && prompt.includes('Paths containing spaces must be quoted')
-      && prompt.includes('starts at the mounted workspace root'));
+      && prompt.includes('Every bash invocation starts at the default cwd')
+      && prompt.includes('/mnt/workspace') && prompt.includes('/home/locus'));
     check('HELP5 help and prompt come from one registry',
       h.output === M.shellHelpText() && h.output.includes(';') && h.output.includes('&&') && h.output.includes('|'));
   }
@@ -449,6 +480,99 @@ async function run() {
     } finally {
       global.fetch = origFetch;
     }
+  }
+
+  // ---------- V. the machine always has a filesystem (VFS invariants) ----------
+  {
+    // pwd defaults
+    const v1 = await M.executeTool('bash', 'pwd', null);
+    check('V1 pwd without workspace is /home/locus', v1.success && v1.output === '/home/locus', v1.output);
+
+    // filesystem root listing is the fixed userland view
+    const vfs = bareVfs();
+    const v2 = await M.executeTool('bash', 'ls /', vfs);
+    check('V2 ls / shows the machine layout', v2.success
+      && v2.output.split('\n').map((s) => s.replace(/\/$/, '')).join(' ') === 'bin home mnt tmp usr', v2.output);
+    const v3 = await M.executeTool('bash', 'ls /mnt', vfs);
+    check('V3 ls /mnt without workspace', v3.success
+      && v3.output.split('\n').map((s) => s.replace(/\/$/, '')).join(' ') === 'download plugins upload', v3.output);
+
+    // /usr/bin is the command registry (drift guard)
+    const v4 = await M.executeTool('bash', 'ls /usr/bin', vfs);
+    const expectedCmds = Object.keys(M.SHELL_COMMANDS).slice().sort();
+    check('V4 /usr/bin lists exactly the shell registry', v4.success
+      && v4.output === expectedCmds.join('\n'), v4.output.slice(0, 120));
+    check('V4b /bin is the same view', (await M.executeTool('bash', 'ls /bin', vfs)).output === v4.output);
+
+    // unmounted /mnt/workspace is a clear error, not an empty dir
+    const v5 = await M.executeTool('bash', 'ls /mnt/workspace', vfs);
+    check('V5 unmounted workspace errors clearly', !v5.success && v5.output.includes('not mounted'), v5.output);
+    const v6 = await M.executeTool('bash', 'cd /mnt/workspace', vfs);
+    check('V6 cd into unmounted workspace → not mounted', !v6.success && v6.output.includes('not mounted'), v6.output);
+
+    // /tmp and /home/locus persist across invocations sharing one vfs
+    await M.executeTool('bash', 'echo tmpdata > /tmp/keep.txt; echo homedata > /home/locus/keep.txt', vfs);
+    const v7 = await M.executeTool('bash', 'cat /tmp/keep.txt /home/locus/keep.txt', vfs);
+    check('V7 /tmp and /home/locus persist across bash calls', v7.success
+      && v7.output.split('\n').includes('tmpdata') && v7.output.split('\n').includes('homedata'), v7.output);
+
+    // structural paths reject writes
+    const v8 = await M.executeTool('bash', 'echo x > /foo.txt', vfs);
+    check('V8 structural write rejected', !v8.success && v8.output.includes('read-only filesystem'), v8.output);
+    const v9 = await M.executeTool('bash', 'echo x > /usr/bin/evil', vfs);
+    check('V9 /usr/bin is read-only', !v9.success && v9.output.includes('read-only'), v9.output);
+
+    // protected roots can never be recursively removed
+    for (const root of ['/', '/mnt', '/mnt/workspace', '/mnt/upload', '/home/locus', '/usr']) {
+      const r = await M.executeTool('bash', 'rm -rf ' + root, vfs);
+      check('V10 rm -rf ' + root + ' refused (protected root)', !r.success
+        && r.output.includes('rm: refusing to recursively remove protected path: ' + root)
+        && !r.output.includes('deleted'), r.output);
+    }
+    // other mount/system roots are still refused (provider-level message)
+    for (const root of ['/home', '/tmp', '/mnt/download', '/mnt/plugins', '/usr/bin']) {
+      const r = await M.executeTool('bash', 'rm -rf ' + root, vfs);
+      check('V10b rm -rf ' + root + ' refused (not silently emptied)', !r.success, r.output);
+    }
+
+    // upload mount: user files readable, never writable/removable
+    const up = vfs.resolveMount('/mnt/upload').provider;
+    const upBytes = new TextEncoder().encode('uploaded input');
+    up.addFile({ name: 'input.txt', size: upBytes.byteLength, arrayBuffer: async () => upBytes.slice().buffer });
+    const v11 = await M.executeTool('bash', 'cat /mnt/upload/input.txt', vfs);
+    check('V11 upload file readable via cat', v11.success && v11.output === 'uploaded input', v11.output);
+    const v12 = await M.executeTool('bash', 'echo x > /mnt/upload/out.txt', vfs);
+    check('V12 write into upload refused', !v12.success && v12.output.includes('read-only filesystem'), v12.output);
+    const v13 = await M.executeTool('bash', 'rm /mnt/upload/input.txt', vfs);
+    check('V13 rm from upload refused, file intact', !v13.success
+      && v13.output.includes('rm: /mnt/upload/input.txt: read-only filesystem')
+      && (await vfs.exists('/mnt/upload/input.txt')), v13.output);
+
+    // cross-mount mv: read-only source fails BEFORE the destination exists
+    const v14 = await M.executeTool('bash', 'mv /mnt/upload/input.txt /mnt/download/copied.txt', vfs);
+    check('V14 mv from read-only source refused before any mutation', !v14.success
+      && v14.output.includes('source is on a read-only filesystem')
+      && !(await vfs.exists('/mnt/download/copied.txt'))
+      && (await vfs.exists('/mnt/upload/input.txt')), v14.output);
+
+    // ... and read-only destination is also refused before any mutation
+    await M.executeTool('bash', 'echo data > /mnt/download/d.txt', vfs);
+    const v15 = await M.executeTool('bash', 'mv /mnt/download/d.txt /mnt/upload/d.txt', vfs);
+    check('V15 mv into read-only destination refused before any mutation', !v15.success
+      && v15.output.includes('read-only filesystem')
+      && (await vfs.exists('/mnt/download/d.txt'))
+      && !(await vfs.exists('/mnt/upload/d.txt')), v15.output);
+
+    // a REAL working mv across writable mounts still works (copy-verify-delete)
+    const v16 = await M.executeTool('bash', 'mv /mnt/download/d.txt /tmp/moved.txt', vfs);
+    check('V16 mv across writable mounts works', v16.success
+      && !(await vfs.exists('/mnt/download/d.txt'))
+      && (await vfs.read('/tmp/moved.txt')) === 'data\n', v16.output);
+
+    // protected roots cannot be moved either
+    const v17 = await M.executeTool('bash', 'mv /mnt/download /tmp/d2', vfs);
+    check('V17 mv of a protected root refused', !v17.success
+      && v17.output.includes('refusing to move protected path: /mnt/download'), v17.output);
   }
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');

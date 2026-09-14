@@ -9,11 +9,18 @@ const path = require('path');
 global.window = { location: { protocol: 'https:' } };
 global.document = { getElementById: () => null };
 
-const src = ['telemetry.js', 'workspace.js', 'network.js', 'shell.js', 'tools.js']
+const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js', 'tools.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
-const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, PythonRuntime, runShellCommand, executeTool,'
+const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, normalizeVfsPath, VirtualWorkspace, PythonRuntime,'
+  + ' runShellCommand, executeTool,'
   + ' Telemetry, SHELL_COMMANDS, shellHelpText, shellSystemPromptSection, shellTokenize, parseShellLine, runPipeline });');
+
+function bareVfs(adapter) {
+  const vfs = new M.VirtualWorkspace({ listCommands: () => Object.keys(M.SHELL_COMMANDS) });
+  if (adapter) vfs.mount('/mnt/workspace', adapter, 'external-read-write');
+  return vfs;
+}
 
 // --- hierarchical in-memory workspace (same model as shell-compat.test.cjs) ---
 class TreeWS extends M.WorkspaceAdapter {
@@ -113,7 +120,8 @@ function fixture() {
 // stdout/stderr (the tool boundary merges them for presentation).
 async function runPipelineOf(line, ws, opts) {
   const steps = M.parseShellLine(M.shellTokenize(line));
-  const ctx = { workspace: ws, opts: opts || {}, cwd: '' };
+  const vfs = bareVfs(ws);
+  const ctx = { vfs: vfs, opts: opts || {}, cwd: vfs.defaultCwd() };
   return M.runPipeline(steps[0].pipeline, ctx);
 }
 
@@ -192,11 +200,14 @@ async function run() {
       && !('dir with space/note.txt' in ws5.files), mv5.output);
 
     const ws6 = fixture();
-    const mv6 = await M.executeTool('bash', 'mv a.txt ../evil.txt', ws6);
-    check('MV6 path escape rejected', !mv6.success && mv6.output.includes('escapes workspace')
+    const mv6 = await M.executeTool('bash', 'mv a.txt ../../../evil.txt', ws6);
+    check('MV6 path escape rejected', !mv6.success && mv6.output.includes('escapes filesystem root')
       && ('a.txt' in ws6.files), mv6.output);
-    const mv6b = await M.executeTool('bash', 'mv /a.txt /mv6b.txt', ws6);
-    check('MV6b / is workspace-root absolute', mv6b.success && ('mv6b.txt' in ws6.files), mv6b.output);
+    const mv6s = await M.executeTool('bash', 'mv a.txt ../evil.txt', ws6);
+    check('MV6s structural destination rejected (no longer an escape)', !mv6s.success
+      && mv6s.output.includes('read-only filesystem') && ('a.txt' in ws6.files), mv6s.output);
+    const mv6b = await M.executeTool('bash', 'mv /mnt/workspace/a.txt /mnt/workspace/mv6b.txt', ws6);
+    check('MV6b absolute paths are filesystem-absolute', mv6b.success && ('mv6b.txt' in ws6.files), mv6b.output);
 
     // cancellation AFTER the destination write but BEFORE the source delete:
     // source is preserved, partial state is honestly reported
@@ -271,16 +282,23 @@ async function run() {
     check('RM8 quoted path with spaces', rm8.success && !('dir with space/note.txt' in ws8.files), rm8.output);
 
     const ws9 = fixture();
-    const rm9 = await M.executeTool('bash', 'rm ../evil.txt', ws9);
-    check('RM9 path escape rejected', !rm9.success && rm9.output.includes('escapes workspace'), rm9.output);
+    const rm9 = await M.executeTool('bash', 'rm ../../../evil.txt', ws9);
+    check('RM9 path escape rejected', !rm9.success && rm9.output.includes('escapes filesystem root'), rm9.output);
+    const rm9b = await M.executeTool('bash', 'rm ../evil.txt', fixture());
+    check('RM9b rm of a structural path misses cleanly', !rm9b.success && rm9b.output.includes('no such file or directory'),
+      rm9b.output);
 
     for (const spelled of ['/', '.', '/.', '/sub/..']) {
       const wsR = fixture();
       const rr = await M.executeTool('bash', 'rm -rf ' + spelled, wsR);
-      check('RM10 rm -rf ' + spelled + ' refused, workspace intact', !rr.success
-        && rr.output.includes('refusing to recursively remove workspace root')
+      check('RM10 rm -rf ' + spelled + ' refused (protected root), workspace intact', !rr.success
+        && rr.output.includes('rm: refusing to recursively remove protected path:')
         && ('a.txt' in wsR.files) && ('sub/deep/d.txt' in wsR.files), rr.output);
     }
+    // any spelling of a protected root — even through .. — is refused
+    const rmProt = await M.executeTool('bash', 'rm -rf sub/../..', fixture());
+    check('RM10b rm -rf sub/../.. resolves to a protected root and is refused', !rmProt.success
+      && rmProt.output.includes('refusing to recursively remove protected path: /mnt'), rmProt.output);
 
     // recursive cancellation stops the traversal and reports what committed
     const ws11 = fixture();
@@ -361,15 +379,25 @@ async function run() {
     const rd11 = await M.executeTool('bash', 'echo hi > "my file.txt"', ws11);
     check('RD11 quoted redirect target with spaces', rd11.success && dec(ws11.files['my file.txt']) === 'hi\n', rd11.output);
 
-    const rd12 = await M.executeTool('bash', 'echo hi > nowhere.txt', null);
-    check('RD12 redirect without workspace fails cleanly', !rd12.success && rd12.output.includes('no workspace selected'),
-      rd12.output);
+    // no workspace: the bare machine still has a filesystem — /home/locus works
+    const rdVfs = bareVfs();
+    const rd12 = await M.executeTool('bash', 'echo hi > nowhere.txt', rdVfs);
+    check('RD12 redirect without workspace lands in /home/locus', rd12.success
+      && (await rdVfs.read('/home/locus/nowhere.txt')) === 'hi\n', rd12.output);
+    // but an unmounted /mnt/workspace target fails BEFORE any side effect
+    let rdFetch = 0;
+    const rd12b = await M.executeTool('bash', 'echo hi > /mnt/workspace/nowhere.txt', rdVfs);
+    check('RD12b redirect into unmounted workspace fails before side effects', !rd12b.success
+      && rd12b.output.includes('not mounted') && !(await rdVfs.exists('/mnt/workspace/nowhere.txt')), rd12b.output);
 
     const ws13 = fixture();
-    const rd13 = await M.executeTool('bash', 'echo hi > /rd13.txt', ws13);
-    check('RD13 redirect target: / is workspace-root absolute', rd13.success && ('rd13.txt' in ws13.files), rd13.output);
-    const rd14 = await M.executeTool('bash', 'echo hi > ../evil.txt', fixture());
-    check('RD14 redirect target escape rejected', !rd14.success && rd14.output.includes('escapes workspace'), rd14.output);
+    const rd13 = await M.executeTool('bash', 'echo hi > /mnt/workspace/rd13.txt', ws13);
+    check('RD13 redirect target: absolute paths are filesystem-absolute', rd13.success && ('rd13.txt' in ws13.files), rd13.output);
+    const rd13s = await M.executeTool('bash', 'echo hi > /rd13s.txt', ws13);
+    check('RD13s structural redirect target rejected before side effects', !rd13s.success
+      && rd13s.output.includes('read-only filesystem'), rd13s.output);
+    const rd14 = await M.executeTool('bash', 'echo hi > ../../../evil.txt', fixture());
+    check('RD14 redirect target escape rejected', !rd14.success && rd14.output.includes('escapes filesystem root'), rd14.output);
 
     // echo > file writes an empty file; a failing command still truncates stdout target
     const ws15 = fixture();
