@@ -456,6 +456,11 @@ async function collectWorkspaceFiles(workspace, signal) {
 // Bounds for command composition and recursive traversal.
 const SHELL_PIPE_MAX_BYTES = 1024 * 1024; // intermediate stdout between pipeline stages
 const CAT_MAX_FILE_BYTES = 512 * 1024;
+// Append (`>>` / `2>>`) holds old+new bytes in memory, so the EXISTING
+// content is bounded (16 MiB, matching the memory-provider per-file cap).
+// A bigger target fails loudly — never a silent truncate, partial write
+// or OOM.
+const APPEND_MAX_EXISTING_BYTES = 16 * 1024 * 1024;
 const FIND_MAX_VISITED = 5000;            // entries visited per find run
 const FIND_MAX_RESULTS = 1000;            // paths emitted per find run
 const GREP_MAX_FILES = 500;               // files searched per recursive grep
@@ -918,6 +923,33 @@ function shErr(stderr) { return { success: false, stdout: '', stderr: stderr }; 
 function shErrAt(stderr, stdout) { return { success: false, stdout: stdout || '', stderr: stderr }; }
 
 // ---------- command handlers ----------
+
+// Byte-preserving append primitive shared by `>>` and `2>>`. The existing
+// target is read as RAW BYTES — never decoded to text (a lossy UTF-8
+// decode would silently replace non-UTF-8 bytes with U+FFFD and corrupt
+// binary files on rewrite). Order: read/preflight → assemble the complete
+// target bytes → re-check cancellation → ONE write, so a read, quota or
+// cancellation failure leaves the original file untouched.
+async function appendFileBytes(vfs, path, payload, signal, what) {
+  let old = null;
+  try {
+    old = await vfs.readBytes(path);
+  } catch (e) {
+    if (!e || e.name !== 'NotFoundError') throw e; // missing target → plain create
+  }
+  let bytes = payload;
+  if (old) {
+    if (old.byteLength > APPEND_MAX_EXISTING_BYTES) {
+      throw vfsError('QuotaExceededError', 'append target is ' + old.byteLength
+        + ' bytes, over the ' + APPEND_MAX_EXISTING_BYTES + '-byte append limit: ' + path);
+    }
+    bytes = new Uint8Array(old.byteLength + payload.byteLength);
+    bytes.set(old, 0);
+    bytes.set(payload, old.byteLength);
+  }
+  throwIfCancelled(signal, what);
+  await vfs.write(path, bytes);
+}
 
 async function shPwd(ctx) {
   return shOk(ctx.cwd);
@@ -1910,12 +1942,16 @@ async function runSimpleCommand(cmd, ctx, stdin) {
     // what the first write just landed (stdout first, then stderr).
     const append = w.dest.append || writtenPaths.has(w.dest.path);
     try {
-      if (append && (await ctx.vfs.exists(w.dest.path))) {
-        text = (await ctx.vfs.read(w.dest.path)) + text;
+      if (append) {
+        // `>>`/`2>>` are byte-preserving: the old content is read as raw
+        // bytes and concatenated with the UTF-8 payload — binary targets
+        // survive an append untouched.
+        await appendFileBytes(ctx.vfs, w.dest.path, new TextEncoder().encode(text), signal, name);
+      } else {
+        // `>`/`2>` truncate + write (text payload, UTF-8).
+        throwIfCancelled(signal, name);
+        await ctx.vfs.write(w.dest.path, text);
       }
-      // reads above awaited: re-check cancellation before writing
-      throwIfCancelled(signal, name);
-      await ctx.vfs.write(w.dest.path, text);
       writtenPaths.add(w.dest.path);
     } catch (e) {
       if (isCancelledError(e)) throw e;

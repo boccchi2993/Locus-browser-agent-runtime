@@ -122,8 +122,12 @@ async function run() {
   await M.runShellCommand('echo first > log.txt', ws);
   await M.runShellCommand('echo second >> log.txt', ws);
   await M.runShellCommand('echo third >> log.txt', ws);
-  check('W9 append preserves old content', tree.files['log.txt'] === 'first\nsecond\nthird\n',
-    JSON.stringify(tree.files['log.txt']));
+  // Appends write raw BYTES (binary-safe); the fake handle may therefore
+  // hold a string (truncate write) or an ArrayBuffer (append write).
+  const w9v = tree.files['log.txt'];
+  const w9text = typeof w9v === 'string' ? w9v : new TextDecoder().decode(w9v);
+  check('W9 append preserves old content', w9text === 'first\nsecond\nthird\n',
+    JSON.stringify(w9text));
 
   // ---------- W5. python snapshot collects real files, skips with paths ----------
   const collected = await M.collectWorkspaceFiles(ws);

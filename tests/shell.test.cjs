@@ -248,10 +248,12 @@ async function run() {
     && y3.output.includes('cancelled'), 'started=' + startedY3 + ' out=' + JSON.stringify(y3.output));
 
   // Y4: echo >> — abort during the read of the old content → no write
+  // (append reads raw BYTES via readBytes — the cancellation gate sits
+  // between the read and the single write).
   const wsY4 = new MemWS({ 'log.txt': 'old\n' });
   const acY4 = new AbortController();
-  const origReadY4 = wsY4.read.bind(wsY4);
-  wsY4.read = async (p) => { const t = await origReadY4(p); acY4.abort(); return t; };
+  const origReadY4 = wsY4.readBytes.bind(wsY4);
+  wsY4.readBytes = async (p) => { const t = await origReadY4(p); acY4.abort(); return t; };
   const y4 = await M.executeTool('bash', 'echo new >> log.txt', wsY4, { signal: acY4.signal });
   check('Y4 echo >> cancel during read → no write', y4.success === false
     && new TextDecoder().decode(wsY4.files['log.txt']) === 'old\n', JSON.stringify(y4.output));
