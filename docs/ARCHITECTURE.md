@@ -25,6 +25,8 @@ Locus is not trying to emulate the Linux kernel or a full POSIX ABI. It is tryin
 
 See [CAPABILITY-BOUNDARIES.md](CAPABILITY-BOUNDARIES.md) for the detailed runtime / harness / extension boundary.
 
+See [LINUX-LIKE-VFS.md](LINUX-LIKE-VFS.md) for the model-visible filesystem topology, mount namespace, and shell/Python filesystem convergence contract.
+
 ## 2. Core invariants
 
 ### 2.1 Execution placement
