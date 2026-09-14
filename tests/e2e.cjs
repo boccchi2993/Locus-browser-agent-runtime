@@ -5,7 +5,10 @@
 //   2. /fetch active-content isolation — tests/verify-active-content.cjs
 //      (self-contained: own HTTP server + own Chrome)
 //   3. Vue presentation e2e — builds the app, serves it with
-//      `vite preview`, drives the REAL UI through CDP (tests/e2e-ui.cjs)
+//      `vite preview`, drives the REAL UI through CDP:
+//      tests/e2e-ui.cjs (desktop three-column flows) and
+//      tests/e2e-responsive.cjs (per-viewport layout/drawer/overflow
+//      assertions + .ui-review/ screenshots)
 //
 // Chrome path: CHROME env var or the default install location.
 const { spawn, spawnSync } = require('child_process');
@@ -66,8 +69,9 @@ async function presentationE2e() {
       await sleep(300);
     }
     if (!up) { console.error('vite preview did not start'); return false; }
-    const r = spawnSync(process.execPath, [path.join(__dirname, 'e2e-ui.cjs')], { stdio: 'inherit' });
-    return r.status === 0;
+    const ui = spawnSync(process.execPath, [path.join(__dirname, 'e2e-ui.cjs')], { stdio: 'inherit' });
+    const resp = spawnSync(process.execPath, [path.join(__dirname, 'e2e-responsive.cjs')], { stdio: 'inherit' });
+    return [['presentation', ui.status === 0], ['responsive', resp.status === 0]];
   } finally {
     kill(preview);
   }
@@ -77,7 +81,9 @@ async function main() {
   const results = [];
   results.push(['runtime', await runtimeE2e()]);
   results.push(['active-content', activeContentE2e()]);
-  results.push(['presentation', await presentationE2e()]);
+  const pres = await presentationE2e();
+  if (Array.isArray(pres)) results.push(...pres);
+  else results.push(['presentation', !!pres], ['responsive', false]);
   console.log('===');
   let failed = 0;
   for (const [name, ok] of results) {

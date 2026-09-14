@@ -23,6 +23,9 @@ async function main() {
     '--headless=new',
     '--disable-gpu',
     '--no-first-run',
+    // Pin a desktop viewport: this suite exercises the three-column layout;
+    // drawer/viewport coverage lives in tests/e2e-responsive.cjs.
+    '--window-size=1440,900',
     '--user-data-dir=' + path.join(require('os').tmpdir(), 'locus-e2e-ui-' + Date.now()),
     '--remote-debugging-port=' + DEBUG_PORT,
     APP_URL,
