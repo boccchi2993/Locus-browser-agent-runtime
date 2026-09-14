@@ -9,10 +9,10 @@ const path = require('path');
 global.window = { location: { protocol: 'https:' } }; // hosted page → relay available
 
 // --- load the real browser-layer sources in one shared scope ---
-const src = ['telemetry.js', 'workspace.js', 'network.js', 'shell.js', 'tools.js']
+const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js', 'tools.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
-const M = eval(src + '\n;({ Telemetry, WorkspaceAdapter, normalizeWorkspacePath, NetworkRuntime, runShellCommand, executeTool, RELAY_CLIENT_TIMEOUT_MS });');
+const M = eval(src + '\n;({ Telemetry, WorkspaceAdapter, normalizeWorkspacePath, VirtualWorkspace, SHELL_COMMANDS, NetworkRuntime, runShellCommand, executeTool, RELAY_CLIENT_TIMEOUT_MS });');
 
 // Any unhandled rejection during the run is a test failure (cleanup paths
 // must attach rejection handlers — see N25/N29).
@@ -84,7 +84,7 @@ async function run() {
   reset();
   on((u) => u === 'https://example.test/data.json', () => jsonResponse('{"hello":"world"}'));
   const t2 = await M.executeTool('bash', 'curl -o raw.json https://example.test/data.json', ws);
-  check('N2 curl -o text written', t2.success && t2.output === '[written to workspace: raw.json, 17 bytes]',
+  check('N2 curl -o text written', t2.success && t2.output === '[written to /mnt/workspace/raw.json, 17 bytes]',
     JSON.stringify(t2.output));
   check('N2b workspace content exact', new TextDecoder().decode(ws.files['raw.json'] || []) === '{"hello":"world"}');
 
@@ -219,12 +219,26 @@ async function run() {
   check('N17 oversized response rejected, not relayed', !t17.success && t17.output.includes('too large')
     && calls.length === 1, t17.output + ' | calls=' + calls.length);
 
-  // ---------- 18. curl -o without workspace performs NO network request ----------
+  // ---------- 18. curl -o target authority is checked BEFORE any network request ----------
   reset();
   on((u) => true, () => { throw new Error('no fetch allowed'); });
-  const t18 = await M.executeTool('bash', 'curl -o file.bin https://example.test/x', null);
-  check('N18 curl -o without workspace: no fetch', !t18.success && t18.output.includes('no workspace selected')
+  const bare18 = new M.VirtualWorkspace({ listCommands: () => Object.keys(M.SHELL_COMMANDS) });
+  // an unmounted /mnt/workspace target fails BEFORE the fetch
+  const t18 = await M.executeTool('bash', 'curl -o /mnt/workspace/file.bin https://example.test/x', bare18);
+  check('N18 curl -o unmounted workspace: fails before network', !t18.success && t18.output.includes('not mounted')
     && calls.length === 0, t18.output + ' | calls=' + calls.length);
+  // a read-only target fails BEFORE the fetch too
+  const t18b = await M.executeTool('bash', 'curl -o /mnt/upload/file.bin https://example.test/x', bare18);
+  check('N18b curl -o read-only mount: fails before network', !t18b.success
+    && t18b.output.includes('read-only filesystem') && calls.length === 0, t18b.output + ' | calls=' + calls.length);
+  // but the bare machine CAN download: /mnt/download works without a workspace
+  reset();
+  on((u) => true, () => new Response('downloaded', { status: 200, headers: { 'content-type': 'application/octet-stream' } }));
+  const t18c = await M.executeTool('bash', 'curl -o /mnt/download/file.bin https://example.test/x', bare18);
+  check('N18c curl -o /mnt/download succeeds WITHOUT a workspace', t18c.success && calls.length === 1
+    && new TextDecoder().decode(await bare18.readBytes('/mnt/download/file.bin')) === 'downloaded'
+    && t18c.output === '[written to /mnt/download/file.bin, 10 bytes]',
+    t18c.output + ' | calls=' + calls.length);
 
   // ---------- 19. pre-aborted cancellation is not misread as CORS ----------
   reset();

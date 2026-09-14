@@ -89,7 +89,7 @@ async function run() {
       seen.bodies.length === 2
       && seen.bodies[1].messages.some((m) => m.content && m.content.includes('<tool_result>')));
     check('S1h system prompt built from the bound workspace (no UI globals)',
-      seen.bodies[0].system.includes('The current workspace is "A".'));
+      seen.bodies[0].system.includes('The current working folder is "A", mounted at /mnt/workspace.'));
     check('S1i assistant rawMessage preserved verbatim in history',
       session.history[1].content.includes('"tool"'));
   }
@@ -394,8 +394,14 @@ async function run() {
   {
     const withWs = M.buildSystemPrompt({ workspace: { name: 'W' } });
     const without = M.buildSystemPrompt({ workspace: null });
-    check('S18 workspace named in prompt', withWs.includes('The current workspace is "W".'));
-    check('S18b no-workspace branch', without.includes('No workspace is selected yet'));
+    check('S18 workspace named + mounted in prompt', withWs.includes('The current working folder is "W", mounted at /mnt/workspace.'));
+    check('S18v VFS-shaped workspace object works too (workspaceName getter)',
+      M.buildSystemPrompt({ workspace: { workspaceName: 'V', name: 'ignored' } })
+        .includes('The current working folder is "V", mounted at /mnt/workspace.'));
+    check('S18b no-workspace branch mentions the still-available paths',
+      without.includes('/mnt/workspace is unavailable')
+      && without.includes('/mnt/upload') && without.includes('/mnt/download')
+      && without.includes('/tmp') && without.includes('/home/locus'));
     check('S18c trust-boundary policy intact',
       withWs.includes('UNTRUSTED DATA') && withWs.includes('prompt-injection')
       && withWs.includes('cloud_bash') && withWs.includes("python <<'PY'"));
