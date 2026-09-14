@@ -262,7 +262,13 @@ export async function submit(text) {
     // run() resolves only AFTER task_end has been emitted (the binding is
     // released by handleRuntimeEvent at that point) — so by the time this
     // await returns, no late event of this task can still be in flight.
-    await session.run(input, { workspace: vfs });
+    //
+    // The task binds a FORK of the live VFS: same providers, but a private
+    // mount table. A workspace switch mid-task (mountFolder replaces the
+    // /mnt/workspace provider on the live VFS) can never rebind this task's
+    // filesystem routing — its late async operations keep touching the OLD
+    // provider, and the generation/abort guards drop its results.
+    await session.run(input, { workspace: vfs.fork() });
   } catch (e) {
     // run() threw without a normal task lifecycle (e.g. the concurrent-run
     // guard): no task_end will arrive, so release the binding here instead
@@ -334,16 +340,21 @@ export async function mountFolder() {
     return;
   }
 
+  const granted = await ensureWorkspacePermission(handle);
+  if (!granted) return;
+
+  // FINAL busy gate, AFTER the picker + permission awaits: a task may have
+  // been submitted while those prompts were open. Cancel and wait for it
+  // HERE — never mount a new workspace underneath a live task.
   if (store.busy) {
     session.cancel();
     const stopped = await waitFor(() => !store.busy, 10000);
     if (!stopped) return; // task would not stop — keep the old workspace
   }
 
-  const granted = await ensureWorkspacePermission(handle);
-  if (!granted) return;
-
   // Re-mounting a different folder replaces the provider at /mnt/workspace.
+  // In-flight tasks hold a fork() of this VFS (see submit) and keep routing
+  // to the OLD provider — this mutation only affects future tasks.
   const provider = new LocalDirectoryWorkspace(handle);
   vfs.mount('/mnt/workspace', provider, 'external-read-write');
   store.workspaceName = provider.name;

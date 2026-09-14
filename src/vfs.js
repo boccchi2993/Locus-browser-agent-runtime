@@ -443,6 +443,18 @@ class VirtualWorkspace {
     this.mounts.splice(i, 1);
   }
 
+  // A task-bound view of this VFS: SAME provider instances, INDEPENDENT
+  // mount table. mount()/unmount() on the original (e.g. a workspace
+  // switch replacing the /mnt/workspace provider) can never rebind an
+  // in-flight task holding a fork — the fork's mount entries are private
+  // copies that keep routing to the providers captured at fork time.
+  fork() {
+    const f = Object.create(VirtualWorkspace.prototype);
+    f.isLocusVFS = true;
+    f.mounts = this.mounts.map((m) => ({ path: m.path, provider: m.provider, authority: m.authority }));
+    return f;
+  }
+
   async list(path) {
     const abs = this._abs(path);
     const r = this.resolveMount(abs);

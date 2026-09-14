@@ -2249,8 +2249,9 @@ async function runCurl(args, ctx, opts) {
   if (!url) return netResult('usage: curl <https-url> | curl -o <file> <https-url>', false);
 
   // A download with an unwritable target must fail BEFORE any network
-  // request: resolve the absolute path, enforce mount authority and check
-  // the parent directory first.
+  // request: resolve the absolute path, enforce mount authority, check the
+  // parent directory and reject an existing DIRECTORY target — nothing here
+  // may hit the network first.
   if (outFile) {
     const display = outFile;
     try {
@@ -2265,6 +2266,17 @@ async function runCurl(args, ctx, opts) {
     }
     const parentErr = await checkParentDir(vfs, outFile);
     if (parentErr) return netResult('curl: cannot write ' + display + ': ' + parentErr, false);
+    let targetStat = null;
+    try {
+      targetStat = await vfs.stat(outFile);
+    } catch (e) {
+      if (!e || e.name !== 'NotFoundError') {
+        return netResult('curl: cannot write ' + display + ': ' + writableErrMsg(e), false);
+      }
+    }
+    if (targetStat && targetStat.kind === 'directory') {
+      return netResult('curl: cannot write ' + display + ': is a directory', false);
+    }
   }
 
   let res;
