@@ -453,6 +453,22 @@ function shellTokenize(line) {
       i++;
       continue;
     }
+    if (c === '>' && has && !quoted && cur === '2') {
+      // Glued stderr redirects: 2> / 2>> / 2>&1 are single operators.
+      cur = '';
+      has = false;
+      if (s[i + 1] === '&' && s[i + 2] === '1') {
+        tokens.push({ text: '2>&1', quoted: false, op: true, pos: i - 1 });
+        i += 3;
+      } else if (s[i + 1] === '>') {
+        tokens.push({ text: '2>>', quoted: false, op: true, pos: i - 1 });
+        i += 2;
+      } else {
+        tokens.push({ text: '2>', quoted: false, op: true, pos: i - 1 });
+        i += 1;
+      }
+      continue;
+    }
     if (c === '>' || c === '<' || c === '|' || c === ';' || c === '&') {
       push();
       let op = c;
@@ -518,8 +534,8 @@ const SHELL_COMMANDS = {
     stdin: true, run: shCat,
   },
   echo: {
-    usage: 'echo <text> [> file | >> file]',
-    summary: 'print text, or write / append it to a workspace file',
+    usage: 'echo <text>',
+    summary: 'print text (combine with > / >> to write files)',
     stdin: false, run: shEcho,
   },
   find: {
@@ -547,6 +563,16 @@ const SHELL_COMMANDS = {
     summary: 'count lines / words / UTF-8 bytes; reads stdin when no file is given',
     stdin: true, run: shWc,
   },
+  mv: {
+    usage: 'mv <src>... <dest>',
+    summary: 'move/rename files or directories; fails if the destination exists (no -f)',
+    stdin: false, run: shMv,
+  },
+  rm: {
+    usage: 'rm [-f] [-r|-R] <path>...',
+    summary: 'remove files; -r for recursive directory removal, -f to ignore missing paths',
+    stdin: false, run: shRm,
+  },
   python: {
     usage: 'python -c "<code>" | python <script.py> | python <<\'PY\' ... PY',
     summary: 'run Python (Pyodide); script paths resolve against the shell cwd, Python\'s own root stays the workspace root',
@@ -567,12 +593,23 @@ const SHELL_COMMANDS = {
 const SHELL_OPERATORS = [
   { op: ';', summary: 'sequence — run the next command regardless of the previous result' },
   { op: '&&', summary: 'run the next command only if the previous one succeeded' },
-  { op: '|', summary: 'pipeline — stdout of the left command becomes stdin of the right one' },
+  { op: '||', summary: 'run the next command only if the previous one failed' },
+  { op: '|', summary: 'pipeline — stdout (only) of the left command becomes stdin of the right one' },
+];
+
+const SHELL_REDIRECTS = [
+  { op: '> file', summary: 'write stdout to file (truncate/create)' },
+  { op: '>> file', summary: 'append stdout to file' },
+  { op: '2> file', summary: 'write stderr to file (truncate/create)' },
+  { op: '2>> file', summary: 'append stderr to file' },
+  { op: '2>&1', summary: 'send stderr to wherever stdout currently goes (order matters: > all.txt 2>&1 merges both into the file)' },
 ];
 
 const SHELL_UNSUPPORTED_NOTE =
-  'Not supported: ||, &, $(...), backticks, subshells, variables/export, '
-  + 'glob expansion, input redirect (<), stderr redirect (2>).';
+  'Not supported: &, $(...), backticks, subshells, variables/export, '
+  + 'glob expansion (* stays literal — use find -name instead), input redirect (<), '
+  + 'heredocs other than python, file descriptors other than 2>&1 (no 1>&2 / 3> / &>). '
+  + 'rm -rf / (the workspace root) is always refused.';
 
 function shellHelpText() {
   return [
@@ -589,6 +626,11 @@ function shellHelpText() {
       'Operators:',
     ])
     .concat(SHELL_OPERATORS.map((o) => '  ' + o.op + '  ' + o.summary))
+    .concat([
+      '',
+      'Redirects:',
+    ])
+    .concat(SHELL_REDIRECTS.map((r) => '  ' + r.op + '  ' + r.summary))
     .concat(['', SHELL_UNSUPPORTED_NOTE])
     .join('\n');
 }
@@ -607,7 +649,18 @@ function shellSystemPromptSection() {
     '  Supported operators:',
     '    cmd1 ; cmd2     run commands in sequence',
     '    cmd1 && cmd2    run cmd2 only if cmd1 succeeded',
-    '    cmd1 | cmd2     pipe stdout of cmd1 into stdin of cmd2 (stdin consumers: cat grep head tail wc)',
+    '    cmd1 || cmd2    run cmd2 only if cmd1 failed',
+    '    cmd1 | cmd2     pipe stdout of cmd1 into stdin of cmd2 (stdin consumers: cat grep head tail wc);',
+    '                    stderr is NOT piped unless merged with 2>&1',
+    '  Supported redirects (applied left to right; order matters for 2>&1):',
+    '    cmd > file      write stdout to file (truncate/create)',
+    '    cmd >> file     append stdout to file',
+    '    cmd 2> file     write stderr to file (truncate/create)',
+    '    cmd 2>> file    append stderr to file',
+    '    cmd 2>&1        merge stderr into stdout\'s current destination',
+    '  Redirection never turns a failed command into a successful one.',
+    '  rm -rf / (the workspace root) is always refused. Shell glob expansion is not supported:',
+    '  * in command arguments stays literal — use find -name "*.tmp" to locate files.',
     '  ' + SHELL_UNSUPPORTED_NOTE,
     '  Run `help` at runtime to see this contract again.',
     '  curl usage (public HTTPS resources only):',
@@ -632,11 +685,11 @@ function shellSystemPromptSection() {
 
 // ---------- parser ----------
 // Grammar:
-//   command_list := pipeline ((';' | '&&') pipeline)*
+//   command_list := pipeline ((';' | '&&' | '||') pipeline)*   (left-associative)
 //   pipeline     := simple_command ('|' simple_command)*
-// Redirect tokens (> >>) stay inside a simple command and are validated by
-// the executor (echo only). Everything else that looks like shell syntax
-// fails loudly with the supported alternative.
+// Redirect tokens (> >> 2> 2>> 2>&1) stay inside a simple command and are
+// applied by the executor, left to right. Everything else that looks like
+// shell syntax fails loudly with the supported alternative.
 function parseShellLine(tokens) {
   const steps = [];
   let connector = null;
@@ -664,37 +717,46 @@ function parseShellLine(tokens) {
         break;
       case ';':
       case '&&':
+      case '||':
         flushPipeline(t.text === ';'); // bare ';' tolerates empty neighbours
         connector = t.text;
         pendingPipe = false;
         break;
-      case '||':
       case '&':
-        fail("unsupported operator: '" + t.text + "' (supported operators: ; && |)");
+        fail("unsupported operator: '&' (supported operators: ; && || |)");
         break;
       case '<':
       case '<<':
         fail("unsupported operator: '<' (input redirection is not supported; pass the file as an argument instead)");
         break;
       case '>':
-      case '>>': {
-        // Detect a glued `2>` / `2>>` (word `2` immediately before the op):
-        // stderr redirection is out of scope and must not silently become
-        // an argument plus a stdout redirect.
-        const prev = current[current.length - 1];
-        if (prev && !prev.op && !prev.quoted && prev.text === '2' && prev.pos + 1 === t.pos) {
-          fail("unsupported redirect: '2" + t.text + "' (stderr redirection is not supported)");
+      case '>>':
+      case '2>':
+      case '2>>':
+      case '2>&1':
+        // A redirect with no command in front of it is a syntax error, not
+        // an empty-command trick (`> file` alone is not supported).
+        if (!current.length) fail("syntax error: redirect '" + t.text + "' without a command");
+        // Other file descriptors (1>, 3>, ...) are out of scope: a digit word
+        // glued to the operator must not silently become an argument.
+        if (t.text === '>' || t.text === '>>') {
+          const prev = current[current.length - 1];
+          if (prev && !prev.op && !prev.quoted && /^[0-9]+$/.test(prev.text)
+            && prev.pos + prev.text.length === t.pos) {
+            fail("unsupported redirect: '" + prev.text + t.text + "' (supported redirects: > >> 2> 2>> 2>&1)");
+          }
         }
         current.push(t);
         pendingPipe = false;
         break;
-      }
+      default:
+        fail("unsupported operator: '" + t.text + "' (supported operators: ; && || |; supported redirects: > >> 2> 2>> 2>&1)");
     }
   }
   if (pendingPipe) fail("syntax error: empty command after '|'");
   if (current.length) pipeline.push({ argv: current });
   if (pipeline.length) steps.push({ connector: connector, pipeline: pipeline });
-  else if (connector === '&&') fail("syntax error: empty command after '&&'");
+  else if (connector === '&&' || connector === '||') fail("syntax error: empty command after '" + connector + "'");
   return steps;
 }
 
@@ -750,8 +812,12 @@ function joinDisplay(base, name) {
   return base === '.' ? './' + name : base.replace(/\/+$/, '') + '/' + name;
 }
 
-function shOk(output) { return { output: output, isError: false }; }
-function shErr(output) { return { output: output, isError: true }; }
+// Internal per-command result: stdout and stderr stay SEPARATED inside the
+// executor (pipelines forward stdout only; 2> / 2>&1 routing depends on the
+// split). They are merged only at the outermost boundary for presentation.
+function shOk(stdout) { return { success: true, stdout: stdout, stderr: '' }; }
+function shErr(stderr) { return { success: false, stdout: '', stderr: stderr }; }
+function shErrAt(stderr, stdout) { return { success: false, stdout: stdout || '', stderr: stderr }; }
 
 // ---------- command handlers ----------
 
@@ -857,30 +923,7 @@ async function shCat(ctx, args, stdin) {
 }
 
 async function shEcho(ctx, args) {
-  // Supports: echo text | echo text > file | echo text >> file
-  // Only UNQUOTED > / >> tokens redirect; quoted ones are text.
-  let redirect = null, rIndex = -1;
-  for (let i = 0; i < args.length; i++) {
-    if (args[i].op && (args[i].text === '>' || args[i].text === '>>')) {
-      if (redirect) return shErr('echo: multiple redirects are not supported');
-      redirect = args[i].text; rIndex = i;
-    }
-  }
-  if (redirect) {
-    if (!ctx.workspace) return shErr('echo: no workspace selected');
-    const target = args[rIndex + 1];
-    if (!target) return shErr('echo: missing redirect target');
-    if (rIndex + 2 < args.length) return shErr('echo: unexpected arguments after redirect target');
-    const rel = resolveShellPath(ctx, target.text);
-    let text = args.slice(0, rIndex).map((t) => t.text).join(' ') + '\n';
-    if (redirect === '>>' && (await ctx.workspace.exists(rel))) {
-      text = (await ctx.workspace.read(rel)) + text;
-    }
-    // reads above awaited: re-check cancellation before writing
-    throwIfCancelled(ctx.opts && ctx.opts.signal, 'echo');
-    await ctx.workspace.write(rel, text);
-    return shOk('');
-  }
+  // Redirection is generic (executor-level) — echo only prints its arguments.
   return shOk(args.map((t) => t.text).join(' '));
 }
 
@@ -1192,6 +1235,303 @@ async function shWc(ctx, args, stdin) {
   return shOk(lines.join('\n'));
 }
 
+// ---------- mv / rm ----------
+// Bounded, workspace-confined file mutations implemented on WorkspaceAdapter
+// primitives only. A move NEVER deletes its source before the destination
+// write has landed and been verified; a recursive delete reports exactly
+// what committed when cancelled (a cancel is not a rollback).
+
+// Bounds for recursive directory moves/copies.
+const MV_MAX_ENTRIES = 1000;
+const MV_MAX_TOTAL_BYTES = 25 * 1024 * 1024;
+
+function baseName(rel) {
+  return rel.slice(rel.lastIndexOf('/') + 1);
+}
+
+function parentRel(rel) {
+  const i = rel.lastIndexOf('/');
+  return i === -1 ? '' : rel.slice(0, i);
+}
+
+// Cancellation inside a mutating traversal: the thrown error carries exactly
+// what already committed so the outer report never pretends a rollback.
+function throwMutationCancelled(signal, what, done) {
+  if (signal && signal.aborted) {
+    const e = makeCancelledError(what);
+    e.detail = what + ': cancelled after committing ' + done.length + ' entrie(s): '
+      + done.slice(0, 10).join(', ') + (done.length > 10 ? ', …' : '') + ' (not rolled back)';
+    throw e;
+  }
+}
+
+async function shMv(ctx, args) {
+  if (!ctx.workspace) return shErr('mv: no workspace selected');
+  const signal = ctx.opts && ctx.opts.signal;
+  const operands = [];
+  for (const t of args) {
+    if (!t.quoted && t.text.charAt(0) === '-' && t.text.length > 1) {
+      if (t.text === '-f') return shErr('mv: -f is not supported (an existing destination is never overwritten)');
+      return shErr('mv: unsupported option: ' + t.text + ' (no options are supported)');
+    }
+    operands.push(t.text);
+  }
+  if (operands.length < 2) return shErr('usage: mv <src>... <dest>');
+
+  const destDisplay = operands[operands.length - 1];
+  let destRel;
+  try {
+    destRel = resolveShellPath(ctx, destDisplay);
+  } catch (e) {
+    return shErr('mv: ' + destDisplay + ': ' + e.message);
+  }
+  const sources = operands.slice(0, -1);
+  let destStat = null;
+  try {
+    destStat = await ctx.workspace.stat(destRel);
+  } catch (e) {
+    if (!e || e.name !== 'NotFoundError') return shErr('mv: ' + destDisplay + ': ' + e.message);
+  }
+  if (sources.length > 1 && (!destStat || destStat.kind !== 'directory')) {
+    return shErr('mv: target ' + destDisplay + ': not a directory (required with multiple sources)');
+  }
+
+  const moved = [];
+  for (const srcDisplay of sources) {
+    throwIfCancelled(signal, 'mv');
+    let srcRel;
+    try {
+      srcRel = resolveShellPath(ctx, srcDisplay);
+    } catch (e) {
+      return shErr('mv: ' + srcDisplay + ': ' + e.message);
+    }
+    if (!srcRel) return shErr('mv: ' + srcDisplay + ': refusing to move the workspace root');
+    let srcStat;
+    try {
+      srcStat = await ctx.workspace.stat(srcRel);
+    } catch (e) {
+      return shErr('mv: ' + srcDisplay + ': ' + (e && e.name === 'NotFoundError' ? 'no such file or directory' : e.message));
+    }
+
+    // An existing destination directory means "move INTO it"; any other
+    // existing destination is a loud failure (no implicit overwrite, no -f).
+    let finalRel = destRel;
+    if (destStat && destStat.kind === 'directory') {
+      finalRel = destRel ? destRel + '/' + baseName(srcRel) : baseName(srcRel);
+    }
+    if (finalRel === srcRel) return shErr('mv: ' + srcDisplay + ' and ' + destDisplay + ' are the same file');
+    if (destStat && destStat.kind !== 'directory') {
+      return shErr('mv: ' + destDisplay + ': destination exists');
+    }
+    if (srcStat.kind === 'directory' && (finalRel === srcRel || finalRel.startsWith(srcRel + '/'))) {
+      return shErr('mv: cannot move a directory into itself: ' + srcDisplay);
+    }
+    if (await ctx.workspace.exists(finalRel)) {
+      return shErr('mv: destination exists: ' + (destStat && destStat.kind === 'directory' ? finalRel : destDisplay));
+    }
+    // The destination parent must be an existing directory.
+    const parent = parentRel(finalRel);
+    if (parent) {
+      let pst;
+      try {
+        pst = await ctx.workspace.stat(parent);
+      } catch (e) {
+        return shErr('mv: ' + destDisplay + ': ' + (e && e.name === 'NotFoundError' ? 'no such directory' : e.message));
+      }
+      if (pst.kind !== 'directory') return shErr('mv: ' + destDisplay + ': parent is not a directory');
+    }
+
+    if (srcStat.kind === 'directory') {
+      const err = await mvDirectory(ctx, srcRel, finalRel, signal);
+      if (err) return shErr(err);
+    } else {
+      const err = await mvFile(ctx, srcRel, finalRel, signal);
+      if (err) return shErr(err);
+    }
+    moved.push(srcRel + ' -> ' + finalRel);
+  }
+  const r = shOk('');
+  r.fs = true;
+  return r;
+}
+
+// file → new path: copy, VERIFY the destination landed, only then remove
+// the source. A failed/short destination write leaves the source untouched.
+async function mvFile(ctx, srcRel, finalRel, signal) {
+  throwIfCancelled(signal, 'mv');
+  const bytes = await ctx.workspace.readBytes(srcRel);
+  throwIfCancelled(signal, 'mv');
+  await ctx.workspace.write(finalRel, bytes);
+  throwIfCancelled(signal, 'mv');
+  const check = await ctx.workspace.readBytes(finalRel);
+  if (check.byteLength !== bytes.byteLength || bytesToB64(check) !== bytesToB64(bytes)) {
+    return 'mv: write verification failed for ' + finalRel + '; source preserved';
+  }
+  throwIfCancelled(signal, 'mv');
+  await ctx.workspace.remove(srcRel);
+  return null;
+}
+
+// directory → new path: bounded pre-scan, full recursive copy, THEN a
+// separate recursive delete of the source. The copy phase completing is the
+// commit point — a cancel during copy leaves the source fully intact.
+async function mvDirectory(ctx, srcRel, finalRel, signal) {
+  const files = [];
+  const dirs = [];
+  let totalBytes = 0;
+  async function scan(rel) {
+    throwIfCancelled(signal, 'mv');
+    if (files.length + dirs.length >= MV_MAX_ENTRIES) {
+      throw new Error('mv: directory exceeds the ' + MV_MAX_ENTRIES + '-entry move limit');
+    }
+    const entries = await ctx.workspace.list(rel);
+    for (const e of entries) {
+      const child = rel + '/' + e.name;
+      if (e.kind === 'directory') {
+        dirs.push(child);
+        await scan(child);
+      } else {
+        const st = await ctx.workspace.stat(child);
+        totalBytes += st.size;
+        if (totalBytes > MV_MAX_TOTAL_BYTES) {
+          throw new Error('mv: directory exceeds the ' + MV_MAX_TOTAL_BYTES + '-byte move limit');
+        }
+        files.push(child);
+      }
+    }
+  }
+  try {
+    await scan(srcRel);
+  } catch (e) {
+    if (isCancelledError(e)) throw e;
+    return e.message;
+  }
+
+  // copy phase — source stays untouched until every file landed
+  for (const f of files) {
+    throwIfCancelled(signal, 'mv');
+    const bytes = await ctx.workspace.readBytes(f);
+    throwIfCancelled(signal, 'mv');
+    try {
+      await ctx.workspace.write(finalRel + '/' + f.slice(srcRel.length + 1), bytes);
+    } catch (e) {
+      return 'mv: copy failed at ' + f + ' (' + (e && e.message ? e.message : String(e))
+        + '); source preserved, partial destination may exist';
+    }
+  }
+
+  // delete phase — deepest first so directories are empty when removed
+  const deleted = [];
+  const all = files.concat(dirs.slice().reverse());
+  try {
+    for (const p of all) {
+      throwMutationCancelled(signal, 'mv', deleted.map((d) => 'delete ' + d));
+      await ctx.workspace.remove(p);
+      deleted.push(p);
+    }
+    throwMutationCancelled(signal, 'mv', deleted.map((d) => 'delete ' + d));
+    await ctx.workspace.remove(srcRel);
+    deleted.push(srcRel);
+  } catch (e) {
+    if (isCancelledError(e)) throw e;
+    return 'mv: delete failed at ' + (deleted.length ? 'entry after ' + deleted[deleted.length - 1] : srcRel)
+      + ' (' + (e && e.message ? e.message : String(e)) + '); destination is complete, source may be partially removed';
+  }
+  return null;
+}
+
+async function shRm(ctx, args) {
+  if (!ctx.workspace) return shErr('rm: no workspace selected');
+  const signal = ctx.opts && ctx.opts.signal;
+  let force = false, recursive = false;
+  const operands = [];
+  for (const t of args) {
+    if (!t.quoted && t.text.charAt(0) === '-' && t.text.length > 1) {
+      for (const ch of t.text.slice(1)) {
+        if (ch === 'f') force = true;
+        else if (ch === 'r' || ch === 'R') recursive = true;
+        else return shErr('rm: unsupported option: -' + ch + ' (supported options: -f -r -R)');
+      }
+    } else {
+      operands.push(t.text);
+    }
+  }
+  if (!operands.length) return force ? shOk('') : shErr('usage: rm [-f] [-r|-R] <path>...');
+
+  const errors = [];
+  const deleted = [];
+  for (const op of operands) {
+    throwMutationCancelled(signal, 'rm', deleted);
+    let rel;
+    try {
+      rel = resolveShellPath(ctx, op);
+    } catch (e) {
+      errors.push('rm: ' + op + ': ' + e.message);
+      continue;
+    }
+    // Hard stop: nothing may recursively remove the workspace root, however
+    // spelled (/, /., /x/.., ...). This is disaster prevention, not a
+    // permission system.
+    if (!rel) {
+      errors.push(recursive
+        ? 'rm: refusing to recursively remove workspace root'
+        : 'rm: ' + op + ': is a directory');
+      continue;
+    }
+    let st;
+    try {
+      st = await ctx.workspace.stat(rel);
+    } catch (e) {
+      if (e && e.name === 'NotFoundError') {
+        if (!force) errors.push('rm: ' + op + ': no such file or directory');
+        continue;
+      }
+      errors.push('rm: ' + op + ': ' + e.message);
+      continue;
+    }
+    if (st.kind === 'directory') {
+      if (!recursive) {
+        errors.push('rm: ' + op + ': is a directory');
+        continue;
+      }
+      await rmRecursive(ctx, rel, signal, deleted);
+    } else {
+      throwMutationCancelled(signal, 'rm', deleted);
+      await ctx.workspace.remove(rel);
+      deleted.push(rel);
+    }
+  }
+  if (errors.length) {
+    const r = shErr(errors.join('\n'));
+    if (deleted.length) r.fs = true;
+    return r;
+  }
+  const r = shOk('');
+  if (deleted.length) r.fs = true;
+  return r;
+}
+
+// Depth-first recursive delete: children (deepest first) before the
+// directory itself, with a cancellation check before EVERY removal. Already
+// committed deletions are reported on the cancellation error, never hidden.
+async function rmRecursive(ctx, rel, signal, deleted) {
+  throwMutationCancelled(signal, 'rm', deleted);
+  const entries = await ctx.workspace.list(rel);
+  for (const e of entries) {
+    const child = rel + '/' + e.name;
+    if (e.kind === 'directory') {
+      await rmRecursive(ctx, child, signal, deleted);
+    } else {
+      throwMutationCancelled(signal, 'rm', deleted);
+      await ctx.workspace.remove(child);
+      deleted.push(child);
+    }
+  }
+  throwMutationCancelled(signal, 'rm', deleted);
+  await ctx.workspace.remove(rel);
+  deleted.push(rel);
+}
+
 async function shPython(ctx, args) {
   return await runPython(args.map((t) => t.text), ctx, ctx.opts);
 }
@@ -1207,7 +1547,9 @@ async function shHelp() {
 // ---------- executor ----------
 
 // Execute one shell command line against the workspace.
-// Returns { output: string, isError: boolean, io: {in, out} } — io in UTF-8 bytes.
+// Returns { output: string, isError: boolean, io: {in, out} } for the tool
+// layer — stdout/stderr are separated INSIDE the executor and merged only
+// here, for presentation. io in UTF-8 bytes.
 // The virtual cwd starts at the workspace root on EVERY invocation and never
 // persists across tool calls.
 async function runShellCommand(input, workspace, opts) {
@@ -1218,7 +1560,9 @@ async function runShellCommand(input, workspace, opts) {
   // Heredoc python is recognized before generic tokenizing.
   const heredoc = extractPythonHeredoc(line);
   if (heredoc) {
-    return await runPythonCode(heredoc.code, workspace, opts);
+    const r = await runPythonCode(heredoc.code, workspace, opts);
+    const output = [r.stdout, r.stderr].filter(Boolean).join('\n');
+    return { output: output, isError: !r.success, io: r.io };
   }
 
   let steps;
@@ -1232,6 +1576,7 @@ async function runShellCommand(input, workspace, opts) {
   const ctx = { workspace: workspace, opts: opts, cwd: '' };
   const outParts = [];
   const networkOps = [];
+  let fsOps = 0;
   let prevSuccess = true;
   let lastRes = null;
 
@@ -1240,31 +1585,44 @@ async function runShellCommand(input, workspace, opts) {
       // Cancellation is re-checked between commands: a task cancelled after
       // `echo A > a.txt` must never run the next command's side effects.
       throwIfCancelled(opts && opts.signal, 'bash');
+      // and_or_list is left-associative: && skips on failure, || on success.
       if (step.connector === '&&' && !prevSuccess) continue;
+      if (step.connector === '||' && prevSuccess) continue;
       const res = await runPipeline(step.pipeline, ctx);
-      prevSuccess = !res.isError;
-      if (res.output) outParts.push(res.output);
+      prevSuccess = res.success;
+      if (res.stdout) outParts.push(res.stdout);
+      if (res.stderr) outParts.push(res.stderr);
       if (res.network) networkOps.push(res.network);
+      if (res.fs) fsOps++;
       lastRes = res;
     }
   } catch (e) {
-    if (isCancelledError(e)) outParts.push('bash: cancelled');
-    else outParts.push('bash: ' + (e && e.message ? e.message : String(e)));
+    if (isCancelledError(e)) {
+      // Mutating commands (rm/mv) attach exactly what already committed —
+      // a cancel is never a rollback and the report must say so.
+      if (e.detail) outParts.push(e.detail);
+      outParts.push('bash: cancelled');
+    } else {
+      outParts.push('bash: ' + (e && e.message ? e.message : String(e)));
+    }
     const output = outParts.join('\n');
     return { output: output, isError: true, io: ioOf(output) };
   }
 
   const output = outParts.join('\n');
-  const result = { output: output, isError: lastRes ? lastRes.isError : false, io: ioOf(output) };
-  // Network metadata: a single network command keeps its real backend; a
-  // compound command mixing several network operations reports honestly as
-  // `compound` instead of attributing one backend to all of them.
-  if (networkOps.length === 1) {
+  const result = { output: output, isError: lastRes ? !lastRes.success : false, io: ioOf(output) };
+  // Operation metadata: a single network command keeps its real backend; a
+  // compound command mixing several operations reports honestly instead of
+  // attributing one backend to all of them.
+  if (networkOps.length === 1 && !fsOps) {
     result.backend = networkOps[0].backend;
     result.operation = 'network';
-  } else if (networkOps.length > 1) {
+  } else if (networkOps.length > 1 || (networkOps.length && fsOps)) {
     result.backend = 'browser';
     result.operation = 'compound';
+  } else if (fsOps) {
+    result.backend = 'browser';
+    result.operation = 'filesystem';
   }
   return result;
 }
@@ -1272,76 +1630,172 @@ async function runShellCommand(input, workspace, opts) {
 async function runPipeline(pipeline, ctx) {
   let stdin = null;
   let network = null;
-  let res = { output: '', isError: false };
+  let fs = false;
+  const stderrParts = [];
+  let res = { success: true, stdout: '', stderr: '' };
   for (let i = 0; i < pipeline.length; i++) {
     throwIfCancelled(ctx.opts && ctx.opts.signal, 'bash');
     res = await runSimpleCommand(pipeline[i], ctx, stdin);
     if (res.network) network = res.network;
-    if (res.isError) { res.network = network; return res; }
+    if (res.fs) fs = true;
+    if (res.stderr) stderrParts.push(res.stderr);
     if (i < pipeline.length - 1) {
-      if (utf8ByteLength(res.output) > SHELL_PIPE_MAX_BYTES) {
+      // A pipeline forwards STDOUT ONLY — stderr is never fed downstream
+      // (that is exactly what an explicit `2>&1` is for). Like a real shell,
+      // a failed left stage does not stop the right stages from running.
+      if (utf8ByteLength(res.stdout) > SHELL_PIPE_MAX_BYTES) {
         // Fail loudly: downstream stages must never receive silently
         // truncated input and mistake it for a complete answer.
         const err = shErr('bash: pipeline stage output exceeds the ' + SHELL_PIPE_MAX_BYTES
           + '-byte limit; refusing to forward truncated data (narrow the command, e.g. with head -n)');
         err.network = network;
+        err.fs = fs;
         return err;
       }
-      stdin = res.output;
+      stdin = res.stdout;
     }
   }
-  res.network = network;
-  return res;
+  // Pipeline status is the LAST stage's status (shell semantics); stderr is
+  // the concatenation of every stage's diagnostics.
+  return {
+    success: res.success,
+    stdout: res.stdout,
+    stderr: stderrParts.join('\n'),
+    network: network,
+    fs: fs,
+  };
 }
 
+// Execute one simple command: resolve the handler, extract redirections
+// (applied LEFT TO RIGHT — `> all.txt 2>&1` and `2>&1 > out.txt` differ),
+// run the command, then deliver its stdout/stderr through the routing state.
 async function runSimpleCommand(cmd, ctx, stdin) {
   const argv = cmd.argv;
   let name = argv[0].text;
   if (name === 'python3') name = 'python'; // alias
   const spec = SHELL_COMMANDS[name];
-  if (!spec) return shErr(shellError(name));
-  for (const t of argv) {
-    if (t.op && (t.text === '>' || t.text === '>>') && name !== 'echo') {
-      return shErr('bash: redirection (> / >>) is only supported for echo text > file / echo text >> file');
+
+  // ---- redirection routing state ----
+  // stdout: {kind:'capture'} | {kind:'file', path, append}
+  // stderr: same, plus {kind:'merge-stdout'} (2>&1 while stdout was captured)
+  const args = [];
+  const route = { stdout: { kind: 'capture' }, stderr: { kind: 'capture' } };
+  for (let i = 1; i < argv.length; i++) {
+    const t = argv[i];
+    if (!t.op) { args.push(t); continue; }
+    if (t.text === '2>&1') {
+      // stderr inherits stdout's CURRENT destination — a snapshot, so a later
+      // `> file` does not retroactively move stderr.
+      route.stderr = route.stdout.kind === 'file'
+        ? { kind: 'file', path: route.stdout.path, append: route.stdout.append }
+        : { kind: 'merge-stdout' };
+      continue;
+    }
+    const target = argv[++i];
+    if (!target || target.op) return shErr('bash: missing redirect target after "' + t.text + '"');
+    if (!ctx.workspace) return shErr('bash: no workspace selected (cannot redirect to a file)');
+    let rel;
+    try {
+      rel = resolveShellPath(ctx, target.text);
+    } catch (e) {
+      return shErr('bash: ' + e.message);
+    }
+    if (!rel) return shErr('bash: redirect target must be a file path, not the workspace root');
+    const dest = { kind: 'file', path: rel, append: t.text === '>>' || t.text === '2>>' };
+    if (t.text.charAt(0) === '2') route.stderr = dest;
+    else route.stdout = dest;
+  }
+
+  let res;
+  if (!spec) {
+    // Even an unknown command's error is stderr and routes like stderr.
+    res = shErr(shellError(name));
+  } else if (stdin !== null && stdin !== undefined && !spec.stdin) {
+    res = shErr('bash: ' + name + ': does not read stdin (pipeline input has nowhere to go)');
+  } else {
+    try {
+      res = await spec.run(ctx, args, stdin);
+    } catch (e) {
+      if (isCancelledError(e)) throw e;
+      // Handler failures are the command's stderr — redirection applies to
+      // them exactly like to normally-produced stderr.
+      res = shErr('bash: ' + name + ': ' + (e && e.message ? e.message : String(e)));
     }
   }
-  if (stdin !== null && stdin !== undefined && !spec.stdin) {
-    return shErr('bash: ' + name + ': does not read stdin (pipeline input has nowhere to go)');
+
+  // ---- deliver streams through the routing state ----
+  // Redirection changes WHERE output goes, never the command's success.
+  const out = {
+    success: res.success,
+    stdout: '',
+    stderr: route.stderr.kind === 'capture' ? (res.stderr || '') : '',
+    network: res.network || null,
+    fs: !!res.fs,
+  };
+  const writes = [];
+  if (route.stdout.kind === 'file') writes.push({ dest: route.stdout, text: res.stdout || '' });
+  else out.stdout = res.stdout || '';
+  if (route.stderr.kind === 'file') writes.push({ dest: route.stderr, text: res.stderr || '' });
+  else if (route.stderr.kind === 'merge-stdout') {
+    out.stdout = [out.stdout, res.stderr].filter(Boolean).join('\n');
   }
-  try {
-    return await spec.run(ctx, argv.slice(1), stdin);
-  } catch (e) {
-    if (isCancelledError(e)) throw e;
-    return shErr('bash: ' + name + ': ' + (e && e.message ? e.message : String(e)));
+
+  const signal = ctx.opts && ctx.opts.signal;
+  const writtenPaths = new Set();
+  for (const w of writes) {
+    let text = w.text;
+    // Captured streams carry no trailing newline; a redirected stream
+    // terminates like a real one would (echo hi > f → "hi\n").
+    if (text && !text.endsWith('\n')) text += '\n';
+    // A second stream aimed at the same file in the same command appends to
+    // what the first write just landed (stdout first, then stderr).
+    const append = w.dest.append || writtenPaths.has(w.dest.path);
+    try {
+      if (append && (await ctx.workspace.exists(w.dest.path))) {
+        text = (await ctx.workspace.read(w.dest.path)) + text;
+      }
+      // reads above awaited: re-check cancellation before writing
+      throwIfCancelled(signal, name);
+      await ctx.workspace.write(w.dest.path, text);
+      writtenPaths.add(w.dest.path);
+    } catch (e) {
+      if (isCancelledError(e)) throw e;
+      out.success = false;
+      out.stderr = [out.stderr, 'bash: ' + name + ': cannot write ' + w.dest.path + ': '
+        + (e && e.message ? e.message : String(e))].filter(Boolean).join('\n');
+      return out;
+    }
   }
+  if (writes.length) out.fs = true;
+  return out;
 }
 
 async function runPython(args, ctx, opts) {
   let code = null;
 
   if (!args.length) {
-    return { output: 'usage: python -c "<code>" | python <script.py> | python <<\'PY\' ... PY', isError: true };
+    return shErr('usage: python -c "<code>" | python <script.py> | python <<\'PY\' ... PY');
   }
   if (args[0] === '--version' || args[0] === '-V') {
-    return { output: 'Python (browser runtime)', isError: false };
+    return shOk('Python (browser runtime)');
   }
   if (args[0] === '-c') {
     code = args.slice(1).join(' ');
   } else {
     const script = args[0];
-    if (!ctx.workspace) return { output: 'python: no workspace selected (cannot read ' + script + ')', isError: true };
+    if (!ctx.workspace) return shErr('python: no workspace selected (cannot read ' + script + ')');
     // The script path resolves against the shell's virtual cwd; Python's own
     // filesystem root remains the workspace root (documented divergence).
     let rel;
     try {
       rel = resolveShellPath(ctx, script);
     } catch (e) {
-      return { output: 'python: ' + e.message, isError: true };
+      return shErr('python: ' + e.message);
     }
     try {
       code = await ctx.workspace.read(rel);
     } catch (e) {
-      return { output: 'python: can\'t open file \'' + script + '\': ' + e.message, isError: true };
+      return shErr('python: can\'t open file \'' + script + '\': ' + e.message);
     }
   }
 
@@ -1350,7 +1804,7 @@ async function runPython(args, ctx, opts) {
 
 async function runPythonCode(code, workspace, opts) {
   if (!code || !code.trim()) {
-    return { output: 'python: empty code', isError: true, io: { in: 0, out: 0 } };
+    return { success: false, stdout: '', stderr: 'python: empty code', io: { in: 0, out: 0 } };
   }
 
   let res;
@@ -1358,42 +1812,47 @@ async function runPythonCode(code, workspace, opts) {
     res = await PythonRuntime.run(code, workspace, opts);
   } catch (e) {
     if (isCancelledError(e)) {
-      return { output: 'python: execution cancelled', isError: true, cancelled: true, io: { in: utf8ByteLength(code), out: 0 } };
+      return { success: false, stdout: '', stderr: 'python: execution cancelled', cancelled: true, io: { in: utf8ByteLength(code), out: 0 } };
     }
     throw e;
   }
 
-  let output = '';
-  if (res.stdout) output += res.stdout.replace(/\n$/, '');
-  if (res.stderr) output += (output ? '\n' : '') + res.stderr.replace(/\n$/, '');
-  if (res.error) output += (output ? '\n' : '') + res.error;
+  // stdout carries normal output + commit reports; stderr carries Python's
+  // own stderr, execution errors and every commit-failure note.
+  const outParts = [];
+  const errParts = [];
+  if (res.stdout) outParts.push(res.stdout.replace(/\n$/, ''));
+  if (res.stderr) errParts.push(res.stderr.replace(/\n$/, ''));
+  if (res.error) errParts.push(res.error);
   if (res.stdoutTruncated) {
-    output += (output ? '\n' : '') + '[python output limit: stdout truncated]';
+    outParts.push('[python output limit: stdout truncated]');
   }
   if (res.stderrTruncated) {
-    output += (output ? '\n' : '') + '[python output limit: stderr truncated]';
+    errParts.push('[python output limit: stderr truncated]');
   }
   if (res.skipped && res.skipped.length) {
     const shown = res.skipped.slice(0, 10).map((s) => s.path + ' (' + s.reason + ')');
-    output += (output ? '\n' : '') +
-      '[workspace sync: ' + res.skipped.length + ' file(s) NOT visible to Python: ' + shown.join('; ') +
-      (res.skipped.length > shown.length ? '; …' : '') + ']';
+    outParts.push('[workspace sync: ' + res.skipped.length + ' file(s) NOT visible to Python: ' + shown.join('; ')
+      + (res.skipped.length > shown.length ? '; …' : '') + ']');
   }
   if (res.written && res.written.length) {
-    output += (output ? '\n' : '') + '[written to workspace: ' + res.written.join(', ') + ']';
+    outParts.push('[written to workspace: ' + res.written.join(', ') + ']');
   }
   if (res.deleted && res.deleted.length) {
-    output += (output ? '\n' : '') + '[deleted from workspace: ' + res.deleted.join(', ') + ']';
+    outParts.push('[deleted from workspace: ' + res.deleted.join(', ') + ']');
   }
   for (const c of res.conflicts || []) {
-    output += (output ? '\n' : '') + '[conflict: ' + c.path + ': ' + c.reason + ']';
+    errParts.push('[conflict: ' + c.path + ': ' + c.reason + ']');
   }
   for (const f of res.writeFailed || []) {
-    output += (output ? '\n' : '') + '[write-back failed: ' + f + ']';
+    errParts.push('[write-back failed: ' + f + ']');
   }
   for (const p of res.notPersisted || []) {
-    output += (output ? '\n' : '') + '[not persisted: ' + p + ']';
+    errParts.push('[not persisted: ' + p + ']');
   }
+
+  const stdout = outParts.join('\n');
+  const stderr = errParts.join('\n');
 
   // Compute success and commit success are reported separately: a run that
   // computed fine but could not fully persist is a FAILURE state (partial
@@ -1404,9 +1863,13 @@ async function runPythonCode(code, workspace, opts) {
     || (res.notPersisted && res.notPersisted.length > 0);
 
   return {
-    output,
-    isError: !!res.error || commitFailed,
-    io: { in: utf8ByteLength(code) + res.inputBytes, out: utf8ByteLength(output) + res.outputBytes },
+    success: !res.error && !commitFailed,
+    stdout,
+    stderr,
+    io: {
+      in: utf8ByteLength(code) + res.inputBytes,
+      out: utf8ByteLength(stdout) + utf8ByteLength(stderr) + res.outputBytes,
+    },
   };
 }
 
@@ -1438,9 +1901,10 @@ function isTextLikeMime(contentType) {
 
 async function runCurl(args, ctx, opts) {
   const workspace = ctx.workspace;
-  const netResult = (output, isError, net) => ({
-    output,
-    isError,
+  const netResult = (text, success, net) => ({
+    success,
+    stdout: success ? text : '',
+    stderr: success ? '' : text,
     // network metadata flows up to telemetry via the compound executor
     network: net ? { backend: net.backend } : null,
   });
@@ -1452,24 +1916,24 @@ async function runCurl(args, ctx, opts) {
     const a = args[i];
     if (a === '-o' || a === '--output') {
       outFile = args[++i];
-      if (!outFile) return netResult('curl: -o requires a file path', true);
+      if (!outFile) return netResult('curl: -o requires a file path', false);
     } else if (a.startsWith('-')) {
-      return netResult('curl: option not supported in local browser runtime: ' + a, true);
+      return netResult('curl: option not supported in local browser runtime: ' + a, false);
     } else if (url) {
-      return netResult('curl: only one URL is supported', true);
+      return netResult('curl: only one URL is supported', false);
     } else {
       url = a;
     }
   }
-  if (!url) return netResult('usage: curl <https-url> | curl -o <file> <https-url>', true);
+  if (!url) return netResult('usage: curl <https-url> | curl -o <file> <https-url>', false);
 
   // A download with nowhere to write must fail BEFORE any network request.
-  if (outFile && !workspace) return netResult('curl: no workspace selected', true);
+  if (outFile && !workspace) return netResult('curl: no workspace selected', false);
   if (outFile) {
     try {
       outFile = resolveShellPath(ctx, outFile);
     } catch (e) {
-      return netResult('curl: ' + e.message, true);
+      return netResult('curl: ' + e.message, false);
     }
   }
 
@@ -1477,8 +1941,8 @@ async function runCurl(args, ctx, opts) {
   try {
     res = await NetworkRuntime.fetch(url, { signal: opts && opts.signal });
   } catch (e) {
-    if (isCancelledError(e)) return netResult('curl: cancelled', true);
-    return netResult('curl: ' + (e && e.message ? e.message : String(e)), true);
+    if (isCancelledError(e)) return netResult('curl: cancelled', false);
+    return netResult('curl: ' + (e && e.message ? e.message : String(e)), false);
   }
 
   // An HTTP error status is an authoritative response, not a transport
@@ -1489,7 +1953,7 @@ async function runCurl(args, ctx, opts) {
       const preview = new TextDecoder().decode(res.bytes.slice(0, 500)).replace(/\n$/, '');
       if (preview.trim()) output += '\n' + preview;
     }
-    return netResult(output, true, res);
+    return netResult(output, false, res);
   }
 
   if (outFile) {
@@ -1497,15 +1961,16 @@ async function runCurl(args, ctx, opts) {
     throwIfCancelled(opts && opts.signal, 'curl');
     // Binary-safe: raw bytes go straight into the workspace, no decoding.
     await workspace.write(outFile, res.bytes);
-    return netResult('[written to workspace: ' + outFile + ', ' + res.bytes.byteLength + ' bytes]', false, res);
+    // Telemetry stays `network`: the download IS the network operation.
+    return netResult('[written to workspace: ' + outFile + ', ' + res.bytes.byteLength + ' bytes]', true, res);
   }
 
   if (isTextLikeMime(res.headers['content-type'])) {
-    return netResult(new TextDecoder('utf-8').decode(res.bytes).replace(/\n$/, ''), false, res);
+    return netResult(new TextDecoder('utf-8').decode(res.bytes).replace(/\n$/, ''), true, res);
   }
 
   const mime = String(res.headers['content-type'] || 'application/octet-stream').split(';')[0].trim();
   return netResult(
     'curl: binary response (' + mime + ', ' + res.bytes.byteLength + ' bytes); use curl -o <file> <url>',
-    false, res);
+    true, res);
 }
