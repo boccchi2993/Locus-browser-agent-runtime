@@ -156,7 +156,12 @@ npm run build    # static build into dist/ (deployable as-is)
 
 The presentation layer is Vue 3 + Vite. It is a **projection of the AgentSession runtime event stream** (`task_start` / `reasoning` / `tool_call` / `tool_result` / `assistant_text` / `warning` / `error` / `task_end`): the runtime under `src/` stays framework-independent classic scripts, and the conversation timeline in the UI is **not** the provider history — provider history is owned by `AgentSession` / the provider adapters, the timeline is owned by the presentation store, and neither is ever reconstructed from the other.
 
-You need an LLM API key (default endpoint: DeepSeek; Anthropic and OpenAI-compatible endpoints also work) — set it in the Settings panel. The key is never written to the repo; if you opt into "remember", it is kept in `sessionStorage` only (cleared when the tab closes).
+You need an LLM API key — set it in the Settings panel. Defaults:
+
+- Default endpoint: `https://api.deepseek.com/anthropic`
+- Default model: DeepSeek V4.1 Flash (`deepseek-flash`)
+
+Locus remains provider/model configurable — this is only the initial default; Anthropic and OpenAI-compatible endpoints and any custom model name work too. The key is never written to the repo; if you opt into "remember", it is kept in `sessionStorage` only (cleared when the tab closes).
 
 Connection behavior: if you configure an explicit proxy URL it is always used. Otherwise the app calls the model API directly; only on a genuine network/CORS failure (and only when hosted over HTTP(S)) does it fall back to a same-origin `/proxy`. HTTP 4xx/5xx provider responses are never re-sent elsewhere.
 
@@ -269,6 +274,7 @@ node tests/shell-compat.test.cjs # Unix compatibility baseline: ; && |, cd/virtu
 node tests/shell-compat2.test.cjs # round 2: stdout/stderr separation, ||, mv, rm, > >> 2> 2>> 2>&1 (order), pipe+stderr, fs telemetry
 node tests/agent.test.cjs        # session binding, cancellation vs session-switch semantics, byte-based history budget with whole-task trimming, 32-iteration cap
 node tests/presentation.test.cjs # runtime-event → timeline projection, markdown-lite safety, AgentSession→projector integration
+node tests/store-defaults.test.cjs # settings defaults (deepseek-flash @ DeepSeek Anthropic endpoint), user override, remembered-session precedence, test-connection model
 node tests/worker-init.test.cjs  # Pyodide init-failure recovery (real worker source from index.html)
 node tests/worker-output.test.cjs # worker diffOut limits: structured uncollected status, rename safety, real commit logic
 node tests/verify-active-content.cjs # /fetch active-content isolation through the REAL handler in headless Chrome

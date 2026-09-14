@@ -30,7 +30,7 @@ const SESSION_CONFIG_KEY = 'bar.v0.sessionConfig.v1';
 const DEFAULTS = {
   apiKey: '',
   apiBase: 'https://api.deepseek.com/anthropic',
-  model: 'deepseek-v4-pro',
+  model: 'deepseek-flash',
   proxy: '',
   dialect: 'auto',
   remember: false,

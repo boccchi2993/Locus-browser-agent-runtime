@@ -15,6 +15,7 @@ const SUITES = [
   'shell-compat2.test.cjs',
   'agent.test.cjs',
   'presentation.test.cjs',
+  'store-defaults.test.cjs',
   'conversation-routing.test.mjs',
   'worker-init.test.cjs',
   'worker-output.test.cjs',

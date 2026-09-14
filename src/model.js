@@ -33,7 +33,7 @@
 const Model = {
   apiKey: '',
   apiBase: 'https://api.deepseek.com/anthropic',
-  model: 'deepseek-v4-pro',
+  model: 'deepseek-flash',
   proxy: '',
   dialect: 'auto', // auto | openai | anthropic — see getProviderAdapter()
 };
@@ -337,7 +337,7 @@ async function verifyConnection() {
   // Always test the model the user actually configured — never silently
   // substitute a different model for the connection check.
   const body = {
-    model: Model.model || 'deepseek-v4-pro',
+    model: Model.model || 'deepseek-flash',
     // 128: reasoning models may spend tokens on internal thinking before
     // emitting the visible text block; 8 was too small to ever see one.
     max_tokens: 128,

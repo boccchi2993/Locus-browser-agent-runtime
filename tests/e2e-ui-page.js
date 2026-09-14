@@ -171,6 +171,8 @@
     L.store.settingsOpen = true;
     await sleep(60);
     check('U35 settings panel fields', !!$('#set-api-key') && !!$('#set-dialect') && !!$('#set-proxy'));
+    check('U47 fresh settings model is deepseek-flash', $('#set-model').value === 'deepseek-flash',
+      $('#set-model').value);
     $('.modal-head .icon-btn').click();
     await sleep(60);
 
