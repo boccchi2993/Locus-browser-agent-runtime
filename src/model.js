@@ -50,10 +50,14 @@ function sanitizeKey(k) {
 
 // ---------- error types ----------
 // HTTP errors carry .status so fallback policy never parses strings.
-function makeHttpError(status, message) {
+// providerError keeps the minimal STRUCTURED provider error metadata
+// (type/code/param — never headers, bodies or secrets) so adapters can
+// classify request-validation rejections (e.g. tools unsupported).
+function makeHttpError(status, message, providerError) {
   const err = new Error(message || ('HTTP ' + status));
   err.name = 'HttpError';
   err.status = status;
+  if (providerError) err.providerError = providerError;
   return err;
 }
 
@@ -220,7 +224,16 @@ async function fetchJsonPost(fetchUrl, headers, body, opts) {
     try { data = text ? JSON.parse(text) : {}; } catch (e) { /* handled below */ }
     if (!res.ok) {
       const msg = data && data.error ? (data.error.message || data.error.type) : ('HTTP ' + res.status);
-      const err = makeHttpError(res.status, msg);
+      let providerError = null;
+      if (data && data.error && typeof data.error === 'object') {
+        for (const k of ['type', 'code', 'param']) {
+          if (data.error[k] !== undefined && data.error[k] !== null) {
+            if (!providerError) providerError = {};
+            providerError[k] = data.error[k];
+          }
+        }
+      }
+      const err = makeHttpError(res.status, msg, providerError);
       // A relay that answered proves it exists (see tryFetch fallback policy).
       if (headerValue(res, 'x-locus-relay')) err.relaySeen = true;
       throw err;
@@ -304,15 +317,10 @@ function isFallbackableError(e) {
 // transport attempts and the fallback/error lifecycle.
 // Returns the response envelope { content, reasoning, reasoningType,
 // toolCalls, rawMessage, stopReason, usage, providerMetadata, truncated }.
-async function callModel(body, opts) {
-  const key = sanitizeKey(Model.apiKey);
-  const adapter = getProviderAdapter({ dialect: Model.dialect, apiBase: Model.apiBase });
-  const headers = adapter.buildHeaders({ apiKey: key, apiBase: Model.apiBase });
-  const requestBody = adapter.serializeRequest(body);
+async function runEndpointAttempts(adapter, headers, requestBody, opts) {
   const attempts = adapter.buildEndpoints(Model.apiBase).map((url) => ({
     url: url, h: headers, b: requestBody, p: adapter.parseResponse,
   }));
-
   let firstErr = null;
   for (const attempt of attempts) {
     try {
@@ -324,6 +332,31 @@ async function callModel(body, opts) {
     }
   }
   throw firstErr || new Error('连接失败');
+}
+
+async function callModel(body, opts) {
+  const key = sanitizeKey(Model.apiKey);
+  const adapter = getProviderAdapter({ dialect: Model.dialect, apiBase: Model.apiBase });
+  const headers = adapter.buildHeaders({ apiKey: key, apiBase: Model.apiBase });
+
+  try {
+    return await runEndpointAttempts(adapter, headers, adapter.serializeRequest(body), opts);
+  } catch (e) {
+    // One-time tools downgrade: only when the adapter classifies the
+    // error as an EXPLICIT request-validation rejection of the tools
+    // payload (HTTP 400/422 naming tools/tool_choice/function schema).
+    // Parse errors, timeouts, body-read failures, 401/402/403/429/5xx
+    // and cancellations NEVER re-send — the inference may already have
+    // happened and been billed. At most ONE downgrade per request.
+    if (body && Array.isArray(body.tools) && body.tools.length &&
+        typeof adapter.isToolingUnsupportedError === 'function' &&
+        adapter.isToolingUnsupportedError(e)) {
+      const reduced = Object.assign({}, body);
+      delete reduced.tools;
+      return await runEndpointAttempts(adapter, headers, adapter.serializeRequest(reduced), opts);
+    }
+    throw e;
+  }
 }
 
 // Compatibility wrapper for callers that only need visible text
