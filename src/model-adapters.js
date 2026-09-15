@@ -18,10 +18,26 @@
 //    adapter.serializeRequest(input)   → provider request JSON
 //    adapter.prepareHistory(messages)  → replay policy for stored history
 //    adapter.parseResponse(data)       → normalized response envelope
+//    adapter.isToolingUnsupportedError(err) → explicit request-validation
+//                                       rejection of the tools payload only
 //
 //  Envelope (docs/MODEL-PROTOCOL.md):
 //    { content, reasoning, reasoningType, toolCalls, rawMessage,
 //      stopReason, usage, providerMetadata, truncated }
+//
+//  toolCalls is the normalized provider-native tool request list:
+//    [{ id, name, input, argumentsError? }]
+//  input is the parsed arguments OBJECT (never a raw string, never
+//  eval'd); argumentsError marks an unparseable/invalid arguments
+//  payload — the harness turns it into a failed tool result, it is
+//  NEVER executed.
+//
+//  History may contain provider-neutral tool results produced by
+//  AgentSession:
+//    { role: 'tool_result', toolCallId, toolName, content, success }
+//  prepareHistory maps them onto the provider wire shape (OpenAI
+//  role:'tool' / Anthropic user tool_result blocks). AgentSession never
+//  sees those wire shapes.
 //
 //  Replay policy lives HERE, not in AgentSession: rawMessage is the
 //  provider-native assistant state, and prepareHistory/serializeRequest
@@ -59,6 +75,25 @@ function pickMetadata(fields) {
   return out;
 }
 
+// A provider-neutral tool result from AgentSession history.
+function isNeutralToolResult(m) {
+  return !!m && m.role === 'tool_result' && typeof m.toolCallId === 'string';
+}
+
+function neutralResultText(m) {
+  return typeof m.content === 'string' ? m.content : String(m.content == null ? '' : m.content);
+}
+
+// Conservative shared test: the provider EXPLICITLY rejected the request
+// at validation time (400/422) because of the tools payload. Anything
+// ambiguous (auth, quota, 5xx, timeouts, parse failures) is NOT a tooling
+// rejection — see the double-billing rules in model.js.
+function errorMentionsTooling(msg) {
+  const s = String(msg || '').toLowerCase();
+  return /\b(tools|tool_choice|functions?|function_call)\b/.test(s) &&
+    /(unknown|unrecognized|unexpect|unsupported|not supported|not allowed|invalid|extra)/.test(s);
+}
+
 // ---------- OpenAI-compatible adapter ----------
 const OpenAIAdapter = {
   dialect: 'openai',
@@ -82,18 +117,30 @@ const OpenAIAdapter = {
     };
   },
 
-  // History entries are already provider-native (rawMessage objects
-  // produced by parseResponse, user/tool-feedback strings). Replay them
-  // unchanged — reasoning_content and any provider-specific continuation
-  // fields ride along.
+  // History entries are provider-native (rawMessage objects produced by
+  // parseResponse, user/tool-feedback strings) EXCEPT neutral tool
+  // results, which map onto role:'tool' messages with the exact matching
+  // tool_call_id. Reasoning_content and any provider-specific
+  // continuation fields ride along unchanged.
   prepareHistory(messages) {
-    return messages;
+    return (messages || []).map((m) => isNeutralToolResult(m)
+      ? { role: 'tool', tool_call_id: m.toolCallId, content: neutralResultText(m) }
+      : m);
   },
 
   serializeRequest(input) {
     const messages = this.prepareHistory(input.messages || []).slice();
     if (input.system) messages.unshift({ role: 'system', content: input.system });
-    return { model: input.model, messages: messages, max_tokens: input.max_tokens || 2000 };
+    const body = { model: input.model, messages: messages, max_tokens: input.max_tokens || 2000 };
+    // Provider-neutral tool definitions → OpenAI function tools. The
+    // model decides whether a tool is needed (no forced tool_choice).
+    if (Array.isArray(input.tools) && input.tools.length) {
+      body.tools = input.tools.map((t) => ({
+        type: 'function',
+        function: { name: t.name, description: t.description, parameters: t.inputSchema },
+      }));
+    }
+    return body;
   },
 
   parseResponse(data) {
@@ -103,14 +150,38 @@ const OpenAIAdapter = {
       const content = typeof msg.content === 'string' ? msg.content : '';
       const reasoning = typeof msg.reasoning_content === 'string' && msg.reasoning_content
         ? msg.reasoning_content : null;
+      // Native tool calls → normalized { id, name, input }. arguments is
+      // a JSON STRING on the wire; parse it safely (never eval). An
+      // unparseable payload is preserved as argumentsError so the harness
+      // can fail the call honestly instead of executing garbage.
+      const toolCalls = [];
+      if (Array.isArray(msg.tool_calls)) {
+        for (const c of msg.tool_calls) {
+          if (!c || typeof c !== 'object') continue;
+          const fn = c.function || {};
+          let input = null;
+          let argumentsError = null;
+          const rawArgs = fn.arguments;
+          if (typeof rawArgs === 'string') {
+            try { input = JSON.parse(rawArgs); } catch (e) { argumentsError = 'tool arguments are not valid JSON'; }
+          } else if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+            input = rawArgs; // some compatible providers send an object directly
+          } else {
+            argumentsError = 'tool arguments missing or not a JSON string';
+          }
+          toolCalls.push({
+            id: typeof c.id === 'string' ? c.id : '',
+            name: typeof fn.name === 'string' ? fn.name : '',
+            input: input,
+            argumentsError: argumentsError,
+          });
+        }
+      }
       const envelope = {
         content: content,
         reasoning: reasoning,
         reasoningType: reasoning ? 'raw' : null,
-        // Native tool calls are NOT consumed by the agent loop yet (the
-        // strict fenced-JSON protocol stays authoritative); the seam exists
-        // and any provider-native call state survives inside rawMessage.
-        toolCalls: null,
+        toolCalls: toolCalls.length ? toolCalls : null,
         stopReason: choice.finish_reason || null,
         usage: data.usage || null,
         providerMetadata: pickMetadata({
@@ -120,11 +191,12 @@ const OpenAIAdapter = {
           service_tier: data.service_tier,
         }),
         // Replay the provider-native message object unchanged (keeps
-        // reasoning_content and any unknown provider-specific fields).
+        // reasoning_content, tool_calls and any unknown provider fields).
         rawMessage: msg,
         truncated: choice.finish_reason === 'length',
       };
-      if (content) return envelope;
+      // A tool-only response (zero visible text) is a VALID response.
+      if (content || toolCalls.length) return envelope;
       if (choice.finish_reason === 'length') {
         throw makeParseError('模型在生成可见回答前达到 token 上限（finish_reason: length）');
       }
@@ -132,6 +204,16 @@ const OpenAIAdapter = {
     }
     if (data.error) throw makeParseError(data.error.message || JSON.stringify(data.error));
     throw makeParseError('响应格式不符合预期');
+  },
+
+  // Only an explicit request-validation rejection of the tools payload
+  // justifies the one-time downgrade to a tool-less request (model.js).
+  isToolingUnsupportedError(e) {
+    if (!e || (e.status !== 400 && e.status !== 422)) return false;
+    const pe = e.providerError || {};
+    const param = String(pe.param || '').toLowerCase();
+    if (param === 'tools' || param === 'tool_choice' || param === 'functions' || param === 'function_call') return true;
+    return errorMentionsTooling(e.message);
   },
 };
 
@@ -160,19 +242,50 @@ const AnthropicAdapter = {
   },
 
   // rawMessage.content is the EXACT provider block array (text, thinking,
-  // redacted_thinking, opaque/unknown blocks) — replay it verbatim, in
-  // order. Unknown does not mean irrelevant.
+  // redacted_thinking, tool_use, opaque/unknown blocks) — replayed
+  // verbatim, in order. Unknown does not mean irrelevant. Neutral tool
+  // results become ONE user message per consecutive run, holding
+  // tool_result blocks with the exact matching tool_use_id.
   prepareHistory(messages) {
-    return messages;
+    const out = [];
+    let pendingResults = null;
+    for (const m of messages || []) {
+      if (isNeutralToolResult(m)) {
+        if (!pendingResults) {
+          pendingResults = { role: 'user', content: [] };
+          out.push(pendingResults);
+        }
+        pendingResults.content.push({
+          type: 'tool_result',
+          tool_use_id: m.toolCallId,
+          content: neutralResultText(m),
+          is_error: m.success === false,
+        });
+      } else {
+        pendingResults = null;
+        out.push(m);
+      }
+    }
+    return out;
   },
 
   serializeRequest(input) {
-    return {
+    const body = {
       model: input.model,
       system: input.system,
       messages: this.prepareHistory(input.messages || []),
       max_tokens: input.max_tokens,
     };
+    // Provider-neutral tool definitions → Anthropic tools. No forced
+    // tool_choice: the model decides whether a tool is needed.
+    if (Array.isArray(input.tools) && input.tools.length) {
+      body.tools = input.tools.map((t) => ({
+        name: t.name,
+        description: t.description,
+        input_schema: t.inputSchema,
+      }));
+    }
+    return body;
   },
 
   parseResponse(data) {
@@ -199,9 +312,10 @@ const AnthropicAdapter = {
     }
 
     // content is a block array. Visible text blocks become `content`;
-    // provider-returned thinking becomes visible `reasoning`; redacted /
-    // opaque / unknown blocks are preserved in rawMessage for replay but
-    // never rendered as fake prose.
+    // provider-returned thinking becomes visible `reasoning`; tool_use
+    // blocks become normalized tool calls; redacted / opaque / unknown
+    // blocks are preserved in rawMessage for replay but never rendered
+    // as fake prose.
     const text = data.content
       .filter((part) => part && part.type === 'text' && typeof part.text === 'string')
       .map((part) => part.text)
@@ -210,12 +324,23 @@ const AnthropicAdapter = {
       .filter((part) => part && part.type === 'thinking' && typeof part.thinking === 'string')
       .map((part) => part.thinking)
       .join('\n') || null;
+    const toolCalls = data.content
+      .filter((part) => part && part.type === 'tool_use')
+      .map((part) => {
+        const validInput = part.input && typeof part.input === 'object' && !Array.isArray(part.input);
+        return {
+          id: typeof part.id === 'string' ? part.id : '',
+          name: typeof part.name === 'string' ? part.name : '',
+          input: validInput ? part.input : null,
+          argumentsError: validInput ? null : 'tool_use input is not an object',
+        };
+      });
 
     const envelope = {
       content: text,
       reasoning: reasoning,
       reasoningType: reasoning ? 'raw' : null,
-      toolCalls: null,
+      toolCalls: toolCalls.length ? toolCalls : null,
       stopReason: data.stop_reason || null,
       usage: data.usage || null,
       providerMetadata: pickMetadata({
@@ -226,13 +351,19 @@ const AnthropicAdapter = {
       rawMessage: { role: 'assistant', content: data.content },
       truncated: data.stop_reason === 'max_tokens',
     };
-    if (!text) {
-      if (data.stop_reason === 'max_tokens') {
-        throw makeParseError('模型在生成可见回答前达到 token 上限（stop_reason: max_tokens）');
-      }
-      throw makeParseError('响应中没有可见文本内容（stop_reason: ' + (data.stop_reason || 'unknown') + '）');
+    // A tool-only response (zero visible text) is a VALID response.
+    if (text || toolCalls.length) return envelope;
+    if (data.stop_reason === 'max_tokens') {
+      throw makeParseError('模型在生成可见回答前达到 token 上限（stop_reason: max_tokens）');
     }
-    return envelope;
+    throw makeParseError('响应中没有可见文本内容（stop_reason: ' + (data.stop_reason || 'unknown') + '）');
+  },
+
+  // Only an explicit request-validation rejection of the tools payload
+  // justifies the one-time downgrade to a tool-less request (model.js).
+  isToolingUnsupportedError(e) {
+    if (!e || (e.status !== 400 && e.status !== 422)) return false;
+    return errorMentionsTooling(e.message);
   },
 };
 
