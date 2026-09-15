@@ -18,8 +18,8 @@
       <button
         class="rail-toggle"
         type="button"
-        aria-label="Open context"
-        :title="store.rightRailCollapsed ? 'Show context panel' : 'Hide context panel'"
+        :aria-label="contextToggleLabel"
+        :title="contextToggleLabel"
         @click="toggleContextPanel"
       >
         <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4">
@@ -70,6 +70,10 @@ import Composer from './Composer.vue';
 
 const conversation = activeConversation;
 const isEmpty = computed(() => !conversation.value || conversation.value.items.length === 0);
+const contextToggleLabel = computed(() => {
+  if (store.narrowLayout) return store.contextDrawerOpen ? 'Close context' : 'Open context';
+  return store.rightRailCollapsed ? 'Show context panel' : 'Hide context panel';
+});
 
 const scrollEl = ref(null);
 watch(
