@@ -19,6 +19,7 @@
       class="rail-reopen"
       type="button"
       title="Show context panel"
+      aria-label="Show context panel"
       @click="store.rightRailCollapsed = false"
     >‹</button>
     <SettingsPanel v-if="store.settingsOpen" />
@@ -35,10 +36,53 @@ import ContextRail from './components/ContextRail.vue';
 import SettingsPanel from './components/SettingsPanel.vue';
 import TerminalPanel from './components/TerminalPanel.vue';
 
-// Escape priority: an open drawer eats the first Escape, then the composer
-// "+" menu, and only with nothing presentation-level open does Escape keep
-// its original meaning — cancel the running task.
+const DRAWER_FOCUSABLE = [
+  'button:not([disabled])',
+  'a[href]',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+function activeDrawer() {
+  if (store.sidebarDrawerOpen) return document.querySelector('.sidebar');
+  if (store.contextDrawerOpen) return document.querySelector('.context-rail');
+  return null;
+}
+
+function trapDrawerFocus(e) {
+  const drawer = activeDrawer();
+  if (!drawer) return;
+  const focusable = Array.from(drawer.querySelectorAll(DRAWER_FOCUSABLE)).filter((el) => {
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length > 0;
+  });
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+
+  if (!drawer.contains(active)) {
+    e.preventDefault();
+    (e.shiftKey ? last : first).focus();
+  } else if (!e.shiftKey && active === last) {
+    e.preventDefault();
+    first.focus();
+  } else if (e.shiftKey && active === first) {
+    e.preventDefault();
+    last.focus();
+  }
+}
+
+// Keyboard priority: Tab is trapped inside the active modal drawer.
+// Escape closes drawers first, then the composer "+" menu, then cancels
+// a running task only when no presentation layer owns the key.
 function onKeydown(e) {
+  if (e.key === 'Tab' && (store.sidebarDrawerOpen || store.contextDrawerOpen)) {
+    trapDrawerFocus(e);
+    return;
+  }
   if (e.key !== 'Escape') return;
   if (store.sidebarDrawerOpen || store.contextDrawerOpen) {
     e.preventDefault();
@@ -57,6 +101,10 @@ function onKeydown(e) {
 function watchDrawer(flag, drawerSel, triggerSel) {
   watch(() => store[flag], async (open) => {
     await nextTick();
+    // When one drawer closes because the other opens, do not bounce focus
+    // back behind the newly opened overlay. Otherwise return focus to the
+    // trigger that launched the drawer.
+    if (!open && (store.sidebarDrawerOpen || store.contextDrawerOpen)) return;
     const target = document.querySelector(open ? drawerSel : triggerSel);
     if (target && typeof target.focus === 'function') target.focus();
   });
