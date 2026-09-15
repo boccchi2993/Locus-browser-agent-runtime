@@ -99,6 +99,7 @@ export const store = reactive({
   // AgentSession, provider history, or any runtime structure.
   sidebarDrawerOpen: false,  // <700px: sidebar as left overlay drawer
   contextDrawerOpen: false,  // <1100px: context rail as right overlay drawer
+  narrowLayout: false,       // reactive mirror of the single <1100px matchMedia boundary
   terminalOpen: false,
   sidebarSearch: '',
 
@@ -383,20 +384,39 @@ const narrowMq = (typeof window !== 'undefined' && typeof window.matchMedia === 
   ? window.matchMedia('(max-width: 1099px)')
   : null;
 
+// Keep the JS-only interaction state reactive when the viewport crosses the
+// one breakpoint JS needs to know about. CSS still owns the actual layout.
+if (narrowMq) {
+  store.narrowLayout = narrowMq.matches;
+  const syncNarrowLayout = (event) => {
+    store.narrowLayout = !!event.matches;
+    if (!store.narrowLayout) store.contextDrawerOpen = false;
+  };
+  if (typeof narrowMq.addEventListener === 'function') {
+    narrowMq.addEventListener('change', syncNarrowLayout);
+  } else if (typeof narrowMq.addListener === 'function') {
+    narrowMq.addListener(syncNarrowLayout);
+  }
+}
+
 // One trigger, two presentations: desktop toggles the static rail in/out
 // of the flex row; tablet/mobile open the same ContextRail as a drawer.
 export function toggleContextPanel() {
   store.plusMenuOpen = false;
-  if (narrowMq && narrowMq.matches) {
+  if (store.narrowLayout) {
     if (store.rightRailCollapsed) store.rightRailCollapsed = false; // rail must be mounted to open as a drawer
-    store.contextDrawerOpen = !store.contextDrawerOpen;
+    const next = !store.contextDrawerOpen;
+    store.contextDrawerOpen = next;
+    if (next) store.sidebarDrawerOpen = false; // only one modal drawer owns focus at a time
   } else {
+    store.contextDrawerOpen = false;
     store.rightRailCollapsed = !store.rightRailCollapsed;
   }
 }
 
 export function openSidebarDrawer() {
   store.plusMenuOpen = false;
+  store.contextDrawerOpen = false;
   store.sidebarDrawerOpen = true;
 }
 
