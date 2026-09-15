@@ -166,7 +166,7 @@
       check(P + 'context trigger label says Close while drawer is open',
         $('.rail-toggle').getAttribute('aria-label') === 'Close context',
         $('.rail-toggle').getAttribute('aria-label'));
-      const art = $('.context-rail .rail-section').find((el) => /Artifacts/.test(el.textContent));
+      const art = $$('.context-rail .rail-section').find((el) => /Artifacts/.test(el.textContent));
       check(P + 'artifacts visible in context drawer',
         !!art && art.textContent.indexOf('reports-2026-') !== -1,
         art && art.textContent.slice(0, 120));

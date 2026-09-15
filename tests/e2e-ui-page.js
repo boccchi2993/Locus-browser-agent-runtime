@@ -106,6 +106,35 @@
       .includes('e2e final answer: two files found.'));
     check('U21 conversation status completed', L.store.conversations.find((c) => c.id === L.store.liveConversationId).status === 'completed');
 
+    // ---------- native tool call flow: provider-native envelope renders as tool UI ----------
+    window.__e2eReplies.push(
+      {
+        content: '',
+        toolCalls: [{ id: 'ui_call_1', name: 'bash', input: { input: 'ls' }, argumentsError: null }],
+        rawMessage: { role: 'assistant', content: null, tool_calls: [
+          { id: 'ui_call_1', type: 'function', function: { name: 'bash', arguments: '{"input":"ls"}' } },
+        ] },
+      },
+      { content: 'native flow final answer.' }
+    );
+    await L.actions.submit('list files natively');
+    await waitFor(() => !L.store.busy, 8000);
+    const convN = L.store.conversations.find((c) => c.id === L.store.liveConversationId);
+    const seg = convN.items.slice(convN.items.map((i) => i.kind).lastIndexOf('user'));
+    check('U21n native tool call rendered as tool item (not assistant JSON text)',
+      seg.filter((i) => i.kind === 'tool').length === 1
+      && !seg.some((i) => i.kind === 'assistant' && i.content.includes('"tool"')),
+      JSON.stringify(seg.map((i) => i.kind)));
+    check('U21o native tool result attached to its call, final answer rendered',
+      (() => {
+        const t = seg.find((i) => i.kind === 'tool');
+        return !!t && !!t.result && t.result.success === true
+          && t.result.output.includes('file-a.csv')
+          && seg.some((i) => i.kind === 'assistant' && i.content.includes('native flow final answer'));
+      })());
+    check('U21p native flow completed without a manual continue',
+      convN.status === 'completed');
+
     // ---------- cancel via REAL UI button ----------
     window.__e2eReplies.push((body, opts) => new Promise((resolve, reject) => {
       opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
