@@ -260,7 +260,8 @@
         $('.rail-toggle').getAttribute('aria-label') === 'Hide context panel',
         $('.rail-toggle').getAttribute('aria-label'));
       const sr = sidebar.getBoundingClientRect();
-      const rr = rail.getBoundingClientRect();
+      const restoredRail = $('.context-rail');
+      const rr = restoredRail.getBoundingClientRect();
       check(P + 'three columns in order (sidebar | main | rail)',
         sr.left === 0 && mainRect.left >= sr.right - 1 && rr.left >= mainRect.right - 1,
         JSON.stringify({ s: sr.right, m: mainRect.left, mR: mainRect.right, r: rr.left }));
