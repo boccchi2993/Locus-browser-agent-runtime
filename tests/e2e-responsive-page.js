@@ -32,6 +32,9 @@
   const tier = W < 700 ? 'mobile' : (W < 1100 ? 'tablet' : 'desktop');
   const P = '[' + W + 'px ' + tier + '] ';
   const esc = () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  const tab = (shiftKey) => document.dispatchEvent(new KeyboardEvent('keydown', {
+    key: 'Tab', shiftKey: !!shiftKey, bubbles: true, cancelable: true,
+  }));
 
   try {
     // ---------- hostile-content fixture (all viewports) ----------
@@ -110,13 +113,33 @@
         'main=' + mainRect.width + ' client=' + clientW);
       check(P + 'nav trigger visible', getComputedStyle($('.nav-toggle')).display !== 'none');
       check(P + 'context trigger visible', getComputedStyle($('.rail-toggle')).display !== 'none');
+      check(P + 'context trigger label says Open while drawer is closed',
+        $('.rail-toggle').getAttribute('aria-label') === 'Open context',
+        $('.rail-toggle').getAttribute('aria-label'));
       check(P + 'closed sidebar drawer not tabbable', getComputedStyle(sidebar).visibility === 'hidden');
 
-      // sidebar drawer: open / backdrop / reopen / New task / Escape
+      // sidebar drawer: open / focus trap / backdrop / reopen / New task / Escape
       $('.nav-toggle').click();
       await waitFor(() => getComputedStyle(sidebar).visibility === 'visible', 2000);
       check(P + 'sidebar drawer opens from nav trigger', L.store.sidebarDrawerOpen);
       check(P + 'open sidebar drawer causes no overflow', noOverflow(), overflowDetail());
+      const sf = Array.from(sidebar.querySelectorAll(
+        'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )).filter((el) => {
+        const st = getComputedStyle(el);
+        return st.display !== 'none' && st.visibility !== 'hidden' && el.getClientRects().length > 0;
+      });
+      if (sf.length >= 2) {
+        sf[0].focus();
+        tab(true);
+        await sleep(40);
+        check(P + 'sidebar focus trap wraps Shift+Tab first→last', document.activeElement === sf[sf.length - 1]);
+        tab(false);
+        await sleep(40);
+        check(P + 'sidebar focus trap wraps Tab last→first', document.activeElement === sf[0]);
+      } else {
+        check(P + 'sidebar focus trap has focusable controls', false, 'count=' + sf.length);
+      }
       $('.drawer-backdrop').click();
       await sleep(250);
       check(P + 'sidebar drawer closes on backdrop', !L.store.sidebarDrawerOpen);
@@ -140,7 +163,10 @@
       await waitFor(() => getComputedStyle(rail).visibility === 'visible', 2000);
       await sleep(350); // let the slide-in transform finish before measuring
       check(P + 'context drawer opens from rail trigger', L.store.contextDrawerOpen);
-      const art = $$('.context-rail .rail-section').find((el) => /Artifacts/.test(el.textContent));
+      check(P + 'context trigger label says Close while drawer is open',
+        $('.rail-toggle').getAttribute('aria-label') === 'Close context',
+        $('.rail-toggle').getAttribute('aria-label'));
+      const art = $('.context-rail .rail-section').find((el) => /Artifacts/.test(el.textContent));
       check(P + 'artifacts visible in context drawer',
         !!art && art.textContent.indexOf('reports-2026-') !== -1,
         art && art.textContent.slice(0, 120));
@@ -153,6 +179,9 @@
       esc();
       await sleep(250);
       check(P + 'context drawer closes on Escape', !L.store.contextDrawerOpen);
+      check(P + 'context trigger label returns to Open after close',
+        $('.rail-toggle').getAttribute('aria-label') === 'Open context',
+        $('.rail-toggle').getAttribute('aria-label'));
 
       // Escape priority: drawer first, running task second
       window.__e2eReplies.push((body, opts) => new Promise((resolve, reject) => {
@@ -194,13 +223,22 @@
       check(P + 'sidebar visible', sidebar.getBoundingClientRect().width > 100);
       check(P + 'main keeps real width', mainRect.width >= 400, 'main=' + mainRect.width);
       check(P + 'nav trigger hidden (no mobile top bar)', getComputedStyle($('.nav-toggle')).display === 'none');
+      check(P + 'tablet context trigger label says Open while closed',
+        $('.rail-toggle').getAttribute('aria-label') === 'Open context',
+        $('.rail-toggle').getAttribute('aria-label'));
       $('.rail-toggle').click();
       await waitFor(() => getComputedStyle(rail).visibility === 'visible', 2000);
       check(P + 'context drawer opens on tablet', L.store.contextDrawerOpen);
+      check(P + 'tablet context trigger label says Close while open',
+        $('.rail-toggle').getAttribute('aria-label') === 'Close context',
+        $('.rail-toggle').getAttribute('aria-label'));
       check(P + 'open drawer causes no overflow', noOverflow(), overflowDetail());
       esc();
       await sleep(250);
       check(P + 'context drawer closes on Escape', !L.store.contextDrawerOpen);
+      check(P + 'tablet context trigger label returns to Open',
+        $('.rail-toggle').getAttribute('aria-label') === 'Open context',
+        $('.rail-toggle').getAttribute('aria-label'));
     } else {
       // ---------- desktop: unchanged three columns ----------
       check(P + 'sidebar static and visible',
@@ -208,6 +246,19 @@
       check(P + 'context rail static and visible',
         getComputedStyle(rail).position !== 'fixed' && rail.getBoundingClientRect().width > 200);
       check(P + 'nav trigger hidden', getComputedStyle($('.nav-toggle')).display === 'none');
+      check(P + 'desktop context trigger label says Hide while rail is visible',
+        $('.rail-toggle').getAttribute('aria-label') === 'Hide context panel',
+        $('.rail-toggle').getAttribute('aria-label'));
+      $('.rail-toggle').click();
+      await sleep(80);
+      check(P + 'desktop context trigger label says Show while rail is collapsed',
+        $('.rail-toggle').getAttribute('aria-label') === 'Show context panel',
+        $('.rail-toggle').getAttribute('aria-label'));
+      $('.rail-toggle').click();
+      await sleep(80);
+      check(P + 'desktop context trigger label returns to Hide after restore',
+        $('.rail-toggle').getAttribute('aria-label') === 'Hide context panel',
+        $('.rail-toggle').getAttribute('aria-label'));
       const sr = sidebar.getBoundingClientRect();
       const rr = rail.getBoundingClientRect();
       check(P + 'three columns in order (sidebar | main | rail)',
