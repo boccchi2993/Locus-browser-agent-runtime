@@ -35,8 +35,26 @@
 
       <label class="check-row">
         <input v-model="store.settings.remember" type="checkbox">
-        Remember key for this tab only (sessionStorage — cleared when the tab closes)
+        Remember API key on this device (local browser profile)
       </label>
+
+      <section class="storage-controls">
+        <div class="section-label">Local storage</div>
+        <div class="hint">
+          {{ storageSummary }}
+          <span v-if="store.storageStatus.error">Persistence fallback: {{ store.storageStatus.error }}</span>
+        </div>
+        <button class="rail-btn" type="button" @click="keepStorage">
+          {{ store.storageStatus.persistent ? 'Persistent storage granted' : 'Keep Locus data on this device' }}
+        </button>
+        <div class="storage-actions">
+          <button class="rail-btn" type="button" @click="clearConversations">Clear conversations</button>
+          <button class="rail-btn" type="button" @click="clearHome">Clear home</button>
+          <button class="rail-btn" type="button" @click="clearPlugins">Clear plugins</button>
+          <button class="rail-btn danger" type="button" @click="forgetApiKeys">Forget API keys</button>
+          <button class="rail-btn danger" type="button" @click="resetAllData">Reset all local data</button>
+        </div>
+      </section>
 
       <div class="modal-actions">
         <button class="primary-btn" type="button" :disabled="store.settingsTesting" @click="testConnection">
@@ -52,11 +70,30 @@
 </template>
 
 <script setup>
-import { store, applySettings, persistSettingsIfNeeded, testConnection } from '../ui/store.js';
+import {
+  store, applySettings, persistSettingsIfNeeded, testConnection,
+  keepDataOnThisDevice, clearConversations as clearConversationData,
+  clearHome as clearHomeData, clearPlugins as clearPluginData,
+  forgetApiKeys as forgetStoredApiKeys, resetAllData as resetLocalData,
+} from '../ui/store.js';
+import { computed } from 'vue';
 
-function close() {
+const storageSummary = computed(() => {
+  const s = store.storageStatus;
+  const mb = (n) => n == null ? '?' : (n / (1024 * 1024)).toFixed(1);
+  return `${s.mode === 'indexeddb' ? 'IndexedDB' : 'Memory-only'} · OPFS ${s.opfs ? 'available' : 'unavailable'} · ${mb(s.usage)} MB used / ${mb(s.quota)} MB available`;
+});
+
+async function keepStorage() { await keepDataOnThisDevice(); }
+async function clearConversations() { await clearConversationData(); }
+async function clearHome() { await clearHomeData(); }
+async function clearPlugins() { await clearPluginData(); }
+async function forgetApiKeys() { await forgetStoredApiKeys(); }
+async function resetAllData() { await resetLocalData(); }
+
+async function close() {
   applySettings();
-  persistSettingsIfNeeded();
+  await persistSettingsIfNeeded();
   store.settingsOpen = false;
   store.settingsResult = null;
 }

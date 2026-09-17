@@ -40,7 +40,7 @@
       </button>
       <div v-if="!filteredRecents.length" class="recents-empty">No tasks yet</div>
     </nav>
-    <p class="recents-note">Tasks live in this tab only — nothing is synced or saved between reloads.</p>
+    <p class="recents-note">Tasks are stored locally in this browser profile; they are not synced to a cloud service.</p>
 
     <div class="sidebar-footer">
       <button class="footer-btn" type="button" @click="store.settingsOpen = true">
@@ -91,6 +91,7 @@ function statusLabel(status) {
     case 'error':
     case 'iteration_limit': return 'error';
     case 'session_changed': return 'switched';
+    case 'interrupted': return 'interrupted';
     default: return '';
   }
 }

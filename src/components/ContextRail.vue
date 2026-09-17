@@ -60,6 +60,14 @@
         <button class="rail-btn" type="button" @click="mountFolder">
           {{ store.workspaceName ? 'Change folder' : 'Mount folder' }}
         </button>
+        <button
+          v-if="store.workspaceHandleAvailable && !store.workspaceName && store.workspacePermission !== 'granted'"
+          class="rail-btn"
+          type="button"
+          @click="reconnectWorkspace"
+        >Reconnect saved folder</button>
+        <div v-if="store.workspacePermission === 'prompt'" class="rail-hint">Permission is waiting for your click on Reconnect.</div>
+        <div v-if="store.workspacePermission === 'stale'" class="rail-hint">Saved folder handle is stale; choose a folder again.</div>
       </div>
     </section>
 
@@ -112,7 +120,7 @@
 
 <script setup>
 import { reactive, computed, watch } from 'vue';
-import { store, activeConversation, mountFolder, refreshArtifacts, downloadArtifact } from '../ui/store.js';
+import { store, activeConversation, mountFolder, reconnectWorkspace, refreshArtifacts, downloadArtifact } from '../ui/store.js';
 
 /* global Telemetry */
 
@@ -129,6 +137,7 @@ const statusLabel = computed(() => {
     case 'error': return 'Error';
     case 'iteration_limit': return 'Stopped (iteration limit)';
     case 'session_changed': return 'Session switched';
+    case 'interrupted': return 'Interrupted';
     default: return 'Idle';
   }
 });
