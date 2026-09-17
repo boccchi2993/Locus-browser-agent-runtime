@@ -11,6 +11,10 @@
   const check = (name, cond, detail) =>
     out.push((cond ? 'PASS ' : 'FAIL ') + name + (detail !== undefined ? ' | ' + detail : ''));
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const settle = (promise, label, timeoutMs) => Promise.race([
+    promise,
+    sleep(timeoutMs || 12000).then(() => { throw new Error('timed out at ' + label + ' state ' + JSON.stringify({ busy: L && L.store.busy, generation: L && L.session.generation, task: L && L.session.task, history: L && L.session.history, live: L && L.store.liveConversationId, active: L && L.store.activeConversationId, conversations: L && L.store.conversations.map(c => ({ title: c.title, status: c.status, runState: c.runState, items: c.items })) })); }),
+  ]);
   const waitFor = async (cond, timeoutMs) => {
     const deadline = Date.now() + (timeoutMs || 8000);
     while (Date.now() < deadline) {
@@ -117,7 +121,7 @@
       },
       { content: 'native flow final answer.' }
     );
-    await L.actions.submit('list files natively');
+    await settle(L.actions.submit('list files natively'), 'native submit');
     await waitFor(() => !L.store.busy, 8000);
     const convN = L.store.conversations.find((c) => c.id === L.store.liveConversationId);
     const seg = convN.items.slice(convN.items.map((i) => i.kind).lastIndexOf('user'));
@@ -141,10 +145,11 @@
     }));
     const p1 = L.actions.submit('hang for cancel-button');
     await waitFor(() => L.store.busy, 3000);
+    await waitFor(() => !!L.session.task, 5000);
     const cancelBtn = $('.cancel-btn');
     check('U22 cancel button while busy', !!cancelBtn && /Cancel/.test(cancelBtn.textContent));
     cancelBtn.click();
-    await p1;
+    await settle(p1, 'button cancel');
     await sleep(80);
     check('U23 button cancel ends task cancelled',
       L.store.conversations.find((c) => c.id === L.store.liveConversationId).status === 'cancelled');
@@ -157,16 +162,22 @@
     }));
     const p2 = L.actions.submit('hang for escape');
     await waitFor(() => L.store.busy, 3000);
+    await waitFor(() => !!L.session.task, 5000);
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-    await p2;
+    await settle(p2, 'escape cancel');
     await sleep(80);
     check('U25 Escape cancels running task',
       L.store.conversations.find((c) => c.id === L.store.liveConversationId).status === 'cancelled');
+    // A persistence-stage cancel can finish before AgentSession allocates its
+    // model request, leaving the synthetic reply function unused. Do not let
+    // that deliberately hanging test reply leak into the next scenario.
+    await waitFor(() => !L.session.task, 5000);
+    window.__e2eReplies.length = 0;
 
     // ---------- workspace mount (OPFS handle via test hook) + session boundary ----------
     const convCountBefore = L.store.conversations.length;
     const genBefore = L.session.generation;
-    await L.actions.mountFolder();
+    await settle(L.actions.mountFolder(), 'mount folder');
     await sleep(80);
     check('U26 mount folder sets workspace name', L.store.workspaceName === 'e2e-workspace', L.store.workspaceName);
     check('U27 workspace chip in composer', ($('.ws-chip') || { textContent: '' }).textContent.includes('e2e-workspace'));
@@ -192,7 +203,7 @@
       { content: 'real tool run done' }
     );
     const teleBefore = Telemetry.records.length;
-    await L.actions.submit('real ls on mounted folder');
+    await settle(L.actions.submit('real ls on mounted folder'), 'real ls submit');
     check('U31 real tool execution recorded in telemetry', Telemetry.records.length > teleBefore,
       'records=' + Telemetry.records.length);
     $('.rail-head') && null;
@@ -319,7 +330,7 @@
     const convB = L.store.conversations.find((c) => c.id === L.store.liveConversationId);
     check('U40 new task creates B while A settles', convB && convB.id !== convA.id
       && L.store.activeConversationId === convB.id);
-    await pA2;
+    await settle(pA2, 'isolation task A');
     await sleep(80);
     check('U41 A tail events (session_changed) stay in A',
       convA.status === 'session_changed'
@@ -330,6 +341,8 @@
 
     // B runs its own task; A must receive none of it — and viewing A
     // mid-task must not reroute B's events.
+    await waitFor(() => !L.session.task, 5000);
+    window.__e2eReplies.length = 0;
     window.__e2eReplies.push(
       { content: '```json\n{"tool":"bash","input":"ls"}\n```', reasoning: 'B reasoning', reasoningType: 'raw' },
       (body, opts) => new Promise((resolve) => { window.__e2eGate = () => resolve({ content: 'B final answer', reasoning: null, reasoningType: 'raw', rawMessage: { role: 'assistant', content: 'B final answer' }, stopReason: 'end_turn', usage: null, providerMetadata: null, truncated: false }); }),
@@ -337,14 +350,18 @@
     window.__e2eToolExecutor = async () => ({ output: 'b-file', success: true, backend: 'browser', operation: 'shell' });
     const aItemCount = convA.items.length;
     const pB2 = L.actions.submit('isolation task B');
-    await waitFor(() => convB.items.some((i) => i.kind === 'tool'), 5000);
+    await waitFor(() => convB.items.some((i) => i.kind === 'tool'), 15000);
+    await waitFor(() => typeof window.__e2eGate === 'function', 15000);
     // user browses history (real recents click) while B's task is mid-flight
     $$('.recent-item').find((el) => el.textContent.includes('isolation task A')).click();
     await sleep(60);
     check('U44 viewing A while B runs', L.store.activeConversationId === convA.id
       && L.store.liveConversationId === convB.id);
+    if (typeof window.__e2eGate !== 'function') {
+      throw new Error('gate unavailable');
+    }
     window.__e2eGate();
-    await pB2;
+    await settle(pB2, 'isolation task B');
     await sleep(80);
     check('U45 B events all landed in B despite view switch',
       convB.status === 'completed'

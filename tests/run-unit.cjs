@@ -6,6 +6,9 @@ const path = require('path');
 const SUITES = [
   'model.test.cjs',
   'model-adapters.test.cjs',
+  'persistence.test.cjs',
+  'provider-replay-persistence.test.cjs',
+  'opfs-workspace.test.cjs',
   'proxy.test.mjs',
   'fetch.test.mjs',
   'network.test.cjs',

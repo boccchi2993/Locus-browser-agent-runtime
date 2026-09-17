@@ -142,7 +142,7 @@ async function closeManagedProcess(handle, options = {}) {
       await forceKillTree(handle);
       exited = await waitForExit(handle, options.forceTimeoutMs ?? 2500);
     }
-    const profileError = await removeProfile(handle.profileDir);
+    const profileError = handle.preserveProfile ? null : await removeProfile(handle.profileDir);
     return { exited, profileRemoved: !profileError, profileError };
   })();
   return handle._closePromise;
@@ -174,7 +174,7 @@ function resolveChromeExecutable(configured) {
 
 async function launchChrome(url, options = {}) {
   const executable = resolveChromeExecutable(options.chromePath);
-  const profileDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'locus-e2e-chrome-'));
+  const profileDir = options.profileDir || await fsp.mkdtemp(path.join(os.tmpdir(), 'locus-e2e-chrome-'));
   let port;
   try {
     port = await allocateFreePort();
@@ -201,9 +201,10 @@ async function launchChrome(url, options = {}) {
     });
     handle.url = url;
     handle.kind = 'chrome';
+    handle.preserveProfile = !!options.preserveProfile;
     return handle;
   } catch (error) {
-    await removeProfile(profileDir);
+    if (!options.profileDir) await removeProfile(profileDir);
     throw error;
   }
 }

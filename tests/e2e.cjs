@@ -82,7 +82,14 @@ async function presentationE2e() {
     const resp = spawnSync(process.execPath, [path.join(__dirname, 'e2e-responsive.cjs')], {
       stdio: 'inherit', env,
     });
-    return [['presentation', ui.status === 0], ['responsive', resp.status === 0]];
+    const persistence = spawnSync(process.execPath, [path.join(__dirname, 'e2e-persistence.cjs')], {
+      stdio: 'inherit', env,
+    });
+    return [
+      ['presentation', ui.status === 0],
+      ['responsive', resp.status === 0],
+      ['persistence', persistence.status === 0],
+    ];
   } catch (error) {
     console.error(error && error.stack || error);
     return false;
