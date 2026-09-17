@@ -151,6 +151,150 @@ class LocalDirectoryWorkspace extends WorkspaceAdapter {
   }
 }
 
+// Durable browser-local filesystem provider. Its directory handle comes from
+// navigator.storage.getDirectory(), never from a user-selected folder.
+class OPFSWorkspace extends WorkspaceAdapter {
+  constructor(dirHandle, opts) {
+    super();
+    this.root = dirHandle;
+    this.name = (opts && opts.name) || dirHandle.name || 'opfs';
+  }
+
+  async _dir(parts, create) {
+    let dir = this.root;
+    for (const name of parts) dir = await dir.getDirectoryHandle(name, { create: !!create });
+    return dir;
+  }
+
+  _split(path) {
+    const rel = normalizeWorkspacePath(path);
+    const parts = rel ? rel.split('/') : [];
+    return { rel, dirParts: parts.slice(0, -1), base: parts[parts.length - 1] || '' };
+  }
+
+  async list(path) {
+    const rel = normalizeWorkspacePath(path);
+    const dir = rel ? await this._dir(rel.split('/'), false) : this.root;
+    const entries = [];
+    for await (const [name, handle] of dir.entries()) entries.push({ name, kind: handle.kind });
+    entries.sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'directory' ? -1 : 1));
+    return entries;
+  }
+
+  async _fileHandle(path, create) {
+    const { dirParts, base } = this._split(path);
+    if (!base) throw new Error('not a file path: ' + path);
+    const dir = await this._dir(dirParts, create);
+    return dir.getFileHandle(base, { create: !!create });
+  }
+
+  async read(path) { return new TextDecoder('utf-8').decode(await this.readBytes(path)); }
+
+  async readBytes(path) {
+    const file = await (await this._fileHandle(path, false)).getFile();
+    return new Uint8Array(await file.arrayBuffer());
+  }
+
+  async write(path, data) {
+    const writable = await (await this._fileHandle(path, true)).createWritable();
+    await writable.write(typeof data === 'string'
+      ? data
+      : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+    await writable.close();
+  }
+
+  async remove(path) {
+    const { dirParts, base } = this._split(path);
+    if (!base) throw new Error('cannot remove workspace root');
+    await (await this._dir(dirParts, false)).removeEntry(base, { recursive: true });
+  }
+
+  async mkdir(path) {
+    const rel = normalizeWorkspacePath(path);
+    if (rel) await this._dir(rel.split('/'), true);
+  }
+
+  async exists(path) {
+    try { await this.stat(path); return true; }
+    catch (e) { if (e && e.name === 'NotFoundError') return false; throw e; }
+  }
+
+  async stat(path) {
+    const { dirParts, base } = this._split(path);
+    const dir = await this._dir(dirParts, false);
+    if (!base) return { kind: 'directory', size: 0, modified: null };
+    try {
+      const file = await (await dir.getFileHandle(base)).getFile();
+      return { kind: 'file', size: file.size, modified: file.lastModified };
+    } catch (e) {
+      if (!isNotFoundOrTypeMismatch(e)) throw e;
+      await dir.getDirectoryHandle(base);
+      return { kind: 'directory', size: 0, modified: null };
+    }
+  }
+}
+
+// IDB-backed virtual history. It intentionally has no write methods: the
+// canonical records remain in IndexedDB, so /home/locus/history can never
+// become a second conversation truth in OPFS.
+class ConversationHistoryWorkspace extends WorkspaceAdapter {
+  constructor(service) { super(); this.service = service; this.name = 'history'; }
+
+  _parts(path) {
+    const rel = normalizeWorkspacePath(path);
+    return rel ? rel.split('/') : [];
+  }
+
+  async list(path) {
+    const parts = this._parts(path);
+    const conversations = await this.service.loadConversations();
+    if (!parts.length) return conversations.map((c) => ({ name: c.id, kind: 'directory' }));
+    if (parts.length === 1) return [
+      { name: 'events.jsonl', kind: 'file' },
+      { name: 'messages.jsonl', kind: 'file' },
+      { name: 'provider-frames.jsonl', kind: 'file' },
+    ];
+    throw new Error('not a directory: ' + path);
+  }
+
+  async read(path) {
+    const parts = this._parts(path);
+    if (parts.length !== 2) throw new Error('is a directory: ' + path);
+    const conversationId = parts[0];
+    const name = parts[1];
+    const rows = name === 'events.jsonl'
+      ? await this.service._byIndex('presentationEvents', 'conversationId', conversationId)
+      : name === 'messages.jsonl'
+        ? await this.service.loadNormalizedMessages(conversationId)
+        : name === 'provider-frames.jsonl'
+          ? await (async () => {
+            const session = await this.service.loadProviderSession(conversationId);
+            return session ? this.service.loadProviderFrames(session.id) : [];
+          })()
+          : null;
+    if (!rows) throw new Error('no such file: ' + path);
+    return rows.map((row) => JSON.stringify(row)).join('\n') + (rows.length ? '\n' : '');
+  }
+
+  async readBytes(path) { return new TextEncoder().encode(await this.read(path)); }
+  async write(path) { throw new Error('read-only filesystem: ' + path); }
+  async remove(path) { throw new Error('read-only filesystem: ' + path); }
+  async mkdir(path) { throw new Error('read-only filesystem: ' + path); }
+  async exists(path) {
+    try { await this.stat(path); return true; } catch (e) { if (e && e.name === 'NotFoundError') return false; throw e; }
+  }
+  async stat(path) {
+    const parts = this._parts(path);
+    if (!parts.length) return { kind: 'directory', size: 0, modified: null };
+    const conversations = await this.service.loadConversations();
+    if (parts.length === 1 && conversations.some((c) => c.id === parts[0])) return { kind: 'directory', size: 0, modified: null };
+    if (parts.length === 2 && ['events.jsonl', 'messages.jsonl', 'provider-frames.jsonl'].includes(parts[1])) {
+      return { kind: 'file', size: (await this.read(path)).length, modified: null };
+    }
+    const e = new Error('no such file or directory: ' + path); e.name = 'NotFoundError'; throw e;
+  }
+}
+
 // True when a failed get*Handle lookup means "no such entry / wrong kind"
 // rather than a real fault. Browsers report a missing entry as
 // NotFoundError; a kind mismatch (file vs directory) surfaces as

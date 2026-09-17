@@ -458,7 +458,21 @@ class VirtualWorkspace {
   async list(path) {
     const abs = this._abs(path);
     const r = this.resolveMount(abs);
-    if (r) return r.provider.list(r.rel);
+    if (r) {
+      const entries = await r.provider.list(r.rel);
+      // A nested virtual mount (for example /home/locus/history) is visible
+      // from its parent even when the parent provider is OPFS-backed.
+      if (abs === r.path) {
+        const names = new Map(entries.map((e) => [e.name, e]));
+        for (const m of this.mounts) {
+          const slash = m.path.lastIndexOf('/');
+          const parent = slash === 0 ? '/' : m.path.slice(0, slash);
+          if (parent === abs) names.set(m.path.slice(slash + 1), { name: m.path.slice(slash + 1), kind: 'directory' });
+        }
+        return [...names.values()].sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'directory' ? -1 : 1));
+      }
+      return entries;
+    }
     if (this._underUnmountedWorkspace(abs)) this._throwNotMounted();
     if (this._isStructural(abs)) {
       const names = new Set(VFS_SKELETON[abs]);
@@ -585,5 +599,15 @@ class VirtualWorkspace {
 
   isProtectedRoot(path) {
     return VFS_PROTECTED_ROOTS.has(this._abs(path));
+  }
+
+  // Browser-session mounts are intentionally recreated on a full reset.
+  // Durable OPFS/IDB providers are left untouched here and are cleared by
+  // PersistenceService's explicit reset operation.
+  resetEphemeral() {
+    const mounts = new Map(this.mounts.map((m) => [m.path, m]));
+    this.mount('/tmp', new MemoryWorkspace({ name: 'tmp' }), 'read-write');
+    this.mount('/mnt/download', new MemoryWorkspace({ name: 'download', maxBytes: 64 * 1024 * 1024 }), 'read-write');
+    this.mount('/mnt/upload', new UploadWorkspace({ name: 'upload' }), 'read-only');
   }
 }
