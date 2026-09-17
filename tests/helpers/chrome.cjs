@@ -463,7 +463,10 @@ async function connectToTarget(target) {
   let id = 0;
   const pending = new Map();
   const rejectPending = (error) => {
-    for (const entry of pending.values()) entry.reject(error);
+    for (const entry of pending.values()) {
+      clearTimeout(entry.timer);
+      entry.reject(error);
+    }
     pending.clear();
   };
   ws.addEventListener('message', (event) => {
@@ -471,6 +474,7 @@ async function connectToTarget(target) {
     if (!message.id || !pending.has(message.id)) return;
     const entry = pending.get(message.id);
     pending.delete(message.id);
+    clearTimeout(entry.timer);
     message.error ? entry.reject(new Error(JSON.stringify(message.error))) : entry.resolve(message.result);
   });
   ws.addEventListener('close', () => rejectPending(new Error('CDP websocket closed')));
@@ -478,13 +482,22 @@ async function connectToTarget(target) {
   return {
     ws,
     send(method, params = {}) {
+      const requestTimeoutMs = Number.isFinite(params.timeout)
+        ? Math.max(10000, params.timeout + 5000)
+        : 10000;
       return new Promise((resolve, reject) => {
         const messageId = ++id;
-        pending.set(messageId, { resolve, reject });
+        const timer = setTimeout(() => {
+          if (!pending.has(messageId)) return;
+          pending.delete(messageId);
+          reject(new Error(`CDP request timed out after ${requestTimeoutMs}ms: ${method}`));
+        }, requestTimeoutMs);
+        pending.set(messageId, { resolve, reject, timer });
         try {
           ws.send(JSON.stringify({ id: messageId, method, params }));
         } catch (error) {
           pending.delete(messageId);
+          clearTimeout(timer);
           reject(error);
         }
       });
