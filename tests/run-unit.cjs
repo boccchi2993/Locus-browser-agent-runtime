@@ -22,6 +22,7 @@ const SUITES = [
   'worker-init.test.cjs',
   'worker-output.test.cjs',
   'vfs-audit.test.cjs',
+  'chrome-helper.test.cjs',
 ];
 
 let failed = 0;
