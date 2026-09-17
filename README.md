@@ -20,6 +20,7 @@ Architecture and planning docs:
 - [Architecture](docs/ARCHITECTURE.md)
 - [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md)
 - [Model protocol and reasoning replay](docs/MODEL-PROTOCOL.md)
+- [Browser-local persistence](docs/PERSISTENCE.md)
 - [Roadmap](ROADMAP.md)
 - [Implementation TODO](TODO.md)
 
@@ -40,6 +41,8 @@ Remote computers should be escalation providers, not the default, for lightweigh
 - Local file output written back into the real workspace directory (create / modify / delete / rename), with external-edit conflict detection and staged (non-atomic) commit reporting
 - Session boundaries that actually isolate: switching workspace or `reset` cancels the running task, clears history, and rebuilds the Python interpreter
 - Structured model responses (visible content / reasoning / stop reason / usage / provider-native replay state) — HTTP 200 semantic errors never trigger a second paid request
+- Browser-local persistence: conversations, presentation events, provider-native replay frames, normalized semantic history and settings live in IndexedDB; `/home/locus` and `/mnt/plugins` use durable OPFS when available
+- Explicit recovery semantics: in-flight runs reopen as `interrupted`, dangling tool calls remain archived but are excluded from the replay checkpoint, and same-provider replay is separate from cross-provider semantic projection
 - In-memory execution telemetry (tool, backend, operation, duration, UTF-8 bytes, success/error) + debug panel
 
 ## Architecture
@@ -90,6 +93,7 @@ package.json          npm run dev / build / test / test:e2e
 vite.config.js        Vue plugin + copies the un-bundled runtime scripts into dist/
 src/
   model.js            LLM API client (Anthropic/OpenAI dialect fallback, optional CORS proxy)
+  persistence.js      IndexedDB schema/migrations, OPFS lifecycle, secrets and storage controls
   agent.js            AgentSession: UI-independent agent tool loop (runtime events, DI) + system prompt + strict tool-call parser
   tools.js            tool router (bash / cloud_bash) + telemetry hooks
   shell.js            browser shell compat layer (incl. curl + python heredoc) + Python runtime bridge
@@ -156,14 +160,14 @@ npm run dev      # Vite dev server (http://localhost:5173)
 npm run build    # static build into dist/ (deployable as-is)
 ```
 
-The presentation layer is Vue 3 + Vite. It is a **projection of the AgentSession runtime event stream** (`task_start` / `reasoning` / `tool_call` / `tool_result` / `assistant_text` / `warning` / `error` / `task_end`): the runtime under `src/` stays framework-independent classic scripts, and the conversation timeline in the UI is **not** the provider history — provider history is owned by `AgentSession` / the provider adapters, the timeline is owned by the presentation store, and neither is ever reconstructed from the other.
+The presentation layer is Vue 3 + Vite. It is a **projection of the AgentSession runtime event stream** (`task_start` / `reasoning` / `tool_call` / `tool_result` / `assistant_text` / `warning` / `error` / `task_end`): the runtime under `src/` stays framework-independent classic scripts, and the conversation timeline in the UI is **not** the provider history. Persistence stores presentation events, provider-native frames and normalized semantic messages as separate projections; the timeline is never reconstructed into provider history.
 
 You need an LLM API key — set it in the Settings panel. Defaults:
 
 - Default endpoint: `https://api.deepseek.com/anthropic`
 - Default model: DeepSeek V4.1 Flash (`deepseek-flash`)
 
-Locus remains provider/model configurable — this is only the initial default; Anthropic and OpenAI-compatible endpoints and any custom model name work too. The key is never written to the repo; if you opt into "remember", it is kept in `sessionStorage` only (cleared when the tab closes).
+Locus remains provider/model configurable — this is only the initial default; Anthropic and OpenAI-compatible endpoints and any custom model name work too. The key is not durable by default. If you explicitly enable "Remember API key", it is stored locally in the browser profile; this is convenience persistence, not hardware-backed encryption or XSS isolation. Disable it or use **Forget API keys** to remove it.
 
 Connection behavior: if you configure an explicit proxy URL it is always used. Otherwise the app calls the model API directly; only on a genuine network/CORS failure (and only when hosted over HTTP(S)) does it fall back to a same-origin `/proxy`. HTTP 4xx/5xx provider responses are never re-sent elsewhere.
 
@@ -310,7 +314,9 @@ node tests/verify-active-content.cjs
 - The Pyodide runtime is **not** a network sandbox: model-generated Python can reach `fetch` through the Worker JS bridge and transmit workspace data it can read, subject to browser networking rules (CORS, mixed content). That traffic bypasses NetworkRuntime, the curl anonymous-GET-only policy, and network telemetry — see the Python capability declaration below
 - Network access via `curl` is anonymous HTTPS GET only: no cookies (`credentials: 'omit'`), no auth headers, no URL userinfo, no custom request headers, no POST
 - Switching workspaces or `reset` is a full session boundary: the running task is cancelled, history is cleared, and the Python interpreter is rebuilt
-- API keys are never committed; opt-in session persistence uses `sessionStorage` only
+- API keys are not persisted by default; explicit opt-in stores them only in this browser profile and never in history, provider frames, normalized messages, telemetry, logs or exports
+- `/home/locus` and `/mnt/plugins` are durable local state when OPFS is available. `/tmp`, `/mnt/upload`, `/mnt/download` and active task/process state are ephemeral
+- Persistent plugin bytes are installed-code state only; they do not grant remote authority, credentials or MCP access
 - `/fetch` responses are de-privileged for rendering: `nosniff` everywhere, `Content-Security-Policy: sandbox` on HTML/SVG/JS — a navigated response lands in an opaque origin with scripting disabled (verified in real Chrome by `tests/verify-active-content.cjs`)
 
 ### Python capability declaration (read this)
@@ -342,7 +348,7 @@ View it in the context rail's **Telemetry** section, or `window.__telemetry` in 
 - full POSIX shell (the `bash` tool is a bounded Unix-*compatibility* shell: `pwd`, `cd`, `ls -a/-l/-h`, `cat`, `echo`, `find`, `grep`, `head`, `tail`, `wc`, `mv`, `rm`, `python`, `curl`, `help` + `;`/`&&`/`||`/`|` + `>`/`>>`/`2>`/`2>>`/`2>&1` — no `&`, `$()`, subshells, variables, glob expansion, input redirects or arbitrary file descriptors) and full curl (no `-H`/`-X`/`-d`/`-u`/cookies/POST)
 - authenticated website sessions
 - local models
-- additional workspace adapters (OPFS / Memory / Cloud — adapter interface is ready)
+- cloud workspace adapters and remote authority persistence
 
 ## License
 
