@@ -44,15 +44,16 @@
           {{ storageSummary }}
           <span v-if="store.storageStatus.error">Persistence fallback: {{ store.storageStatus.error }}</span>
         </div>
+        <div v-if="store.storageNotice" class="hint storage-notice">{{ store.storageNotice }}</div>
         <button class="rail-btn" type="button" @click="keepStorage">
           {{ store.storageStatus.persistent ? 'Persistent storage granted' : 'Keep Locus data on this device' }}
         </button>
         <div class="storage-actions">
-          <button class="rail-btn" type="button" @click="clearConversations">Clear conversations</button>
-          <button class="rail-btn" type="button" @click="clearHome">Clear home</button>
-          <button class="rail-btn" type="button" @click="clearPlugins">Clear plugins</button>
-          <button class="rail-btn danger" type="button" @click="forgetApiKeys">Forget API keys</button>
-          <button class="rail-btn danger" type="button" @click="resetAllData">Reset all local data</button>
+          <button class="rail-btn" type="button" :disabled="store.busy || store.cancelling" @click="clearConversations">Clear conversations</button>
+          <button class="rail-btn" type="button" :disabled="store.busy || store.cancelling" @click="clearHome">Clear home</button>
+          <button class="rail-btn" type="button" :disabled="store.busy || store.cancelling" @click="clearPlugins">Clear plugins</button>
+          <button class="rail-btn danger" type="button" :disabled="store.busy || store.cancelling" @click="forgetApiKeys">Forget API keys</button>
+          <button class="rail-btn danger" type="button" :disabled="store.busy || store.cancelling" @click="resetAllData">Reset all local data</button>
         </div>
       </section>
 
@@ -85,11 +86,11 @@ const storageSummary = computed(() => {
 });
 
 async function keepStorage() { await keepDataOnThisDevice(); }
-async function clearConversations() { await clearConversationData(); }
-async function clearHome() { await clearHomeData(); }
-async function clearPlugins() { await clearPluginData(); }
-async function forgetApiKeys() { await forgetStoredApiKeys(); }
-async function resetAllData() { await resetLocalData(); }
+async function clearConversations() { try { await clearConversationData(); } catch (e) { store.storageNotice = e.message || String(e); } }
+async function clearHome() { try { await clearHomeData(); } catch (e) { store.storageNotice = e.message || String(e); } }
+async function clearPlugins() { try { await clearPluginData(); } catch (e) { store.storageNotice = e.message || String(e); } }
+async function forgetApiKeys() { try { await forgetStoredApiKeys(); } catch (e) { store.storageNotice = e.message || String(e); } }
+async function resetAllData() { try { await resetLocalData(); } catch (e) { store.storageNotice = e.message || String(e); } }
 
 async function close() {
   applySettings();

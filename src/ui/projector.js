@@ -38,8 +38,9 @@ var LocusProjector = (function () {
       updatedAt: new Date().toISOString(),
       activeProviderSessionId: null,
       runState: 'idle', // idle | running | interrupted
-      schemaVersion: 1,
-      status: 'idle', // idle | running | completed | error | cancelled | session_changed | iteration_limit
+      schemaVersion: 2,
+      persistenceState: 'healthy',
+      status: 'idle', // idle | running | completed | error | cancelled | session_changed | iteration_limit | persistence_error
       items: [],
       meta: {
         toolCount: 0,
@@ -137,7 +138,8 @@ var LocusProjector = (function () {
         break;
       case 'task_end':
         conv.status = event.reason || 'completed';
-        conv.runState = event.reason === 'interrupted' ? 'interrupted' : 'idle';
+        conv.runState = event.reason === 'interrupted' || event.reason === 'persistence_error' ? 'interrupted' : 'idle';
+        if (event.reason === 'persistence_error') conv.persistenceState = 'degraded';
         conv.updatedAt = new Date().toISOString();
         break;
     }

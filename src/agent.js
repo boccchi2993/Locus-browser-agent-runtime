@@ -37,6 +37,21 @@ const HISTORY_BUDGET_BYTES = 768 * 1024;
 // base64-free system framing, etc.).
 const REQUEST_OVERHEAD_BYTES = 4096;
 
+function agentPersistenceFailure(cause, method) {
+  if (cause && cause.persistenceFailure) return cause;
+  const e = new Error((method || 'persistence') + ' failed: ' + (cause && cause.message ? cause.message : String(cause)));
+  e.name = 'PersistenceError';
+  e.code = 'persistence_write_failed';
+  e.persistenceFailure = true;
+  e.cause = cause;
+  return e;
+}
+
+function isAgentPersistenceFailure(error) {
+  return !!(error && (error.persistenceFailure || error.code === 'persistence_write_failed'
+    || error.name === 'PersistenceError' || error.name === 'StorageClearError'));
+}
+
 // Internal bookkeeping fields (task boundaries) are prefixed with '_' and
 // are NEVER sent to a provider — stripInternalFields removes them when a
 // request is built.
@@ -224,15 +239,30 @@ class AgentSession {
     this.history = [];    // provider conversation history for the API
     this.generation = 0;  // bumped at every session boundary (workspace switch / reset)
     this.task = null;     // { controller: AbortController } while a task is running
+    this.replayBlocked = false;
     this.persistence = d.persistence || null;
   }
 
   setPersistenceContext(context) { this.persistence = context || null; }
 
-  async _persist(method, payload) {
+  async _persist(method, payload, options) {
     const p = this.persistence;
     if (!p || typeof p[method] !== 'function') return null;
-    try { return await p[method](payload); } catch (e) { return null; }
+    try {
+      return await p[method](payload);
+    } catch (e) {
+      const failure = agentPersistenceFailure(e, method);
+      if (!options || options.required !== false) {
+        if (typeof p.onPersistenceError === 'function') {
+          try { await p.onPersistenceError(failure, method); } catch (ignored) {}
+        }
+        throw failure;
+      }
+      if (typeof p.onPersistenceWarning === 'function') {
+        try { await p.onPersistenceWarning(failure, method); } catch (ignored) {}
+      }
+      return null;
+    }
   }
 
   // Full session reset: conversation history, generation, and (via the
@@ -244,6 +274,7 @@ class AgentSession {
   reset() {
     if (this.task) this.task.controller.abort();
     this.history = [];
+    this.replayBlocked = false;
     this.generation++;
     if (this.onSessionReset) this.onSessionReset();
   }
@@ -644,6 +675,16 @@ class AgentSession {
         const lastCall = nativeCalls[nativeCalls.length - 1];
         await this._persist('onCheckpoint', { frame: lastCall && lastCall._lastFrame || assistantFrame, reason: 'tool_results_complete' });
       }
+    } catch (e) {
+      if (isAgentPersistenceFailure(e)) {
+        emit({
+          type: 'error', code: 'persistence_write_failed',
+          message: '持久化失败，本轮任务未完成：' + (e && e.message ? e.message : String(e)),
+        });
+        end('persistence_error');
+        return;
+      }
+      throw e;
     } finally {
       if (this.task && this.task.controller === controller) this.task = null;
     }

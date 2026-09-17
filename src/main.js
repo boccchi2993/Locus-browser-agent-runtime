@@ -8,6 +8,8 @@
 //    ?e2e=1       expose window.__locus { store, actions, session, vfs },
 //                 honor window.__e2eReplies / __e2eToolExecutor fakes,
 //                 collect console errors into window.__e2eErrors
+//    ?e2e=1&wire=1 use the production callModel adapter/serializer/header
+//                 path with a deterministic in-page transport queue
 //    ?demo=task   scripted fake model + tool, auto-mount an OPFS demo
 //                 folder and run one demo task (screenshot fixture)
 //    ?demo=plus   open the composer "+" menu after mount
@@ -24,6 +26,7 @@ import './ui/theme.css';
 
 const params = new URLSearchParams(window.location.search);
 const e2eMode = params.get('e2e') === '1';
+const wireMode = e2eMode && params.get('wire') === '1';
 const demoMode = params.get('demo');
 
 function normalizeEnvelope(partial) {
@@ -48,13 +51,7 @@ if (e2eMode) {
   window.addEventListener('error', (e) => window.__e2eErrors.push(String(e.message || e)));
   window.addEventListener('unhandledrejection', (e) => window.__e2eErrors.push('unhandledrejection: ' + String(e.reason && e.reason.message || e.reason)));
   window.__e2eReplies = [];
-  window.__LOCUS_HOOKS__ = {
-    modelClient: (body, opts) => {
-      const q = window.__e2eReplies;
-      const next = q.length ? q.shift() : { content: 'e2e default answer' };
-      if (typeof next === 'function') return next(body, opts);
-      return Promise.resolve(normalizeEnvelope(next));
-    },
+  const hooks = {
     toolExecutor: (tool, input, ws, opts) => {
       // null → delegate to the REAL tool layer (telemetry, workspace authority)
       if (typeof window.__e2eToolExecutor === 'function') return window.__e2eToolExecutor(tool, input, ws, opts);
@@ -65,6 +62,33 @@ if (e2eMode) {
       return root.getDirectoryHandle('e2e-workspace', { create: true });
     },
   };
+  if (!wireMode) {
+    hooks.modelClient = (body, opts) => {
+      const q = window.__e2eReplies;
+      const next = q.length ? q.shift() : { content: 'e2e default answer' };
+      if (typeof next === 'function') return next(body, opts);
+      return Promise.resolve(normalizeEnvelope(next));
+    };
+  } else {
+    // Keep the transport fake below the real model boundary. callModel still
+    // selects the adapter, builds provider-native JSON and auth headers; only
+    // the final network hop is deterministic for browser integration tests.
+    window.__locusWire = { calls: [], responses: [] };
+    Model.transport = async (url, init) => {
+      const wire = window.__locusWire;
+      const headers = {};
+      for (const [key, value] of Object.entries(init.headers || {})) headers[key] = value;
+      const body = JSON.parse(init.body || '{}');
+      wire.calls.push({ url, headers, body });
+      const response = wire.responses.length ? wire.responses.shift() : {
+        choices: [{ message: { role: 'assistant', content: 'wire default answer' }, finish_reason: 'stop' }],
+      };
+      return new Response(JSON.stringify(response), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    };
+  }
+  window.__LOCUS_HOOKS__ = hooks;
 }
 
 // ---------- demo hooks (screenshot fixtures; deterministic, offline) ----------
