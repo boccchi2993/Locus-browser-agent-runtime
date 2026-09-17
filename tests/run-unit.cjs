@@ -7,6 +7,7 @@ const SUITES = [
   'model.test.cjs',
   'model-adapters.test.cjs',
   'persistence.test.cjs',
+  'persistence-audit.test.cjs',
   'provider-replay-persistence.test.cjs',
   'opfs-workspace.test.cjs',
   'proxy.test.mjs',

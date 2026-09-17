@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const adapterSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'model-adapters.js'), 'utf8');
-const A = (0, eval)(adapterSource + '\n;({ OpenAIAdapter, AnthropicAdapter, projectNormalizedHistory });');
+const A = (0, eval)(adapterSource + '\n;({ OpenAIAdapter, AnthropicAdapter, projectNormalizedHistory, normalizeCredentialEndpoint });');
 
 let passed = 0;
 let failed = 0;
@@ -19,11 +19,11 @@ const rawAnthropic = {
     { type: 'future_vendor_block', nested: { value: 7 } },
   ],
 };
-const antMeta = { adapterId: A.AnthropicAdapter.adapterId, dialect: 'anthropic', provider: 'anthropic' };
-const oaiMeta = { adapterId: A.OpenAIAdapter.adapterId, dialect: 'openai', provider: 'openai' };
+const antMeta = { adapterId: A.AnthropicAdapter.adapterId, dialect: 'anthropic', provider: 'anthropic', endpointIdentity: 'https://api.example.test/v1', model: 'test', protocolVersion: 'messages-v1' };
+const oaiMeta = { adapterId: A.OpenAIAdapter.adapterId, dialect: 'openai', provider: 'openai', endpointIdentity: 'https://api.example.test/v1', model: 'test', protocolVersion: 'chat-completions-v1' };
 
-check('R1 same adapter accepts raw replay', A.AnthropicAdapter.isRawReplayCompatible(antMeta, { dialect: 'anthropic' }));
-check('R2 cross adapter rejects foreign raw replay', !A.OpenAIAdapter.isRawReplayCompatible(antMeta, { dialect: 'openai' }));
+check('R1 same adapter accepts raw replay', A.AnthropicAdapter.isRawReplayCompatible(antMeta, { dialect: 'anthropic', apiBase: 'https://API.example.test/v1', model: 'test' }));
+check('R2 cross adapter rejects foreign raw replay', !A.OpenAIAdapter.isRawReplayCompatible(antMeta, { dialect: 'openai', apiBase: 'https://api.example.test/v1', model: 'test' }));
 
 const normalized = [
   { conversationId: 'c', sequence: 1, role: 'user', kind: 'message', text: 'run pwd' },
@@ -42,4 +42,3 @@ check('R7 raw archive retains the complete Anthropic block array', JSON.stringif
 console.log('---');
 console.log('provider-replay-persistence.test.cjs: ' + passed + ' passed, ' + failed + ' failed');
 process.exit(failed ? 1 : 0);
-
