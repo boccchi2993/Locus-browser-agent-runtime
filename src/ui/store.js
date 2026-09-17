@@ -23,7 +23,9 @@ import { reactive, computed } from 'vue';
 
 /* global AgentSession, Model, callModel, executeTool, buildSystemPrompt,
    LocalDirectoryWorkspace, ensureWorkspacePermission, PythonRuntime,
-   Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS */
+   Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS,
+   PersistenceServiceInstance, OPFSWorkspace, ConversationHistoryWorkspace,
+   getProviderAdapter, projectNormalizedHistory */
 
 // ONE persistent VFS for the whole page lifetime. All static mounts
 // (home/tmp/upload/download/bin/usrbin) are wired inside the constructor;
@@ -78,6 +80,11 @@ function hooks() {
 
 let conversationSeq = 1;
 
+function durableId(prefix) {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return prefix + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+}
+
 export const store = reactive({
   settings: loadSettings(),
   settingsOpen: false,
@@ -92,6 +99,11 @@ export const store = reactive({
   cancelling: false,
 
   workspaceName: null, // null = not mounted
+  workspacePermission: 'none', // none | granted | prompt | denied | stale
+  workspaceHandleAvailable: false,
+
+  storageStatus: { mode: 'memory', dbName: 'locus', schemaVersion: 1, opfs: false, persistent: null, usage: null, quota: null, error: null },
+  storageNotice: null,
 
   plusMenuOpen: false,
   rightRailCollapsed: false,
@@ -147,10 +159,171 @@ function wiredToolExecutor(tool, input, workspace, opts) {
 // live when a tail event (warning/session_changed/task_end) arrives.
 let runningConversationId = null;
 
+let persistenceContext = null;
+let persistenceBootPromise = null;
+let persistenceBootComplete = false;
+let pendingCancel = false;
+
+function persistConversation(conv) {
+  if (!conv || typeof PersistenceServiceInstance === 'undefined') return Promise.resolve();
+  return PersistenceServiceInstance.saveConversation(Object.assign({}, conv, {
+    // Private counters are useful for deterministic ordering after reload;
+    // the actual protocol truth remains in the dedicated stores.
+    presentationSequence: conv.presentationSequence || 0,
+  })).catch(() => {});
+}
+
+function providerConfig() {
+  const adapter = getProviderAdapter({ dialect: store.settings.dialect, apiBase: store.settings.apiBase });
+  return {
+    provider: adapter.providerFamily || adapter.dialect,
+    adapterId: adapter.adapterId || adapter.dialect,
+    dialect: adapter.dialect,
+    apiBase: store.settings.apiBase,
+    model: store.settings.model,
+  };
+}
+
+function sessionCompatible(meta, config) {
+  try {
+    const adapter = getProviderAdapter({ dialect: config.dialect, apiBase: config.apiBase });
+    return !!(adapter && typeof adapter.isRawReplayCompatible === 'function'
+      && adapter.isRawReplayCompatible(meta, { dialect: config.dialect, apiBase: config.apiBase }));
+  } catch (e) { return false; }
+}
+
+async function ensureProviderSession(conv) {
+  if (typeof PersistenceServiceInstance === 'undefined' || typeof getProviderAdapter !== 'function') return null;
+  const service = PersistenceServiceInstance;
+  const config = providerConfig();
+  let previous = conv && conv.activeProviderSessionId ? await service.get('providerSessions', conv.activeProviderSessionId) : null;
+  if (!previous) previous = conv ? await service.loadProviderSession(conv.id) : null;
+  if (previous && sessionCompatible(previous, config)) {
+    if (previous.nextFrameSequence == null) {
+      const frames = await service.loadProviderFrames(previous.id);
+      previous.nextFrameSequence = frames.reduce((n, f) => Math.max(n, f.sequence || 0), 0);
+    }
+    if (previous.nextNormalizedSequence == null) {
+      const messages = await service.loadNormalizedMessages(conv.id);
+      previous.nextNormalizedSequence = messages.reduce((n, m) => Math.max(n, m.sequence || 0), 0);
+    }
+    if (conv.activeProviderSessionId !== previous.id) {
+      conv.activeProviderSessionId = previous.id;
+      await persistConversation(conv);
+    }
+    return previous;
+  }
+  const row = {
+    id: durableId('provider-session'), conversationId: conv.id,
+    provider: config.provider, adapterId: config.adapterId, dialect: config.dialect,
+    model: config.model, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    replayCheckpointSequence: 0, nextFrameSequence: 0, nextNormalizedSequence: 0, schemaVersion: 1,
+  };
+  row._projectedHistory = await service.loadNormalizedMessages(conv.id);
+  const persistedRow = Object.assign({}, row);
+  delete persistedRow._projectedHistory;
+  await service.saveProviderSession(persistedRow);
+  conv.activeProviderSessionId = row.id;
+  await persistConversation(conv);
+  return row;
+}
+
+async function restoreSessionForConversation(conv) {
+  if (!conv || typeof PersistenceServiceInstance === 'undefined') return null;
+  const config = providerConfig();
+  const previous = conv.activeProviderSessionId
+    ? await PersistenceServiceInstance.get('providerSessions', conv.activeProviderSessionId)
+    : await PersistenceServiceInstance.loadProviderSession(conv.id);
+  session.reset();
+  if (!previous) return null;
+  if (sessionCompatible(previous, config)) {
+    const frames = await PersistenceServiceInstance.loadProviderFrames(previous.id, previous.replayCheckpointSequence);
+    session.history = frames.map((f) => f.raw).filter(Boolean);
+  } else {
+    const normalized = await PersistenceServiceInstance.loadNormalizedMessages(conv.id);
+    session.history = projectNormalizedHistory(normalized, config.dialect);
+  }
+  return previous;
+}
+
+function makePersistenceContext(conv, providerSession) {
+  let frameSequence = providerSession.nextFrameSequence || 0;
+  let normalizedSequence = providerSession.nextNormalizedSequence || 0;
+  return {
+    async onUserMessage(text) {
+      const raw = { role: 'user', content: text };
+      await PersistenceServiceInstance.appendProviderFrame({
+        sessionId: providerSession.id, conversationId: conv.id,
+        sequence: ++frameSequence, turnId: providerSession.id,
+        direction: 'outbound', role: 'user', kind: 'user', raw: raw,
+      });
+      await PersistenceServiceInstance.saveNormalizedMessage({
+        conversationId: conv.id, sequence: ++normalizedSequence,
+        role: 'user', kind: 'message', text: text,
+      });
+      providerSession.nextFrameSequence = frameSequence;
+      providerSession.nextNormalizedSequence = normalizedSequence;
+      // A user frame is a safe replay boundary. If the browser dies before
+      // the provider answers, the next run can still resume from this turn
+      // without replaying a dangling assistant/tool frame.
+      providerSession.replayCheckpointSequence = frameSequence;
+      providerSession.updatedAt = new Date().toISOString();
+      await PersistenceServiceInstance.saveProviderSession(providerSession);
+    },
+    async onProviderFrame(payload) {
+      const raw = payload.raw || null;
+      const frame = await PersistenceServiceInstance.appendProviderFrame({
+        sessionId: providerSession.id, conversationId: conv.id,
+        sequence: ++frameSequence, turnId: providerSession.id,
+        direction: payload.role === 'assistant' ? 'inbound' : 'outbound',
+        role: payload.role || (raw && raw.role) || null, kind: payload.kind || 'message', raw: raw,
+        toolCallId: payload.toolCallId || null,
+      });
+      providerSession.updatedAt = new Date().toISOString();
+      providerSession.nextFrameSequence = frameSequence;
+      providerSession.nextNormalizedSequence = normalizedSequence;
+      if (payload.rawResponse) {
+        await PersistenceServiceInstance.saveNormalizedMessage({
+          conversationId: conv.id, sequence: ++normalizedSequence,
+          role: 'assistant', kind: payload.rawResponse.toolCalls ? 'tool_call' : 'message', text: payload.rawResponse.content || '',
+          reasoning: payload.rawResponse.reasoning || null,
+          toolCalls: payload.rawResponse.toolCalls || null,
+        });
+      }
+      providerSession.nextNormalizedSequence = normalizedSequence;
+      await PersistenceServiceInstance.saveProviderSession(providerSession);
+      return frame;
+    },
+    async onNormalizedMessage(payload) {
+      const row = await PersistenceServiceInstance.saveNormalizedMessage(Object.assign({}, payload, {
+        conversationId: conv.id, sequence: ++normalizedSequence,
+      }));
+      providerSession.nextNormalizedSequence = normalizedSequence;
+      await PersistenceServiceInstance.saveProviderSession(providerSession);
+      return row;
+    },
+    async onCheckpoint(payload) {
+      if (!payload || !payload.frame) return;
+      providerSession.replayCheckpointSequence = payload.frame.sequence || providerSession.replayCheckpointSequence || 0;
+      providerSession.updatedAt = new Date().toISOString();
+      await PersistenceServiceInstance.saveProviderSession(providerSession);
+    },
+  };
+}
+
 function handleRuntimeEvent(event) {
   const targetId = runningConversationId !== null ? runningConversationId : store.liveConversationId;
   const conv = store.conversations.find((c) => c.id === targetId);
-  if (conv) LocusProjector.projectEvent(conv, event);
+  if (conv) {
+    LocusProjector.projectEvent(conv, event);
+    conv.presentationSequence = (conv.presentationSequence || 0) + 1;
+    if (event.type === 'task_start') conv.runState = 'running';
+    if (event.type === 'task_end') conv.runState = 'idle';
+    persistConversation(conv);
+    if (typeof PersistenceServiceInstance !== 'undefined') {
+      PersistenceServiceInstance.appendPresentationEvent(conv.id, conv.presentationSequence, event).catch(() => {});
+    }
+  }
   if (event.type === 'tool_result') store.telemetryVersion++;
   if (event.type === 'task_end') {
     // Reliable lifecycle end: release the binding only when the task that
@@ -184,23 +357,12 @@ export function applySettings() {
   Model.dialect = store.settings.dialect || 'auto';
 }
 
-export function persistSettingsIfNeeded() {
-  if (!store.settings.remember) {
-    sessionRemove(REMEMBER_SESSION_KEY);
-    sessionRemove(SESSION_CONFIG_KEY);
-    return;
-  }
-  // SECURITY NOTE: the API key lives in sessionStorage (per-tab, cleared
-  // when the tab closes) only because the user explicitly opted in. It is
-  // never written to localStorage, cookies, or any server.
-  sessionSet(REMEMBER_SESSION_KEY, '1');
-  sessionSet(SESSION_CONFIG_KEY, JSON.stringify({
-    apiKey: store.settings.apiKey.trim(),
-    apiBase: store.settings.apiBase.trim(),
-    model: store.settings.model.trim(),
-    proxy: store.settings.proxy.trim(),
-    dialect: store.settings.dialect,
-  }));
+export async function persistSettingsIfNeeded() {
+  if (typeof PersistenceServiceInstance === 'undefined') return;
+  await PersistenceServiceInstance.saveSettings(store.settings);
+  await PersistenceServiceInstance.setRememberedApiKey(store.settings.apiKey, !!store.settings.remember);
+  sessionRemove(REMEMBER_SESSION_KEY);
+  sessionRemove(SESSION_CONFIG_KEY);
 }
 
 export async function testConnection() {
@@ -209,7 +371,7 @@ export async function testConnection() {
   store.settingsResult = null;
   try {
     await verifyConnection(); // eslint-disable-line no-undef
-    persistSettingsIfNeeded();
+    await persistSettingsIfNeeded();
     store.settingsResult = { ok: true, message: 'Connected — ' + Model.model + ' via ' + Model.dialect + ' dialect.' };
   } catch (e) {
     store.settingsResult = { ok: false, message: 'Connection failed: ' + (e && e.message ? e.message : String(e)) };
@@ -221,10 +383,12 @@ export async function testConnection() {
 // ---------- conversations ----------
 
 function startConversation() {
-  const conv = LocusProjector.createConversation(conversationSeq++);
+  const conv = LocusProjector.createConversation(durableId('conversation'));
+  conv.presentationSequence = 0;
   store.conversations.unshift(conv); // newest first, Cowork-style recents
   store.activeConversationId = conv.id;
   store.liveConversationId = conv.id;
+  persistConversation(conv);
   return conv;
 }
 
@@ -249,7 +413,27 @@ export function openConversation(id) {
 
 export async function submit(text) {
   const input = String(text || '').trim();
-  if (!input || store.busy) return;
+  if (!input) return;
+  const waitingForPersistence = !!persistenceBootPromise && !persistenceBootComplete;
+  if (store.busy && !waitingForPersistence) return;
+  if (waitingForPersistence) {
+    // The page can become interactive before IndexedDB/OPFS restoration has
+    // finished. Hold the composer in a busy state while boot settles so a
+    // first task cannot race boot's conversation/session restoration.
+    store.busy = true;
+    store.cancelling = false;
+    try { await persistenceBootPromise; } catch (e) {}
+  }
+  // An idle user may open an archived conversation and continue it. The
+  // presentation-only switch remains harmless while another task is live;
+  // only submission rebinds the session to the selected conversation.
+  if (store.activeConversationId && store.activeConversationId !== store.liveConversationId) {
+    const selected = store.conversations.find((c) => c.id === store.activeConversationId);
+    if (selected) {
+      store.liveConversationId = selected.id;
+      await restoreSessionForConversation(selected);
+    }
+  }
   // Submitting always targets the live session. If the user is viewing an
   // archived conversation, snap back to the live one first — presentation
   // history is never replayed into provider history.
@@ -257,13 +441,61 @@ export async function submit(text) {
   store.plusMenuOpen = false;
   store.busy = true;
   store.cancelling = false;
+  pendingCancel = false;
   // Bind this task's events to the conversation that is live NOW, before
   // run() starts. If newTask()/mountFolder() later moves liveConversationId
   // while this task is still settling, its tail events still land here.
   if (store.liveConversationId == null) startConversation(); // defensive: never route into a random conversation
   runningConversationId = store.liveConversationId;
   const boundId = runningConversationId;
+  const boundConversation = store.conversations.find((c) => c.id === boundId);
+  const submitGeneration = session.generation;
+  const finishPreRunSessionSwitch = () => {
+    // Persistence can still be committing the first user frame when a
+    // workspace/new-task boundary or cancel arrives. Preserve that intent in
+    // the presentation projection before recording the terminal outcome, so
+    // the interrupted attempt remains visible in recents.
+    if (boundConversation && !boundConversation.items.length && boundConversation.status === 'idle') {
+      handleRuntimeEvent({ type: 'task_start', input: input });
+    }
+    if (pendingCancel) {
+      handleRuntimeEvent({
+        type: 'warning',
+        code: 'task_cancelled',
+        message: '任务已取消，尚未开始模型请求。',
+      });
+      handleRuntimeEvent({ type: 'task_end', reason: 'cancelled' });
+      return true;
+    }
+    if (session.generation === submitGeneration) return false;
+    handleRuntimeEvent({
+      type: 'warning',
+      code: 'session_changed',
+      message: '会话已切换，丢弃本次任务的后续结果。',
+    });
+    handleRuntimeEvent({ type: 'task_end', reason: 'session_changed' });
+    return true;
+  };
   try {
+    if (typeof PersistenceServiceInstance !== 'undefined' && typeof getProviderAdapter === 'function') {
+      const providerSession = await ensureProviderSession(boundConversation);
+      if (finishPreRunSessionSwitch()) return;
+      persistenceContext = makePersistenceContext(boundConversation, providerSession);
+      if (providerSession && Array.isArray(providerSession._projectedHistory)
+        && providerSession._projectedHistory.length) {
+        if (typeof session.reset === 'function') session.reset();
+        session.history = projectNormalizedHistory(providerSession._projectedHistory, providerConfig().dialect);
+        delete providerSession._projectedHistory;
+      }
+      boundConversation.runState = 'running';
+      boundConversation.updatedAt = new Date().toISOString();
+      await persistConversation(boundConversation);
+      // Durable ordering: user presentation/semantic/provider state is
+      // committed before AgentSession can make the first model request.
+      await persistenceContext.onUserMessage(input);
+      if (finishPreRunSessionSwitch()) return;
+      if (typeof session.setPersistenceContext === 'function') session.setPersistenceContext(persistenceContext);
+    }
     // run() resolves only AFTER task_end has been emitted (the binding is
     // released by handleRuntimeEvent at that point) — so by the time this
     // await returns, no late event of this task can still be in flight.
@@ -289,13 +521,21 @@ export async function submit(text) {
       conv.status = 'error';
     }
   } finally {
+    if (typeof session.setPersistenceContext === 'function') session.setPersistenceContext(null);
+    persistenceContext = null;
+    pendingCancel = false;
     store.busy = false;
     store.cancelling = false;
   }
 }
 
 export function cancelTask() {
-  if (!store.busy || !session.task) return;
+  if (!store.busy) return;
+  if (!session.task) {
+    pendingCancel = true;
+    store.cancelling = true;
+    return;
+  }
   if (!session.task.controller.signal.aborted) {
     session.cancel();
     store.cancelling = true;
@@ -323,6 +563,74 @@ async function pickDirectory() {
     throw new Error('This browser does not support the File System Access API (use desktop Chrome / Edge).');
   }
   return window.showDirectoryPicker({ mode: 'readwrite' });
+}
+
+async function mountExternalHandle(handle, persistHandle) {
+  const provider = new LocalDirectoryWorkspace(handle);
+  vfs.mount('/mnt/workspace', provider, 'external-read-write');
+  store.workspaceName = provider.name;
+  store.workspacePermission = 'granted';
+  store.workspaceHandleAvailable = true;
+  if (persistHandle && typeof PersistenceServiceInstance !== 'undefined') {
+    await PersistenceServiceInstance.saveWorkspaceHandle(handle);
+  }
+  return provider;
+}
+
+async function mountDurableStorage() {
+  if (typeof PersistenceServiceInstance === 'undefined') return;
+  try {
+    const homeDir = await PersistenceServiceInstance.opfsDirectory(['home', 'locus'], true);
+    vfs.mount('/home/locus', new OPFSWorkspace(homeDir, { name: 'home' }), 'read-write');
+  } catch (e) {
+    store.storageNotice = 'Durable home storage unavailable; using memory-only home for this session.';
+  }
+  try {
+    const pluginDir = await PersistenceServiceInstance.opfsDirectory(['mnt', 'plugins'], true);
+    vfs.mount('/mnt/plugins', new OPFSWorkspace(pluginDir, { name: 'plugins' }), 'system-read-only');
+  } catch (e) {}
+  try {
+    vfs.mount('/home/locus/history', new ConversationHistoryWorkspace(PersistenceServiceInstance), 'system-read-only');
+  } catch (e) {}
+}
+
+async function restoreWorkspaceHandle() {
+  if (typeof PersistenceServiceInstance === 'undefined') return;
+  const handle = await PersistenceServiceInstance.loadWorkspaceHandle();
+  if (!handle) return;
+  store.workspaceHandleAvailable = true;
+  try {
+    if (handle.queryPermission) {
+      const state = await handle.queryPermission({ mode: 'readwrite' });
+      if (state === 'granted') {
+        await mountExternalHandle(handle, false);
+      } else if (state === 'prompt') {
+        store.workspacePermission = 'prompt';
+      } else {
+        store.workspacePermission = 'denied';
+      }
+    } else {
+      await mountExternalHandle(handle, false);
+    }
+  } catch (e) {
+    store.workspacePermission = 'stale';
+    store.storageNotice = 'The saved external folder is no longer available. Choose Reconnect to select it again.';
+  }
+}
+
+export async function reconnectWorkspace() {
+  if (typeof PersistenceServiceInstance === 'undefined') return;
+  const handle = await PersistenceServiceInstance.loadWorkspaceHandle();
+  if (!handle) return mountFolder();
+  try {
+    const granted = await ensureWorkspacePermission(handle);
+    if (!granted) { store.workspacePermission = 'denied'; return; }
+    await mountExternalHandle(handle, false);
+    store.storageNotice = null;
+  } catch (e) {
+    store.workspacePermission = 'stale';
+    store.storageNotice = 'Reconnect failed: ' + (e && e.message ? e.message : String(e));
+  }
 }
 
 // Mount folder: real File System Access API flow (same semantics as the
@@ -360,9 +668,7 @@ export async function mountFolder() {
   // Re-mounting a different folder replaces the provider at /mnt/workspace.
   // In-flight tasks hold a fork() of this VFS (see submit) and keep routing
   // to the OLD provider — this mutation only affects future tasks.
-  const provider = new LocalDirectoryWorkspace(handle);
-  vfs.mount('/mnt/workspace', provider, 'external-read-write');
-  store.workspaceName = provider.name;
+  await mountExternalHandle(handle, true);
   // Full session boundary, only on success.
   session.reset();
   clearAttachments();
@@ -540,8 +846,103 @@ export function openTerminal() {
   store.terminalOpen = true;
 }
 
+// ---------- storage controls ----------
+
+export async function refreshStorageStatus() {
+  if (typeof PersistenceServiceInstance === 'undefined') return;
+  store.storageStatus = await PersistenceServiceInstance.storageStatus();
+}
+
+export async function keepDataOnThisDevice() {
+  if (typeof PersistenceServiceInstance === 'undefined') return false;
+  const granted = await PersistenceServiceInstance.requestPersistentStorage();
+  await refreshStorageStatus();
+  return granted;
+}
+
+export async function clearConversations() {
+  if (typeof PersistenceServiceInstance !== 'undefined') await PersistenceServiceInstance.clearConversations();
+  store.conversations = [];
+  session.reset();
+  startConversation();
+}
+
+export async function clearHome() {
+  if (typeof PersistenceServiceInstance !== 'undefined') await PersistenceServiceInstance.clearHome();
+  await mountDurableStorage();
+}
+
+export async function clearPlugins() {
+  if (typeof PersistenceServiceInstance !== 'undefined') await PersistenceServiceInstance.clearPlugins();
+  await mountDurableStorage();
+}
+
+export async function forgetApiKeys() {
+  store.settings.apiKey = '';
+  store.settings.remember = false;
+  Model.apiKey = '';
+  if (typeof PersistenceServiceInstance !== 'undefined') await PersistenceServiceInstance.forgetApiKeys();
+}
+
+export async function resetAllData() {
+  if (typeof PersistenceServiceInstance !== 'undefined') await PersistenceServiceInstance.reset();
+  if (typeof vfs.resetEphemeral === 'function') vfs.resetEphemeral();
+  store.attachments = [];
+  store.artifacts = [];
+  store.settings = Object.assign({}, DEFAULTS);
+  applySettings();
+  store.conversations = [];
+  store.activeConversationId = null;
+  store.liveConversationId = null;
+  session.reset();
+  await mountDurableStorage();
+  startConversation();
+  await refreshStorageStatus();
+}
+
 // ---------- boot ----------
 
 applySettings();
 startConversation();
 refreshArtifacts(); // initial artifacts listing (fire-and-forget, self-guarded)
+
+async function bootPersistence() {
+  if (typeof PersistenceServiceInstance === 'undefined') return;
+  await PersistenceServiceInstance.ready;
+  try {
+    const settings = await PersistenceServiceInstance.loadSettings();
+    for (const key of ['apiBase', 'model', 'proxy', 'dialect']) {
+      if (settings[key]) store.settings[key] = settings[key];
+    }
+    if (settings.remember && settings.apiKey) {
+      store.settings.apiKey = settings.apiKey;
+      store.settings.remember = true;
+    } else {
+      store.settings.apiKey = '';
+      store.settings.remember = false;
+    }
+    applySettings();
+    await mountDurableStorage();
+    const rows = await PersistenceServiceInstance.loadConversations();
+    if (rows.length) {
+      rows.forEach((c) => { if (c.runState === 'running') { c.runState = 'interrupted'; c.status = 'interrupted'; } });
+      store.conversations = rows;
+      const continuation = rows.find((c) => c.items && c.items.length || c.status && c.status !== 'idle') || rows[0];
+      store.activeConversationId = continuation.id;
+      store.liveConversationId = continuation.id;
+      await restoreSessionForConversation(continuation);
+      for (const c of rows) await persistConversation(c);
+    }
+    await restoreWorkspaceHandle();
+    await refreshStorageStatus();
+  } catch (e) {
+    store.storageNotice = 'Persistence initialization failed; Locus is running in memory-only mode.';
+    try { await refreshStorageStatus(); } catch (ignored) {}
+  }
+}
+
+persistenceBootPromise = bootPersistence();
+persistenceBootPromise.then(
+  () => { persistenceBootComplete = true; },
+  () => { persistenceBootComplete = true; },
+);

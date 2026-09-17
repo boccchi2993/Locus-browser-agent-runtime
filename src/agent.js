@@ -224,6 +224,15 @@ class AgentSession {
     this.history = [];    // provider conversation history for the API
     this.generation = 0;  // bumped at every session boundary (workspace switch / reset)
     this.task = null;     // { controller: AbortController } while a task is running
+    this.persistence = d.persistence || null;
+  }
+
+  setPersistenceContext(context) { this.persistence = context || null; }
+
+  async _persist(method, payload) {
+    const p = this.persistence;
+    if (!p || typeof p[method] !== 'function') return null;
+    try { return await p[method](payload); } catch (e) { return null; }
   }
 
   // Full session reset: conversation history, generation, and (via the
@@ -383,9 +392,14 @@ class AgentSession {
         // Provider-native replay state, not just visible text
         // (docs/MODEL-PROTOCOL.md): reasoning blocks, tool call blocks,
         // opaque state and provider-specific fields ride along in rawMessage.
-        this.history.push(envelope.rawMessage && envelope.rawMessage.role
+        const rawMessage = envelope.rawMessage && envelope.rawMessage.role
           ? envelope.rawMessage
-          : { role: 'assistant', content: envelope.content });
+          : { role: 'assistant', content: envelope.content };
+        this.history.push(rawMessage);
+        const assistantFrame = await this._persist('onProviderFrame', {
+          role: 'assistant', kind: 'assistant', raw: rawMessage,
+          rawResponse: envelope, toolCalls: envelope.toolCalls || null,
+        });
 
         // Provider-visible reasoning is emitted COMPLETE — presentation
         // truncation is a UI concern, not a runtime one. Opaque replay
@@ -424,6 +438,7 @@ class AgentSession {
               message: '以上回答在 token 上限处截断，可能不完整。请要求模型继续或细化任务。',
             });
           }
+          await this._persist('onCheckpoint', { frame: assistantFrame, reason: 'assistant_final' });
           end('completed');
           return;
         }
@@ -479,6 +494,14 @@ class AgentSession {
             truncateFor(result.output, TOOL_RESULT_MAX_CHARS) + '\n' +
             '</tool_result>';
           this.history.push({ role: 'user', content: feedback });
+          const feedbackFrame = await this._persist('onProviderFrame', {
+            role: 'user', kind: 'tool_feedback', raw: { role: 'user', content: feedback },
+            tool: textCall.tool, success: result.success,
+          });
+          await this._persist('onNormalizedMessage', {
+            role: 'user', kind: 'tool_result', text: feedback,
+            toolName: textCall.tool, toolResult: result.output, success: result.success,
+          });
 
           // CURRENT-SESSION cancel: the tool already ran to completion, so
           // the report emitted above (and recorded in history) is real — it
@@ -497,6 +520,7 @@ class AgentSession {
             end('cancelled');
             return;
           }
+          await this._persist('onCheckpoint', { frame: feedbackFrame, reason: 'tool_result' });
           continue;
         }
 
@@ -505,7 +529,7 @@ class AgentSession {
         // They still get an honest "not executed" result so every provider
         // tool-call id in history keeps a matching result (protocol-valid
         // replay) — cancel is not a rollback and not a silent drop.
-        const markSkipped = (from) => {
+        const markSkipped = async (from) => {
           for (let j = from; j < nativeCalls.length; j++) {
             const r = nativeCalls[j];
             const msg = r.error || 'not executed: task cancelled before this call';
@@ -514,6 +538,14 @@ class AgentSession {
             this.history.push({
               role: 'tool_result', toolCallId: r.id, toolName: r.name,
               content: nativeResultContent(r.name, 'harness', false, msg), success: false,
+            });
+            await this._persist('onProviderFrame', {
+              role: 'tool_result', kind: 'tool_result',
+              raw: this.history[this.history.length - 1], toolCallId: r.id, success: false,
+            });
+            await this._persist('onNormalizedMessage', {
+              role: 'tool_result', kind: 'tool_result', toolCallId: r.id,
+              toolName: r.name, toolResult: msg, success: false,
             });
           }
           toolCallsUsed += nativeCalls.length - from;
@@ -546,10 +578,18 @@ class AgentSession {
               role: 'tool_result', toolCallId: call.id, toolName: call.name,
               content: nativeResultContent(call.name, 'harness', false, call.error), success: false,
             });
+            await this._persist('onProviderFrame', {
+              role: 'tool_result', kind: 'tool_result',
+              raw: this.history[this.history.length - 1], toolCallId: call.id, success: false,
+            });
+            await this._persist('onNormalizedMessage', {
+              role: 'tool_result', kind: 'tool_result', toolCallId: call.id,
+              toolName: call.name, toolResult: call.error, success: false,
+            });
             continue;
           }
           if (controller.signal.aborted) {
-            markSkipped(i);
+            await markSkipped(i);
             cancelledEnd();
             return;
           }
@@ -581,13 +621,28 @@ class AgentSession {
             content: nativeResultContent(call.name, backend, result.success, result.output),
             success: !!result.success,
           });
+          const resultFrame = await this._persist('onProviderFrame', {
+            role: 'tool_result', kind: 'tool_result',
+            raw: this.history[this.history.length - 1], toolCallId: call.id,
+            toolName: call.name, success: !!result.success,
+          });
+          await this._persist('onNormalizedMessage', {
+            role: 'tool_result', kind: 'tool_result', toolCallId: call.id,
+            toolName: call.name, toolResult: result.output, success: !!result.success,
+          });
+          call._lastFrame = resultFrame;
 
           if (controller.signal.aborted) {
-            markSkipped(i + 1);
+            await markSkipped(i + 1);
             cancelledEnd();
             return;
           }
         }
+        // Only a complete native batch is a protocol-valid continuation
+        // boundary. A crash between the assistant tool call and this point
+        // therefore leaves the raw archive intact but the old checkpoint.
+        const lastCall = nativeCalls[nativeCalls.length - 1];
+        await this._persist('onCheckpoint', { frame: lastCall && lastCall._lastFrame || assistantFrame, reason: 'tool_results_complete' });
       }
     } finally {
       if (this.task && this.task.controller === controller) this.task = null;

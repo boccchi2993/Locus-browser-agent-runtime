@@ -35,6 +35,10 @@ var LocusProjector = (function () {
       id: id,
       title: title || 'New task',
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      activeProviderSessionId: null,
+      runState: 'idle', // idle | running | interrupted
+      schemaVersion: 1,
       status: 'idle', // idle | running | completed | error | cancelled | session_changed | iteration_limit
       items: [],
       meta: {
@@ -49,6 +53,7 @@ var LocusProjector = (function () {
   function push(conv, item) {
     item.id = nextItemId++;
     conv.items.push(item);
+    conv.updatedAt = new Date().toISOString();
     return item;
   }
 
@@ -90,6 +95,7 @@ var LocusProjector = (function () {
     switch (event.type) {
       case 'task_start':
         conv.status = 'running';
+        conv.runState = 'running';
         if (typeof event.input === 'string' && event.input.trim()) {
           push(conv, { kind: 'user', content: event.input });
           if (conv.title === 'New task') {
@@ -131,6 +137,8 @@ var LocusProjector = (function () {
         break;
       case 'task_end':
         conv.status = event.reason || 'completed';
+        conv.runState = event.reason === 'interrupted' ? 'interrupted' : 'idle';
+        conv.updatedAt = new Date().toISOString();
         break;
     }
     return conv;

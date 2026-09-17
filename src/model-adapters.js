@@ -97,6 +97,14 @@ function errorMentionsTooling(msg) {
 // ---------- OpenAI-compatible adapter ----------
 const OpenAIAdapter = {
   dialect: 'openai',
+  adapterId: 'openai-compatible',
+  providerFamily: 'openai',
+
+  isRawReplayCompatible(sessionMeta, currentConfig) {
+    return !!sessionMeta && sessionMeta.dialect === 'openai'
+      && sessionMeta.adapterId === this.adapterId
+      && (!currentConfig || currentConfig.dialect === 'openai' || currentConfig.dialect === 'auto');
+  },
 
   // Tolerate both endpoint layouts: bare base + /chat/completions first,
   // then the /v1 variant (fallback policy in model.js decides when the
@@ -220,6 +228,14 @@ const OpenAIAdapter = {
 // ---------- Anthropic-compatible adapter ----------
 const AnthropicAdapter = {
   dialect: 'anthropic',
+  adapterId: 'anthropic-compatible',
+  providerFamily: 'anthropic',
+
+  isRawReplayCompatible(sessionMeta, currentConfig) {
+    return !!sessionMeta && sessionMeta.dialect === 'anthropic'
+      && sessionMeta.adapterId === this.adapterId
+      && (!currentConfig || currentConfig.dialect === 'anthropic' || currentConfig.dialect === 'auto');
+  },
 
   buildEndpoints(apiBase) {
     return [String(apiBase || '').replace(/\/+$/, '') + '/v1/messages'];
@@ -385,4 +401,33 @@ function getProviderAdapter(config) {
     throw new Error('unknown API dialect "' + requested + '" (expected: auto, openai, anthropic)');
   }
   return adapter;
+}
+
+// Cross-provider continuation is intentionally semantic. It never forwards
+// a foreign raw protocol object (thinking signatures, vendor extensions,
+// tool-call wire wrappers, etc.) to a different adapter.
+function projectNormalizedHistory(messages, dialect) {
+  var out = [];
+  for (const m of messages || []) {
+    if (!m) continue;
+    if (m.kind === 'tool_result' || m.role === 'tool_result') {
+      out.push({ role: 'tool_result', toolCallId: m.toolCallId || '', toolName: m.toolName || '', content: String(m.toolResult == null ? (m.content || '') : m.toolResult), success: m.success !== false });
+      continue;
+    }
+    if (m.kind === 'tool_call' && Array.isArray(m.toolCalls)) {
+      if (dialect === 'anthropic') {
+        var blocks = [];
+        if (m.text) blocks.push({ type: 'text', text: m.text });
+        m.toolCalls.forEach(function (c) { blocks.push({ type: 'tool_use', id: c.id || '', name: c.name || '', input: c.input || {} }); });
+        out.push({ role: 'assistant', content: blocks });
+      } else {
+        out.push({ role: 'assistant', content: m.text || '', tool_calls: m.toolCalls.map(function (c) {
+          return { id: c.id || '', type: 'function', function: { name: c.name || '', arguments: JSON.stringify(c.input || {}) } };
+        }) });
+      }
+      continue;
+    }
+    out.push({ role: m.role || 'user', content: typeof m.text === 'string' ? m.text : (typeof m.content === 'string' ? m.content : '') });
+  }
+  return out;
 }
