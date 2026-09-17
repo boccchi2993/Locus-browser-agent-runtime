@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path';
 // Node test suites, which eval these sources directly).
 const RUNTIME_SCRIPTS = [
   'src/telemetry.js',
+  'src/persistence.js',
   'src/model-adapters.js',
   'src/model.js',
   'src/workspace.js',
