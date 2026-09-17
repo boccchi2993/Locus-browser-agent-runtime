@@ -36,6 +36,10 @@ const Model = {
   model: 'deepseek-flash',
   proxy: '',
   dialect: 'auto', // auto | openai | anthropic — see getProviderAdapter()
+  // Test/integration seam. Production leaves this null and uses fetch;
+  // callers still pass through the real adapter, serializer and header
+  // builder before the transport is invoked.
+  transport: null,
 };
 
 // Model inference deadline: covers request start → headers → full body.
@@ -195,7 +199,8 @@ async function fetchJsonPost(fetchUrl, headers, body, opts) {
   let res;
   try {
     try {
-      res = await fetch(fetchUrl, {
+      const transport = o.transport || Model.transport || fetch;
+      res = await transport(fetchUrl, {
         method: 'POST',
         headers: headers,
         body: JSON.stringify(body),

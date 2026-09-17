@@ -61,6 +61,79 @@ function detectDialect(apiBase) {
   return 'openai';
 }
 
+// Endpoint identity is deliberately narrower than an origin and deliberately
+// wider than a hostname: gateway paths often select a different tenant or
+// protocol. The relay/proxy is transport only and is not part of this
+// identity.
+function normalizeCredentialEndpoint(apiBase) {
+  const raw = String(apiBase || '').trim();
+  let url;
+  try { url = new URL(raw); } catch (e) { throw new Error('invalid custom endpoint: ' + raw); }
+  const scheme = String(url.protocol || '').toLowerCase();
+  if (scheme !== 'http:' && scheme !== 'https:') throw new Error('invalid custom endpoint scheme: ' + raw);
+  if (url.username || url.password) throw new Error('custom endpoint must not contain URL credentials');
+  const path = (url.pathname || '').replace(/\/+$/, '');
+  const port = url.port ? ':' + url.port : '';
+  const query = url.search ? '?' + Array.from(url.searchParams.entries()).sort(function (a, b) {
+    return a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0]);
+  }).map(function (pair) { return encodeURIComponent(pair[0]) + '=' + encodeURIComponent(pair[1]); }).join('&') : '';
+  return scheme + '//' + String(url.hostname || '').toLowerCase() + port + path + query;
+}
+
+function adapterForIdentity(config) {
+  const c = config || {};
+  const name = c.adapterId || c.dialect;
+  if (name === 'anthropic-compatible' || c.provider === 'anthropic' || c.dialect === 'anthropic') return AnthropicAdapter;
+  if (name === 'openai-compatible' || c.provider === 'openai' || c.dialect === 'openai') return OpenAIAdapter;
+  return null;
+}
+
+function createCredentialIdentity(config) {
+  const c = config || {};
+  const adapter = adapterForIdentity(c) || (typeof getProviderAdapter === 'function' ? getProviderAdapter(c) : null);
+  const requestedDialect = String(c.dialect || '');
+  const dialect = requestedDialect && requestedDialect !== 'auto'
+    ? requestedDialect : String(adapter && adapter.dialect || requestedDialect);
+  const provider = String(c.provider || adapter && adapter.providerFamily || dialect);
+  const adapterId = String(c.adapterId || adapter && adapter.adapterId || dialect);
+  const endpointIdentity = normalizeCredentialEndpoint(String(c.endpointIdentity || c.apiBase || ''));
+  if (!endpointIdentity) throw new Error('credential endpoint identity is required');
+  return { provider: provider, adapterId: adapterId, dialect: dialect, endpointIdentity: endpointIdentity };
+}
+
+function createProviderIdentity(config) {
+  const c = config || {};
+  const credential = createCredentialIdentity(c);
+  const adapter = adapterForIdentity(c) || (typeof getProviderAdapter === 'function' ? getProviderAdapter(c) : null);
+  return {
+    provider: credential.provider,
+    adapterId: credential.adapterId,
+    dialect: credential.dialect,
+    endpointIdentity: credential.endpointIdentity,
+    model: String(c.model || ''),
+    protocolVersion: String(c.protocolVersion || adapter && adapter.protocolVersion || ''),
+  };
+}
+
+function rawReplayIdentityCompatible(adapter, sessionMeta, currentConfig) {
+  if (!sessionMeta || sessionMeta.rawReplayInvalid || sessionMeta.persistenceState && sessionMeta.persistenceState !== 'healthy') return false;
+  const c = currentConfig || {};
+  let current;
+  try {
+    current = createProviderIdentity(Object.assign({}, c, {
+      adapterId: adapter.adapterId, provider: adapter.providerFamily, dialect: adapter.dialect,
+    }));
+  } catch (e) { return false; }
+  if (sessionMeta.provider !== current.provider
+      || sessionMeta.adapterId !== current.adapterId
+      || sessionMeta.dialect !== current.dialect
+      || sessionMeta.endpointIdentity !== current.endpointIdentity) return false;
+  if (sessionMeta.protocolVersion !== current.protocolVersion) return false;
+  // Raw protocol state is model-specific by default. Adapters must opt in
+  // explicitly before a model switch may reuse opaque reasoning/signatures.
+  return sessionMeta.model === current.model || adapter.rawHistoryModelPortable === true;
+}
+
 // Light response metadata worth keeping for debugging/future adapters —
 // never a second copy of the full response body (rawMessage already holds
 // the replay-relevant assistant state).
@@ -99,11 +172,21 @@ const OpenAIAdapter = {
   dialect: 'openai',
   adapterId: 'openai-compatible',
   providerFamily: 'openai',
+  rawHistoryModelPortable: false,
+  protocolVersion: 'chat-completions-v1',
 
   isRawReplayCompatible(sessionMeta, currentConfig) {
-    return !!sessionMeta && sessionMeta.dialect === 'openai'
-      && sessionMeta.adapterId === this.adapterId
-      && (!currentConfig || currentConfig.dialect === 'openai' || currentConfig.dialect === 'auto');
+    return rawReplayIdentityCompatible(this, sessionMeta, currentConfig);
+  },
+
+  validateRawReplay(frames) {
+    for (const frame of frames || []) {
+      if (frame.kind !== 'assistant') continue;
+      const raw = frame.raw;
+      if (!raw || raw.role !== 'assistant') throw new Error('OpenAI raw replay assistant frame is malformed');
+      if (raw.tool_calls !== undefined && !Array.isArray(raw.tool_calls)) throw new Error('OpenAI raw replay tool_calls is malformed');
+    }
+    return true;
   },
 
   // Tolerate both endpoint layouts: bare base + /chat/completions first,
@@ -230,11 +313,20 @@ const AnthropicAdapter = {
   dialect: 'anthropic',
   adapterId: 'anthropic-compatible',
   providerFamily: 'anthropic',
+  rawHistoryModelPortable: false,
+  protocolVersion: 'messages-v1',
 
   isRawReplayCompatible(sessionMeta, currentConfig) {
-    return !!sessionMeta && sessionMeta.dialect === 'anthropic'
-      && sessionMeta.adapterId === this.adapterId
-      && (!currentConfig || currentConfig.dialect === 'anthropic' || currentConfig.dialect === 'auto');
+    return rawReplayIdentityCompatible(this, sessionMeta, currentConfig);
+  },
+
+  validateRawReplay(frames) {
+    for (const frame of frames || []) {
+      if (frame.kind !== 'assistant') continue;
+      const raw = frame.raw;
+      if (!raw || raw.role !== 'assistant' || !Array.isArray(raw.content)) throw new Error('Anthropic raw replay assistant frame is malformed');
+    }
+    return true;
   },
 
   buildEndpoints(apiBase) {
