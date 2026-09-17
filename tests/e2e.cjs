@@ -1,79 +1,94 @@
-// Full browser e2e orchestrator (npm run test:e2e):
+// Full browser e2e orchestrator (npm run test:e2e).
 //
-//   1. runtime regression suite — real headless Chrome over
-//      file://tests/e2e.html (Pyodide from CDN, OPFS native handles)
-//   2. /fetch active-content isolation — tests/verify-active-content.cjs
-//      (self-contained: own HTTP server + own Chrome)
-//   3. Vue presentation e2e — builds the app, serves it with
-//      `vite preview`, drives the REAL UI through CDP:
-//      tests/e2e-ui.cjs (desktop three-column flows) and
-//      tests/e2e-responsive.cjs (per-viewport layout/drawer/overflow
-//      assertions + .ui-review/ screenshots)
-//
-// Chrome path: CHROME env var or the default install location.
-const { spawn, spawnSync } = require('child_process');
+// Each browser suite owns its Chrome process, temporary profile, and dynamic
+// CDP port. The presentation suites share one explicitly-owned, dynamically
+// allocated Vite preview server and run serially.
+const { spawnSync } = require('child_process');
 const path = require('path');
-const os = require('os');
+const {
+  allocateFreePort,
+  closeChrome,
+  closeManagedProcess,
+  launchChrome,
+  launchManagedProcess,
+  waitForCdp,
+  waitForHttp,
+  waitForPageTarget,
+} = require('./helpers/chrome.cjs');
+const { runE2e } = require('./run-e2e.cjs');
 
-const CHROME = process.env.CHROME
-  || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function kill(p) { try { p && p.kill(); } catch (e) {} }
+const ROOT = path.join(__dirname, '..');
+const CHROME = process.env.CHROME;
+const VITE_CLI = path.join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js');
 
 // ---------- 1. runtime e2e (file://) ----------
 async function runtimeE2e() {
   console.log('=== runtime e2e (tests/e2e.html, headless Chrome) ===');
-  const chrome = spawn(CHROME, [
-    '--headless=new',
-    '--disable-gpu',
-    '--no-first-run',
-    '--allow-file-access-from-files',
-    '--remote-debugging-port=9333',
-    '--user-data-dir=' + path.join(os.tmpdir(), 'locus-e2e-' + Date.now()),
-    'file:///' + path.join(__dirname, 'e2e.html').replace(/\\/g, '/'),
-  ], { stdio: 'ignore' });
+  const pageUrl = 'file:///' + path.join(__dirname, 'e2e.html').replace(/\\/g, '/');
+  const chrome = await launchChrome(pageUrl, {
+    chromePath: CHROME,
+    label: 'runtime Chrome',
+    extraArgs: ['--allow-file-access-from-files'],
+  });
   try {
-    const r = spawnSync(process.execPath, [path.join(__dirname, 'run-e2e.cjs')], { stdio: 'inherit' });
-    return r.status === 0;
+    await waitForCdp(chrome, { timeoutMs: 15000 });
+    await waitForPageTarget(chrome, pageUrl, { timeoutMs: 15000 });
+    return await runE2e({ chrome, expectedUrl: pageUrl });
+  } catch (error) {
+    console.error(error && error.stack || error);
+    return false;
   } finally {
-    kill(chrome);
+    const cleanup = await closeChrome(chrome);
+    if (!cleanup.exited) console.error('runtime Chrome did not exit after bounded cleanup');
+    if (!cleanup.profileRemoved) console.error('runtime Chrome profile cleanup failed: ' + cleanup.profileError);
   }
 }
 
 // ---------- 2. active-content isolation ----------
 function activeContentE2e() {
   console.log('=== /fetch active-content isolation (tests/verify-active-content.cjs) ===');
-  const r = spawnSync(process.execPath, [path.join(__dirname, 'verify-active-content.cjs')], { stdio: 'inherit' });
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'verify-active-content.cjs')], {
+    stdio: 'inherit',
+    env: process.env,
+  });
   return r.status === 0;
 }
 
-// ---------- 3. Vue presentation e2e (vite preview + CDP) ----------
+// ---------- 3. Vue presentation e2e (Vite preview + CDP) ----------
 async function presentationE2e() {
   console.log('=== presentation e2e (built app, real UI events) ===');
-  const build = spawnSync('npx', ['vite', 'build'], {
-    stdio: 'inherit', cwd: path.join(__dirname, '..'), shell: true,
+  const build = spawnSync(process.execPath, [VITE_CLI, 'build'], {
+    stdio: 'inherit', cwd: ROOT,
   });
   if (build.status !== 0) return false;
 
-  const preview = spawn('npx', ['vite', 'preview', '--port', '4173', '--strictPort'], {
-    stdio: 'ignore', cwd: path.join(__dirname, '..'), shell: true,
+  const port = await allocateFreePort();
+  const preview = launchManagedProcess(process.execPath, [
+    VITE_CLI, 'preview', '--host', '127.0.0.1', '--port', String(port), '--strictPort',
+  ], {
+    cwd: ROOT,
+    port,
+    label: 'Vite preview',
+    env: process.env,
   });
+  const appRoot = `http://127.0.0.1:${port}/`;
+  const appUrl = `${appRoot}?e2e=1`;
   try {
-    let up = false;
-    for (let i = 0; i < 50; i++) {
-      try {
-        const res = await fetch('http://localhost:4173/');
-        if (res.ok) { up = true; break; }
-      } catch (e) {}
-      await sleep(300);
-    }
-    if (!up) { console.error('vite preview did not start'); return false; }
-    const ui = spawnSync(process.execPath, [path.join(__dirname, 'e2e-ui.cjs')], { stdio: 'inherit' });
-    const resp = spawnSync(process.execPath, [path.join(__dirname, 'e2e-responsive.cjs')], { stdio: 'inherit' });
+    await waitForHttp(appRoot, { process: preview, timeoutMs: 15000 });
+    const env = { ...process.env, E2E_APP_URL: appUrl };
+    const ui = spawnSync(process.execPath, [path.join(__dirname, 'e2e-ui.cjs')], {
+      stdio: 'inherit', env,
+    });
+    const resp = spawnSync(process.execPath, [path.join(__dirname, 'e2e-responsive.cjs')], {
+      stdio: 'inherit', env,
+    });
     return [['presentation', ui.status === 0], ['responsive', resp.status === 0]];
+  } catch (error) {
+    console.error(error && error.stack || error);
+    return false;
   } finally {
-    kill(preview);
+    const cleanup = await closeManagedProcess(preview);
+    if (!cleanup.exited) console.error('Vite preview did not exit after bounded cleanup');
   }
 }
 
@@ -90,7 +105,7 @@ async function main() {
     console.log((ok ? 'PASS' : 'FAIL') + ' suite: ' + name);
     if (!ok) failed++;
   }
-  process.exit(failed ? 1 : 0);
+  process.exitCode = failed ? 1 : 0;
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((error) => { console.error(error && error.stack || error); process.exitCode = 1; });

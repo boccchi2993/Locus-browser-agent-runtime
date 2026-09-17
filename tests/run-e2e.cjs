@@ -1,54 +1,54 @@
-// Minimal CDP runner: waits until the e2e page reports DONE/FAIL, then prints the log.
-// Usage: launch Chrome with --headless=new --remote-debugging-port=9333
-//        --allow-file-access-from-files <path-to>/tests/e2e.html, then `node tests/run-e2e.cjs`.
-const DEBUG_PORT = 9333;
-const DEADLINE = Date.now() + 280000;
+// Minimal CDP runner for the runtime e2e page.
+// The orchestrator owns Chrome; this module owns only the page connection.
+const path = require('path');
+const {
+  connectToTarget,
+  waitForPageTarget,
+} = require('./helpers/chrome.cjs');
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DEFAULT_DEADLINE_MS = 280000;
 
-async function main() {
-  // find the page target
-  let target = null;
-  for (let i = 0; i < 50; i++) {
-    try {
-      const list = await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json();
-      target = list.find((t) => t.url.includes('e2e.html'));
-      if (target) break;
-    } catch (e) {}
-    await sleep(500);
-  }
-  if (!target) throw new Error('page target not found');
-
-  const ws = new WebSocket(target.webSocketDebuggerUrl);
-  let id = 0;
-  const send = (method, params) => new Promise((resolve, reject) => {
-    const mid = ++id;
-    const onMsg = (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.id === mid) {
-        ws.removeEventListener('message', onMsg);
-        msg.error ? reject(new Error(JSON.stringify(msg.error))) : resolve(msg.result);
-      }
-    };
-    ws.addEventListener('message', onMsg);
-    ws.send(JSON.stringify({ id: mid, method, params }));
+async function runE2e(options = {}) {
+  const chrome = options.chrome || {
+    kind: 'chrome',
+    executable: process.env.CHROME || null,
+    port: Number(process.env.CDP_PORT || 0),
+    pid: null,
+    child: null,
+  };
+  const expectedUrl = options.expectedUrl
+    || process.env.E2E_TARGET_URL
+    || ('file:///' + path.join(__dirname, 'e2e.html').replace(/\\/g, '/'));
+  const target = await waitForPageTarget(chrome, expectedUrl, {
+    timeoutMs: options.targetTimeoutMs ?? 15000,
   });
-  await new Promise((r) => ws.addEventListener('open', r));
-
-  while (Date.now() < DEADLINE) {
-    const res = await send('Runtime.evaluate', {
-      expression: `document.getElementById('out') ? document.getElementById('out').textContent : ''`,
-      returnByValue: true,
-    });
-    const text = (res.result && res.result.value) || '';
-    if (/\nDONE$|E2E-FAIL/.test(text)) {
-      console.log(text);
-      process.exit(text.includes('E2E-FAIL') ? 1 : 0);
+  const cdp = await connectToTarget(target);
+  const deadline = Date.now() + (options.deadlineMs ?? DEFAULT_DEADLINE_MS);
+  try {
+    while (Date.now() < deadline) {
+      const result = await cdp.send('Runtime.evaluate', {
+        expression: "document.getElementById('out') ? document.getElementById('out').textContent : ''",
+        returnByValue: true,
+      });
+      const text = (result?.result?.value) || '';
+      if (/\nDONE$|E2E-FAIL/.test(text)) {
+        console.log(text);
+        return !text.includes('E2E-FAIL');
+      }
+      // This is a short polling yield after CDP is ready, not a readiness
+      // contract; completion is always determined by the page condition.
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
-    await sleep(2000);
+    console.log('TIMEOUT waiting for DONE');
+    return false;
+  } finally {
+    cdp.close();
   }
-  console.log('TIMEOUT waiting for DONE');
-  process.exit(2);
 }
 
-main().catch((e) => { console.error('RUNNER FAIL:', e.message); process.exit(1); });
+if (require.main === module) {
+  runE2e().then((ok) => { process.exitCode = ok ? 0 : 1; })
+    .catch((error) => { console.error('RUNNER FAIL:', error && error.stack || error); process.exitCode = 1; });
+}
+
+module.exports = { runE2e };

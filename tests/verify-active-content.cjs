@@ -15,14 +15,18 @@
 // shipped artifact, not a handwritten header copy.
 //
 // Run: node tests/verify-active-content.cjs
-// Uses its own Chrome instance on port 9334. No external network needed.
+// Uses its own isolated Chrome instance. No external network needed.
 
 const http = require('http');
-const { spawn } = require('child_process');
-
-const CHROME = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-const HTTP_PORT = 8899;
-const DEBUG_PORT = 9334;
+const {
+  closeChrome,
+  connectToTarget,
+  launchChrome,
+  waitForCdp,
+  waitForHttp,
+  waitForPageTarget,
+  waitForRuntimeCondition,
+} = require('./helpers/chrome.cjs');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -87,50 +91,42 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function main() {
-  handler = (await import('../functions/fetch.js')).onRequestGet;
-  if (typeof handler !== 'function') throw new Error('onRequestGet not exported by functions/fetch.js');
-
-  await new Promise((r) => server.listen(HTTP_PORT, '127.0.0.1', r));
-  const chrome = spawn(CHROME, [
-    '--headless=new',
-    '--remote-debugging-port=' + DEBUG_PORT,
-    '--user-data-dir=/tmp/chrome-secverify',
-    '--no-first-run',
-    'about:blank',
-  ], { stdio: 'ignore' });
-
-  let ws;
+  let chrome;
+  let cdp;
+  let httpPort;
   try {
-    let target = null;
-    for (let i = 0; i < 40 && !target; i++) {
-      try {
-        const list = await (await realFetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json();
-        target = list.find((t) => t.type === 'page');
-      } catch (e) {}
-      await sleep(500);
-    }
-    if (!target) throw new Error('chrome target not found');
+    handler = (await import('../functions/fetch.js')).onRequestGet;
+    if (typeof handler !== 'function') throw new Error('onRequestGet not exported by functions/fetch.js');
 
-    ws = new WebSocket(target.webSocketDebuggerUrl);
-    let id = 0;
-    const send = (method, params) => new Promise((resolve, reject) => {
-      const mid = ++id;
-      const onMsg = (ev) => {
-        const msg = JSON.parse(ev.data);
-        if (msg.id === mid) {
-          ws.removeEventListener('message', onMsg);
-          msg.error ? reject(new Error(JSON.stringify(msg.error))) : resolve(msg.result);
-        }
-      };
-      ws.addEventListener('message', onMsg);
-      ws.send(JSON.stringify({ id: mid, method, params }));
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        httpPort = server.address().port;
+        resolve();
+      });
     });
-    await new Promise((r) => ws.addEventListener('open', r));
+    await waitForHttp(`http://127.0.0.1:${httpPort}/set-secret`, { timeoutMs: 5000, pollIntervalMs: 50 });
+    chrome = await launchChrome('about:blank', {
+      chromePath: process.env.CHROME,
+      label: 'active-content Chrome',
+    });
+    await waitForCdp(chrome, { timeoutMs: 15000, fetchImpl: realFetch });
+    const target = await waitForPageTarget(chrome, 'about:blank', {
+      timeoutMs: 15000,
+      fetchImpl: realFetch,
+    });
+    cdp = await connectToTarget(target);
+    const send = cdp.send.bind(cdp);
 
     const visit = async (path) => {
       await send('Page.enable');
-      await send('Page.navigate', { url: `http://127.0.0.1:${HTTP_PORT}${path}` });
-      await sleep(1500);
+      await send('Page.navigate', { url: `http://127.0.0.1:${httpPort}${path}` });
+      await waitForRuntimeCondition(cdp, 'document.readyState === "complete"', {
+        process: chrome,
+        phase: 'active-content-navigation:' + path,
+        description: 'Active-content page did not finish loading: ' + path,
+        timeoutMs: 5000,
+      });
       const res = await send('Runtime.evaluate', {
         expression: 'JSON.stringify({pwned: !!window.__pwned, title: document.title})',
         returnByValue: true,
@@ -161,7 +157,8 @@ async function main() {
     // can read same-origin sessionStorage after navigation
     const before = exfilHits.length;
     const control = await visit('/control');
-    await sleep(800);
+    const exfilDeadline = Date.now() + 2000;
+    while (exfilHits.length === before && Date.now() < exfilDeadline) await sleep(50);
     check('CONTROL payload executes without isolation (proves the risk is real)',
       control.pwned === true && exfilHits.length > before && exfilHits[exfilHits.length - 1] === 'sk-demo',
       JSON.stringify(control) + ' exfil=' + JSON.stringify(exfilHits));
@@ -169,7 +166,6 @@ async function main() {
     // fixed: the response the REAL handler produces → script never runs
     const beforeFixed = exfilHits.length;
     const fixed = await visit('/fixed');
-    await sleep(800);
     check('FIXED real-handler payload neutralized (no script execution, no exfil)',
       fixed.pwned === false && fixed.title !== 'PWNED' && exfilHits.length === beforeFixed,
       JSON.stringify(fixed) + ' exfil=' + JSON.stringify(exfilHits));
@@ -177,10 +173,16 @@ async function main() {
     console.log('\n' + passed + ' passed, ' + failed + ' failed');
     process.exitCode = failed ? 1 : 0;
   } finally {
-    try { ws && ws.close(); } catch (e) {}
-    chrome.kill();
-    server.close();
+    try { cdp?.close(); } catch (e) {}
+    if (chrome) {
+      const cleanup = await closeChrome(chrome);
+      if (!cleanup.exited) console.error('active-content Chrome did not exit after bounded cleanup');
+      if (!cleanup.profileRemoved) console.error('active-content Chrome profile cleanup failed: ' + cleanup.profileError);
+    }
+    if (server.listening) {
+      await new Promise((resolve) => server.close(() => resolve()));
+    }
   }
 }
 
-main().catch((e) => { console.error('VERIFY FAIL:', e); process.exit(1); });
+main().catch((e) => { console.error('VERIFY FAIL:', e && e.stack || e); process.exitCode = 1; });
