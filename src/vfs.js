@@ -357,6 +357,10 @@ const VFS_SKELETON = {
   '/mnt/plugins': [],
 };
 
+const VFS_HOME_SKELETON = typeof LOCUS_HOME_SKELETON !== 'undefined'
+  ? LOCUS_HOME_SKELETON.slice()
+  : ['.skills', '.config/locus/mcp', '.cache/locus'];
+
 const VFS_PROTECTED_ROOTS = new Set([
   '/', '/usr', '/home', '/home/locus', '/mnt',
   '/mnt/workspace', '/mnt/upload', '/mnt/download', '/mnt/plugins',
@@ -370,7 +374,7 @@ class VirtualWorkspace {
 
     const home = new MemoryWorkspace({
       name: 'home',
-      dirs: ['.skills', '.config/locus/mcp', '.cache/locus'],
+      dirs: VFS_HOME_SKELETON,
     });
     const sysbin = new SystemBinWorkspace(opts.listCommands);
 

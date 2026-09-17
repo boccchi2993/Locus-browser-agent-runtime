@@ -8,8 +8,16 @@
 //  APIs themselves.
 // ============================================================
 
-var PERSISTENCE_SCHEMA_VERSION = 1;
+var PERSISTENCE_SCHEMA_VERSION = 2;
 var PERSISTENCE_DB_NAME = 'locus';
+
+// One canonical home layout.  The VFS consumes the same value when it
+// creates its memory provider, while OPFS consumes it after mount/clear/reset.
+var LOCUS_HOME_SKELETON = [
+  '.skills',
+  '.config/locus/mcp',
+  '.cache/locus',
+];
 
 var PERSISTENCE_STORES = [
   'conversations', 'presentationEvents', 'providerSessions',
@@ -24,7 +32,73 @@ function persistenceUuid(prefix) {
 
 function persistenceClone(value) {
   if (typeof structuredClone === 'function') return structuredClone(value);
-  return JSON.parse(JSON.stringify(value));
+  // The supported browser path has structuredClone.  This fallback is only
+  // for older test/runtime hosts; keep the same supported semantic types
+  // instead of silently converting them to JSON.
+  return persistenceCloneFallback(value, new Map());
+}
+
+function persistenceCloneFallback(value, seen) {
+  if (value === null || typeof value !== 'object') {
+    if (typeof value === 'function') throw persistenceSerializationError('functions are not persistable');
+    return value;
+  }
+  if (seen.has(value)) return seen.get(value);
+  if (value instanceof Date) return new Date(value.getTime());
+  if (Array.isArray(value)) {
+    var array = []; seen.set(value, array);
+    for (var ai = 0; ai < value.length; ai++) array[ai] = persistenceCloneFallback(value[ai], seen);
+    return array;
+  }
+  if (value instanceof ArrayBuffer) return value.slice(0);
+  if (ArrayBuffer.isView(value)) {
+    if (value instanceof DataView) return new DataView(persistenceCloneFallback(value.buffer, seen), value.byteOffset, value.byteLength);
+    return new value.constructor(value);
+  }
+  if (value instanceof Map) {
+    var map = new Map(); seen.set(value, map);
+    value.forEach(function (v, k) { map.set(persistenceCloneFallback(k, seen), persistenceCloneFallback(v, seen)); });
+    return map;
+  }
+  if (value instanceof Set) {
+    var set = new Set(); seen.set(value, set);
+    value.forEach(function (v) { set.add(persistenceCloneFallback(v, seen)); });
+    return set;
+  }
+  if (typeof Blob !== 'undefined' && value instanceof Blob) return value.slice(0, value.size, value.type);
+  if (typeof value === 'function' || value.nodeType || value === globalThis) {
+    throw persistenceSerializationError('unsupported non-cloneable value');
+  }
+  var out = Object.create(Object.getPrototypeOf(value) === null ? null : Object.prototype);
+  seen.set(value, out);
+  Object.keys(value).forEach(function (key) { out[key] = persistenceCloneFallback(value[key], seen); });
+  return out;
+}
+
+function persistenceSerializationError(message, cause) {
+  var e = new Error(message);
+  e.name = 'PersistenceSerializationError';
+  e.code = 'persistence_serialization_failed';
+  if (cause) e.cause = cause;
+  return e;
+}
+
+function persistenceError(message, cause) {
+  var e = new Error(message);
+  e.name = 'PersistenceError';
+  e.code = 'persistence_write_failed';
+  if (cause) e.cause = cause;
+  return e;
+}
+
+function storageClearError(paths, cause) {
+  var e = new Error('storage clear partially failed for: ' + paths.join(', '));
+  e.name = 'StorageClearError';
+  e.code = 'storage_clear_failed';
+  e.failedPaths = paths.slice();
+  e.partial = true;
+  if (cause) e.cause = cause;
+  return e;
 }
 
 function persistenceNow() { return new Date().toISOString(); }
@@ -48,6 +122,7 @@ function persistenceUpgrade(db, oldVersion, newVersion, tx) {
     var frames = db.createObjectStore('providerFrames', { keyPath: 'id' });
     frames.createIndex('sessionSequence', ['sessionId', 'sequence'], { unique: true });
     frames.createIndex('sessionId', 'sessionId');
+    frames.createIndex('conversationId', 'conversationId');
     var normalized = db.createObjectStore('normalizedMessages', { keyPath: 'id' });
     normalized.createIndex('conversationSequence', ['conversationId', 'sequence'], { unique: true });
     normalized.createIndex('conversationId', 'conversationId');
@@ -55,6 +130,16 @@ function persistenceUpgrade(db, oldVersion, newVersion, tx) {
     db.createObjectStore('secrets', { keyPath: 'key' });
     db.createObjectStore('workspaceHandles', { keyPath: 'key' });
     db.createObjectStore('meta', { keyPath: 'key' });
+  }
+  if (oldVersion < 2) {
+    var providerFrames = tx.objectStore('providerFrames');
+    if (!providerFrames.indexNames.contains('conversationId')) {
+      providerFrames.createIndex('conversationId', 'conversationId');
+    }
+    // v1's global apiKey has no destination identity.  Never guess where it
+    // belongs; migration deliberately removes it and asks the user again.
+    var secrets = tx.objectStore('secrets');
+    secrets.delete('apiKey');
   }
 }
 
@@ -77,6 +162,91 @@ function persistenceSafeString(value) {
   return typeof value === 'string' ? value : String(value == null ? '' : value);
 }
 
+function replayValidationError(code, message) {
+  var e = new Error(message);
+  e.name = 'ReplayValidationError';
+  e.code = code;
+  e.replayInvalid = true;
+  return e;
+}
+
+function replayToolCallIds(raw) {
+  if (!raw || typeof raw !== 'object') return [];
+  if (Array.isArray(raw.tool_calls)) return raw.tool_calls.map(function (c) { return c && c.id; });
+  if (Array.isArray(raw.content)) return raw.content.filter(function (b) { return b && b.type === 'tool_use'; })
+    .map(function (b) { return b.id; });
+  return [];
+}
+
+// Generic durable-prefix validation.  Provider-specific wire details remain
+// adapter-owned, but identity, sequence and the basic tool-call/result
+// pairing are checked before any raw state can reach serializeRequest().
+function validateReplayPrefix(session, frames, adapter) {
+  if (!session || typeof session !== 'object') throw replayValidationError('session_missing', 'provider session is missing');
+  var checkpoint = session.replayCheckpointSequence;
+  if (!Number.isInteger(checkpoint) || checkpoint < 0) throw replayValidationError('checkpoint_invalid', 'replay checkpoint must be a non-negative integer');
+  var rows = Array.isArray(frames) ? frames.slice().sort(function (a, b) { return (a && a.sequence || 0) - (b && b.sequence || 0); }) : [];
+  if (checkpoint === 0 && rows.length) throw replayValidationError('checkpoint_mismatch', 'checkpoint 0 requires an empty raw prefix');
+  if (rows.length !== checkpoint) throw replayValidationError('checkpoint_beyond_tail', 'replay checkpoint ' + checkpoint + ' does not match the loaded frame tail');
+  for (var i = 0; i < rows.length; i++) {
+    var frame = rows[i];
+    if (!frame || !Number.isInteger(frame.sequence) || frame.sequence !== i + 1) {
+      throw replayValidationError('sequence_invalid', 'raw transcript must be a contiguous prefix 1..' + checkpoint);
+    }
+    if (frame.sessionId !== session.id) throw replayValidationError('session_identity_mismatch', 'raw frame has the wrong provider session id');
+    if (frame.conversationId !== session.conversationId) throw replayValidationError('conversation_identity_mismatch', 'raw frame has the wrong conversation id');
+  }
+  var pending = null;
+  for (var j = 0; j < rows.length; j++) {
+    var current = rows[j];
+    if (current.kind === 'assistant') {
+      var ids = replayToolCallIds(current.raw);
+      if (ids.some(function (id) { return typeof id !== 'string' || !id; })) {
+        throw replayValidationError('tool_call_invalid', 'provider tool-call ids must be non-empty strings');
+      }
+      if (new Set(ids).size !== ids.length) throw replayValidationError('tool_call_duplicate', 'provider tool-call ids must be unique within an assistant frame');
+      if (pending) throw replayValidationError('tool_batch_dangling', 'a new assistant frame starts before the previous tool batch completed');
+      if (ids.length) pending = { ids: new Set(ids), seen: new Set() };
+    } else if (current.kind === 'tool_result') {
+      if (!pending) throw replayValidationError('tool_result_unpaired', 'tool result has no preceding provider tool call');
+      var id = current.toolCallId || current.raw && current.raw.toolCallId;
+      if (!pending.ids.has(id)) throw replayValidationError('tool_result_unpaired', 'tool result id does not belong to the pending tool batch');
+      if (pending.seen.has(id)) throw replayValidationError('tool_result_duplicate', 'duplicate tool result id in provider tool batch');
+      pending.seen.add(id);
+      if (pending.seen.size === pending.ids.size) pending = null;
+    }
+  }
+  if (pending) throw replayValidationError('tool_batch_dangling', 'replay checkpoint ends inside a provider tool batch');
+  if (adapter && typeof adapter.validateRawReplay === 'function') adapter.validateRawReplay(rows);
+  return { valid: true, checkpoint: checkpoint, frames: rows };
+}
+
+function validateNormalizedPrefix(conversationId, rows) {
+  var list = Array.isArray(rows) ? rows.slice().sort(function (a, b) { return (a && a.sequence || 0) - (b && b.sequence || 0); }) : [];
+  for (var i = 0; i < list.length; i++) {
+    if (!list[i] || list[i].conversationId !== conversationId || list[i].sequence !== i + 1) {
+      throw replayValidationError('normalized_sequence_invalid', 'normalized history is not a contiguous conversation prefix');
+    }
+  }
+  var pending = null;
+  for (var j = 0; j < list.length; j++) {
+    var row = list[j];
+    var calls = Array.isArray(row.toolCalls) ? row.toolCalls.map(function (c) { return c && c.id; }).filter(function (id) { return typeof id === 'string' && id; }) : [];
+    if (row.kind === 'tool_call' && calls.length) {
+      if (pending) throw replayValidationError('normalized_tool_batch_dangling', 'normalized history starts a tool batch before the previous one completed');
+      pending = { ids: new Set(calls), seen: new Set() };
+    } else if (row.kind === 'tool_result' || row.role === 'tool_result') {
+      if (!pending || !pending.ids.has(row.toolCallId) || pending.seen.has(row.toolCallId)) {
+        throw replayValidationError('normalized_tool_result_invalid', 'normalized tool result is not paired with its tool call');
+      }
+      pending.seen.add(row.toolCallId);
+      if (pending.seen.size === pending.ids.size) pending = null;
+    }
+  }
+  if (pending) throw replayValidationError('normalized_tool_batch_dangling', 'normalized history ends inside a tool batch');
+  return { valid: true, rows: list };
+}
+
 class PersistenceService {
   constructor(opts) {
     this.name = (opts && opts.name) || PERSISTENCE_DB_NAME;
@@ -88,7 +258,31 @@ class PersistenceService {
     this.opfsAvailable = false;
     this.initializationError = null;
     this.secrets = new Set();
+    this.persistenceHealth = 'healthy'; // healthy | degraded | unavailable
+    this.lastPersistenceError = null;
     this.ready = this.init();
+  }
+
+  _recordPersistenceError(error, operation) {
+    var e = error instanceof Error ? error : new Error(String(error));
+    this.persistenceHealth = this.mode === 'memory' && this.initializationError
+      ? 'unavailable' : 'degraded';
+    this.lastPersistenceError = {
+      operation: operation || 'persistence',
+      name: e.name || 'Error',
+      message: e.message || String(e),
+      code: e.code || null,
+      at: persistenceNow(),
+    };
+    return e;
+  }
+
+  notePersistenceError(error, operation) { return this._recordPersistenceError(error, operation); }
+
+  _throwPersistenceError(error, operation) {
+    var recorded = this._recordPersistenceError(error, operation);
+    if (recorded.name === 'PersistenceError' || recorded.name === 'PersistenceSerializationError' || recorded.name === 'StorageClearError') throw recorded;
+    throw persistenceError((operation || 'persistence') + ' failed: ' + recorded.message, recorded);
   }
 
   async init() {
@@ -110,6 +304,11 @@ class PersistenceService {
       this.initializationError = e;
       this.mode = 'memory';
       this.db = null;
+      this.persistenceHealth = 'unavailable';
+      this.lastPersistenceError = {
+        operation: 'init', name: e.name || 'Error', message: e.message || String(e),
+        code: 'persistence_unavailable', at: persistenceNow(),
+      };
     }
     try {
       if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.getDirectory) {
@@ -130,88 +329,136 @@ class PersistenceService {
 
   async get(storeName, key) {
     await this.ready;
-    if (this.db) return persistenceRequest(this.db.transaction(storeName, 'readonly').objectStore(storeName).get(key));
-    return this.memory[storeName].get(key) || null;
+    try {
+      if (this.db) return await persistenceRequest(this.db.transaction(storeName, 'readonly').objectStore(storeName).get(key));
+      var value = this.memory[storeName].get(key);
+      return value === undefined ? null : persistenceClone(value);
+    } catch (e) { this._throwPersistenceError(e, 'get ' + storeName); }
   }
 
   async all(storeName) {
     await this.ready;
-    if (this.db) return persistenceRequest(this.db.transaction(storeName, 'readonly').objectStore(storeName).getAll());
-    return Array.from(this.memory[storeName].values()).map(persistenceClone);
+    try {
+      if (this.db) return await persistenceRequest(this.db.transaction(storeName, 'readonly').objectStore(storeName).getAll());
+      return Array.from(this.memory[storeName].values()).map(persistenceClone);
+    } catch (e) { this._throwPersistenceError(e, 'all ' + storeName); }
   }
 
   async put(storeName, value) {
     await this.ready;
-    var copy = persistenceClone(value);
-    if (this.db) {
-      var tx = this.db.transaction(storeName, 'readwrite');
-      tx.objectStore(storeName).put(copy);
-      await persistenceTx(tx);
-    } else {
-      this.memory[storeName].set(copy.id !== undefined ? copy.id : copy.key, copy);
-    }
-    return copy;
+    try {
+      var copy = persistenceClone(value);
+      var key = copy && copy.id !== undefined ? copy.id : copy && copy.key;
+      if (key === undefined) throw persistenceSerializationError('persisted record has no id/key for ' + storeName);
+      if (this.db) {
+        var tx = this.db.transaction(storeName, 'readwrite');
+        tx.objectStore(storeName).put(copy);
+        await persistenceTx(tx);
+      } else {
+        this.memory[storeName].set(key, copy);
+      }
+      return copy;
+    } catch (e) { this._throwPersistenceError(e, 'put ' + storeName); }
   }
 
   async delete(storeName, key) {
     await this.ready;
-    if (this.db) {
-      var tx = this.db.transaction(storeName, 'readwrite');
-      tx.objectStore(storeName).delete(key);
-      await persistenceTx(tx);
-    } else this.memory[storeName].delete(key);
+    try {
+      if (this.db) {
+        var tx = this.db.transaction(storeName, 'readwrite');
+        tx.objectStore(storeName).delete(key);
+        await persistenceTx(tx);
+      } else this.memory[storeName].delete(key);
+    } catch (e) { this._throwPersistenceError(e, 'delete ' + storeName); }
   }
 
   async clear(storeName) {
     await this.ready;
-    if (this.db) {
-      var tx = this.db.transaction(storeName, 'readwrite');
-      tx.objectStore(storeName).clear();
-      await persistenceTx(tx);
-    } else this.memory[storeName].clear();
+    try {
+      if (this.db) {
+        var tx = this.db.transaction(storeName, 'readwrite');
+        tx.objectStore(storeName).clear();
+        await persistenceTx(tx);
+      } else this.memory[storeName].clear();
+    } catch (e) { this._throwPersistenceError(e, 'clear ' + storeName); }
   }
 
   async _byIndex(storeName, indexName, query) {
     await this.ready;
-    if (!this.db) {
-      var values = Array.from(this.memory[storeName].values());
-      return values.filter(function (v) {
-        if (indexName === 'conversationId') return v.conversationId === query;
-        if (indexName === 'sessionId') return v.sessionId === query;
-        if (indexName === 'conversationSequence') return v.conversationId === query[0];
-        if (indexName === 'sessionSequence') return v.sessionId === query[0];
-        return false;
-      }).sort(function (a, b) { return (a.sequence || 0) - (b.sequence || 0); }).map(persistenceClone);
-    }
-    var tx = this.db.transaction(storeName, 'readonly');
-    var index = tx.objectStore(storeName).index(indexName);
-    var range = Array.isArray(query) ? IDBKeyRange.bound(query, query) : IDBKeyRange.only(query);
-    return persistenceRequest(index.getAll(range));
+    try {
+      if (!this.db) {
+        var values = Array.from(this.memory[storeName].values());
+        return values.filter(function (v) {
+          if (indexName === 'conversationId') return v.conversationId === query;
+          if (indexName === 'sessionId') return v.sessionId === query;
+          if (indexName === 'conversationSequence') return v.conversationId === query[0];
+          if (indexName === 'sessionSequence') return v.sessionId === query[0];
+          return false;
+        }).sort(function (a, b) { return (a.sequence || 0) - (b.sequence || 0); }).map(persistenceClone);
+      }
+      var tx = this.db.transaction(storeName, 'readonly');
+      var index = tx.objectStore(storeName).index(indexName);
+      var range = Array.isArray(query) ? IDBKeyRange.bound(query, query) : IDBKeyRange.only(query);
+      return await persistenceRequest(index.getAll(range));
+    } catch (e) { this._throwPersistenceError(e, 'index ' + storeName + '/' + indexName); }
   }
 
   _redact(value) {
     var self = this;
-    if (typeof value === 'string') {
-      var out = value;
-      self.secrets.forEach(function (secret) { if (secret) out = out.split(secret).join('[REDACTED]'); });
-      return out;
-    }
-    if (Array.isArray(value)) return value.map(function (v) { return self._redact(v); });
-    if (value && typeof value === 'object') {
-      var obj = {};
-      Object.keys(value).forEach(function (k) { obj[k] = self._redact(value[k]); });
+    var seen = typeof WeakMap !== 'undefined' ? new WeakMap() : new Map();
+    function redact(v) {
+      if (typeof v === 'function') throw persistenceSerializationError('functions are not persistable');
+      if (typeof v === 'string') {
+        var out = v;
+        self.secrets.forEach(function (secret) { if (secret) out = out.split(secret).join('[REDACTED]'); });
+        return out;
+      }
+      if (v === null || typeof v !== 'object') return v;
+      if (seen.has(v)) return seen.get(v);
+
+      // These are the structured-clone semantic types that the old
+      // object-rebuild implementation silently destroyed.
+      if (Array.isArray(v)) {
+        var array = []; seen.set(v, array);
+        for (var ai = 0; ai < v.length; ai++) array[ai] = redact(v[ai]);
+        return array;
+      }
+      if (v instanceof Date) return new Date(v.getTime());
+      if (v instanceof ArrayBuffer) return v.slice(0);
+      if (ArrayBuffer.isView(v)) {
+        if (v instanceof DataView) return new DataView(v.buffer.slice(0), v.byteOffset, v.byteLength);
+        return new v.constructor(v);
+      }
+      if (v instanceof Map) {
+        var map = new Map(); seen.set(v, map);
+        v.forEach(function (mv, mk) { map.set(redact(mk), redact(mv)); });
+        return map;
+      }
+      if (v instanceof Set) {
+        var set = new Set(); seen.set(v, set);
+        v.forEach(function (sv) { set.add(redact(sv)); });
+        return set;
+      }
+      if (typeof Blob !== 'undefined' && v instanceof Blob) return v.slice(0, v.size, v.type);
+      if (v.nodeType || v === globalThis) throw persistenceSerializationError('unsupported non-cloneable object');
+
+      var proto = Object.getPrototypeOf(v);
+      // Custom class instances are not reliably structured-cloned across
+      // browsers. Preserve their enumerable data, then let the final clone
+      // reject anything the platform cannot store; never JSON-coerce it.
+      var obj = Object.create(proto === null ? null : Object.prototype);
+      seen.set(v, obj);
+      Object.keys(v).forEach(function (k) { obj[k] = redact(v[k]); });
       return obj;
     }
-    return value;
+    return redact(value);
   }
 
   async _loadSecrets() {
-    try {
-      var rows = this.db
-        ? await persistenceRequest(this.db.transaction('secrets', 'readonly').objectStore('secrets').getAll())
-        : Array.from(this.memory.secrets.values());
-      this.secrets = new Set(rows.map(function (r) { return r.value; }).filter(function (v) { return typeof v === 'string' && v; }));
-    } catch (e) {}
+    var rows = this.db
+      ? await persistenceRequest(this.db.transaction('secrets', 'readonly').objectStore('secrets').getAll())
+      : Array.from(this.memory.secrets.values());
+    this.secrets = new Set(rows.map(function (r) { return r.value; }).filter(function (v) { return typeof v === 'string' && v; }));
   }
 
   async saveSettings(settings) {
@@ -222,25 +469,61 @@ class PersistenceService {
     }
   }
 
-  async loadSettings() {
+  async loadSettings(config) {
     var rows = await this.all('settings');
     var out = {};
     rows.forEach(function (r) { out[r.key] = r.value; });
-    var remembered = await this.get('secrets', 'apiKey');
-    if (remembered && remembered.value) out.apiKey = remembered.value;
-    out.remember = !!(remembered && remembered.value);
+    if (config) {
+      var remembered = await this.loadRememberedApiKey(config);
+      if (remembered) out.apiKey = remembered;
+      out.remember = !!remembered;
+    } else {
+      out.remember = false;
+    }
     return out;
   }
 
-  async setRememberedApiKey(value, remember) {
+  _credentialIdentity(config) {
+    if (!config) throw persistenceSerializationError('credential destination identity is required');
+    if (typeof createCredentialIdentity === 'function') return createCredentialIdentity(config);
+    var endpoint = String(config.endpointIdentity || config.apiBase || '').trim();
+    if (!endpoint) throw persistenceSerializationError('credential endpoint identity is required');
+    return {
+      provider: String(config.provider || ''), adapterId: String(config.adapterId || ''),
+      dialect: String(config.dialect || ''), endpointIdentity: endpoint,
+    };
+  }
+
+  _credentialKey(identity) {
+    return 'credential:' + encodeURIComponent([
+      identity.provider, identity.adapterId, identity.dialect, identity.endpointIdentity,
+    ].join('|'));
+  }
+
+  async loadRememberedApiKey(config) {
+    var identity;
+    try { identity = this._credentialIdentity(config); } catch (e) { return null; }
+    var row = await this.get('secrets', this._credentialKey(identity));
+    return row && typeof row.value === 'string' && row.value ? row.value : null;
+  }
+
+  async setRememberedApiKey(value, remember, config) {
+    var identity = this._credentialIdentity(config);
+    var key = this._credentialKey(identity);
     var secret = persistenceSafeString(value || '').trim();
     if (!remember || !secret) {
-      await this.delete('secrets', 'apiKey');
-      this.secrets.delete(secret);
+      await this.delete('secrets', key);
+      await this._loadSecrets();
       return;
     }
-    await this.put('secrets', { key: 'apiKey', value: secret, createdAt: persistenceNow() });
-    this.secrets.add(secret);
+    var old = await this.get('secrets', key);
+    await this.put('secrets', {
+      key: key, id: key, value: secret,
+      provider: identity.provider, adapterId: identity.adapterId,
+      dialect: identity.dialect, endpointIdentity: identity.endpointIdentity,
+      createdAt: old && old.createdAt || persistenceNow(), updatedAt: persistenceNow(),
+    });
+    await this._loadSecrets();
   }
 
   async forgetApiKeys() {
@@ -258,19 +541,46 @@ class PersistenceService {
   }
 
   async deleteConversation(conversationId) {
-    var conv = await this.get('conversations', conversationId);
-    var sessions = await this._byIndex('providerSessions', 'conversationId', conversationId);
-    var events = await this._byIndex('presentationEvents', 'conversationId', conversationId);
-    var normalized = await this._byIndex('normalizedMessages', 'conversationId', conversationId);
-    for (var i = 0; i < events.length; i++) await this.delete('presentationEvents', events[i].id);
-    for (var j = 0; j < normalized.length; j++) await this.delete('normalizedMessages', normalized[j].id);
-    for (var k = 0; k < sessions.length; k++) {
-      var frames = await this._byIndex('providerFrames', 'sessionId', sessions[k].id);
-      for (var n = 0; n < frames.length; n++) await this.delete('providerFrames', frames[n].id);
-      await this.delete('providerSessions', sessions[k].id);
-    }
-    await this.delete('conversations', conversationId);
-    return !!conv;
+    await this.ready;
+    try {
+      if (!this.db) {
+        var had = this.memory.conversations.has(conversationId);
+        var names = ['presentationEvents', 'providerSessions', 'providerFrames', 'normalizedMessages'];
+        for (var mi = 0; mi < names.length; mi++) {
+          var mem = this.memory[names[mi]];
+          for (var mk of Array.from(mem.values())) {
+            if (mk.conversationId === conversationId) mem.delete(mk.id !== undefined ? mk.id : mk.key);
+          }
+        }
+        this.memory.conversations.delete(conversationId);
+        return had;
+      }
+
+      // All five stores share one atomic transaction.  In particular,
+      // providerFrames are selected by conversationId, so an orphan frame
+      // cannot survive merely because its providerSession row is missing.
+      var tx = this.db.transaction([
+        'conversations', 'presentationEvents', 'providerSessions',
+        'providerFrames', 'normalizedMessages',
+      ], 'readwrite');
+      var stores = ['presentationEvents', 'providerSessions', 'providerFrames', 'normalizedMessages'];
+      for (var i = 0; i < stores.length; i++) {
+        var objectStore = tx.objectStore(stores[i]);
+        var request = objectStore.index('conversationId').getAll(IDBKeyRange.only(conversationId));
+        request.onsuccess = (function (targetStore, event) {
+          var rows = event.target.result || [];
+          for (var j = 0; j < rows.length; j++) targetStore.delete(rows[j].id);
+        }).bind(null, objectStore);
+      }
+      var found = null;
+      var convRequest = tx.objectStore('conversations').get(conversationId);
+      convRequest.onsuccess = function () {
+        found = convRequest.result || null;
+        tx.objectStore('conversations').delete(conversationId);
+      };
+      await persistenceTx(tx);
+      return !!found;
+    } catch (e) { this._throwPersistenceError(e, 'delete conversation ' + conversationId); }
   }
 
   async appendPresentationEvent(conversationId, sequence, event) {
@@ -311,7 +621,7 @@ class PersistenceService {
 
   async saveWorkspaceHandle(handle) {
     if (!handle) return;
-    try { await this.put('workspaceHandles', { key: 'externalWorkspace', handle: handle, updatedAt: persistenceNow() }); } catch (e) {}
+    await this.put('workspaceHandles', { key: 'externalWorkspace', handle: handle, updatedAt: persistenceNow() });
   }
 
   async loadWorkspaceHandle() {
@@ -323,10 +633,12 @@ class PersistenceService {
 
   async opfsDirectory(parts, create) {
     await this.ready;
-    if (!this.opfsRoot) throw new Error('OPFS unavailable');
-    var dir = this.opfsRoot;
-    for (var i = 0; i < (parts || []).length; i++) dir = await dir.getDirectoryHandle(parts[i], { create: create !== false });
-    return dir;
+    try {
+      if (!this.opfsRoot) throw new Error('OPFS unavailable');
+      var dir = this.opfsRoot;
+      for (var i = 0; i < (parts || []).length; i++) dir = await dir.getDirectoryHandle(parts[i], { create: create !== false });
+      return dir;
+    } catch (e) { this._throwPersistenceError(e, 'OPFS directory ' + (parts || []).join('/')); }
   }
 
   async storageStatus() {
@@ -340,6 +652,8 @@ class PersistenceService {
       usage: estimate && typeof estimate.usage === 'number' ? estimate.usage : null,
       quota: estimate && typeof estimate.quota === 'number' ? estimate.quota : null,
       error: this.initializationError ? String(this.initializationError.message || this.initializationError) : null,
+      persistenceHealth: this.persistenceHealth,
+      lastPersistenceError: this.lastPersistenceError,
     };
   }
 
@@ -349,53 +663,107 @@ class PersistenceService {
   }
 
   async clearConversations() {
-    var conversations = await this.loadConversations();
-    for (var i = 0; i < conversations.length; i++) await this.deleteConversation(conversations[i].id);
+    await this.ready;
+    try {
+      var names = ['conversations', 'presentationEvents', 'providerSessions', 'providerFrames', 'normalizedMessages'];
+      if (this.db) {
+        var tx = this.db.transaction(names, 'readwrite');
+        for (var i = 0; i < names.length; i++) tx.objectStore(names[i]).clear();
+        await persistenceTx(tx);
+      } else {
+        for (var j = 0; j < names.length; j++) this.memory[names[j]].clear();
+      }
+    } catch (e) { this._throwPersistenceError(e, 'clear conversations'); }
   }
 
   async _clearOpfsDir(parts) {
     var dir;
-    try { dir = await this.opfsDirectory(parts, false); } catch (e) { return; }
+    try { dir = await this.opfsDirectory(parts, false); }
+    catch (e) {
+      if (e && (e.name === 'NotFoundError' || e.cause && e.cause.name === 'NotFoundError')) return;
+      this._throwPersistenceError(e, 'open OPFS ' + parts.join('/'));
+    }
     var entries = [];
-    for await (var pair of dir.entries()) entries.push(pair);
+    try {
+      for await (var pair of dir.entries()) entries.push(pair);
+    } catch (e) {
+      throw storageClearError([parts.join('/')], e);
+    }
+    var failures = [];
     for (var i = 0; i < entries.length; i++) {
       var name = entries[i][0];
       var handle = entries[i][1];
-      if (handle.kind === 'directory') await this._clearOpfsEntry(handle);
-      try { await dir.removeEntry(name, { recursive: handle.kind === 'directory' }); } catch (e) {}
+      var target = parts.join('/') + '/' + name;
+      try {
+        if (handle.kind === 'directory') await this._clearOpfsEntry(handle, target, failures);
+        await dir.removeEntry(name, { recursive: handle.kind === 'directory' });
+      } catch (e) { failures.push({ path: target, error: e }); }
     }
+    if (failures.length) throw storageClearError(failures.map(function (f) { return f.path; }), failures[0].error);
   }
 
-  async _clearOpfsEntry(dir) {
+  async _clearOpfsEntry(dir, path, failures) {
     var entries = [];
-    for await (var pair of dir.entries()) entries.push(pair);
+    try {
+      for await (var pair of dir.entries()) entries.push(pair);
+    } catch (e) {
+      failures.push({ path: path, error: e });
+      return;
+    }
     for (var i = 0; i < entries.length; i++) {
       var name = entries[i][0];
       var handle = entries[i][1];
-      if (handle.kind === 'directory') await this._clearOpfsEntry(handle);
-      try { await dir.removeEntry(name, { recursive: handle.kind === 'directory' }); } catch (e) {}
+      var target = path + '/' + name;
+      try {
+        if (handle.kind === 'directory') await this._clearOpfsEntry(handle, target, failures);
+        await dir.removeEntry(name, { recursive: handle.kind === 'directory' });
+      } catch (e) { failures.push({ path: target, error: e }); }
     }
   }
 
-  async clearHome() { await this._clearOpfsDir(['home', 'locus']); }
-  async clearPlugins() { await this._clearOpfsDir(['mnt', 'plugins']); }
+  async ensureHomeSkeleton() {
+    if (!this.opfsRoot) return false; // memory-only mode has the VFS skeleton
+    for (var i = 0; i < LOCUS_HOME_SKELETON.length; i++) {
+      var parts = ['home', 'locus'].concat(LOCUS_HOME_SKELETON[i].split('/'));
+      await this.opfsDirectory(parts, true);
+    }
+  }
+
+  async clearHome() {
+    if (!this.opfsRoot) return false;
+    try {
+      await this._clearOpfsDir(['home', 'locus']);
+      await this.ensureHomeSkeleton();
+    } catch (e) {
+      if (e && e.name === 'StorageClearError') this._recordPersistenceError(e, 'clear home');
+      else this._recordPersistenceError(e, 'clear home');
+      throw e;
+    }
+  }
+  async clearPlugins() {
+    if (!this.opfsRoot) return false;
+    try { await this._clearOpfsDir(['mnt', 'plugins']); }
+    catch (e) { this._recordPersistenceError(e, 'clear plugins'); throw e; }
+  }
 
   // Privileged plugin installation seam. The normal agent-facing VFS mounts
   // /mnt/plugins with system-read-only authority; only an explicit host
   // integration may call this method.
   async writePlugin(path, data) {
-    var rel = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '');
-    if (!rel || rel.split('/').some(function (part) { return !part || part === '..' || part.includes(':'); })) throw new Error('invalid plugin path');
-    var parts = rel.split('/');
-    var file = parts.pop();
-    var dir = await this.opfsDirectory(['mnt', 'plugins'].concat(parts), true);
-    var writable = await (await dir.getFileHandle(file, { create: true })).createWritable();
-    if (typeof data === 'string') await writable.write(data);
-    else {
-      var bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-      await writable.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-    }
-    await writable.close();
+    try {
+      var rel = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '');
+      if (!rel || rel.split('/').some(function (part) { return !part || part === '..' || part.includes(':'); })) throw new Error('invalid plugin path');
+      var parts = rel.split('/');
+      var file = parts.pop();
+      var dir = await this.opfsDirectory(['mnt', 'plugins'].concat(parts), true);
+      var writable = await (await dir.getFileHandle(file, { create: true })).createWritable();
+      if (typeof data === 'string') await writable.write(data);
+      else {
+        var bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+        await writable.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+      }
+      await writable.close();
+    } catch (e) { this._throwPersistenceError(e, 'write plugin'); }
   }
 
   async readPlugin(path) {
