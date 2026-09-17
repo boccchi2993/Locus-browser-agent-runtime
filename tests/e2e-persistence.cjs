@@ -60,7 +60,11 @@ async function main() {
     await evaluate(first.cdp, `window.__locus.actions.resetAllData()`);
     await evaluate(first.cdp, `window.__e2eReplies.push({
       content: 'persisted answer', reasoning: 'provider returned reasoning',
-      rawMessage: { role: 'assistant', content: 'persisted answer', reasoning_content: 'provider returned reasoning', future_vendor_field: { nested: [1, 2, 3] } }
+      rawMessage: { role: 'assistant', future_vendor_field: { nested: [1, 2, 3] }, content: [
+        { type: 'thinking', thinking: 'provider returned reasoning' },
+        { type: 'text', text: 'persisted answer' },
+        { type: 'future_opaque_block', payload: { nested: [1, 2, 3] } }
+      ] }
     }); window.__locus.actions.submit('persist this conversation')`);
     await waitForRuntimeCondition(first.cdp, `(() => {
       const c = window.__locus.store.conversations.find(x => x.title === 'persist this conversation');
@@ -113,6 +117,27 @@ async function main() {
     await evaluate(second.cdp, `window.__e2eReplies.push({ content: 'continued' }); window.__locus.actions.submit('continue old conversation')`);
     await waitForRuntimeCondition(second.cdp, `window.__locus.store.conversations.find(c => c.title === 'persist this conversation').items.some(i => i.content === 'continued')`, { process: second.chrome, phase: 'persistence-continuation', timeoutMs: 15000 });
     check('P-E13 restored conversation continues', true);
+
+    await evaluate(second.cdp, `window.__e2eReplies.push((body, opts) => new Promise((resolve) => {
+      const answer = { content: 'cancelled answer', reasoning: null, reasoningType: 'raw',
+        toolCalls: null, rawMessage: { role: 'assistant', content: 'cancelled answer' },
+        stopReason: 'end_turn', usage: null, providerMetadata: null, truncated: false };
+      if (opts?.signal?.aborted) resolve(answer);
+      else opts.signal.addEventListener('abort', () => resolve(answer), { once: true });
+    })); void window.__locus.actions.submit('gate cancellation'); true`);
+    await waitForRuntimeCondition(second.cdp, '!!(window.__locus.store.busy && window.__locus.session.task)', {
+      process: second.chrome, phase: 'persistence-gate-active-task', timeoutMs: 10000,
+    });
+    await evaluate(second.cdp, 'window.__locus.actions.clearConversations()');
+    check('P-E14 storage gate waits for task settlement before clear', await evaluate(second.cdp, '!window.__locus.store.busy && window.__locus.session.task === null'));
+    check('P-E15 clear conversations leaves no durable conversation rows', await evaluate(second.cdp, `new Promise((resolve, reject) => {
+      const req = indexedDB.open('locus'); req.onerror = () => reject(req.error);
+      req.onsuccess = () => { const tx = req.result.transaction('conversations', 'readonly'); const get = tx.objectStore('conversations').getAll(); get.onsuccess = () => resolve(get.result.length === 1); };
+    })`));
+
+    await evaluate(second.cdp, 'window.__locus.actions.resetAllData()');
+    check('P-E16 reset unmounts external workspace and clears handle state', await evaluate(second.cdp, '!window.__locus.vfs.resolveMount("/mnt/workspace") && window.__locus.store.workspaceHandleAvailable === false'));
+    check('P-E17 reset recreates canonical home skeleton', await evaluate(second.cdp, 'window.__locus.vfs.exists("/home/locus/.skills") && window.__locus.vfs.exists("/home/locus/.config/locus/mcp") && window.__locus.vfs.exists("/home/locus/.cache/locus")'));
 
     console.log('---');
     console.log('e2e-persistence: ' + passed + ' passed, ' + failed + ' failed');
