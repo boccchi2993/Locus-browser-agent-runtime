@@ -179,13 +179,38 @@ const OpenAIAdapter = {
     return rawReplayIdentityCompatible(this, sessionMeta, currentConfig);
   },
 
-  validateRawReplay(frames) {
-    for (const frame of frames || []) {
-      if (frame.kind !== 'assistant') continue;
-      const raw = frame.raw;
-      if (!raw || raw.role !== 'assistant') throw new Error('OpenAI raw replay assistant frame is malformed');
+  // Raw provider state is the protocol source of truth. Persisted frame
+  // metadata is checked by validateReplayPrefix after this classification;
+  // it must never decide whether an assistant tool call is inspected.
+  inspectRawReplayFrame(frame) {
+    const raw = frame && frame.raw;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('OpenAI raw replay frame is malformed');
+    if (raw.role === 'assistant') {
       if (raw.tool_calls !== undefined && !Array.isArray(raw.tool_calls)) throw new Error('OpenAI raw replay tool_calls is malformed');
+      const toolCallIds = [];
+      for (const call of raw.tool_calls || []) {
+        if (!call || typeof call !== 'object' || Array.isArray(call)
+          || typeof call.id !== 'string' || !call.id
+          || !call.function || typeof call.function !== 'object'
+          || Array.isArray(call.function) || typeof call.function.name !== 'string'
+          || !call.function.name) {
+          throw new Error('OpenAI raw replay tool call is malformed');
+        }
+        toolCallIds.push(call.id);
+      }
+      if (new Set(toolCallIds).size !== toolCallIds.length) throw new Error('OpenAI raw replay tool-call ids are duplicated');
+      return { semanticKind: 'assistant', role: 'assistant', toolCallIds: toolCallIds, toolResultId: null };
     }
+    if (raw.role === 'tool_result') {
+      if (typeof raw.toolCallId !== 'string' || !raw.toolCallId) throw new Error('OpenAI raw replay tool result id is malformed');
+      return { semanticKind: 'tool_result', role: 'tool_result', toolCallIds: [], toolResultId: raw.toolCallId };
+    }
+    if (raw.role === 'user') return { semanticKind: 'user', role: 'user', toolCallIds: [], toolResultId: null };
+    throw new Error('OpenAI raw replay role is unknown');
+  },
+
+  validateRawReplay(frames) {
+    for (const frame of frames || []) this.inspectRawReplayFrame(frame);
     return true;
   },
 
@@ -320,12 +345,31 @@ const AnthropicAdapter = {
     return rawReplayIdentityCompatible(this, sessionMeta, currentConfig);
   },
 
-  validateRawReplay(frames) {
-    for (const frame of frames || []) {
-      if (frame.kind !== 'assistant') continue;
-      const raw = frame.raw;
-      if (!raw || raw.role !== 'assistant' || !Array.isArray(raw.content)) throw new Error('Anthropic raw replay assistant frame is malformed');
+  inspectRawReplayFrame(frame) {
+    const raw = frame && frame.raw;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Anthropic raw replay frame is malformed');
+    if (raw.role === 'assistant') {
+      if (!Array.isArray(raw.content)) throw new Error('Anthropic raw replay assistant content is malformed');
+      const toolCallIds = [];
+      for (const block of raw.content) {
+        if (block && block.type === 'tool_use') {
+          if (typeof block.id !== 'string' || !block.id) throw new Error('Anthropic raw replay tool-use id is malformed');
+          toolCallIds.push(block.id);
+        }
+      }
+      if (new Set(toolCallIds).size !== toolCallIds.length) throw new Error('Anthropic raw replay tool-use ids are duplicated');
+      return { semanticKind: 'assistant', role: 'assistant', toolCallIds: toolCallIds, toolResultId: null };
     }
+    if (raw.role === 'tool_result') {
+      if (typeof raw.toolCallId !== 'string' || !raw.toolCallId) throw new Error('Anthropic raw replay tool result id is malformed');
+      return { semanticKind: 'tool_result', role: 'tool_result', toolCallIds: [], toolResultId: raw.toolCallId };
+    }
+    if (raw.role === 'user') return { semanticKind: 'user', role: 'user', toolCallIds: [], toolResultId: null };
+    throw new Error('Anthropic raw replay role is unknown');
+  },
+
+  validateRawReplay(frames) {
+    for (const frame of frames || []) this.inspectRawReplayFrame(frame);
     return true;
   },
 

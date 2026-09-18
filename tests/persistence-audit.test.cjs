@@ -28,7 +28,9 @@ function rejects(fn, code) {
 function frame(session, sequence, kind, raw, extra) {
   return Object.assign({
     id: 'frame-' + sequence, sessionId: session.id, conversationId: session.conversationId,
-    sequence, kind, role: kind === 'assistant' ? 'assistant' : 'user', raw,
+    sequence, kind,
+    role: kind === 'assistant' ? 'assistant' : (kind === 'tool_result' ? 'tool_result' : 'user'),
+    raw, toolCallId: kind === 'tool_result' && raw ? raw.toolCallId || null : null,
   }, extra || {});
 }
 
@@ -86,6 +88,103 @@ async function run() {
       { conversationId: 'c', sequence: 1, role: 'user', kind: 'message', text: 'a' },
       { conversationId: 'c', sequence: 3, role: 'assistant', kind: 'message', text: 'b' },
     ]), 'normalized_sequence_invalid'));
+
+    // ---------- F-C01: raw semantic truth cannot be hidden by metadata ----------
+    const rawToolCall = { role: 'assistant', content: null, tool_calls: [
+      { id: 'call-c01', type: 'function', function: { name: 'bash', arguments: '{}' } },
+    ], vendor_opaque: { keep: true } };
+    const hiddenKind = openAiSession(1);
+    check('C01-1 raw assistant tool call + kind=message rejected', await rejects(() => P.validateReplayPrefix(hiddenKind, [
+      frame(hiddenKind, 1, 'message', rawToolCall, { role: 'assistant' }),
+    ], A.OpenAIAdapter), 'metadata_kind_mismatch'));
+    const hiddenRole = openAiSession(1);
+    check('C01-2 raw assistant + role metadata mismatch rejected', await rejects(() => P.validateReplayPrefix(hiddenRole, [
+      frame(hiddenRole, 1, 'assistant', rawToolCall, { role: 'user' }),
+    ], A.OpenAIAdapter), 'metadata_role_mismatch'));
+    const badResultKind = openAiSession(2);
+    check('C01-3 raw tool_result + kind mismatch rejected', await rejects(() => P.validateReplayPrefix(badResultKind, [
+      frame(badResultKind, 1, 'assistant', rawToolCall),
+      frame(badResultKind, 2, 'message', { role: 'tool_result', toolCallId: 'call-c01', content: 'ok' }, { role: 'tool_result' }),
+    ], A.OpenAIAdapter), 'metadata_kind_mismatch'));
+    const badResultId = openAiSession(2);
+    check('C01-4 toolCallId raw/metadata mismatch rejected', await rejects(() => P.validateReplayPrefix(badResultId, [
+      frame(badResultId, 1, 'assistant', rawToolCall),
+      frame(badResultId, 2, 'tool_result', { role: 'tool_result', toolCallId: 'call-c01', content: 'ok' }, { toolCallId: 'call-other' }),
+    ], A.OpenAIAdapter), 'tool_result_id_mismatch'));
+    let harmlessKindsRejected = true;
+    for (const badKind of ['message', 'text', 'unknown', null, '']) {
+      const s = openAiSession(1);
+      const corrupted = frame(s, 1, badKind, rawToolCall, { role: 'assistant', kind: badKind });
+      if (!(await rejects(() => P.validateReplayPrefix(s, [corrupted], A.OpenAIAdapter)))) harmlessKindsRejected = false;
+    }
+    check('C01-5 harmless metadata cannot hide raw tool call', harmlessKindsRejected);
+    const finalSession = openAiSession(2);
+    check('C01-6 normal assistant final accepted', P.validateReplayPrefix(finalSession, [
+      frame(finalSession, 1, 'user', { role: 'user', content: 'hello' }),
+      frame(finalSession, 2, 'assistant', { role: 'assistant', content: 'done' }),
+    ], A.OpenAIAdapter).valid === true);
+    const batchSession = openAiSession(2);
+    check('C01-7 normal tool batch accepted', P.validateReplayPrefix(batchSession, [
+      frame(batchSession, 1, 'assistant', rawToolCall),
+      frame(batchSession, 2, 'tool_result', { role: 'tool_result', toolCallId: 'call-c01', content: 'ok' }),
+    ], A.OpenAIAdapter).valid === true);
+    const multiSession = openAiSession(3);
+    const multiRaw = { role: 'assistant', content: null, tool_calls: [
+      { id: 'call-one', type: 'function', function: { name: 'bash', arguments: '{}' } },
+      { id: 'call-two', type: 'function', function: { name: 'bash', arguments: '{}' } },
+    ] };
+    check('C01-8 multi-tool complete accepted', P.validateReplayPrefix(multiSession, [
+      frame(multiSession, 1, 'assistant', multiRaw),
+      frame(multiSession, 2, 'tool_result', { role: 'tool_result', toolCallId: 'call-one', content: 'one' }),
+      frame(multiSession, 3, 'tool_result', { role: 'tool_result', toolCallId: 'call-two', content: 'two' }),
+    ], A.OpenAIAdapter).valid === true);
+    const reverse = openAiSession(1);
+    check('C01-9 raw user + kind=assistant rejected', await rejects(() => P.validateReplayPrefix(reverse, [
+      frame(reverse, 1, 'assistant', { role: 'user', content: 'feedback' }),
+    ], A.OpenAIAdapter)));
+    const missingMetadata = openAiSession(1);
+    const missing = frame(missingMetadata, 1, 'assistant', rawToolCall);
+    delete missing.kind;
+    check('C01-10 required metadata missing rejected', await rejects(() => P.validateReplayPrefix(missingMetadata, [missing], A.OpenAIAdapter), 'metadata_missing'));
+    const unchanged = JSON.stringify(rawToolCall);
+    const unchangedSession = openAiSession(2);
+    P.validateReplayPrefix(unchangedSession, [
+      frame(unchangedSession, 1, 'assistant', rawToolCall),
+      frame(unchangedSession, 2, 'tool_result', { role: 'tool_result', toolCallId: 'call-c01', content: 'ok' }),
+    ], A.OpenAIAdapter);
+    check('C01-11 raw provider object remains unchanged', JSON.stringify(rawToolCall) === unchanged);
+
+    const anthropicSession = {
+      id: 's-anthropic-audit', conversationId: 'c-anthropic-audit', replayCheckpointSequence: 2,
+      provider: 'anthropic', adapterId: 'anthropic-compatible', dialect: 'anthropic',
+      endpointIdentity: 'https://gateway.example/v1', model: 'audit', protocolVersion: 'messages-v1',
+      persistenceState: 'healthy',
+    };
+    const anthropicCall = { role: 'assistant', content: [
+      { type: 'text', text: 'inspect' },
+      { type: 'tool_use', id: 'tool-c01', name: 'bash', input: {} },
+    ] };
+    check('C01-12 Anthropic native tool batch accepted', P.validateReplayPrefix(anthropicSession, [
+      frame(anthropicSession, 1, 'assistant', anthropicCall),
+      frame(anthropicSession, 2, 'tool_result', { role: 'tool_result', toolCallId: 'tool-c01', content: 'ok' }),
+    ], A.AnthropicAdapter).valid === true);
+    const anthropicCorrupt = Object.assign({}, anthropicSession, { replayCheckpointSequence: 1 });
+    check('C01-13 Anthropic raw tool_use + kind=message rejected', await rejects(() => P.validateReplayPrefix(anthropicCorrupt, [
+      frame(anthropicCorrupt, 1, 'message', anthropicCall, { role: 'assistant' }),
+    ], A.AnthropicAdapter), 'metadata_kind_mismatch'));
+
+    let fuzzRejected = 0;
+    for (let i = 0; i < 100; i++) {
+      const s = openAiSession(2);
+      const resultFrame = frame(s, 2, 'tool_result', { role: 'tool_result', toolCallId: 'call-c01', content: 'ok' });
+      if (i % 3 === 0) resultFrame.kind = 'message';
+      else if (i % 3 === 1) resultFrame.role = 'user';
+      else resultFrame.toolCallId = 'corrupt-' + i;
+      if (await rejects(() => P.validateReplayPrefix(s, [
+        frame(s, 1, 'assistant', rawToolCall), resultFrame,
+      ], A.OpenAIAdapter))) fuzzRejected++;
+    }
+    check('C01-14 metadata corruption fuzz 100/100 rejected', fuzzRejected === 100, String(fuzzRejected));
   }
 
   // ---------- F-03/F-07/F-08: identities, types, and atomic cascade ----------

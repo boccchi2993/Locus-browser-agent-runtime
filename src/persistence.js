@@ -170,14 +170,6 @@ function replayValidationError(code, message) {
   return e;
 }
 
-function replayToolCallIds(raw) {
-  if (!raw || typeof raw !== 'object') return [];
-  if (Array.isArray(raw.tool_calls)) return raw.tool_calls.map(function (c) { return c && c.id; });
-  if (Array.isArray(raw.content)) return raw.content.filter(function (b) { return b && b.type === 'tool_use'; })
-    .map(function (b) { return b.id; });
-  return [];
-}
-
 // Generic durable-prefix validation.  Provider-specific wire details remain
 // adapter-owned, but identity, sequence and the basic tool-call/result
 // pairing are checked before any raw state can reach serializeRequest().
@@ -196,28 +188,83 @@ function validateReplayPrefix(session, frames, adapter) {
     if (frame.sessionId !== session.id) throw replayValidationError('session_identity_mismatch', 'raw frame has the wrong provider session id');
     if (frame.conversationId !== session.conversationId) throw replayValidationError('conversation_identity_mismatch', 'raw frame has the wrong conversation id');
   }
-  var pending = null;
+  // The adapter classifies raw provider state before any persisted metadata is
+  // consulted.  A corrupt kind/role cannot therefore hide an assistant tool
+  // call or a provider-neutral tool result from the pairing validator.
+  if (!adapter || typeof adapter.inspectRawReplayFrame !== 'function') {
+    throw replayValidationError('raw_classifier_missing', 'raw replay requires a provider raw-frame classifier');
+  }
+  var semanticRows = [];
   for (var j = 0; j < rows.length; j++) {
     var current = rows[j];
-    if (current.kind === 'assistant') {
-      var ids = replayToolCallIds(current.raw);
+    var semantic;
+    try {
+      semantic = adapter.inspectRawReplayFrame(current);
+    } catch (e) {
+      throw replayValidationError('raw_semantics_invalid', 'provider raw replay frame is malformed: ' + (e && e.message ? e.message : String(e)));
+    }
+    if (!semantic || !semantic.semanticKind || !semantic.role || !Array.isArray(semantic.toolCallIds)) {
+      throw replayValidationError('raw_semantics_invalid', 'provider raw replay classifier returned an invalid result');
+    }
+    if (!Object.prototype.hasOwnProperty.call(current, 'kind')
+      || typeof current.kind !== 'string'
+      || !Object.prototype.hasOwnProperty.call(current, 'role')
+      || typeof current.role !== 'string') {
+      throw replayValidationError('metadata_missing', 'raw replay frame is missing durable kind/role metadata');
+    }
+    if (current.role !== semantic.role) {
+      throw replayValidationError('metadata_role_mismatch', 'raw replay role does not match persisted frame role');
+    }
+    if (semantic.semanticKind === 'assistant' && current.kind !== 'assistant') {
+      throw replayValidationError('metadata_kind_mismatch', 'raw assistant frame must persist kind assistant');
+    }
+    if (semantic.semanticKind === 'tool_result' && current.kind !== 'tool_result') {
+      throw replayValidationError('metadata_kind_mismatch', 'raw tool result frame must persist kind tool_result');
+    }
+    if (semantic.semanticKind === 'user' && current.kind !== 'user' && current.kind !== 'tool_feedback') {
+      throw replayValidationError('metadata_kind_mismatch', 'raw user frame must persist kind user or tool_feedback');
+    }
+    if (semantic.semanticKind !== 'assistant' && semantic.semanticKind !== 'tool_result' && semantic.semanticKind !== 'user') {
+      throw replayValidationError('raw_semantics_invalid', 'raw replay semantic kind is unknown');
+    }
+    if (semantic.semanticKind === 'tool_result') {
+      if (!Object.prototype.hasOwnProperty.call(current, 'toolCallId')
+        || typeof current.toolCallId !== 'string' || !current.toolCallId) {
+        throw replayValidationError('tool_result_id_missing', 'raw tool result is missing persisted toolCallId metadata');
+      }
+      if (current.toolCallId !== semantic.toolResultId) {
+        throw replayValidationError('tool_result_id_mismatch', 'raw tool result id does not match persisted toolCallId metadata');
+      }
+    } else if (current.toolCallId !== undefined && current.toolCallId !== null) {
+      throw replayValidationError('tool_result_id_unexpected', 'non-tool-result raw frame has toolCallId metadata');
+    }
+    semanticRows.push({ frame: current, semantic: semantic });
+  }
+
+  var pending = null;
+  for (var k = 0; k < semanticRows.length; k++) {
+    var classified = semanticRows[k];
+    var kind = classified.semantic.semanticKind;
+    if (kind === 'assistant') {
+      var ids = classified.semantic.toolCallIds;
       if (ids.some(function (id) { return typeof id !== 'string' || !id; })) {
         throw replayValidationError('tool_call_invalid', 'provider tool-call ids must be non-empty strings');
       }
       if (new Set(ids).size !== ids.length) throw replayValidationError('tool_call_duplicate', 'provider tool-call ids must be unique within an assistant frame');
       if (pending) throw replayValidationError('tool_batch_dangling', 'a new assistant frame starts before the previous tool batch completed');
       if (ids.length) pending = { ids: new Set(ids), seen: new Set() };
-    } else if (current.kind === 'tool_result') {
+    } else if (kind === 'tool_result') {
       if (!pending) throw replayValidationError('tool_result_unpaired', 'tool result has no preceding provider tool call');
-      var id = current.toolCallId || current.raw && current.raw.toolCallId;
+      var id = classified.semantic.toolResultId;
       if (!pending.ids.has(id)) throw replayValidationError('tool_result_unpaired', 'tool result id does not belong to the pending tool batch');
       if (pending.seen.has(id)) throw replayValidationError('tool_result_duplicate', 'duplicate tool result id in provider tool batch');
       pending.seen.add(id);
       if (pending.seen.size === pending.ids.size) pending = null;
+    } else if (pending) {
+      throw replayValidationError('tool_batch_interrupted', 'raw user frame interrupts a pending provider tool batch');
     }
   }
   if (pending) throw replayValidationError('tool_batch_dangling', 'replay checkpoint ends inside a provider tool batch');
-  if (adapter && typeof adapter.validateRawReplay === 'function') adapter.validateRawReplay(rows);
   return { valid: true, checkpoint: checkpoint, frames: rows };
 }
 
