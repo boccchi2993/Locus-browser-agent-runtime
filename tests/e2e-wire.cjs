@@ -123,8 +123,105 @@ async function main() {
     const afterCorrupt = await evaluate(cdp, 'window.__locusWire.calls.length');
     check('W-E9 corrupt checkpoint sends zero provider request', afterCorrupt === beforeCorrupt, 'before=' + beforeCorrupt + ',after=' + afterCorrupt);
 
+    // F-C01 closure probe: create a real native tool transcript through the
+    // production callModel/adapter/fake transport path, then corrupt only its
+    // durable metadata and remove the result suffix. Raw tool semantics must
+    // still make restore fail closed before another provider request.
+    await evaluate(cdp, `(async () => {
+      window.__locus.actions.newTask();
+      window.__e2eToolExecutor = async () => ({ output: 'seeded tool output', success: true, backend: 'browser' });
+      const s = window.__locus.store.settings;
+      s.apiBase = 'https://gateway.example/tenant-a'; s.dialect = 'openai'; s.model = 'audit-model'; s.apiKey = 'KEY_A'; s.remember = false;
+      window.__locus.actions.applySettings();
+      window.__locusWire.responses.push(${literal({
+        choices: [{ message: { role: 'assistant', content: null, tool_calls: [{ id: 'wire-c01-openai', type: 'function', function: { name: 'bash', arguments: '{"input":"pwd"}' } }] }, finish_reason: 'tool_calls' }],
+      })}, ${literal({
+        choices: [{ message: { role: 'assistant', content: 'seeded openai final' }, finish_reason: 'stop' }],
+      })});
+      await window.__locus.actions.submit('seed openai raw tool transcript');
+    })()`);
+    await waitForRuntimeCondition(cdp, `window.__locus.store.conversations.some(c => c.title === 'seed openai raw tool transcript' && c.status === 'completed')`, {
+      process: chrome, phase: 'wire-c01-openai-seed', timeoutMs: 15000,
+    });
+    const openAiAttackId = await evaluate(cdp, `window.__locus.store.conversations.find(c => c.title === 'seed openai raw tool transcript').id`);
+    const openAiAttackSession = await evaluate(cdp, `window.__locus.store.conversations.find(c => c.id === ${literal(openAiAttackId)}).activeProviderSessionId`);
+    await evaluate(cdp, `(async () => {
+      const db = await new Promise((resolve, reject) => { const req = indexedDB.open('locus'); req.onerror = () => reject(req.error); req.onsuccess = () => resolve(req.result); });
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(['providerFrames', 'providerSessions'], 'readwrite');
+        const index = tx.objectStore('providerFrames').index('sessionId');
+        const get = index.getAll(${literal(openAiAttackSession)});
+        get.onerror = () => reject(get.error);
+        get.onsuccess = () => {
+          const rows = get.result.sort((a, b) => a.sequence - b.sequence);
+          const target = rows.find(r => r.raw && r.raw.role === 'assistant' && Array.isArray(r.raw.tool_calls) && r.raw.tool_calls.length);
+          if (!target) return reject(new Error('OpenAI attack assistant frame not found'));
+          const frames = tx.objectStore('providerFrames');
+          rows.filter(r => r.sequence > target.sequence).forEach(r => frames.delete(r.id));
+          target.kind = 'message'; frames.put(target);
+          const sessions = tx.objectStore('providerSessions');
+          const sessionGet = sessions.get(${literal(openAiAttackSession)});
+          sessionGet.onerror = () => reject(sessionGet.error);
+          sessionGet.onsuccess = () => { const session = sessionGet.result; session.replayCheckpointSequence = target.sequence; session.nextFrameSequence = target.sequence; sessions.put(session); };
+        };
+        tx.oncomplete = () => resolve(true); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || new Error('attack transaction aborted'));
+      });
+    })()`);
+    const beforeOpenAiCorrupt = await evaluate(cdp, 'window.__locusWire.calls.length');
+    await evaluate(cdp, `window.__locus.actions.newTask(); window.__locus.actions.openConversation(${literal(openAiAttackId)}); window.__locus.actions.submit('continue corrupt openai raw')`);
+    await waitForRuntimeCondition(cdp, `window.__locus.store.conversations.find(c => c.id === ${literal(openAiAttackId)})?.replayState === 'raw_invalid'`, {
+      process: chrome, phase: 'wire-c01-openai-corrupt', timeoutMs: 15000,
+    });
+    const afterOpenAiCorrupt = await evaluate(cdp, 'window.__locusWire.calls.length');
+    check('C01 wire OpenAI raw dangling tool call sends zero requests', afterOpenAiCorrupt === beforeOpenAiCorrupt, 'before=' + beforeOpenAiCorrupt + ',after=' + afterOpenAiCorrupt);
+
+    // The same metadata corruption must be rejected for Anthropic tool_use.
+    await evaluate(cdp, `(async () => { await window.__locus.actions.resetAllData(); const s = window.__locus.store.settings; s.apiBase = 'https://gateway.example/tenant-b'; s.dialect = 'anthropic'; s.model = 'audit-model'; s.apiKey = 'KEY_B'; s.remember = false; window.__locus.actions.applySettings(); })()`);
+    await evaluate(cdp, `(async () => {
+      window.__locusWire.responses.push(${literal({
+        content: [{ type: 'tool_use', id: 'wire-c01-anthropic', name: 'bash', input: { input: 'pwd' } }], stop_reason: 'tool_use',
+      })}, ${literal({
+        content: [{ type: 'text', text: 'seeded anthropic final' }], stop_reason: 'end_turn',
+      })});
+      await window.__locus.actions.submit('seed anthropic raw tool transcript');
+    })()`);
+    await waitForRuntimeCondition(cdp, `window.__locus.store.conversations.some(c => c.title === 'seed anthropic raw tool transcript' && c.status === 'completed')`, {
+      process: chrome, phase: 'wire-c01-anthropic-seed', timeoutMs: 15000,
+    });
+    const anthropicAttackId = await evaluate(cdp, `window.__locus.store.conversations.find(c => c.title === 'seed anthropic raw tool transcript').id`);
+    const anthropicAttackSession = await evaluate(cdp, `window.__locus.store.conversations.find(c => c.id === ${literal(anthropicAttackId)}).activeProviderSessionId`);
+    await evaluate(cdp, `(async () => {
+      const db = await new Promise((resolve, reject) => { const req = indexedDB.open('locus'); req.onerror = () => reject(req.error); req.onsuccess = () => resolve(req.result); });
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(['providerFrames', 'providerSessions'], 'readwrite');
+        const get = tx.objectStore('providerFrames').index('sessionId').getAll(${literal(anthropicAttackSession)});
+        get.onerror = () => reject(get.error);
+        get.onsuccess = () => {
+          const rows = get.result.sort((a, b) => a.sequence - b.sequence);
+          const target = rows.find(r => r.raw && r.raw.role === 'assistant' && Array.isArray(r.raw.content) && r.raw.content.some(b => b && b.type === 'tool_use'));
+          if (!target) return reject(new Error('Anthropic attack assistant frame not found'));
+          const frames = tx.objectStore('providerFrames');
+          rows.filter(r => r.sequence > target.sequence).forEach(r => frames.delete(r.id));
+          target.kind = 'message'; frames.put(target);
+          const sessions = tx.objectStore('providerSessions');
+          const sessionGet = sessions.get(${literal(anthropicAttackSession)});
+          sessionGet.onerror = () => reject(sessionGet.error);
+          sessionGet.onsuccess = () => { const session = sessionGet.result; session.replayCheckpointSequence = target.sequence; session.nextFrameSequence = target.sequence; sessions.put(session); };
+        };
+        tx.oncomplete = () => resolve(true); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || new Error('attack transaction aborted'));
+      });
+    })()`);
+    const beforeAnthropicCorrupt = await evaluate(cdp, 'window.__locusWire.calls.length');
+    await evaluate(cdp, `window.__locus.actions.newTask(); window.__locus.actions.openConversation(${literal(anthropicAttackId)}); window.__locus.actions.submit('continue corrupt anthropic raw')`);
+    await waitForRuntimeCondition(cdp, `window.__locus.store.conversations.find(c => c.id === ${literal(anthropicAttackId)})?.replayState === 'raw_invalid'`, {
+      process: chrome, phase: 'wire-c01-anthropic-corrupt', timeoutMs: 15000,
+    });
+    const afterAnthropicCorrupt = await evaluate(cdp, 'window.__locusWire.calls.length');
+    check('C01 wire Anthropic raw dangling tool call sends zero requests', afterAnthropicCorrupt === beforeAnthropicCorrupt, 'before=' + beforeAnthropicCorrupt + ',after=' + afterAnthropicCorrupt);
+
     await evaluate(cdp, 'window.__locus.actions.newTask()');
     const failureId = await evaluate(cdp, 'window.__locus.store.liveConversationId');
+    const beforeFailure = await evaluate(cdp, 'window.__locusWire.calls.length');
     await evaluate(cdp, `(() => {
       const original = window.PersistenceServiceInstance.appendProviderFrame.bind(window.PersistenceServiceInstance);
       window.__wireToolCount = 0;
@@ -144,7 +241,7 @@ async function main() {
     const failureState = await evaluate(cdp, `(() => { const c = window.__locus.store.conversations.find(x => x.id === ${literal(failureId)}); return { status: c.status, runState: c.runState, persistenceState: c.persistenceState }; })()`);
     const afterFailure = await evaluate(cdp, '({ calls: window.__locusWire.calls.length, tools: window.__wireToolCount })');
     check('W-E10 persistence failure is terminal and degraded', failureState.status === 'persistence_error' && failureState.runState === 'interrupted' && failureState.persistenceState === 'degraded');
-    check('W-E11 persistence failure stops tool retry/model resend', afterFailure.calls === afterCorrupt + 1 && afterFailure.tools === 1, JSON.stringify(afterFailure));
+    check('W-E11 persistence failure stops tool retry/model resend', afterFailure.calls === beforeFailure + 1 && afterFailure.tools === 1, JSON.stringify(afterFailure));
 
     check('W-E12 browser reported no unhandled errors', (await evaluate(cdp, '(window.__e2eErrors || []).length')) === 0);
     console.log('---');
