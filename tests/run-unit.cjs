@@ -23,6 +23,7 @@ const SUITES = [
   'presentation.test.cjs',
   'store-defaults.test.cjs',
   'conversation-routing.test.mjs',
+  'submit-presentation.test.mjs',
   'worker-init.test.cjs',
   'worker-output.test.cjs',
   'vfs-audit.test.cjs',

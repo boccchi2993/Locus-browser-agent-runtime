@@ -619,15 +619,17 @@ export async function submit(text) {
   const boundId = runningConversationId;
   const boundConversation = store.conversations.find((c) => c.id === boundId);
   let submitGeneration = session.generation;
-  const finishPreRunSessionSwitch = () => {
-    // Persistence can still be committing the first user frame when a
-    // workspace/new-task boundary or cancel arrives. Preserve that intent in
-    // the presentation projection before recording the terminal outcome, so
-    // the interrupted attempt remains visible in recents.
+  const projectPreRunIntent = () => {
     if (boundConversation && !boundConversation.items.length && boundConversation.status === 'idle') {
       handleRuntimeEvent({ type: 'task_start', input: input });
     }
+  };
+  const finishPreRunSessionSwitch = () => {
     if (pendingCancel) {
+      // Persistence can still be committing the first user frame when a
+      // cancel arrives. Preserve that intent only on this terminal path;
+      // normal task_start ownership belongs to AgentSession.run().
+      projectPreRunIntent();
       handleRuntimeEvent({
         type: 'warning',
         code: 'task_cancelled',
@@ -637,6 +639,9 @@ export async function submit(text) {
       return true;
     }
     if (session.generation === submitGeneration) return false;
+    // A session boundary can arrive before AgentSession.run(). Preserve the
+    // submitted intent once before recording that terminal outcome.
+    projectPreRunIntent();
     handleRuntimeEvent({
       type: 'warning',
       code: 'session_changed',

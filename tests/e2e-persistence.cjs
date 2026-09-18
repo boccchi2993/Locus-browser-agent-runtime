@@ -19,6 +19,29 @@ async function evaluate(cdp, expression, awaitPromise = true) {
   return result?.result?.value;
 }
 
+async function waitForPresentationTaskStarts(cdp, conversationId, input, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  const conversationLiteral = JSON.stringify(conversationId);
+  const inputLiteral = JSON.stringify(input);
+  while (Date.now() < deadline) {
+    const count = await evaluate(cdp, `(async () => new Promise((resolve, reject) => {
+      const req = indexedDB.open('locus');
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        const tx = db.transaction('presentationEvents', 'readonly');
+        const get = tx.objectStore('presentationEvents').index('conversationId').getAll(${conversationLiteral});
+        get.onerror = () => reject(get.error);
+        get.onsuccess = () => resolve(get.result.filter(row =>
+          row.event && row.event.type === 'task_start' && row.event.input === ${inputLiteral}).length);
+      };
+    }))()`);
+    if (count === 1) return count;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+  }
+  throw new Error('timed out waiting for one persisted task_start for ' + input);
+}
+
 async function open(profileDir, preserveProfile) {
   const chrome = await launchChrome(APP_URL, {
     chromePath: process.env.CHROME,
@@ -70,6 +93,13 @@ async function main() {
       const c = window.__locus.store.conversations.find(x => x.title === 'persist this conversation');
       return !!c && c.status === 'completed' && c.items.some(i => i.content === 'persisted answer');
     })()`, { process: first.chrome, phase: 'persistence-first-run', timeoutMs: 15000 });
+    const firstConversationId = await evaluate(first.cdp, `window.__locus.store.conversations.find(c => c.title === 'persist this conversation')?.id`);
+    const firstUserCount = await evaluate(first.cdp, `window.__locus.store.conversations
+      .find(c => c.id === ${JSON.stringify(firstConversationId)})?.items
+      .filter(i => i.kind === 'user' && i.content === 'persist this conversation').length`);
+    check('P-E0 first submit projects exactly one user item', firstUserCount === 1, String(firstUserCount));
+    check('P-E0b first submit persists exactly one presentation task_start',
+      await waitForPresentationTaskStarts(first.cdp, firstConversationId, 'persist this conversation') === 1);
 
     await evaluate(first.cdp, `window.__locus.store.settings.apiKey = 'TEST_SECRET_123'; window.__locus.store.settings.remember = true; window.__locus.actions.persistSettingsIfNeeded()`);
     await evaluate(first.cdp, `window.__locus.vfs.write('/home/locus/durable.txt', 'durable'); window.__locus.vfs.write('/tmp/ephemeral.txt', 'ephemeral'); window.PersistenceServiceInstance.writePlugin('test-plugin/plugin.json', '{"name":"test"}')`);
