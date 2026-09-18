@@ -105,6 +105,37 @@
       chip && chip.getAttribute('title'));
     check(P + 'no overflow after upload chip', noOverflow(), overflowDetail());
 
+    // ---------- approval card (all viewports, spec §33) ----------
+    // A hostile-length action summary must wrap inside the card — never
+    // stretch the page — and the three buttons must stay reachable.
+    const longApprovalUrl = 'https://example.com/approval/' + 'segment/'.repeat(30) + 'target?q=' + 'x'.repeat(160);
+    const approvalP = L.approvals.requestTestPermission({
+      policyKey: 'e2e:resp:approval',
+      summary: 'Fetch ' + longApprovalUrl + ' and write it to /mnt/workspace/' + 'y'.repeat(120) + '.txt',
+    });
+    check(P + 'approval card appears', await waitFor(() => !!$('.approval-card')));
+    await sleep(80);
+    const aCard = $('.approval-card');
+    const aSummary = $('.approval-card .approval-summary');
+    check(P + 'approval card: no horizontal page overflow (long summary)', noOverflow(), overflowDetail());
+    check(P + 'approval summary wraps inside the card',
+      !!aSummary && aSummary.scrollWidth <= aSummary.clientWidth + 1,
+      'summary scrollW=' + (aSummary && aSummary.scrollWidth) + ' clientW=' + (aSummary && aSummary.clientWidth));
+    const aActions = $('.approval-card .approval-actions');
+    check(P + 'approval buttons stay inside the viewport',
+      !!aActions && aActions.getBoundingClientRect().right <= W + 1
+      && aActions.getBoundingClientRect().left >= -1,
+      JSON.stringify(aActions && aActions.getBoundingClientRect()));
+    aCard.focus({ preventScroll: true });
+    check(P + 'approval focus lands on the card, never an Allow button',
+      document.activeElement === aCard, document.activeElement && document.activeElement.className);
+    esc(); // Escape = Deny while an approval is pending
+    const approvalDecision = await approvalP;
+    check(P + 'Escape denied the approval and the card closed',
+      approvalDecision.outcome === 'deny' && !$('.approval-card') && !L.store.pendingApproval,
+      JSON.stringify(approvalDecision));
+    check(P + 'no overflow after approval closed', noOverflow(), overflowDetail());
+
     if (tier === 'mobile') {
       // ---------- mobile: drawers out of flow, main full width ----------
       check(P + 'sidebar is a fixed overlay', getComputedStyle(sidebar).position === 'fixed');

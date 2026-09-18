@@ -20,6 +20,7 @@ const SUITES = [
   'shell-compat2.test.cjs',
   'agent.test.cjs',
   'approval.test.cjs',
+  'agent-approval.test.cjs',
   'native-tools.test.cjs',
   'presentation.test.cjs',
   'store-defaults.test.cjs',
