@@ -80,6 +80,8 @@ globalThis.createProviderIdentity = (config) => ({
   endpointIdentity: config.apiBase,
   protocolVersion: 'test-v1',
 });
+globalThis.ApprovalController = (0, eval)(
+  readFileSync(join(root, 'src', 'approval.js'), 'utf8') + '\n;ApprovalController');
 globalThis.validateNormalizedPrefix = () => {};
 globalThis.projectNormalizedHistory = (rows) => rows || [];
 

@@ -98,6 +98,13 @@ export const store = reactive({
   busy: false,
   cancelling: false,
 
+  // Projection of the ApprovalController's canonical pending state (set
+  // via its onChange hook). Null = nothing awaiting a human decision.
+  // Approval is orthogonal to the task lifecycle: while this is set the
+  // running task is still ALIVE — runState stays 'running', only the
+  // composer/card reflect the suspension.
+  pendingApproval: null,
+
   workspaceName: null, // null = not mounted
   workspacePermission: 'none', // none | granted | prompt | denied | stale
   workspaceHandleAvailable: false,
@@ -451,6 +458,37 @@ export const session = new AgentSession({
   onSessionReset: () => { if (typeof PythonRuntime !== 'undefined') PythonRuntime.reset(); },
 });
 
+// Approval Framework v1 (src/approval.js): the controller is the CANONICAL
+// owner of pending approval state; this store only mirrors it through
+// onChange so the UI can render an ApprovalCard. A pending approval is a
+// suspension of the SAME task — it never touches runState, provider
+// history, or persistence. Session grants live in the controller's memory
+// for this page session only (cleared by resetAllData / page reload).
+export const approvals = new ApprovalController({
+  onChange: (pending) => { store.pendingApproval = pending; },
+});
+
+// Resolve the CURRENT pending approval from UI input. Stale ids (old card,
+// late click) are no-ops inside the controller — they can never resolve a
+// newer request. Returns true when a decision was applied.
+export function resolveApproval(requestId, decision) {
+  return approvals.resolve(requestId, decision);
+}
+
+// Escape-path deny: refuse the current action only. Never cancels the task.
+export function denyApproval() {
+  const pending = store.pendingApproval;
+  if (!pending) return false;
+  return approvals.resolve(pending.id, { outcome: 'deny', scope: 'once' });
+}
+
+// Dismiss path for kinds without an allow decision in v1 (reserved).
+export function cancelApproval(requestId) {
+  const pending = store.pendingApproval;
+  if (!pending || (requestId && pending.id !== requestId)) return false;
+  return approvals.cancel(pending.id, 'dismissed');
+}
+
 // The VFS (declared at module scope above) replaces the raw adapter in
 // the workspace slot: buildSystemPrompt and the tool executor both
 // receive it (buildSystemPrompt reads workspace.workspaceName; tools
@@ -550,6 +588,11 @@ export function newTask() {
   // guard is never bypassed by flipping UI flags early.
   if (store.busy) session.cancel();
   session.reset();
+  // Session boundary: a pending approval dies with the old task (running
+  // approvals normally die via the task's own AbortSignal; this also
+  // closes test-only standalone requests). Session GRANTS survive — they
+  // belong to the page session, not to a conversation.
+  approvals.cancelAll('session_boundary');
   clearAttachments();
   startConversation();
 }
@@ -563,6 +606,9 @@ export function openConversation(id) {
 export async function submit(text) {
   const input = String(text || '').trim();
   if (!input) return;
+  // While an approval is pending the composer must not start a new task —
+  // approve, deny, or cancel the task are the three available actions.
+  if (store.pendingApproval) return;
   const waitingForPersistence = !!persistenceBootPromise && !persistenceBootComplete;
   if (store.busy && !waitingForPersistence) return;
   if (waitingForPersistence) {
@@ -914,6 +960,7 @@ export async function mountFolder() {
       // Re-mounting a different folder replaces the provider at
       // /mnt/workspace. In-flight tasks hold a fork() of the VFS and keep
       // routing to the OLD provider until their finally block settles.
+      approvals.cancelAll('session_boundary');
       await mountExternalHandle(handle, true);
       // Full session boundary after the new authority is live.
       session.reset();
@@ -1158,6 +1205,10 @@ export async function resetAllData() {
     // forkable /mnt/workspace provider in the VFS.
     const workspaceMount = vfs.resolveMount('/mnt/workspace');
     session.reset();
+    // resetAllData is the one in-page action that ends the PAGE session:
+    // pending approvals close and every session grant is forgotten.
+    approvals.cancelAll('reset');
+    approvals.clearSessionGrants();
     if (workspaceMount) vfs.unmount('/mnt/workspace');
     store.workspaceName = null;
     store.workspacePermission = 'none';

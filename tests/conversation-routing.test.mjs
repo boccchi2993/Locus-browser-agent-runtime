@@ -65,6 +65,8 @@ globalThis.ensureWorkspacePermission = async () => true;
 // store.js boots ONE persistent VFS at module scope: provide the REAL
 // vfs.js (plus workspace.js it extends from) exactly like index.html does.
 globalThis.SHELL_COMMANDS = {};
+globalThis.ApprovalController = (0, eval)(
+  readFileSync(join(root, 'src', 'approval.js'), 'utf8') + String.fromCharCode(10) + ';ApprovalController');
 globalThis.VirtualWorkspace = (0, eval)(
   readFileSync(join(root, 'src', 'workspace.js'), 'utf8') + '\n'
   + readFileSync(join(root, 'src', 'vfs.js'), 'utf8') + '\n;VirtualWorkspace');

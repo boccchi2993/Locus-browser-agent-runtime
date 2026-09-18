@@ -18,6 +18,7 @@ const src = fs.readFileSync(path.join(root, 'src', 'ui', 'store.js'), 'utf8');
 // exactly like index.html's script order.
 const workspaceSrc = fs.readFileSync(path.join(root, 'src', 'workspace.js'), 'utf8');
 const vfsSrc = fs.readFileSync(path.join(root, 'src', 'vfs.js'), 'utf8');
+const approvalSrc = fs.readFileSync(path.join(root, 'src', 'approval.js'), 'utf8');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -56,6 +57,7 @@ function loadStore(sessionData) {
     'const computed = (fn) => ({ get value() { return fn(); } });\n' +
     workspaceSrc + '\n' +
     vfsSrc + '\n' +
+    approvalSrc + '\n' +
     'const SHELL_COMMANDS = {};\n' +
     code + '\n;({ store, vfs, applySettings, persistSettingsIfNeeded, testConnection, addUploadFiles, removeAttachment, refreshArtifacts, downloadArtifact });'
   );

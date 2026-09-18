@@ -29,7 +29,7 @@
 
 <script setup>
 import { onMounted, onBeforeUnmount, watch, nextTick } from 'vue';
-import { store, cancelTask, closeDrawers } from './ui/store.js';
+import { store, cancelTask, closeDrawers, denyApproval } from './ui/store.js';
 import Sidebar from './components/Sidebar.vue';
 import MainWorkspace from './components/MainWorkspace.vue';
 import ContextRail from './components/ContextRail.vue';
@@ -76,15 +76,20 @@ function trapDrawerFocus(e) {
 }
 
 // Keyboard priority: Tab is trapped inside the active modal drawer.
-// Escape closes drawers first, then the composer "+" menu, then cancels
-// a running task only when no presentation layer owns the key.
+// Escape resolves the most specific surface first — a pending approval is
+// DENIED (deny ≠ cancel task), then drawers close, then the composer "+"
+// menu, then a running task is cancelled only when no presentation layer
+// owns the key.
 function onKeydown(e) {
   if (e.key === 'Tab' && (store.sidebarDrawerOpen || store.contextDrawerOpen)) {
     trapDrawerFocus(e);
     return;
   }
   if (e.key !== 'Escape') return;
-  if (store.sidebarDrawerOpen || store.contextDrawerOpen) {
+  if (store.pendingApproval) {
+    e.preventDefault();
+    denyApproval();
+  } else if (store.sidebarDrawerOpen || store.contextDrawerOpen) {
     e.preventDefault();
     closeDrawers();
   } else if (store.plusMenuOpen) {

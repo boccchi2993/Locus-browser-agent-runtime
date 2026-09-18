@@ -42,6 +42,7 @@
         <p v-else-if="!store.workspaceName" class="empty-hint">
           Use <span class="kbd-ish">+</span> below to mount a folder, or just ask something.
         </p>
+        <ApprovalCard />
         <Composer :centered="true" />
       </div>
     </div>
@@ -55,6 +56,7 @@
       </div>
       <div class="composer-dock">
         <div class="composer-column">
+          <ApprovalCard />
           <Composer />
         </div>
       </div>
@@ -67,6 +69,7 @@ import { computed, ref, watch, nextTick } from 'vue';
 import { store, activeConversation, toggleContextPanel, openSidebarDrawer } from '../ui/store.js';
 import Timeline from './Timeline.vue';
 import Composer from './Composer.vue';
+import ApprovalCard from './ApprovalCard.vue';
 
 const conversation = activeConversation;
 const isEmpty = computed(() => !conversation.value || conversation.value.items.length === 0);

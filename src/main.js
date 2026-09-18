@@ -133,6 +133,36 @@ if (e2eMode || demoMode) {
   window.__locus = { store: ui.store, actions: ui, session: ui.session, vfs: ui.vfs };
 }
 
+// Test-only approval seam: lets browser e2e drive the real ApprovalCard /
+// ApprovalController without a production consumer. It can trigger a
+// Harness-shaped permission request (canonical policyKey, plain-text
+// action) bound to the running task's AbortSignal when one exists.
+// Never exposed outside ?e2e=1 and never rendered as a UI button.
+if (e2eMode) {
+  window.__locus.approvals = {
+    // Harness-shaped request passthrough for fake tool executors (the exact
+    // shape a real consumer will use).
+    request: (spec, opts) => ui.approvals.request(spec, opts),
+    // Prebuilt synthetic permission request for card-level tests.
+    requestTestPermission(spec) {
+      const s = spec && typeof spec === 'object' ? spec : {};
+      const signal = ui.session.task ? ui.session.task.controller.signal : undefined;
+      return ui.approvals.request({
+        kind: 'permission',
+        action: {
+          type: 'test',
+          summary: typeof s.summary === 'string' ? s.summary : 'Run the e2e approval probe',
+          detail: typeof s.detail === 'string' ? s.detail : null,
+        },
+        resource: s.resource || null,
+        policyKey: typeof s.policyKey === 'string' ? s.policyKey : 'e2e:permission:default',
+        conversationId: ui.store.liveConversationId,
+        taskGeneration: ui.session.generation,
+      }, { signal });
+    },
+  };
+}
+
 // Python worker status is owned by the runtime (plain object); mirror it
 // into the store for display.
 setInterval(() => {

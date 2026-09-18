@@ -50,7 +50,7 @@
             v-else
             class="send-btn"
             type="button"
-            :disabled="!draft.trim()"
+            :disabled="!draft.trim() || store.pendingApproval"
             title="Send (Enter)"
             aria-label="Send"
             @click="send"
@@ -103,12 +103,16 @@ defineProps({ centered: { type: Boolean, default: false } });
 const draft = ref('');
 const ta = ref(null);
 
-const placeholder = computed(() =>
-  store.busy ? 'Working… (Esc to cancel)' : 'Describe a task for your workspace…');
+const placeholder = computed(() => {
+  if (store.pendingApproval) return 'Waiting for approval…';
+  return store.busy ? 'Working… (Esc to cancel)' : 'Describe a task for your workspace…';
+});
 
 function send() {
   const text = draft.value;
-  if (!text.trim() || store.busy) return;
+  // A pending approval suspends the running task — it must never be
+  // bypassed (or double-tracked) by submitting over it.
+  if (!text.trim() || store.busy || store.pendingApproval) return;
   draft.value = '';
   autogrow();
   submit(text);

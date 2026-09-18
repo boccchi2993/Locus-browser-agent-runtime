@@ -408,6 +408,57 @@ input, select, textarea { font-family: inherit; font-size: inherit; color: inher
   text-align: center; font-size: 11px; color: var(--faint); margin-top: 8px;
 }
 
+/* ============ approval card ============ */
+/* Control-plane surface for "pause → human decision → same task
+   continues" (docs/APPROVALS.md). Deliberately calm: not an alarm, not a
+   fullscreen modal — the task context stays visible above it. */
+.approval-card {
+  border: 1px solid var(--border); border-radius: 14px;
+  background: var(--surface); box-shadow: var(--shadow-soft);
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  max-width: 100%; min-width: 0;
+  outline: none;
+}
+.approval-card:focus-visible { border-color: var(--accent); }
+.approval-title { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: 0.02em; }
+.approval-lead { font-size: 13px; color: var(--muted); margin-top: 6px; }
+.approval-summary {
+  font-size: 14px; font-weight: 500; color: var(--text); margin-top: 3px;
+  overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap;
+}
+.approval-detail {
+  font-family: var(--mono); font-size: 12px; line-height: 1.5; color: var(--muted);
+  background: var(--surface-soft); border: 1px solid var(--border-soft); border-radius: 8px;
+  padding: 6px 8px; margin-top: 8px;
+  max-height: 140px; overflow: auto;
+  overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap;
+}
+.approval-resource {
+  font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 6px;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+.approval-context { font-size: 12px; color: var(--faint); margin-top: 6px; }
+.approval-actions {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end;
+  gap: 8px; margin-top: 10px;
+}
+.approval-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 30px; padding: 0 14px; border-radius: 15px;
+  font-size: 12.5px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  transition: background 0.15s, border-color 0.15s;
+  max-width: 100%;
+}
+.approval-btn:hover { background: var(--surface-soft); }
+.approval-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+.approval-btn.primary:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
+.approval-btn.secondary { border-color: var(--accent); color: var(--accent); background: transparent; }
+.approval-btn.secondary:hover { background: var(--accent-soft); }
+.approval-btn.deny { color: var(--muted); }
+.approval-btn.deny:hover { color: var(--error); border-color: var(--error); background: transparent; }
+
 /* plus menu */
 .plus-backdrop { position: fixed; inset: 0; z-index: 30; }
 .plus-menu {
