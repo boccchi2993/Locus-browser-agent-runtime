@@ -22,6 +22,7 @@ const RUNTIME_SCRIPTS = [
   'src/network.js',
   'src/shell.js',
   'src/tools.js',
+  'src/approval.js',
   'src/agent.js',
   'src/ui/projector.js',
   'src/ui/markdown.js',
