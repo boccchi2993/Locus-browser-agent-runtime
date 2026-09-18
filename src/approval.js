@@ -32,6 +32,16 @@
 //    - Decisions are structured ({ outcome, scope, requestId }), never a
 //      bare boolean: 'allow once' and 'allow for session' differ, and
 //      'deny' is distinct from 'cancelled'.
+//    - Observer callbacks (onChange/onEvent) are presentation/debug
+//      surfaces, never control flow: a throwing observer is contained
+//      and reported console-only. It cannot decide outcomes, block
+//      Promise settlement, strand pending state or auto-allow.
+//    - An allow decision authorizes an ACTION, not task liveness. What
+//      happens between decision delivery and the start of the protected
+//      side effect is known only to the consumer, which MUST re-check
+//      the task AbortSignal immediately before that side effect
+//      (docs/APPROVALS.md, "Consumer execution contract"). This
+//      controller deliberately does not enforce task liveness.
 //
 //  The controller is framework/DOM/Vue/provider/tool independent. The
 //  pending state owner is this class; UI stores are projections via the
@@ -81,6 +91,22 @@ function normalizeText(v) {
   return s ? s : null;
 }
 
+// Observer failure containment (docs/APPROVALS.md, "Observer failures"):
+// onChange/onEvent are best-effort presentation/debug observers. A throw
+// from either must NEVER re-enter approval control flow — it cannot
+// settle, reject or strand a request, cannot mint or drop a grant and
+// cannot auto-allow. Failures are reported console-only: never as a
+// semantic Agent event and never into provider/model history.
+function safeNotify(label, invoke) {
+  try {
+    invoke();
+  } catch (error) {
+    try {
+      console.error('ApprovalController: ' + label + ' observer threw (contained):', error);
+    } catch (ignored) {}
+  }
+}
+
 function normalizeAction(action) {
   const a = action && typeof action === 'object' ? action : {};
   return {
@@ -106,7 +132,10 @@ function normalizeResource(resource) {
 //  new ApprovalController({ onChange, onEvent })
 //    onChange(pending | null) — projection hook for UI stores. The
 //                  controller stays the canonical pending-state owner.
-//    onEvent(name, data)    — lightweight debug hook:
+//                  Best-effort: a throwing projection is contained and
+//                  never blocks settlement or strands pending state.
+//    onEvent(name, data)    — lightweight debug hook (best-effort, same
+//                  containment):
 //                  approval_requested / approval_resolved /
 //                  approval_cancelled / approval_grant_added /
 //                  approval_grant_hit / approval_grants_cleared
@@ -117,6 +146,11 @@ function normalizeResource(resource) {
 //            conversationId, taskGeneration }
 //    decision: { outcome: 'allow'|'deny'|'cancelled', scope: 'once'|'session',
 //                requestId, reason? }
+//  request() NEVER rejects — including when an observer callback throws.
+//  A delivered decision authorizes the action only; task liveness after
+//  delivery is the consumer's responsibility (final AbortSignal recheck
+//  immediately before the protected side effect — docs/APPROVALS.md,
+//  "Consumer execution contract").
 //  resolve(requestId, decision) / cancel(requestId, reason) /
 //  cancelAll(reason) / clearSessionGrants() / hasPending()
 // ------------------------------------------------------------
@@ -145,7 +179,7 @@ class ApprovalController {
 
   clearSessionGrants() {
     this._grants.clear();
-    this._onEvent('approval_grants_cleared', {});
+    safeNotify('onEvent', () => this._onEvent('approval_grants_cleared', {}));
   }
 
   // Ask for human approval. Resolves when the UI (or an abort, or a
@@ -169,7 +203,7 @@ class ApprovalController {
     // A session grant covers this exact policy key: resolve immediately —
     // no pending state, no UI, no busy interaction.
     if (policyKey && this._grants.has(policyKey)) {
-      this._onEvent('approval_grant_hit', { policyKey: policyKey });
+      safeNotify('onEvent', () => this._onEvent('approval_grant_hit', { policyKey: policyKey }));
       return Promise.resolve({ outcome: 'allow', scope: 'session', requestId: null, viaGrant: true });
     }
 
@@ -181,6 +215,11 @@ class ApprovalController {
       resource: normalizeResource(s.resource),
       policyKey: policyKey,
       conversationId: normalizeText(s.conversationId),
+      // F-A34: INFORMATIONAL CONTEXT ONLY — debugging, UI diagnostics and
+      // future audit events. Never a security enforcement token, never an
+      // authorization identity and never a replacement for the AbortSignal:
+      // runtime liveness enforcement relies on requestId + AbortSignal +
+      // the caller's final liveness recheck (docs/APPROVALS.md).
       taskGeneration: Number.isFinite(s.taskGeneration) ? s.taskGeneration : null,
       createdAt: new Date().toISOString(),
     };
@@ -202,8 +241,12 @@ class ApprovalController {
         this._signalHandler = () => { this.cancel(id, 'aborted'); };
         signal.addEventListener('abort', this._signalHandler, { once: true });
       }
-      this._onEvent('approval_requested', { id: id, kind: request.kind, policyKey: request.policyKey });
-      this._onChange(request);
+      // Canonical pending state is registered ABOVE, before the observers
+      // run: even a throwing projection can never leave a half-created
+      // request, and these contained throws can never reject this Promise
+      // (request() never rejects).
+      safeNotify('onEvent', () => this._onEvent('approval_requested', { id: id, kind: request.kind, policyKey: request.policyKey }));
+      safeNotify('onChange', () => this._onChange(request));
     });
   }
 
@@ -236,7 +279,7 @@ class ApprovalController {
     this._finish(pending.id, { outcome: d.outcome, scope: scope, requestId: pending.id }, 'approval_resolved');
     if (scope === 'session' && pending.policyKey) {
       this._grants.set(pending.policyKey, { requestId: pending.id, createdAt: new Date().toISOString() });
-      this._onEvent('approval_grant_added', { policyKey: pending.policyKey });
+      safeNotify('onEvent', () => this._onEvent('approval_grant_added', { policyKey: pending.policyKey }));
     }
     return true;
   }
@@ -264,13 +307,22 @@ class ApprovalController {
       this._signal.removeEventListener('abort', this._signalHandler);
     }
     const resolve = this._resolvePending;
+    // Canonical cleanup happens FIRST and exactly once (the id guard above
+    // makes every later finish/resolve/cancel for this id a no-op).
     this._pending = null;
     this._resolvePending = null;
     this._signal = null;
     this._signalHandler = null;
-    this._onEvent(eventName, { id: pending.id, outcome: decision.outcome, scope: decision.scope });
-    // UI projection clears BEFORE the awaiting continuation resumes.
-    this._onChange(null);
-    resolve(decision);
+    try {
+      // Observers stay best-effort: each is individually contained, so the
+      // UI projection still clears BEFORE the awaiting continuation resumes
+      // and an observer throw can never prevent settlement.
+      safeNotify('onEvent', () => this._onEvent(eventName, { id: pending.id, outcome: decision.outcome, scope: decision.scope }));
+      safeNotify('onChange', () => this._onChange(null));
+    } finally {
+      // Unconditional exactly-once settlement — the invariant observers
+      // must never be able to break.
+      resolve(decision);
+    }
   }
 }

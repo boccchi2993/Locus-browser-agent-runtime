@@ -464,8 +464,26 @@ export const session = new AgentSession({
 // suspension of the SAME task — it never touches runState, provider
 // history, or persistence. Session grants live in the controller's memory
 // for this page session only (cleared by resetAllData / page reload).
+//
+// ?e2e=1 TEST SEAM (never set in production): window.__e2eObserverFailure
+// makes these observer callbacks throw so browser e2e can prove a throwing
+// observer cannot break approval settlement (docs/APPROVALS.md,
+// "Observer failures"). The controller contains every throw; the flag is
+// only ever set by e2e page scripts.
+function e2eObserverFailureWanted(kind) {
+  return typeof window !== 'undefined'
+    && !!window.__e2eObserverFailure
+    && window.__e2eObserverFailure[kind] === true;
+}
 export const approvals = new ApprovalController({
-  onChange: (pending) => { store.pendingApproval = pending; },
+  onChange: (pending) => {
+    if (e2eObserverFailureWanted('onChange')) throw new Error('e2e injected onChange failure');
+    store.pendingApproval = pending;
+  },
+  onEvent: (name, data) => {
+    if (e2eObserverFailureWanted('onEvent')) throw new Error('e2e injected onEvent failure');
+    // Debug hook: the event stream is observability-only for the store.
+  },
 });
 
 // Resolve the CURRENT pending approval from UI input. Stale ids (old card,

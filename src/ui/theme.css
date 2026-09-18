@@ -411,7 +411,13 @@ input, select, textarea { font-family: inherit; font-size: inherit; color: inher
 /* ============ approval card ============ */
 /* Control-plane surface for "pause → human decision → same task
    continues" (docs/APPROVALS.md). Deliberately calm: not an alarm, not a
-   fullscreen modal — the task context stays visible above it. */
+   fullscreen modal — the task context stays visible above it.
+
+   Vertical containment (F-A29/F-A30): the card is a flex column capped
+   against the viewport; only its BODY scrolls, and the action row is
+   pinned to the card bottom. No summary/detail length (2KB+ text, long
+   URLs, no-whitespace tokens) can push the buttons — or the composer's
+   Cancel task below the card — out of the pointer-reachable viewport. */
 .approval-card {
   border: 1px solid var(--border); border-radius: 14px;
   background: var(--surface); box-shadow: var(--shadow-soft);
@@ -419,8 +425,18 @@ input, select, textarea { font-family: inherit; font-size: inherit; color: inher
   margin-bottom: 8px;
   max-width: 100%; min-width: 0;
   outline: none;
+  display: flex; flex-direction: column;
+  max-height: min(60vh, 520px);
+  max-height: min(60dvh, 520px);
+  overflow: hidden;
 }
 .approval-card:focus-visible { border-color: var(--accent); }
+.approval-body {
+  min-height: 0; /* let the flex child shrink so the region can scroll */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.approval-body:focus-visible { outline: 1px solid var(--border); outline-offset: 2px; border-radius: 4px; }
 .approval-title { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: 0.02em; }
 .approval-lead { font-size: 13px; color: var(--muted); margin-top: 6px; }
 .approval-summary {
@@ -438,10 +454,11 @@ input, select, textarea { font-family: inherit; font-size: inherit; color: inher
   font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 6px;
   overflow-wrap: anywhere; word-break: break-word;
 }
-.approval-context { font-size: 12px; color: var(--faint); margin-top: 6px; }
+.approval-context { font-size: 12px; color: var(--faint); margin-top: 6px; overflow-wrap: anywhere; }
 .approval-actions {
   display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end;
   gap: 8px; margin-top: 10px;
+  flex: 0 0 auto; /* pinned: actions stay visible while the body scrolls */
 }
 .approval-btn {
   display: inline-flex; align-items: center; justify-content: center;

@@ -143,6 +143,11 @@ if (e2eMode) {
     // Harness-shaped request passthrough for fake tool executors (the exact
     // shape a real consumer will use).
     request: (spec, opts) => ui.approvals.request(spec, opts),
+    // Direct controller access for e2e-only assertions on the CANONICAL
+    // pending state (e.g. when the injected observer failure breaks the
+    // store projection, the controller must still own a resolvable
+    // request). Never exposed outside ?e2e=1.
+    controller: ui.approvals,
     // Prebuilt synthetic permission request for card-level tests.
     requestTestPermission(spec) {
       const s = spec && typeof spec === 'object' ? spec : {};

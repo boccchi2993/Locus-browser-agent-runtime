@@ -10,13 +10,19 @@
   >
     <div class="approval-title">Approval required</div>
     <p class="approval-lead">Locus wants permission to:</p>
-    <!-- All request content is plain text ({{ }} interpolation escapes it);
-         buttons/labels come from the fixed per-kind set below, never from
-         the request payload. -->
-    <div class="approval-summary">{{ pending.action.summary }}</div>
-    <div v-if="pending.action.detail" class="approval-detail">{{ pending.action.detail }}</div>
-    <div v-if="resourceLine" class="approval-resource">{{ resourceLine }}</div>
-    <div v-if="fromTitle" class="approval-context">Request from running task: {{ fromTitle }}</div>
+    <!-- Vertical containment (docs/APPROVALS.md): the card is height-capped
+         and this body is its only scrollable region, so no summary/detail
+         length can push the action row (or the composer's Cancel task)
+         out of the viewport. tabindex="0" keeps the scroll region
+         keyboard-reachable. All request content is plain text ({{ }}
+         interpolation escapes it); buttons/labels come from the fixed
+         per-kind set below, never from the request payload. -->
+    <div class="approval-body" tabindex="0">
+      <div class="approval-summary">{{ pending.action.summary }}</div>
+      <div v-if="pending.action.detail" class="approval-detail">{{ pending.action.detail }}</div>
+      <div v-if="resourceLine" class="approval-resource">{{ resourceLine }}</div>
+      <div v-if="fromTitle" class="approval-context">Request from running task: {{ fromTitle }}</div>
+    </div>
     <div class="approval-actions">
       <button
         v-for="b in buttons"
