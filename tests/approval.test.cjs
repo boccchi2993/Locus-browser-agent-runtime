@@ -270,6 +270,165 @@ async function run() {
     await pcap;
   }
 
+  // ---------- T. observer failure cannot break settlement (F-A36) ----------
+  // onChange/onEvent are best-effort observers: a throw must never reject
+  // request(), never strand pending state, never prevent exactly-once
+  // settlement and never brick the controller (docs/APPROVALS.md).
+  {
+    // Containment reports console-only; keep the suite output readable and
+    // assert the report actually happened.
+    const consoleErrors = [];
+    const realConsoleError = console.error;
+    console.error = function () { consoleErrors.push(Array.from(arguments).join(' ')); };
+    const throwingOnChange = () => { throw new Error('projection boom'); };
+    const throwingOnEvent = () => { throw new Error('event boom'); };
+
+    try {
+      // A. onChange throws when the pending request is projected:
+      //    request stays pending (Option A), never rejects, no fail-open,
+      //    still resolvable through the controller API.
+      {
+        const { c, events } = newController({ onChange: throwingOnChange });
+        const p = c.request(permSpec('perm:obs-a'));
+        let settled = false, rejected = false;
+        p.then(() => { settled = true; }, () => { rejected = true; });
+        await Promise.resolve();
+        await Promise.resolve();
+        check('T-A1 projection throw leaves request pending (never rejects)',
+          c.hasPending() && !settled && !rejected);
+        check('T-A2 canonical pending survives the failed projection',
+          c.pending && c.pending.policyKey === 'perm:obs-a');
+        check('T-A3 failure contained + console-only (no semantic event emitted)',
+          consoleErrors.length > 0 && /onChange/.test(consoleErrors[0])
+          && !events.some((e) => /observer|boom/.test(JSON.stringify(e))));
+        const ok = c.resolve(c.pending.id, { outcome: 'allow', scope: 'once' });
+        const d = await p;
+        check('T-A4 request settles with the intended decision after observer failure',
+          ok && d.outcome === 'allow' && !c.hasPending());
+        consoleErrors.length = 0;
+      }
+
+      // B. onChange throws on finish(null): Promise still settles with the
+      //    intended decision, pending cleaned up.
+      {
+        const { c } = newController({ onChange: throwingOnChange });
+        const p = c.request(permSpec('perm:obs-b'));
+        await Promise.resolve();
+        c.resolve(c.pending.id, { outcome: 'deny', scope: 'once' });
+        const d = await p;
+        check('T-B1 onChange throw on finish cannot prevent settlement',
+          d.outcome === 'deny' && d.scope === 'once' && !c.hasPending());
+      }
+
+      // C. onEvent throws on approval_requested: pending + projection valid.
+      {
+        const { c, projections } = newController({ onEvent: throwingOnEvent });
+        const p = c.request(permSpec('perm:obs-c'));
+        await Promise.resolve();
+        check('T-C1 onEvent throw on request keeps pending + projection valid',
+          c.hasPending() && projections.length === 1 && projections[0].id === c.pending.id);
+        c.resolve(c.pending.id, { outcome: 'allow', scope: 'once' });
+        check('T-C2 request still settles after onEvent throw on requested', (await p).outcome === 'allow');
+      }
+
+      // D. onEvent throws on resolved: decision settles exactly once; the
+      //    grant path (approval_grant_added) is equally contained.
+      {
+        const { c } = newController({ onEvent: throwingOnEvent });
+        const p = c.request(permSpec('perm:obs-d'));
+        c.resolve(c.pending.id, { outcome: 'allow', scope: 'session' });
+        const d = await p;
+        check('T-D1 onEvent throw on resolved/grant_added cannot break settlement',
+          d.outcome === 'allow' && d.scope === 'session' && c.hasSessionGrant('perm:obs-d'));
+        // The grant-hit path (approval_grant_hit) is contained too.
+        const granted = await c.request(permSpec('perm:obs-d'));
+        check('T-D2 grant-hit auto-allow survives a throwing onEvent',
+          granted.viaGrant === true && !c.hasPending());
+      }
+
+      // E. both observers throw: settlement still exactly once, controller
+      //    remains usable for the NEXT request (no permanent brick).
+      {
+        const { c } = newController({ onChange: throwingOnChange, onEvent: throwingOnEvent });
+        const p1 = c.request(permSpec('perm:obs-e1'));
+        c.resolve(c.pending.id, { outcome: 'allow', scope: 'once' });
+        check('T-E1 both observers throwing still settles once', (await p1).outcome === 'allow');
+        const p2 = c.request(permSpec('perm:obs-e2'));
+        check('T-E2 controller usable for a NEW request after failures', c.hasPending());
+        c.resolve(c.pending.id, { outcome: 'deny', scope: 'once' });
+        check('T-E3 second request also settles', (await p2).outcome === 'deny');
+      }
+
+      // F. observer throw on the abort path (cancel while pending): the
+      //    cancelled decision still settles exactly once, no dangling task.
+      {
+        const { c } = newController({ onChange: throwingOnChange, onEvent: throwingOnEvent });
+        const ac = new AbortController();
+        const p = c.request(permSpec('perm:obs-f'), { signal: ac.signal });
+        await Promise.resolve();
+        ac.abort();
+        const d = await p;
+        check('T-F1 abort-path settlement survives throwing observers',
+          d.outcome === 'cancelled' && d.reason === 'aborted' && !c.hasPending());
+      }
+
+      // Settlement exactly-once under any combination (resolve/stale/abort).
+      {
+        const { c, events } = newController();
+        const p = c.request(permSpec('perm:settle-once'));
+        const id = c.pending.id;
+        c.resolve(id, { outcome: 'allow', scope: 'session' });
+        const stale = c.resolve(id, { outcome: 'allow', scope: 'session' });
+        const d = await p;
+        check('T-G1 double resolve: stale is a no-op, settled exactly once',
+          stale === false && d.outcome === 'allow' && d.scope === 'session');
+        check('T-G2 session grant created at most once',
+          events.filter((e) => e.name === 'approval_grant_added').length === 1);
+
+        const ac = new AbortController();
+        const p2 = c.request(permSpec('perm:settle-race'), { signal: ac.signal });
+        const id2 = c.pending.id;
+        ac.abort(); // cancel path finishes the request first
+        const d2 = await p2;
+        check('T-G3 abort then stale resolve: one settlement, no grant minted',
+          d2.outcome === 'cancelled'
+          && c.resolve(id2, { outcome: 'allow', scope: 'session' }) === false
+          && !c.hasSessionGrant('perm:settle-race'));
+      }
+    } finally {
+      console.error = realConsoleError;
+    }
+  }
+
+  // ---------- U. taskGeneration is informational only (F-A34) ----------
+  // The controller records taskGeneration for debugging/UI diagnostics but
+  // MUST NOT treat it as an enforcement or staleness token: runtime
+  // liveness enforcement is requestId + AbortSignal + the caller's final
+  // liveness recheck (docs/APPROVALS.md, "Consumer execution contract").
+  {
+    const { c } = newController();
+    const p = c.request(Object.assign(permSpec('perm:gen'), { taskGeneration: 7 }));
+    check('U1 taskGeneration recorded as informational context', c.pending.taskGeneration === 7);
+    // No generation API exists on the controller and none is needed: a
+    // changed generation elsewhere cannot and must not alter controller
+    // behavior — the request stays resolvable by requestId alone.
+    const d = await (c.resolve(c.pending.id, { outcome: 'allow', scope: 'once' }), p);
+    check('U2 generation is never an enforcement token (requestId governs)',
+      d.outcome === 'allow' && !!d.requestId);
+    const p2 = c.request(Object.assign(permSpec('perm:gen2'), { taskGeneration: 'not-finite' }));
+    check('U3 non-finite taskGeneration normalized to null', c.pending.taskGeneration === null);
+    c.resolve(c.pending.id, { outcome: 'deny', scope: 'once' });
+    await p2;
+    const granted = await (async () => {
+      const pg = c.request(Object.assign(permSpec('perm:gen3'), { taskGeneration: 99 }));
+      c.resolve(c.pending.id, { outcome: 'allow', scope: 'session' });
+      await pg;
+      return c.request(Object.assign(permSpec('perm:gen3'), { taskGeneration: 100 }));
+    })();
+    check('U4 grants are policyKey-scoped, not generation-scoped',
+      granted.viaGrant === true);
+  }
+
   console.log('---');
   console.log(failed ? failed + ' check(s) FAILED' : 'all ' + passed + ' approval core checks passed');
   process.exit(failed ? 1 : 0);

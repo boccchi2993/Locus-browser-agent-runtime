@@ -105,17 +105,37 @@
       { content: 'should never be reached when cancelled' }
     );
     window.__e2eApprovalDecisions = [];
+    window.__e2eToolRuns = 0;
+    window.__e2eGateReached = false;
+    // Optional barrier between the allow decision and the side effect,
+    // used by the abort-race scenario below (models non-side-effecting
+    // preparation that can yield to a cancel).
+    window.__e2ePreSideEffectGate = null;
+    // Consumer execution contract (docs/APPROVALS.md): allow authorizes
+    // the ACTION; task liveness is revalidated immediately before the
+    // protected side effect, with NO await after that final check.
     window.__e2eToolExecutor = async (tool, input, ws, opts) => {
+      const signal = opts && opts.signal;
       const decision = await L.approvals.request({
         kind: 'permission',
         action: { type: 'tool', summary: 'Run ' + tool + ': ' + input },
         policyKey: 'e2e:tool:' + tool,
         conversationId: L.store.liveConversationId,
         taskGeneration: L.session.generation,
-      }, { signal: opts && opts.signal });
+      }, { signal });
       window.__e2eApprovalDecisions.push(decision);
-      if (decision.outcome === 'allow') return { output: 'ran', success: true, backend: 'harness' };
-      return { output: 'not executed: ' + decision.outcome, success: false, backend: 'harness' };
+      if (decision.outcome !== 'allow') {
+        return { output: 'not executed: ' + decision.outcome, success: false, backend: 'harness' };
+      }
+      if (window.__e2ePreSideEffectGate) {
+        window.__e2eGateReached = true;
+        await window.__e2ePreSideEffectGate;
+      }
+      if (signal && signal.aborted) {
+        return { output: 'not executed: cancelled after allow (task no longer live)', success: false, backend: 'harness' };
+      }
+      window.__e2eToolRuns++; // protected side effect starts here — never rolled back
+      return { output: 'ran', success: true, backend: 'harness' };
     };
     const lastDecision = () => window.__e2eApprovalDecisions[window.__e2eApprovalDecisions.length - 1] || {};
     const ta = $('.composer-input');
@@ -180,6 +200,90 @@
       !finalConv.items.some((i) => /Approval required|Allow once|Allow for this session/.test(i.content || '')));
     check('A34 provider history has no approval-derived turns',
       L.session.history.every((m) => !String(m.content || '').includes('Approval required')));
+
+    // ---------- F-A02/A03: allow → synthetic abort BEFORE the side effect ----------
+    // Scenario 3 of the closure spec: allow → decision delivered → consumer
+    // yields in preparation → task cancel → final liveness recheck. The
+    // action must never run, and the task must end cancelled exactly once.
+    {
+      let openGate;
+      window.__e2ePreSideEffectGate = new Promise((r) => { openGate = r; });
+      const convRace = L.store.conversations.find((c) => c.id === L.store.liveConversationId);
+      const toolItemsBefore = convRace ? convRace.items.filter((i) => i.kind === 'tool').length : 0;
+      // Drop replies left unconsumed by the cancelled A28 task, so this
+      // task's own tool-call reply is the first one the fake model serves.
+      window.__e2eReplies.length = 0;
+      window.__e2eReplies.push({ content: '```json\n{"tool":"bash","input":"rm -rf /tmp/scratch3"}\n```' });
+      const ta3 = $('.composer-input');
+      ta3.value = 'abort race probe';
+      ta3.dispatchEvent(new Event('input', { bubbles: true }));
+      ta3.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      check('A36 abort-race task reaches the approval gate', await waitFor(() => !!$('.approval-card')));
+      $('.approval-card .approval-btn.primary').click(); // Allow once — decision delivered
+      check('A37 consumer reached the pre-side-effect window', await waitFor(() => window.__e2eGateReached, 4000));
+      $('.composer .cancel-btn').click(); // task aborts inside the window
+      openGate();
+      await waitFor(() => !L.store.busy, 8000);
+      check('A38 allow was delivered but the action never started',
+        window.__e2eApprovalDecisions[window.__e2eApprovalDecisions.length - 1].outcome === 'allow'
+        && window.__e2eToolRuns === 0,
+        'runs=' + window.__e2eToolRuns);
+      const raceTool = (convRace.items.filter((i) => i.kind === 'tool')[toolItemsBefore]) || {};
+      check('A39 unstarted action honestly reported as not executed (task ended cancelled, no fake rollback)',
+        !L.store.busy && !L.session.task && raceTool.result
+        && raceTool.result.success === false && /not executed/.test(raceTool.result.output),
+        'result=' + JSON.stringify(raceTool.result || null));
+      window.__e2ePreSideEffectGate = null;
+      window.__e2eGateReached = false;
+    }
+
+    // ---------- F-A36: observer callback failure cannot break settlement ----------
+    // Scenario 4 of the closure spec, via the ?e2e=1-only seam
+    // window.__e2eObserverFailure (docs/APPROVALS.md, test-only seam).
+    {
+      // onChange throws at projection time: no card, canonical pending
+      // intact, request still resolvable through the controller API.
+      window.__e2eObserverFailure = { onChange: true };
+      let settledObs = false;
+      const pObs = L.approvals.requestTestPermission({ policyKey: 'e2e:perm:obsfail', summary: 'Observer failure probe' });
+      pObs.then(() => { settledObs = true; });
+      await sleep(250);
+      check('A40 throwing onChange: no card, projection is best-effort only',
+        !$('.approval-card') && !L.store.pendingApproval);
+      check('A41 canonical pending survives (controller recoverable, no fail-open, no dangling promise)',
+        L.approvals.controller.hasPending() && !settledObs);
+      const obsId = L.approvals.controller.pending.id;
+      const okObs = L.actions.resolveApproval(obsId, { outcome: 'allow', scope: 'once' });
+      const dObs = await pObs;
+      check('A42 request settles exactly once with the intended decision',
+        okObs && dObs.outcome === 'allow' && dObs.requestId === obsId);
+
+      // onEvent throws on requested + resolved: card still renders and the
+      // pointer decision still settles.
+      window.__e2eObserverFailure = { onEvent: true };
+      const pObs2 = L.approvals.requestTestPermission({ policyKey: 'e2e:perm:obsfail2', summary: 'onEvent failure probe' });
+      check('A43 card still renders while onEvent throws', await waitFor(() => !!$('.approval-card')));
+      $('.approval-card .approval-btn.primary').click();
+      const dObs2 = await pObs2;
+      check('A44 approval still resolves while onEvent throws', dObs2.outcome === 'allow' && dObs2.scope === 'once');
+
+      // Both observers throw: settlement still exactly once; the controller
+      // must remain usable for the NEXT request (no permanent brick).
+      window.__e2eObserverFailure = { onChange: true, onEvent: true };
+      const pObs3 = L.approvals.requestTestPermission({ policyKey: 'e2e:perm:obsfail3', summary: 'Both observers throw' });
+      await sleep(200);
+      const okObs3 = L.actions.resolveApproval(L.approvals.controller.pending.id, { outcome: 'deny', scope: 'once' });
+      const dObs3 = await pObs3;
+      check('A45 both observers throwing still settles once (deny)', okObs3 && dObs3.outcome === 'deny');
+
+      // Recovery: flags cleared → next request renders and settles normally.
+      window.__e2eObserverFailure = null;
+      const pRec = L.approvals.requestTestPermission({ policyKey: 'e2e:perm:recovery', summary: 'Recovery probe' });
+      check('A46 controller usable for a NEW request after observer failures', await waitFor(() => !!$('.approval-card')));
+      esc();
+      const dRec = await pRec;
+      check('A47 recovery request settles normally (no permanent brick)', dRec.outcome === 'deny' && !$('.approval-card'));
+    }
 
     // ---------- console / rejection hygiene ----------
     check('A35 no console errors / unhandled rejections',
