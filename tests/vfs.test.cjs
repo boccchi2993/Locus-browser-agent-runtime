@@ -170,6 +170,27 @@ async function run() {
   check('V36b deep skeleton dirs exist', (await vfs2.exists('/home/locus/.config/locus/mcp'))
     && (await vfs2.exists('/home/locus/.cache/locus')) && (await vfs2.exists('/usr/local/share/locus/skills')));
 
+  // ---------- C02. replacing the current home provider ----------
+  const homeBeforeClear = vfs2.resolveMount('/home/locus').provider;
+  const tmpBeforeClear = vfs2.resolveMount('/tmp').provider;
+  await vfs2.write('/home/locus/clear-survivor.txt', 'old');
+  vfs2.resetHome();
+  check('C02-1 memory home Clear removes files', await vfs2.exists('/home/locus/clear-survivor.txt') === false);
+  check('C02-2 memory home Clear rebuilds skeleton',
+    await vfs2.exists('/home/locus/.skills')
+    && await vfs2.exists('/home/locus/.config/locus/mcp')
+    && await vfs2.exists('/home/locus/.cache/locus'));
+  await vfs2.write('/home/locus/reset-survivor.txt', 'old');
+  vfs2.resetHome();
+  check('C02-3 memory home Reset removes files', await vfs2.exists('/home/locus/reset-survivor.txt') === false);
+  check('C02-4 memory home Reset rebuilds skeleton',
+    await vfs2.exists('/home/locus/.skills')
+    && await vfs2.exists('/home/locus/.config/locus/mcp')
+    && await vfs2.exists('/home/locus/.cache/locus'));
+  check('C02-5 resetHome replaces only the home provider',
+    vfs2.resolveMount('/home/locus').provider !== homeBeforeClear
+    && vfs2.resolveMount('/tmp').provider === tmpBeforeClear);
+
   // protected roots: exact set
   const prot = ['/', '/usr', '/home', '/home/locus', '/mnt', '/mnt/workspace', '/mnt/upload', '/mnt/download', '/mnt/plugins'];
   check('V37 protected roots exact set', prot.every((p) => vfs2.isProtectedRoot(p))

@@ -55,6 +55,8 @@ The normalized store carries portable fields such as role, kind, text, tool name
 
 Same-provider or compatible-adapter continuation uses the provider-native frames up to the session checkpoint. Before serialization, the checkpoint is checked for contiguous sequences, session/conversation identity, checkpoint/tail agreement and complete tool-call/result pairing. Invalid raw state is marked degraded and is never sent; Locus may retain a normalized inspection projection, but requires a new task boundary before another provider request. Cross-provider continuation uses the normalized semantic projection; a foreign Anthropic block or OpenAI wire object is never sent directly to the other provider.
 
+Replay validation derives protocol semantics from raw provider state and cross-checks persisted `kind`, `role` and tool-call metadata against that state. Persisted metadata is an index and invariant, never a safety gate that can hide provider-native tool calls or results.
+
 All raw frames are archived, including an assistant tool call that was interrupted. The checkpoint advances only at a protocol-valid boundary: a final assistant response, or a complete multi-tool result batch. A dangling tool call therefore remains inspectable but is excluded from the next replay. Locus never automatically reruns an interrupted tool because it may already have caused a real side effect.
 
 ## Crash recovery
@@ -82,5 +84,7 @@ Local browser-profile storage is not immune to XSS, not hardware secured and not
 ## Management actions
 
 Settings exposes a storage estimate, a browser persistent-storage request, and isolated actions for Clear conversations, Clear home, Clear plugins and Forget API keys. These actions share one runtime gate: an active AgentSession is cancelled, its `finally` settlement is awaited, and a timeout fails loudly without mutating storage. Reset all local data clears all IndexedDB durable state, unmounts `/mnt/workspace`, resets workspace UI state, clears OPFS home/plugins and recreates the ephemeral session mounts. Each clear action is scoped to its named surface; deleting a conversation cascades presentation events, provider sessions, provider frames (including orphan frames selected by conversation id) and normalized messages in one IndexedDB transaction.
+
+Clear home and Reset also clear the current `/home/locus` provider when the durable backend is unavailable, then rebuild the canonical memory-backed skeleton. A durable clear failure is propagated before the live provider is replaced.
 
 Persistence redaction is type-preserving for structured-clone values such as `Date`, typed arrays, `ArrayBuffer`, `Map` and `Set`. Unsupported non-cloneable values fail explicitly rather than being silently converted through JSON. OPFS enumeration, mount, write and clear failures are reported with the affected operation/path; a workspace can remain mounted for the current session while a failed handle-remember operation is shown as not remembered.

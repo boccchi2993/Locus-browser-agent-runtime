@@ -605,6 +605,16 @@ class VirtualWorkspace {
     return VFS_PROTECTED_ROOTS.has(this._abs(path));
   }
 
+  // Replace the live home provider with a fresh memory-backed home. Durable
+  // clearing belongs to PersistenceService; this primitive only resets the
+  // currently mounted VFS provider after the storage mutation has quiesced.
+  resetHome() {
+    this.mount('/home/locus', new MemoryWorkspace({
+      name: 'home',
+      dirs: VFS_HOME_SKELETON,
+    }), 'read-write');
+  }
+
   // Browser-session mounts are intentionally recreated on a full reset.
   // Durable OPFS/IDB providers are left untouched here and are cleared by
   // PersistenceService's explicit reset operation.

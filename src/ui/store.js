@@ -1119,6 +1119,11 @@ export async function clearConversations() {
 export async function clearHome() {
   return withStorageMutation(async () => {
     if (typeof PersistenceServiceInstance !== 'undefined') await PersistenceServiceInstance.clearHome();
+    // PersistenceService owns the durable backend; VFS owns the provider
+    // currently mounted at /home/locus. Once the durable clear resolves (or
+    // reports memory-only mode), replace the live fallback with a fresh
+    // canonical home before attempting a durable remount.
+    if (typeof vfs.resetHome === 'function') vfs.resetHome();
     await mountDurableStorage();
     await refreshArtifacts();
   });
@@ -1153,6 +1158,7 @@ export async function resetAllData() {
     store.workspacePermission = 'none';
     store.workspaceHandleAvailable = false;
     if (typeof PersistenceServiceInstance !== 'undefined') await PersistenceServiceInstance.reset();
+    if (typeof vfs.resetHome === 'function') vfs.resetHome();
     if (typeof vfs.resetEphemeral === 'function') vfs.resetEphemeral();
     store.attachments = [];
     store.artifacts = [];
