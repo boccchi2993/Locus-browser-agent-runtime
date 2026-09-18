@@ -4,3 +4,5 @@ node_modules/
 *.log
 dist/
 .ui-review/
+tests/real-world-50/.generated/
+tests/real-world-50/__pycache__/

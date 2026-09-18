@@ -1,0 +1,41 @@
+{
+  "version": "REAL-WORLD-50-v1",
+  "generatedRoots": {
+    "workspace": ".generated/workspace",
+    "upload": ".generated/upload"
+  },
+  "determinism": {
+    "fixedZipTimestamp": "2026-09-17T12:00:00",
+    "randomness": "none",
+    "runtimeManagedPaths": ["/home/locus", "/tmp"]
+  },
+  "workspace": {
+    "minimumSalesRows": 30,
+    "minimumCustomerRows": 20,
+    "minimumApplicationLogRows": 250,
+    "minimumAccessLogRows": 300,
+    "binary": {
+      "path": "binary/sample.bin",
+      "bytes": 4096,
+      "pattern": "(index * 73 + 19) % 256"
+    },
+    "requiredSearchMarkers": ["TODO", "FIXME", "HACK", "fetch(", "config"],
+    "requiredDirectories": ["empty-root/existing-empty", "logs/old", "config/nested", "tmp-output/nested"]
+  },
+  "uploads": {
+    "requiredFiles": ["report.xlsx", "sales.xlsx", "contract.docx", "report.pdf", "project.zip", "mixed-audit-project.zip"],
+    "formats": {
+      "report.xlsx": "OOXML workbook with Summary and Data sheets",
+      "sales.xlsx": "OOXML workbook with a Sales sheet and no Total column",
+      "contract.docx": "OOXML document with heading, paragraphs, and table",
+      "report.pdf": "three-page PDF with selectable text",
+      "project.zip": "deterministic ZIP with an empty directory entry",
+      "mixed-audit-project.zip": "deterministic cross-document audit ZIP"
+    }
+  },
+  "isolation": {
+    "oracleMustNotBeGenerated": true,
+    "generatedMustNotContain": ["oracle/", "expected.json"],
+    "allCredentialLikeValuesAreSynthetic": true
+  }
+}

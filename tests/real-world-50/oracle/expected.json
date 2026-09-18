@@ -1,0 +1,113 @@
+{
+  "version": "REAL-WORLD-50-v1",
+  "workspace": {
+    "binary/sample.bin": {
+      "size": 4096,
+      "sha256": "f965b526538d757ca2d6114af6517c57cbcb3650b71d8cfb92046a04ef2f566b"
+    }
+  },
+  "sales": {
+    "rows": 32,
+    "regionRevenue": {
+      "North": 12300,
+      "South": 11650,
+      "East": 12800,
+      "West": 12000
+    },
+    "totalRevenue": 48750
+  },
+  "customers": {
+    "rows": 20
+  },
+  "messyCities": {
+    "cleanedUniqueRows": 4
+  },
+  "nestedJson": {
+    "releaseYear": 2025,
+    "releaseChannel": "stable",
+    "sha256": "ff49bf62d2a3487f0f698640b10c1a5ab55574252fa52e3152ab3a31671bb9b2"
+  },
+  "appLog": {
+    "rows": 300,
+    "info": 179,
+    "warn": 47,
+    "error": 74,
+    "topErrors": [
+      ["database timeout", 27],
+      ["upstream unavailable", 16],
+      ["failed to parse request", 12]
+    ]
+  },
+  "accessLog": {
+    "rows": 360,
+    "busiestHour": "10",
+    "fiveXX": 153,
+    "fiveXXRatio": 0.425
+  },
+  "xlsxReport": {
+    "sheetNames": ["Summary", "Data"],
+    "dimensions": {
+      "Summary": "A1:B4",
+      "Data": "A1:C16"
+    },
+    "keyCells": {
+      "B2": 2025,
+      "B3": 48750,
+      "B4": 128
+    }
+  },
+  "xlsxSales": {
+    "sheetNames": ["Sales"],
+    "dimension": "A1:C12",
+    "expectedTotals": [1200, 1500, 1350, 1800, 1250, 1400, 1600, 1800, 1950, 2000, 1750]
+  },
+  "contract": {
+    "parties": ["Acme Analytics Ltd.", "Northwind Retail LLC"],
+    "amount": "USD 48,000",
+    "dates": ["2025-10-01", "2025-12-31"],
+    "year2025Occurrences": 3
+  },
+  "pdf": {
+    "pageCount": 3,
+    "sectionHeadings": [
+      "Quarterly Operations Report",
+      "Executive Summary",
+      "Sales Performance",
+      "Risks and Recommendations"
+    ],
+    "tableValues": [
+      "North | 12,300",
+      "South | 11,650",
+      "East | 12,800",
+      "West | 12,000"
+    ]
+  },
+  "zip": {
+    "entries": [
+      "project/README.md",
+      "project/package.json",
+      "project/src/index.js",
+      "project/src/helper.js",
+      "project/config/app.json",
+      "project/assets/empty-dir/"
+    ],
+    "readmeSha256": "78f5a3271dbf102e2b13d58f662ee46e77d79cde767e20b3101159d256f760ba",
+    "config": {
+      "mode": "fixture",
+      "enabled": true
+    }
+  },
+  "mixedAudit": {
+    "entries": [
+      "mixed-audit-project/sales.csv",
+      "mixed-audit-project/contract.docx",
+      "mixed-audit-project/report.pdf",
+      "mixed-audit-project/notes.txt",
+      "mixed-audit-project/README.md"
+    ],
+    "expectedInconsistencies": [
+      "revenue: sales.csv/PDF 48,750 vs DOCX 47,850",
+      "customer count: sales/report 128 vs DOCX 120"
+    ]
+  }
+}
