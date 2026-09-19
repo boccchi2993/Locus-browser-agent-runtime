@@ -911,6 +911,24 @@ class PersistenceService {
     }
   }
 
+  // Used ONLY by AttachmentStore orphan rollback (F-I02): remove a blob
+  // that THIS ingest just created after its metadata write failed.
+  // Callers must never point this at a pre-existing (shared) blob. A
+  // NotFoundError means the bytes are already gone — deletion succeeded
+  // in every sense that matters.
+  async deleteAttachmentBytes(storageKey) {
+    await this.ready;
+    this.memoryAttachmentBytes.delete(storageKey);
+    if (!this.opfsRoot) return;
+    try {
+      var dir = await this.opfsDirectory(['attachments', String(storageKey).slice(0, 2)], false);
+      await dir.removeEntry(String(storageKey));
+    } catch (e) {
+      if (e && (e.name === 'NotFoundError' || e.cause && e.cause.name === 'NotFoundError')) return;
+      this._throwPersistenceError(e, 'delete attachment bytes');
+    }
+  }
+
   async clearAttachments() {
     await this.ready;
     try {

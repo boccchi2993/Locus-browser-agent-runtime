@@ -369,6 +369,13 @@ class AgentSession {
   //   otherwise   → replace the image part with the deterministic
   //                  domain notice (tool failure is NOT implied; the
   //                  image simply does not cross this boundary)
+  // Error contract:
+  //   missing record / vanished durable bytes → degrade honestly in-band
+  //     (deterministic textual notice + warning event, task continues);
+  //   AttachmentIntegrityError (present metadata, corrupt backing bytes)
+  //     → THROWN so the caller fails closed BEFORE any provider side
+  //     effect (docs/IMAGE-INPUT.md, "Read-path integrity": a corrupted
+  //     blob must never be quietly swapped for a notice-and-continue).
   // Returns new message objects — history keeps its semantic refs.
   async _materializeImageContent(messages, gateResult) {
     const imageInput = this.imageInput;
@@ -388,7 +395,12 @@ class AgentSession {
           try {
             resolved = typeof imageInput.resolveAttachment === 'function'
               ? await imageInput.resolveAttachment(part.attachmentId) : null;
-          } catch (e) { resolved = null; }
+          } catch (e) {
+            // Integrity failures fail closed (see contract above); any
+            // other resolution problem takes the honest missing path.
+            if (e && (e.name === 'AttachmentIntegrityError' || e.code === 'attachment_integrity_error')) throw e;
+            resolved = null;
+          }
           if (resolved && resolved.dataBase64) {
             parts.push({ type: 'image', mimeType: resolved.mimeType || part.mimeType, dataBase64: resolved.dataBase64 });
           } else {
@@ -530,7 +542,31 @@ class AgentSession {
               message: '图片能力询问已取消，本次图片不会发送给模型。',
             });
           }
-          requestMessages = await this._materializeImageContent(requestMessages, gate);
+          try {
+            requestMessages = await this._materializeImageContent(requestMessages, gate);
+          } catch (e) {
+            if (e && (e.name === 'AttachmentIntegrityError' || e.code === 'attachment_integrity_error')) {
+              // Fail closed BEFORE any provider side effect (provider call
+              // count stays 0): corrupted/truncated/replaced durable bytes
+              // must never reach a provider, and an integrity failure is
+              // never reinterpreted as a capability verdict — the registry
+              // is untouched, and there is no automatic resend.
+              if (isStale()) {
+                noteDiscarded();
+                end(sessionChanged() ? 'session_changed' : 'cancelled');
+                return;
+              }
+              emit({
+                type: 'error', code: 'image_attachment_integrity',
+                reason: e.reason || 'unknown',
+                message: 'Image attachment failed durable-storage verification ('
+                  + String(e.reason || 'unknown') + '); nothing was sent to the model. Re-attach the image and try again.',
+              });
+              end('error');
+              return;
+            }
+            throw e;
+          }
           if (isStale()) {
             noteDiscarded();
             end(sessionChanged() ? 'session_changed' : 'cancelled');

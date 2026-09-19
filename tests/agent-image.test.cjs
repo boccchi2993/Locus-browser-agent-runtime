@@ -22,7 +22,8 @@ const P = eval(
   fs.readFileSync(path.join(__dirname, '..', 'src', 'persistence.js'), 'utf8') +
   '\n;({ PersistenceService });'
 );
-eval(fs.readFileSync(path.join(__dirname, '..', 'src', 'attachments.js'), 'utf8') + '\n;void AttachmentStore;');
+const AT = eval(fs.readFileSync(path.join(__dirname, '..', 'src', 'attachments.js'), 'utf8') +
+  '\n;({ AttachmentStore, isAttachmentIntegrityError });');
 const AP = eval(
   fs.readFileSync(path.join(__dirname, '..', 'src', 'approval.js'), 'utf8') +
   '\n;({ ApprovalController });'
@@ -255,6 +256,65 @@ async function main() {
     check('M1 vanished bytes → explicit warning + model told, no phantom image',
       !h.modelCalls[0].messages[0].content.some((p) => p.type === 'image')
         && h.modelCalls[0].messages[0].content.some((p) => p.text && p.text.includes('no longer available'))
+        && h.events.some((e) => e.type === 'warning' && e.code === 'image_attachment_missing')
+        && h.events.some((e) => e.type === 'task_end' && e.reason === 'completed'));
+  }
+
+  // ---------- F-I04: corrupted durable blob fails closed BEFORE the provider ----------
+  {
+    const service = new P.PersistenceService();
+    await service.ready;
+    const attStore = new AT.AttachmentStore({ persistence: service });
+    const pngBytes = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4, 5, 6, 7, 8]);
+    const rec = await attStore.ingestImage({ bytes: pngBytes, name: 'doomed.png', declaredType: 'image/png' });
+    // External corruption (bit flip) of the durable bytes behind live metadata.
+    const stored = await service.readAttachmentBytes(rec.sha256);
+    stored[5] ^= 0xFF;
+    await service.writeAttachmentBytes(rec.sha256, stored);
+
+    const fIdentity = {
+      provider: 'anthropic', adapterId: 'anthropic-compatible', dialect: 'anthropic',
+      endpointIdentity: 'https://gateway.example/anthropic', model: 'f-model', protocolVersion: 'messages-v1',
+    };
+    const registry = new C.ModelCapabilityRegistry({ persistence: service });
+    await registry.setUserDecision(fIdentity, 'supported');
+
+    const imageInput = {
+      ensureCapability: async () => ({ state: 'supported', source: 'user' }),
+      resolveAttachment: (id) => attStore.resolveForWire(id),
+      unavailableNotice: C.imageInputUnavailableNotice,
+    };
+    const h = makeHarness(imageInput);
+    // Reference the REAL record id — the corruption must be hit through
+    // the actual resolver, not the shared fixture's synthetic 'att_1'.
+    await h.session.run('看这张图', { userContent: [
+      { type: 'text', text: '看这张图' },
+      { type: 'image', attachmentId: rec.id, mimeType: rec.mimeType, sha256: rec.sha256, size: rec.size },
+    ] });
+    check('F1 (T4) corrupted durable blob → ZERO provider calls, fail closed with the integrity reason',
+      h.modelCalls.length === 0
+        && h.events.some((e) => e.type === 'error' && e.code === 'image_attachment_integrity' && e.reason === 'hash_mismatch')
+        && h.events.some((e) => e.type === 'task_end' && e.reason === 'error'),
+      JSON.stringify(h.events.map((e) => e.type + ':' + (e.code || e.reason || ''))));
+    check('F1b the corruption never leaked into any event payload',
+      !h.events.some((e) => JSON.stringify(e).includes(Buffer.from(pngBytes).toString('base64'))));
+    const looked = await registry.lookup(fIdentity);
+    check('F2 (H) an integrity failure NEVER mutates the capability registry',
+      looked.state === 'supported' && looked.source === 'user', JSON.stringify(looked));
+  }
+
+  // ---------- non-integrity resolution errors still degrade honestly ----------
+  {
+    const imageInput = {
+      ensureCapability: async () => ({ state: 'supported', source: 'user' }),
+      resolveAttachment: async () => { throw new Error('transient storage hiccup'); },
+      unavailableNotice: C.imageInputUnavailableNotice,
+    };
+    const h = makeHarness(imageInput);
+    await runRich(h.session);
+    check('F3 non-integrity resolution failures keep the honest missing path (degrade + continue)',
+      h.modelCalls.length === 1
+        && !h.modelCalls[0].messages[0].content.some((p) => p.type === 'image')
         && h.events.some((e) => e.type === 'warning' && e.code === 'image_attachment_missing')
         && h.events.some((e) => e.type === 'task_end' && e.reason === 'completed'));
   }

@@ -6,6 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const P = eval(
   fs.readFileSync(path.join(__dirname, '..', 'src', 'persistence.js'), 'utf8') +
@@ -13,7 +14,7 @@ const P = eval(
 );
 const A = eval(
   fs.readFileSync(path.join(__dirname, '..', 'src', 'attachments.js'), 'utf8') +
-  '\n;({ AttachmentStore, IMAGE_MIME_TYPES, MAX_IMAGE_ATTACHMENT_BYTES, imageContentPart, textContentPart });'
+  '\n;({ AttachmentStore, IMAGE_MIME_TYPES, MAX_IMAGE_ATTACHMENT_BYTES, imageContentPart, textContentPart, attachmentIntegrityError, isAttachmentIntegrityError });'
 );
 
 let passed = 0, failed = 0;
@@ -145,6 +146,181 @@ async function main() {
   try { await store.getBytes(rec.id); } catch (e) { gone = e; }
   check('S10 clearAttachments drops metadata AND bytes (no dead refs)',
     afterClear.length === 0 && !!gone, String(afterClear.length));
+
+  // ============================================================
+  //  F-I04 — read-path integrity (verify before model-input boundary)
+  // ============================================================
+  // Fresh service so corruption tests start from a known state.
+  const isvc = new P.PersistenceService();
+  await isvc.ready;
+  const istore = new A.AttachmentStore({ persistence: isvc });
+  const IREC = await istore.ingestImage({ bytes: PNG_BYTES, name: 'integrity.png', declaredType: 'image/png' });
+  // Mutate the durable blob the way an external bug/hostile write would.
+  // The mutator may return replacement bytes (e.g. a truncated copy).
+  const mutateBlob = async (mutator) => {
+    const bytes = await isvc.readAttachmentBytes(IREC.sha256);
+    const next = mutator(bytes) || bytes;
+    await isvc.writeAttachmentBytes(IREC.sha256, next);
+  };
+  // `expectedRecord` is the metadata AS STORED — the integrity error must
+  // carry exactly those expected values (with tampered metadata, the
+  // tampered values are what the store believed).
+  async function integrityCheck(fn, reason, label, expectedRecord) {
+    const want = expectedRecord || IREC;
+    let err = null;
+    try { await fn(); } catch (e) { err = e; }
+    check(label,
+      !!err && A.isAttachmentIntegrityError(err) && err.code === 'attachment_integrity_error'
+        && err.reason === reason && err.attachmentId === want.id
+        && err.expectedSha256 === want.sha256 && err.expectedSize === want.size,
+      err && (err.reason || err.message));
+    return err;
+  }
+
+  const okResolved = await istore.resolveForWire(IREC.id);
+  check('I1 happy path: verified read materializes the exact payload',
+    okResolved && okResolved.mimeType === 'image/png'
+      && okResolved.dataBase64 === Buffer.from(PNG_BYTES).toString('base64'));
+
+  await mutateBlob((b) => { b[5] ^= 0xFF; }); // flip one byte
+  await integrityCheck(() => istore.getBytes(IREC.id), 'hash_mismatch',
+    'I2 (T1) flipped blob byte → hash_mismatch, fail closed');
+  await integrityCheck(() => istore.resolveForWire(IREC.id), 'hash_mismatch',
+    'I2b resolveForWire refuses a bit-flipped blob');
+  const hashErr = await integrityCheck(async () => {
+    const s2 = new A.AttachmentStore({ persistence: isvc }); // "reload"
+    return s2.getBytes(IREC.id);
+  }, 'hash_mismatch', 'I2c (G) reload after corruption still fails closed');
+
+  await mutateBlob((b) => b.slice(0, b.length - 3)); // truncate
+  await integrityCheck(() => istore.getBytes(IREC.id), 'size_mismatch',
+    'I3 (T2) truncated blob → size_mismatch (cheap first gate, no hash needed)');
+
+  // Restore original bytes, then tamper METADATA only.
+  await isvc.writeAttachmentBytes(IREC.sha256, PNG_BYTES);
+  const mimeTampered = Object.assign({}, IREC, { mimeType: 'image/jpeg' });
+  await isvc.saveAttachmentMeta(mimeTampered);
+  await integrityCheck(() => istore.getBytes(IREC.id), 'mime_mismatch',
+    'I4 (T3) metadata MIME contradicts magic bytes → mime_mismatch');
+  await isvc.saveAttachmentMeta(IREC); // restore
+
+  const shaTampered = Object.assign({}, IREC, { sha256: 'f'.repeat(64) });
+  await isvc.saveAttachmentMeta(shaTampered);
+  await integrityCheck(() => istore.getBytes(IREC.id), 'hash_mismatch',
+    'I5 (E) tampered metadata sha256 → fail closed', shaTampered);
+  await isvc.saveAttachmentMeta(IREC); // restore
+
+  const sizeTampered = Object.assign({}, IREC, { size: IREC.size + 1 });
+  await isvc.saveAttachmentMeta(sizeTampered);
+  await integrityCheck(() => istore.getBytes(IREC.id), 'size_mismatch',
+    'I6 (F) tampered metadata size → fail closed', sizeTampered);
+  await isvc.saveAttachmentMeta(IREC); // restore
+
+  const payloadB64 = Buffer.from(PNG_BYTES).toString('base64');
+  check('I7 the integrity error carries expected metadata only — never payload bytes',
+    !!hashErr && !JSON.stringify(hashErr).includes(payloadB64)
+      && hashErr.message.indexOf('iVBOR') === -1,
+    hashErr && hashErr.message);
+
+  const missingWire = await istore.resolveForWire('att_does_not_exist');
+  check('I8 missing record still resolves to null (honest unavailable path)',
+    missingWire === null);
+
+  // ============================================================
+  //  F-I01C — concurrent same-SHA ingest canonicalizes
+  // ============================================================
+  const csvc = new P.PersistenceService();
+  await csvc.ready;
+  const cstore = new A.AttachmentStore({ persistence: csvc });
+  const CONC_BYTES = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 7, 7, 7, 7, 7, 7, 7, 7]);
+  const results = await Promise.all(Array.from({ length: 50 }, (_, i) =>
+    cstore.ingestImage({ bytes: CONC_BYTES, name: 'conc-' + i + '.png', declaredType: 'image/png' })));
+  const concMetas = await csvc.allAttachmentMetas();
+  const concIds = new Set(results.map((r) => r.id));
+  check('C1 (T13) 50 parallel same-bytes ingests → ONE canonical attachment identity',
+    concIds.size === 1 && concMetas.length === 1 && results.every((r) => r.id === results[0].id)
+      && results.every((r) => r.sha256 === results[0].sha256),
+    JSON.stringify({ ids: concIds.size, metas: concMetas.length }));
+  check('C1b one blob, exact bytes', (await csvc.readAttachmentBytes(results[0].sha256))
+    .every((b, i) => b === CONC_BYTES[i]));
+
+  const diffSpecs = Array.from({ length: 8 }, (_, i) => {
+    const bytes = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, i, i, i, i]);
+    return cstore.ingestImage({ bytes, name: 'diff-' + i + '.png', declaredType: 'image/png' });
+  });
+  const diffResults = await Promise.all(diffSpecs);
+  const diffMetas = await csvc.allAttachmentMetas();
+  check('C2 (T14) different-SHA parallel ingests stay independent (no cross-blocking, no dedupe)',
+    new Set(diffResults.map((r) => r.sha256)).size === 8
+      && diffMetas.length === 9 && new Set(diffMetas.map((m) => m.sha256)).size === 9,
+    JSON.stringify({ metas: diffMetas.length }));
+
+  const renamed = await cstore.ingestImage({ bytes: CONC_BYTES, name: 'renamed-after.png', declaredType: 'image/png' });
+  check('C3 same filename / different bytes → different identity; same bytes / new name → canonical identity',
+    renamed.id === results[0].id
+      && (await cstore.ingestImage({
+        bytes: new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 7, 7, 7, 7, 7, 7, 7, 8]),
+        name: 'conc-0.png', declaredType: 'image/png',
+      })).sha256 !== results[0].sha256);
+
+  // ============================================================
+  //  F-I02 — orphan rollback on metadata failure
+  // ============================================================
+  const rsvc = new P.PersistenceService();
+  await rsvc.ready;
+  const rstore = new A.AttachmentStore({ persistence: rsvc });
+  const RREC = await rstore.ingestImage({ bytes: PNG_BYTES2, name: 'rollback.png', declaredType: 'image/png' });
+
+  // RB1/A: blob-exists-but-no-metadata + metadata failure → NEW blob is rolled back.
+  await rsvc.delete('attachments', RREC.id); // remove meta, keep blob (shared-blob setup)
+  const failSvc = rsvc;
+  const realSave = failSvc.saveAttachmentMeta.bind(failSvc);
+  let failFirst = true;
+  failSvc.saveAttachmentMeta = async (record) => {
+    if (failFirst) { failFirst = false; throw new Error('simulated metadata write failure'); }
+    return realSave(record);
+  };
+  let rbErr = null;
+  try { await rstore.ingestImage({ bytes: PNG_BYTES, name: 'orphan.png', declaredType: 'image/png' }); }
+  catch (e) { rbErr = e; }
+  check('RB1 (T15) metadata failure after a NEW blob write → ingest fails, no false success',
+    !!rbErr && /simulated metadata write failure/.test(rbErr.message), rbErr && rbErr.message);
+  const orphanSha = crypto.createHash('sha256').update(PNG_BYTES).digest('hex');
+  const orphanGone = !(await failSvc.hasAttachmentBytes(orphanSha));
+  check('RB1b the just-created orphan blob was rolled back',
+    orphanGone && failSvc.memoryAttachmentBytes.size === 1, String(failSvc.memoryAttachmentBytes.size));
+
+  // RB2/B: pre-existing shared blob + metadata failure → blob PRESERVED.
+  const sharedBefore = failSvc.memoryAttachmentBytes.get(RREC.sha256);
+  failFirst = true;
+  rbErr = null;
+  try { await rstore.ingestImage({ bytes: PNG_BYTES2, name: 'shared.png', declaredType: 'image/png' }); }
+  catch (e) { rbErr = e; }
+  check('RB2 (T16) metadata failure with a PRE-EXISTING blob → blob never deleted',
+    !!rbErr && sharedBefore && !!failSvc.memoryAttachmentBytes.get(RREC.sha256)
+      && failSvc.memoryAttachmentBytes.get(RREC.sha256).every((b, i) => b === sharedBefore[i]),
+    rbErr && rbErr.message);
+
+  // RB3/C: cleanup failure must not mask the original error (no false success).
+  const realDelete = failSvc.deleteAttachmentBytes.bind(failSvc);
+  failSvc.deleteAttachmentBytes = async () => { throw new Error('simulated cleanup failure'); };
+  failSvc.saveAttachmentMeta = async () => { throw new Error('simulated metadata write failure 2'); };
+  rbErr = null;
+  try { await rstore.ingestImage({ bytes: JPEG_BYTES, name: 'cleanup-fail.png', declaredType: 'image/jpeg' }); }
+  catch (e) { rbErr = e; }
+  check('RB3 cleanup failure never replaces/masks the original metadata error',
+    !!rbErr && /simulated metadata write failure 2/.test(rbErr.message)
+      && /simulated cleanup failure/.test(String(rbErr.attachmentCleanupFailure)),
+    rbErr && rbErr.message + ' | cleanup=' + rbErr.attachmentCleanupFailure);
+
+  // RB4/D: retry after failure ingests normally.
+  failSvc.saveAttachmentMeta = realSave;
+  failSvc.deleteAttachmentBytes = realDelete;
+  const retried = await rstore.ingestImage({ bytes: JPEG_BYTES, name: 'retry.png', declaredType: 'image/jpeg' });
+  check('RB4 retry after a failed ingest succeeds normally',
+    !!retried && retried.mimeType === 'image/jpeg'
+      && !!(await rsvc.findAttachmentMetaBySha256(retried.sha256))
+      && !!(await rsvc.hasAttachmentBytes(retried.sha256)));
 
   console.log('---');
   console.log('attachments.test.cjs: ' + passed + ' passed, ' + failed + ' failed');
