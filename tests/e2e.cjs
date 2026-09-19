@@ -91,12 +91,16 @@ async function presentationE2e() {
     const approval = spawnSync(process.execPath, [path.join(__dirname, 'e2e-approval.cjs')], {
       stdio: 'inherit', env,
     });
+    const image = spawnSync(process.execPath, [path.join(__dirname, 'e2e-image.cjs')], {
+      stdio: 'inherit', env,
+    });
     return [
       ['presentation', ui.status === 0],
       ['responsive', resp.status === 0],
       ['persistence', persistence.status === 0],
       ['wire', wire.status === 0],
       ['approval', approval.status === 0],
+      ['image', image.status === 0],
     ];
   } catch (error) {
     console.error(error && error.stack || error);

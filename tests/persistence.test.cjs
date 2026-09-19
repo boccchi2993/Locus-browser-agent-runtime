@@ -18,7 +18,7 @@ function check(name, condition, detail) {
   const service = new P.PersistenceService();
   await service.ready;
 
-  check('P1 schema version is explicit', P.PERSISTENCE_SCHEMA_VERSION === 2);
+  check('P1 schema version is explicit', P.PERSISTENCE_SCHEMA_VERSION === 3);
   check('P2 stable database name', P.PERSISTENCE_DB_NAME === 'locus');
   check('P3 unavailable IndexedDB degrades to memory', service.mode === 'memory');
 

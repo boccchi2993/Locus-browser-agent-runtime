@@ -29,6 +29,11 @@ const SUITES = [
   'worker-init.test.cjs',
   'worker-output.test.cjs',
   'vfs-audit.test.cjs',
+  'attachments.test.cjs',
+  'capabilities.test.cjs',
+  'image-probe.test.cjs',
+  'model-adapters-image.test.cjs',
+  'agent-image.test.cjs',
   'chrome-helper.test.cjs',
 ];
 
