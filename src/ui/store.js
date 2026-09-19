@@ -178,9 +178,18 @@ function wiredModelClient(body, opts) {
 }
 
 function wiredToolExecutor(tool, input, workspace, opts) {
+  // NetworkRuntime approval consumer context (docs/NETWORK-RUNTIME.md):
+  // side-effecting network requests ask through the page's ApprovalController.
+  // The approval provider is injected here — the shell neither constructs
+  // approvals nor knows their internals. Read-only in the hooks path.
+  const o = Object.assign({}, opts || {}, {
+    approvals: approvals,
+    conversationId: runningConversationId || store.liveConversationId || null,
+    taskGeneration: session.generation,
+  });
   const h = hooks();
-  if (h && typeof h.toolExecutor === 'function') return h.toolExecutor(tool, input, workspace, opts);
-  return executeTool(tool, input, workspace, opts);
+  if (h && typeof h.toolExecutor === 'function') return h.toolExecutor(tool, input, workspace, o);
+  return executeTool(tool, input, workspace, o);
 }
 
 // Conversation identity semantics — three DIFFERENT concepts, never merge:
