@@ -70,7 +70,7 @@ actions that are already inside the runtime's authority.
 ## Not v1
 
 - persistent allow rules / "always allow"
-- image capability probes (the `capability` kind schema is reserved)
+- ~~image capability probes (the `capability` kind schema is reserved)~~ — consumed by Image Feedback v1 (docs/IMAGE-INPUT.md): the `capability` kind (confirm / decline / unsure, no session scope) carries ONLY the human decision; all persistence lives in the separate capability registry
 - network policy / NetworkRuntime / CORS routing
 - MCP permissions
 - auto-review agent / risk classifier
@@ -223,7 +223,8 @@ const approvals = new ApprovalController({ onChange, onEvent });
 
 const decision = await approvals.request(
   {
-    kind: 'permission',                    // 'capability' | 'confirmation' reserved
+    kind: 'permission',                    // 'capability' consumed by Image
+                                           // Feedback v1; 'confirmation' reserved
     action: { type, summary, detail },     // plain text; summary required
     resource: { type, key, label },        // optional
     policyKey: 'network-origin:https://example.com',  // Harness-canonical
