@@ -52,8 +52,35 @@ continuation state references the **durable snapshot**, never the File.
   per-request wire budget is enforced separately (see "Request budget").
   Oversized → explicit rejection; no silent compression or transcoding.
 - **Content addressing**: `storageKey` IS the SHA-256. Byte-identical files
-  dedupe to one blob regardless of filename; metadata rows are per-ingest
-  so conversation frames keep stable attachment ids.
+  dedupe to one blob regardless of filename. Attachments are
+  **content-addressed and metadata is canonicalized by SHA-256**: the same
+  exact bytes — ingested once or many times, serially or concurrently —
+  produce ONE blob and ONE canonical attachment identity, not one row per
+  ingest. (If user-visible per-upload instances are ever needed, that is a
+  separate upload-reference layer, not extra metadata rows.)
+- **Ingest serialization + partial failure**: same-SHA ingests serialize on
+  a per-key lock (Map<sha256, Promise>) with an inside-lock re-check, so
+  concurrent identical uploads under real OPFS/IndexedDB canonicalize
+  instead of racing into duplicate metadata; different SHAs stay
+  concurrent. If the metadata write fails after a NEW blob was written,
+  the just-created blob is best-effort deleted (orphan rollback); a
+  pre-existing shared blob is NEVER touched, and the original metadata
+  error always wins over any cleanup failure.
+- **Read-path integrity (fail closed)**: a content-addressed attachment is
+  verified against its metadata on EVERY read that can cross the
+  model-input boundary, before any base64 is materialized — in order:
+  exact `size`, re-hashed `sha256` (against the record AND the storage
+  key — the address itself is not the check), then MIME magic
+  consistency (`metadata.mimeType` must equal what the bytes actually
+  sniff as; unrecognizable bytes are a failure). Mismatches throw
+  `AttachmentIntegrityError` with `code: 'attachment_integrity_error'` and
+  a closed reason set — `size_mismatch` | `hash_mismatch` | `mime_mismatch`
+  — carrying expected metadata only, never payload bytes/base64. No
+  verified result is ever cached across reads. The agent-layer contract:
+  a MISSING record/bytes degrades honestly in-band (textual notice +
+  warning, task continues); a present-but-CORRUPT attachment fails the
+  task closed BEFORE any provider request (provider call count = 0),
+  never auto-retried, never reinterpreted as a capability verdict.
 - **Durable backing**: bytes in OPFS `attachments/<h2>/<sha256>`, metadata
   in the IndexedDB `attachments` store (schema v3). Memory mode mirrors the
   semantics for tests/degraded environments. UI/components never touch
@@ -84,9 +111,12 @@ A user turn with images is ONE turn:
   projection (`projectNormalizedHistory`) carries semantic parts through; the
   TARGET provider's gate decides per request — a text-only target gets the
   deterministic notice, never a silent drop and never foreign wire shapes.
-- If durable bytes vanish (e.g. storage cleared), the model receives an
+- If durable bytes VANISH (e.g. storage cleared), the model receives an
   explicit "no longer available" text part and the UI gets a warning; the
-  task continues honestly.
+  task continues honestly. If durable bytes are PRESENT but fail
+  integrity verification (corrupted/truncated/replaced — see
+  "Read-path integrity"), the task instead fails closed with zero
+  provider requests; the UI error names the verification reason.
 
 ## Provider serialization (src/model-adapters.js)
 
@@ -133,8 +163,19 @@ Two DIFFERENT concepts, never merged (docs/APPROVALS.md):
   mistaken Yes/No is never a dead end. `resetAllData` clears the registry
   (full wipe); `clear conversations` keeps it.
 - **Builtin seed** (verified against current vendor docs; deliberately
-  narrow — known provider family + OFFICIAL endpoint family + known model
+  narrow — known provider family + OFFICIAL hostname + known model
   patterns, never `/vision/`-style substrings):
+  - **Endpoint identity (F-I21)**: builtin rules match the URL-PARSED
+    hostname with EXACT equality (`parseEndpointIdentity` → `url.hostname`
+    === official host, http(s) only, default port only, userinfo
+    rejected) — never a substring/regex `contains` on the raw endpoint
+    string. Official seeds: `api.deepseek.com`, `api.openai.com`,
+    `api.anthropic.com`. Lookalikes such as `api.deepseek.com.evil.com`,
+    `evil-api.deepseek.com`, `https://evil.com/api.deepseek.com/v1`,
+    `https://api.deepseek.com@evil.com` (real hostname: evil.com),
+    `deepseek.com` and `api.deepseek.co` all stay UNKNOWN — a third-party
+    compatible endpoint never inherits the official builtin, whatever
+    model string or path it carries.
   - DeepSeek official endpoint: `deepseek-flash` → supported (official
     vision docs); `deepseek-chat` / `deepseek-reasoner` (V3-series) →
     unsupported (text-only).
@@ -206,10 +247,31 @@ accepts images, not whether some model family is philosophically multimodal.
 ## Provider rejection correction
 
 If the registry says supported but a real image request receives an
-explicit pre-inference image validation rejection, the registry is corrected
-to `unsupported / provider-rejection`. Classification is conservative —
-auth/quota/5xx/size-limit errors never downgrade capability. There is NO
-automatic image-less resend after an ambiguous failure (double-billing /
+explicit provider rejection, the error is classified
+(`classifyImageProviderError`, F-I56) into exactly one of:
+
+- `model_unsupported` — explicit MODEL/path capability attribution
+  ("this model does not support image input", "vision is not available
+  for this model", "image content is unsupported for the selected
+  model"). The ONLY category that corrects the registry to
+  `unsupported / provider-rejection`.
+- `invalid_image` — the image BYTES were rejected (corrupt, truncated,
+  malformed, undecodable, bad base64, invalid dimensions, oversized).
+  Input-instance failure: request fails, capability UNCHANGED.
+- `mime_unsupported` — the FORMAT/media type was rejected ("unsupported
+  media_type image/gif", "unsupported image format"). Input-instance
+  failure: capability UNCHANGED (no per-MIME registry in v1).
+- `ambiguous` — auth (401/403), model-not-found (404), quota (429), 5xx,
+  timeouts, network, parse errors, tool-schema rejections, generic
+  400/422 validation. Never capability evidence.
+
+The conservative principle is deliberate and documented in code: FALSE
+NEGATIVE capability detection is acceptable; FALSE POSITIVE persistent
+downgrade is not. HTTP status alone (400/422) is never evidence — the
+downgrade must come from explicit model-level image semantics. Local
+integrity failures (`AttachmentIntegrityError`) happen BEFORE any
+provider request and never enter this classifier at all. There is NO
+automatic image-less resend after any of these failures (double-billing /
 duplicate-inference rules of docs/MODEL-PROTOCOL.md apply unchanged).
 
 ## Request budget
@@ -230,6 +292,25 @@ text + images bind into ONE user turn / ONE provider turn / ONE user bubble
 (the bubble shows an "N images" chip). Individual rejected images surface a
 conversation warning and the text still goes out.
 
+## Memory-only durability (honesty, F-I52)
+
+When OPFS is unavailable, the AttachmentStore's bytes fall back to the
+page-lifetime `memoryAttachmentBytes` Map (metadata may still persist in
+IndexedDB). The current task MAY still send the image — memory-only
+storage never disables image input — but the submit path surfaces an
+explicit, user-visible warning at submit time:
+
+> Image attachment storage is memory-only in this browser session; the
+> attached image will not survive a page reload.
+
+The warning is a presentation/storage-UX event ONLY: it never enters
+provider-visible history (providerFrames, normalizedMessages, raw replay)
+and is never sent to the model. After a reload with memory-only storage
+the attachment bytes are gone, and the existing honest missing-bytes path
+applies — but the user was warned at submit time, so this is no longer a
+silent durability lie. The signal comes from the PersistenceService's own
+OPFS state (`opfsAvailable`); there is no per-submit OPFS probe.
+
 ## Security boundaries
 
 - The capability registry is Harness-only; the agent has no write path.
@@ -249,6 +330,14 @@ card is pending → task cancelled, card closed, registry untouched.
 
 ## Known v1 limitations
 
+- **Per-conversation deletion does not garbage-collect attachments**
+  (F-I44): deleting ONE persisted conversation does not currently
+  garbage-collect attachment blobs uniquely referenced by that
+  conversation — there is no attachment reference-counting or
+  mark-and-sweep in v1. Attachment cleanup currently occurs with
+  "Clear conversations" and "Reset all data" (both verified to clear
+  metadata AND bytes). If a per-conversation deletion UI is ever
+  exposed, it MUST ship with a matching attachment reference GC.
 - No agent-readable filesystem projection of the registry (future
   system-read-only mount at `/home/locus/.config/locus/model-capabilities.json`).
 - Builtin seed covers only the families above; anything else asks once.
