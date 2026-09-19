@@ -72,11 +72,20 @@ Likewise `cat`, `ls`, Python `open()`, JavaScript file APIs, and future Unix uti
 
 ### 2.3 Network
 
-The network capability provides Internet connectivity.
+The network capability provides Internet connectivity as bounded HTTP/HTTPS
+request/response — nothing more.
 
-`curl` is a Unix-facing frontend to this capability. It is not the architectural primitive itself.
+`curl` is the Unix-facing frontend to this capability. It is not the
+architectural primitive itself.
 
-The long-term target is:
+**v1 status:** the primitive now exists — `NetworkRuntime`
+(src/network.js, docs/NETWORK-RUNTIME.md). It normalizes requests, enforces
+scheme/method/size policy, routes between the browser fetch backend and the
+edge relay, consumes the Approval Framework for side-effecting methods, and
+reports an explicit error taxonomy. The model experiences ordinary HTTP;
+CORS topology and backend routing are Harness-internal.
+
+The long-term target is unchanged:
 
 ```
                      Network Runtime
@@ -94,9 +103,15 @@ Examples of Python-side consumers may include:
 - `urllib`,
 - `pyfetch`.
 
-The runtime should eventually virtualize HTTP so these consumers can reuse the same Locus routing, policy, telemetry and relay behavior instead of bypassing the harness.
+These consumers are NOT implemented in v1. The runtime should eventually
+virtualize HTTP so they reuse the same Locus routing, policy, telemetry and
+relay behavior instead of bypassing the harness.
 
-The browser does not provide Linux raw sockets. Locus therefore virtualizes useful Internet access at the HTTP/runtime layer rather than pretending to expose a real TCP/IP stack.
+The browser does not provide Linux raw sockets. Locus therefore virtualizes
+useful Internet access at the HTTP/runtime layer rather than pretending to
+expose a real TCP/IP stack. Arbitrary TCP/UDP, raw sockets and non-HTTP
+protocols are unavailable, and the model-facing capability text never claims
+otherwise.
 
 ## 3. Model-facing interface vs runtime substrate
 

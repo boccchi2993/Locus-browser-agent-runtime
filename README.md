@@ -34,8 +34,8 @@ Remote computers should be escalation providers, not the default, for lightweigh
 - Local workspace access via the File System Access API (user-picked directory mounted at `/mnt/workspace`, read/write)
 - Unix-like compatibility shell (`bash` tool): `pwd`, `cd` (invocation-local), `ls` (`-a`/`-l`/`-h`), `cat`, `echo`, `find`, `grep`, `head`, `tail`, `wc`, `mv`, `rm`, `python`, `curl`, `help`, with `;`, `&&`, `||` and `|` command composition and `>`, `>>`, `2>`, `2>>`, `2>&1` redirection — see "The Unix compatibility shell" below
 - Python execution via Pyodide in a Web Worker (lazy-loaded, stdout/stderr/traceback returned, pandas auto-loaded on import)
-- **Browser-native network capability currently exposed through `curl`** (HTTPS GET: `curl <url>` prints text, `curl -o <file> <url>` downloads); long term, Python/JS networking should reuse the same runtime boundary
-- **Direct browser fetch with transparent edge relay fallback** (only on genuine CORS/network failure, never on HTTP error statuses)
+- **Browser-native network capability via `NetworkRuntime` + `curl`** (HTTP/HTTPS: GET/HEAD reads plus `-X POST/-H/-d` writes that ask for user approval; `curl <url>` prints text, `curl -o <file> <url>` downloads); long term, Python/JS networking should reuse the same runtime boundary — see [docs/NETWORK-RUNTIME.md](docs/NETWORK-RUNTIME.md)
+- **Direct browser fetch with transparent edge relay fallback** (GET/HEAD only, on genuine network failure, never after an HTTP response; side-effecting methods pick their backend before sending and are never ambiguously retried)
 - **Binary-safe downloads into the local workspace** (no text decoding anywhere in the network path)
 - Agent tool loop (structured ` ```json ` tool calls, results fed back, max 32 iterations)
 - Local file output written back into the real workspace directory (create / modify / delete / rename), with external-edit conflict detection and staged (non-atomic) commit reporting
