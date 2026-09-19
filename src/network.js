@@ -1,27 +1,59 @@
 // ============================================================
-//  NETWORK RUNTIME
-//  Thin browser-native network execution layer behind `curl`.
-//  Routing is decided HERE, not by the model and not by the shell:
+//  NETWORK RUNTIME v1
+//  Unified, provider-neutral, tool-neutral HTTP/HTTPS execution
+//  substrate (docs/NETWORK-RUNTIME.md). Every future HTTP consumer
+//  goes through request(); routing is decided HERE, not by the model
+//  and not by the shell:
 //
-//    direct browser fetch
-//        ↓ only on genuine network/CORS failure (TypeError)
-//    same-origin edge relay (/fetch)
+//    READ-LIKE (GET/HEAD)
+//      direct browser fetch
+//          ↓ only on genuine network failure (TypeError), once
+//      edge relay (/fetch)
 //
-//  An HTTP response — even 404/500 — is an authoritative application
-//  result and is NEVER re-sent through a different backend (same rule
-//  as the model layer). Payloads are binary-safe: `bytes` is always a
-//  Uint8Array, never a decoded string.
+//    SIDE-EFFECTING (POST/PUT/PATCH/DELETE/OPTIONS)
+//      backend chosen BEFORE the request starts
+//        (same-origin → direct, cross-origin → relay),
+//      gated by a user approval, dispatched EXACTLY ONCE —
+//      an ambiguous failure is NEVER retried across backends
+//      (a browser TypeError can mean the server already processed
+//      the request: double POST / double payment / double delete).
 //
-//  Resource semantics (aligned with the edge relay):
-//  - anonymous by construction: credentials: 'omit', URL userinfo rejected
+//  An HTTP response — even 404/500/3xx — is an authoritative
+//  application result and is NEVER re-sent through a different
+//  backend (any method). Payloads are binary-safe: `bytes` is always
+//  a Uint8Array, never a decoded string.
+//
+//  Resource semantics:
+//  - anonymous by construction: credentials: 'omit', URL userinfo
+//    rejected, no ambient cookies (explicit Cookie headers are
+//    dropped for parity with the browser fetch boundary)
+//  - only http:/https:, parsed with `new URL` (never regex);
+//    fragments are never sent; the canonical identity is the
+//    WHATWG origin (protocol//host:effective-port)
 //  - every request has a client deadline covering headers AND body
-//  - response bodies are stream-read with a hard byte cap
-//  - timeouts / size-cap / user cancellation are NOT network failures:
-//    they never trigger a relay retry of the same request
-//  - redirects: the browser follows them and enforces CORS per hop;
-//    cross-origin hops the page cannot read simply fail as network
-//    errors (and may then go through the relay, which re-validates
-//    HTTPS per hop). We do not claim per-hop visibility we do not have.
+//  - response bodies are stream-read with a hard byte cap; request
+//    bodies have their own (smaller) hard cap
+//  - timeouts / size caps / user cancellation are NOT network
+//    failures: they never trigger a relay retry of the same request
+//  - redirects: followed for GET/HEAD (finalUrl recorded, final
+//    scheme re-validated); a side-effecting request NEVER follows a
+//    redirect — a 3xx whose Location leaves the approved origin
+//    fails with network_redirect_blocked
+//  - SSRF: the edge relay refuses loopback/private/link-local
+//    targets; the client pre-checks every relay leg with the same
+//    policy. The direct backend keeps the browser's own boundary.
+//
+//  Approval integration: side-effecting methods are the Approval
+//  Framework's first production consumer — the Harness constructs
+//  the canonical `network-write:<origin>` policy key, and the
+//  consumer contract (pure validation → approval → bounds re-check →
+//  FINAL liveness check → NO await → request begins) prevents TOCTOU.
+//  Approval can reduce autonomy; it can never manufacture authority:
+//  a granted approval never enables a non-HTTP scheme or method.
+//
+//  The runtime knows nothing about curl, shells, VFS, providers or
+//  the model. The shell is a consumer: it parses CLI flags and passes
+//  a normalized request + policyContext (approval provider).
 // ============================================================
 
 // Ordinary download deadline (distinct from the model inference deadline).
@@ -29,89 +61,587 @@ const DIRECT_TIMEOUT_MS = 60000;
 // Slightly longer than the relay's own 30s upstream timeout, so the
 // relay's structured 504 arrives before the client gives up.
 const RELAY_CLIENT_TIMEOUT_MS = 45000;
-// Aligned with the relay's MAX_FETCH_RESPONSE_BYTES default.
-const NETWORK_MAX_BYTES = 16 * 1024 * 1024;
+// Response cap, aligned with the relay's MAX_FETCH_RESPONSE_BYTES default.
+const NETWORK_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+// Request bodies are small by design (API calls); a --data-binary of a
+// huge file must fail BEFORE approval and BEFORE any send. Aligned with
+// the relay's MAX_FETCH_REQUEST_BYTES default.
+const NETWORK_MAX_REQUEST_BYTES = 2 * 1024 * 1024;
+// v0 alias kept for existing consumers.
+const NETWORK_MAX_BYTES = NETWORK_MAX_RESPONSE_BYTES;
+
+// Harness-canonical policy key prefix for network write grants. The
+// appended origin is the WHATWG-canonical origin of the PARSED URL —
+// never a model/tool-provided string, path, or query.
+const NETWORK_WRITE_POLICY_PREFIX = 'network-write:';
+
+const READ_LIKE_METHODS = ['GET', 'HEAD'];
+const SIDE_EFFECTING_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
+const REFUSED_METHODS = ['TRACE', 'CONNECT'];
+// RFC 7230 token charset — anything outside is not an HTTP method.
+const METHOD_PATTERN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+// Browser-controlled / unsafe-to-spoof / ambient-credential request
+// headers. Applied on the client AND re-applied on the relay (defense
+// in depth). Authorization is deliberately NOT forbidden — the model may
+// explicitly authenticate a request — but it never appears in logs,
+// approval cards or telemetry (docs/NETWORK-RUNTIME.md).
+const FORBIDDEN_HEADERS = new Set([
+  'host', 'content-length', 'connection', 'transfer-encoding', 'upgrade',
+  'te', 'trailer', 'keep-alive', 'expect', 'via', 'date',
+  'cookie', 'cookie2', 'dnt', 'origin', 'referer',
+  'accept-charset', 'accept-encoding',
+  'access-control-request-headers', 'access-control-request-method',
+]);
+const FORBIDDEN_HEADER_PREFIXES = ['proxy-', 'sec-'];
 
 const NetworkRuntime = {
   relayPath: '/fetch',
+  maxResponseBytes: NETWORK_MAX_RESPONSE_BYTES,
+  maxRequestBytes: NETWORK_MAX_REQUEST_BYTES,
+  directTimeoutMs: DIRECT_TIMEOUT_MS,
+  relayClientTimeoutMs: RELAY_CLIENT_TIMEOUT_MS,
 
-  // fetch(url, {signal, timeoutMs, relayTimeoutMs}) → {
-  //   status, statusText, headers: {lowercase: value},
-  //   bytes: Uint8Array, finalUrl, backend: 'browser-direct' | 'edge-relay'
-  // }
-  // timeoutMs covers the direct attempt (default DIRECT_TIMEOUT_MS);
-  // relayTimeoutMs covers the relay attempt (default
-  // RELAY_CLIENT_TIMEOUT_MS). Throws Error with a clear message when the
-  // request cannot complete.
+  // ----------------------------------------------------------
+  //  request(spec) → {
+  //    status, statusText,
+  //    headers:    {lowercase-name: value}   (last value wins),
+  //    headerList: [[name, value]…]          (duplicates preserved),
+  //    bytes: Uint8Array, finalUrl,
+  //    backend: 'browser-direct' | 'edge-relay'   (telemetry/debug only)
+  //  }
+  //
+  //  spec: {
+  //    method        'GET' (default) | 'HEAD' | 'POST' | 'PUT' |
+  //                  'PATCH' | 'DELETE' | 'OPTIONS'
+  //    url           absolute http(s) URL (fragment is never sent)
+  //    headers       {name: value}; forbidden headers are dropped
+  //    body          string (UTF-8) | Uint8Array | ArrayBuffer | null
+  //                  (side-effecting methods only)
+  //    signal        task AbortSignal (cancellation, not rollback)
+  //    policyContext { approvals, conversationId, taskGeneration }
+  //    timeoutMs      direct-attempt deadline (default 60s)
+  //    relayTimeoutMs relay-attempt deadline (default 45s)
+  //  }
+  //
+  //  Throws Error with e.networkCode from the taxonomy in
+  //  docs/NETWORK-RUNTIME.md. The backend is chosen before the request
+  //  starts and side effects are never retried.
+  // ----------------------------------------------------------
+  async request(spec) {
+    const opts = spec && typeof spec === 'object' ? spec : {};
+    const method = normalizeMethod(opts.method || 'GET');
+    const readLike = isReadLikeMethod(method);
+    const parsed = parseHttpUrl(opts.url); // invalid-url / scheme / userinfo
+    const headers = filterRequestHeaders(opts.headers);
+    const targetUrl = parsed.origin + parsed.pathname + parsed.search; // fragment-free
+    const canonicalOrigin = parsed.origin;
+
+    // ---- pure validation BEFORE any approval: nothing side-effecting
+    // has happened, so there is nothing to approve yet — and a request
+    // that cannot be sent is never offered for approval.
+    let body = null;
+    if (!readLike) {
+      body = toRequestBody(opts.body);
+      if (body && body.byteLength > NETWORK_MAX_REQUEST_BYTES) {
+        throw makeNetError('network_request_too_large',
+          'request body too large (limit ' + NETWORK_MAX_REQUEST_BYTES + ' bytes)');
+      }
+    } else if (opts.body != null) {
+      throw new Error('GET/HEAD requests cannot carry a body');
+    }
+
+    // ---- backend selection + SSRF pre-check BEFORE the approval: both
+    // are pure, and the chosen backend is FINAL. After a request is in
+    // flight it is never re-routed or re-sent.
+    const backend = selectBackend(readLike, canonicalOrigin);
+    if (backend === 'edge-relay') {
+      assertRelayTargetAllowed(parsed); // client-side SSRF pre-check
+    }
+
+    const externalSignal = opts.signal || null;
+
+    // ---- approval (side-effecting methods only; the Approval
+    // Framework's production consumer contract — docs/APPROVALS.md).
+    if (!readLike) {
+      const policyContext = opts.policyContext && typeof opts.policyContext === 'object'
+        ? opts.policyContext : null;
+      const approvals = policyContext && policyContext.approvals;
+      if (!approvals || typeof approvals.request !== 'function') {
+        throw makeNetError('network_approval_unavailable',
+          'side-effecting network requests require an approval consumer (none is wired)');
+      }
+      const summary = method + ' ' + canonicalOrigin + parsed.pathname;
+      const detail = body && body.byteLength
+        ? 'Request body size: ' + formatByteSize(body.byteLength)
+        : null;
+      const decision = await approvals.request({
+        kind: 'permission',
+        action: { type: 'network-request', summary: summary, detail: detail },
+        resource: { type: 'network-origin', key: canonicalOrigin, label: canonicalOrigin },
+        policyKey: NETWORK_WRITE_POLICY_PREFIX + canonicalOrigin,
+        conversationId: policyContext.conversationId || null,
+        taskGeneration: Number.isFinite(policyContext.taskGeneration)
+          ? policyContext.taskGeneration : null,
+      }, { signal: externalSignal });
+      if (decision.outcome !== 'allow') {
+        // Deny ≠ cancel: a denial is a deterministic user decision; a
+        // task cancellation flows through the signal and is NEVER
+        // reported as a denial (docs/NETWORK-RUNTIME.md).
+        if (decision.outcome === 'cancelled') throw makeNetCancelledError();
+        throw makeNetError('network_denied', 'network request denied by user');
+      }
+      // Safe preparation (post-approval, pre-side-effect): re-check the
+      // request bounds, then the FINAL task-liveness check.
+      if (body && body.byteLength > NETWORK_MAX_REQUEST_BYTES) {
+        throw makeNetError('network_request_too_large',
+          'request body too large (limit ' + NETWORK_MAX_REQUEST_BYTES + ' bytes)');
+      }
+      throwIfSignalAborted(externalSignal);
+      // NO await between here and the start of the request.
+    }
+
+    return await this._perform(backend, readLike, method, targetUrl, parsed,
+      headers, body, externalSignal, opts);
+  },
+
+  // Read-like GET convenience wrapper (v0 entry point, unchanged
+  // semantics: direct first, transparent relay fallback on TypeError).
   async fetch(url, options) {
-    const opts = options || {};
-    const parsed = parseHttpsUrl(url); // throws on non-HTTPS / userinfo
-
-    try {
-      return await this._direct(parsed.href, opts.signal, opts.timeoutMs || DIRECT_TIMEOUT_MS);
-    } catch (e) {
-      if (!isNetworkFailure(e)) throw e; // timeout/cap/cancel/HTTP-layer: no retry
-      if (!isHostedPage()) {
-        throw new Error(
-          'network access blocked by the browser (CORS) and no edge relay is available ' +
-          'when the page is opened from ' + pageProtocol() + ' — host the app over HTTP(S) to enable the relay');
-      }
-      return await this._relay(parsed.href, opts.signal, opts.relayTimeoutMs);
-    }
-  },
-
-  async _direct(url, externalSignal, timeoutMs) {
-    return fetchWithDeadline(url, {
+    return await this.request({
       method: 'GET',
-      redirect: 'follow',
-      credentials: 'omit', // anonymous by construction — never send cookies
-    }, timeoutMs, externalSignal, async (res, signal) => ({
-      status: res.status,
-      statusText: res.statusText || '',
-      headers: headersToObject(res.headers),
-      bytes: await readBytesCapped(res, NETWORK_MAX_BYTES, signal),
-      finalUrl: res.url || url,
-      backend: 'browser-direct',
-    }));
+      url: url,
+      signal: options && options.signal,
+      timeoutMs: options && options.timeoutMs,
+      relayTimeoutMs: options && options.relayTimeoutMs,
+    });
   },
 
-  async _relay(url, externalSignal, timeoutMs) {
-    try {
-      return await fetchWithDeadline(this.relayPath + '?url=' + encodeURIComponent(url), {
-        method: 'GET',
-        credentials: 'omit',
-      }, timeoutMs || RELAY_CLIENT_TIMEOUT_MS, externalSignal, async (res, signal) => {
-        // The relay's OWN failures (bad URL, non-HTTPS target, timeout, size
-        // cap, redirect cap) are marked with X-Locus-Relay-Error and carry a
-        // JSON {error:{message}} body — read INSIDE the same deadline, then
-        // surface the message; never treat them as upstream content.
-        if (res.headers.get('x-locus-relay-error')) {
-          let msg = 'edge relay error (HTTP ' + res.status + ')';
-          try {
-            const j = await raceAbort(res.json(), signal);
-            if (j && j.error && j.error.message) msg = j.error.message;
-          } catch (e) {
-            if (e && (e.cancelled || e.timeout)) throw e;
-          }
-          throw new Error('edge relay: ' + msg);
+  // Perform the request on the pre-selected backend. Read-like requests
+  // may fall back browser → relay ONCE on a genuine network failure;
+  // side-effecting requests never do (zero automatic retries).
+  async _perform(backend, readLike, method, targetUrl, parsed, headers, body,
+    externalSignal, opts) {
+    if (backend === 'browser-direct') {
+      try {
+        return await this._direct(method, targetUrl, headers, body,
+          externalSignal, opts.timeoutMs || DIRECT_TIMEOUT_MS);
+      } catch (e) {
+        if (!readLike || !isNetworkFailure(e)) {
+          throw mapWriteDispatchError(e, 'network_direct_failed');
         }
-        return {
-          status: res.status,
-          statusText: res.statusText || '',
-          headers: headersToObject(res.headers),
-          bytes: await readBytesCapped(res, NETWORK_MAX_BYTES, signal),
-          finalUrl: res.headers.get('x-locus-final-url') || url,
-          backend: 'edge-relay',
-        };
-      });
-    } catch (e) {
-      if (isNetworkFailure(e)) {
-        throw new Error('edge relay unreachable: ' + (e && e.message ? e.message : String(e)));
+        // GET/HEAD safe fallback: reads duplicate harmlessly. The relay
+        // leg is still subject to the relay's private-address policy —
+        // refuse here for the same deterministic error without the
+        // wasted round-trip.
+        if (isPrivateHostname(parsed.hostname)) {
+          assertRelayTargetAllowed(parsed); // throws network_private_address_blocked
+        }
+        if (!isHostedPage()) {
+          throw new Error(
+            'network request failed: the target could not be reached and no edge relay is available ' +
+            'when the page is opened from ' + pageProtocol() + ' — host the app over HTTP(S) to enable the relay');
+        }
       }
-      throw e; // timeout / cancellation / size cap: surfaced as-is, never retried
     }
+    try {
+      // Legacy GET ?url= form for headerless read-like requests (kept
+      // for wire compatibility); everything else — GET/HEAD with
+      // headers and all side-effecting methods — uses the POST /fetch
+      // JSON envelope.
+      if (readLike && !Object.keys(headers).length) {
+        return await this._relayGet(targetUrl, externalSignal, opts.relayTimeoutMs);
+      }
+      return await this._relayRequest(method, targetUrl, headers, body,
+        externalSignal, opts.relayTimeoutMs);
+    } catch (e) {
+      if (e && e.networkCode) {
+        // Classified (relay structured error / timeout / cap / …): a
+        // dispatched side effect still needs the ambiguity verdict.
+        if (!readLike) throw mapWriteDispatchError(e, 'network_relay_failed');
+        throw e;
+      }
+      if (readLike && isNetworkFailure(e)) {
+        throw makeNetError('network_relay_failed',
+          'edge relay unreachable: ' + (e && e.message ? e.message : String(e)));
+      }
+      throw mapWriteDispatchError(e, 'network_relay_failed');
+    }
+  },
+
+  async _direct(method, url, headers, body, externalSignal, timeoutMs) {
+    const readLike = isReadLikeMethod(method);
+    return fetchWithDeadline(url, {
+      method: method,
+      // Side-effecting requests must not follow redirects: the browser
+      // reports redirect:'manual' as an opaque response whose target
+      // cannot be inspected, so it is blocked outright instead of
+      // replaying an approved body somewhere else.
+      redirect: readLike ? 'follow' : 'manual',
+      credentials: 'omit', // anonymous by construction — never send ambient cookies
+      headers: Object.keys(headers || {}).length ? headers : undefined,
+      body: readLike ? undefined : (body || undefined),
+    }, timeoutMs, externalSignal, async (res, signal) => {
+      if (!readLike && isRedirectResponse(res)) {
+        throw makeNetError('network_redirect_blocked',
+          'redirect blocked: side-effecting requests cannot be redirected to another origin');
+      }
+      const headersAndList = headersFromResponse(res.headers);
+      const finalUrl = res.url || url;
+      assertFinalScheme(finalUrl);
+      return {
+        status: res.status,
+        statusText: res.statusText || '',
+        headers: headersAndList.object,
+        headerList: headersAndList.list,
+        bytes: await readBytesCapped(res, NETWORK_MAX_RESPONSE_BYTES, signal),
+        finalUrl: finalUrl,
+        backend: 'browser-direct',
+      };
+    });
+  },
+
+  // Relay fallback for READ-LIKE requests (legacy GET ?url= form).
+  async _relayGet(url, externalSignal, timeoutMs) {
+    return fetchWithDeadline(this.relayPath + '?url=' + encodeURIComponent(url), {
+      method: 'GET',
+      credentials: 'omit',
+    }, timeoutMs || RELAY_CLIENT_TIMEOUT_MS, externalSignal, async (res, signal) => {
+      return await consumeRelayResponse(res, signal, url);
+    });
+  },
+
+  // Relay request for everything else: the POST /fetch JSON envelope
+  // carries method/target/headers/body; the relay re-validates
+  // everything server-side (docs/NETWORK-RUNTIME.md).
+  async _relayRequest(method, url, headers, body, externalSignal, timeoutMs) {
+    const envelope = { method: method, url: url, headers: headers || {} };
+    if (body && body.byteLength) envelope.bodyBase64 = bytesToBase64(body);
+    return fetchWithDeadline(this.relayPath, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(envelope),
+      credentials: 'omit',
+    }, timeoutMs || RELAY_CLIENT_TIMEOUT_MS, externalSignal, async (res, signal) => {
+      return await consumeRelayResponse(res, signal, url);
+    });
   },
 };
+
+// ------------------------------------------------------------
+//  Shared relay response consumption (X-Locus-Relay-Error handling,
+//  final-URL exposure, bounded byte read) — normalized ONCE here so
+//  the relay's wire shape never leaks to consumers.
+// ------------------------------------------------------------
+async function consumeRelayResponse(res, signal, targetUrl) {
+  // The relay's OWN failures (bad URL, unsupported method, private
+  // target, timeout, size cap, redirect block) are marked with
+  // X-Locus-Relay-Error and carry a JSON {error:{code, message}} body —
+  // read INSIDE the same deadline, then surface with the relay's
+  // classification; never treat them as upstream content.
+  if (res.headers.get('x-locus-relay-error')) {
+    let code = null;
+    let msg = 'edge relay error (HTTP ' + res.status + ')';
+    try {
+      const j = await raceAbort(res.json(), signal);
+      if (j && j.error && j.error.message) msg = j.error.message;
+      if (j && j.error && j.error.code) code = j.error.code;
+    } catch (e) {
+      if (e && (e.cancelled || e.timeout)) throw e;
+    }
+    throw makeNetError(code || 'network_relay_failed', 'edge relay: ' + msg);
+  }
+  const headersAndList = headersFromResponse(res.headers);
+  const finalUrl = res.headers.get('x-locus-final-url') || targetUrl;
+  assertFinalScheme(finalUrl);
+  return {
+    status: res.status,
+    statusText: res.statusText || '',
+    headers: headersAndList.object,
+    headerList: headersAndList.list,
+    bytes: await readBytesCapped(res, NETWORK_MAX_RESPONSE_BYTES, signal),
+    finalUrl: finalUrl,
+    backend: 'edge-relay',
+  };
+}
+
+// ------------------------------------------------------------
+//  Request validation + classification
+// ------------------------------------------------------------
+
+function isReadLikeMethod(method) {
+  return READ_LIKE_METHODS.indexOf(method) !== -1;
+}
+
+// v1 accepts exactly the seven ordinary methods and rejects
+// TRACE/CONNECT and custom verbs (docs/NETWORK-RUNTIME.md).
+function normalizeMethod(raw) {
+  const name = String(raw || '').trim().toUpperCase();
+  if (!name || !METHOD_PATTERN.test(name)
+    || (READ_LIKE_METHODS.indexOf(name) === -1
+      && SIDE_EFFECTING_METHODS.indexOf(name) === -1)) {
+    throw makeNetError('network_unsupported_method',
+      'unsupported HTTP method: ' + (name || '(empty)')
+      + ' (only GET, HEAD, POST, PUT, PATCH, DELETE and OPTIONS are available)');
+  }
+  return name;
+}
+
+// Only http:/https: URLs; credentials embedded in the URL are rejected —
+// requests must be anonymous. Returns the WHATWG-canonicalized URL.
+function parseHttpUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(String(url || ''));
+  } catch (e) {
+    throw makeNetError('network_invalid_url', 'invalid URL: ' + String(url == null ? '' : url));
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw makeNetError('network_unsupported_scheme',
+      'unsupported URL scheme: ' + parsed.protocol + ' (only http: and https: are available)');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('credentials in URLs are not allowed (anonymous requests only)');
+  }
+  return parsed;
+}
+
+// The backend decision needs the page's own origin (a same-origin
+// side-effecting request may go direct). null when the page has no real
+// origin (file://, non-browser test context).
+function pageOrigin() {
+  try {
+    if (typeof window === 'undefined' || !window.location) return null;
+    const loc = window.location;
+    if ((loc.protocol === 'http:' || loc.protocol === 'https:') && loc.host) {
+      return loc.protocol + '//' + loc.host;
+    }
+  } catch (e) { /* no window: non-browser context */ }
+  return null;
+}
+
+// BACKEND MUST BE CHOSEN BEFORE THE REQUEST STARTS (docs/NETWORK-RUNTIME.md):
+//   read-like       → browser first (relay fallback handled in _perform)
+//   side-effecting  → same-origin: browser; everything else: relay.
+// There is no ambiguous-failure re-route after send for side effects.
+function selectBackend(readLike, canonicalOrigin) {
+  if (readLike) return 'browser-direct';
+  const page = pageOrigin();
+  if (page && page === canonicalOrigin) return 'browser-direct';
+  return 'edge-relay';
+}
+
+// ------------------------------------------------------------
+//  SSRF pre-check (client-side mirror of the relay's own guard): the
+//  relay must never be driven against loopback/private/link-local
+//  targets, so the client refuses them before choosing the relay.
+//  Literal IPs are compared in WHATWG-canonicalized form (the URL
+//  parser already reduced decimal/octal/hex IPv4 spellings), so
+//  obfuscated literals do not slip through. A public DNS name that
+//  RESOLVES to a private address cannot be detected here — a
+//  documented limitation, re-checked server-side by the relay where
+//  possible (docs/NETWORK-RUNTIME.md, "Known limitation").
+// ------------------------------------------------------------
+function isPrivateHostname(hostname) {
+  let h = String(hostname || '').toLowerCase();
+  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1); // IPv6 literal
+  if (h.endsWith('.')) h = h.slice(0, -1); // FQDN trailing dot
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  if (h === '::1' || h === '::') return true;
+  if (h.startsWith('::ffff:')) h = h.slice(7); // IPv4-mapped IPv6
+  const v4 = h.split('.');
+  if (v4.length === 4 && v4.every((p) => /^\d+$/.test(p) && Number(p) <= 255)) {
+    const [a, b] = v4.map(Number);
+    return a === 0 || a === 10 || a === 127
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168);
+  }
+  if (h.indexOf(':') !== -1) { // remaining IPv6: fc00::/7 and fe80::/10
+    const first = h.split(':')[0] || '0';
+    const n = parseInt(first, 16);
+    if (Number.isFinite(n)) {
+      if ((n & 0xfe00) === 0xfc00) return true; // fc00-feff: unique local
+      if ((n & 0xffc0) === 0xfe80) return true; // fe80-febf: link local
+    }
+  }
+  return false;
+}
+
+function assertRelayTargetAllowed(parsed) {
+  if (isPrivateHostname(parsed.hostname)) {
+    throw makeNetError('network_private_address_blocked',
+      'refusing to reach a private or loopback address through the network relay: ' + parsed.hostname);
+  }
+}
+
+// ------------------------------------------------------------
+//  Header policy (docs/NETWORK-RUNTIME.md): drop browser-controlled /
+//  unsafe headers, reject CR/LF injection attempts. Authorization and
+//  application-defined headers pass — authenticated API calls are
+//  ordinary HTTP usage.
+// ------------------------------------------------------------
+function filterRequestHeaders(input) {
+  if (input == null) return {};
+  if (typeof input !== 'object') throw new Error('headers must be an object');
+  const out = {};
+  for (const key of Object.keys(input)) {
+    const name = String(key).trim().toLowerCase();
+    if (!name) continue;
+    if (FORBIDDEN_HEADERS.has(name)
+      || FORBIDDEN_HEADER_PREFIXES.some((p) => name.startsWith(p))) {
+      continue;
+    }
+    const value = String(input[key]);
+    if (/[\r\n]/.test(name) || /[\r\n]/.test(value)) {
+      throw makeNetError('network_invalid_header', 'invalid header value (control characters)');
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
+function toRequestBody(raw) {
+  if (raw == null) return null;
+  if (raw instanceof Uint8Array) return raw;
+  if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+  if (typeof raw === 'string') return new TextEncoder().encode(raw);
+  throw new Error('request body must be a Uint8Array, ArrayBuffer or string');
+}
+
+function formatByteSize(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+// ------------------------------------------------------------
+//  Error taxonomy — every failure carries a stable e.networkCode.
+//  Browser implementation details (CORS topology, backend names) stay
+//  OUT of model-facing messages; they live in the code and telemetry.
+//  Legacy markers (timeout/tooLarge/cancelled/AbortError) are preserved
+//  so existing classification keeps working.
+// ------------------------------------------------------------
+function makeNetError(code, message) {
+  const e = new Error(message);
+  e.networkCode = code;
+  return e;
+}
+
+function makeNetTimeoutError(timeoutMs) {
+  const e = makeNetError('network_timeout',
+    'network request timed out after ' + timeoutMs + 'ms');
+  e.name = 'NetworkTimeoutError';
+  e.timeout = true;
+  return e;
+}
+
+function makeNetTooLargeError(maxBytes) {
+  const e = makeNetError('network_response_too_large',
+    'response too large (limit ' + maxBytes + ' bytes)');
+  e.name = 'NetworkTooLargeError';
+  e.tooLarge = true;
+  return e;
+}
+
+function makeNetCancelledError() {
+  const e = makeNetError('network_aborted', 'network request cancelled');
+  e.name = 'AbortError';
+  e.cancelled = true;
+  return e;
+}
+
+// A failure AFTER a side-effecting request was dispatched: the request
+// may or may not have reached the server. Never retried — not on the
+// other backend, not at all. Errors that are already classified
+// (timeout / cancel / cap / redirect / relay code) pass through.
+function mapWriteDispatchError(e, fallbackCode) {
+  if (e && e.networkCode) {
+    // Already classified. For a dispatched side effect, a transport-level
+    // failure (direct failure / relay failure / deadline) is ambiguous:
+    // the upstream server may already have processed the request.
+    // Definitive pre-dispatch refusals (denied / aborted / redirect /
+    // private / scheme / method / caps) stay unflagged.
+    if (e.networkCode === fallbackCode || e.networkCode === 'network_timeout') {
+      e.ambiguous = true;
+      if (!/NOT retried/.test(e.message)) {
+        e.message = e.message
+          + ' (the request may or may not have reached the server; it was NOT retried)';
+      }
+    }
+    return e;
+  }
+  if (e && (e.timeout || e.cancelled || e.tooLarge)) return e; // legacy markers, no code
+  const err = e instanceof TypeError
+    ? makeNetError(fallbackCode,
+      'network request failed after dispatch; it may or may not have reached the server, '
+      + 'so it was NOT retried')
+    : makeNetError(fallbackCode, e && e.message ? e.message : String(e));
+  err.ambiguous = true; // the request WAS dispatched: never retry, never re-route
+  return err;
+}
+
+function throwIfSignalAborted(signal) {
+  if (!signal) return;
+  if (signal.aborted) throw makeNetCancelledError();
+}
+
+// Genuine network/CORS failures reject fetch() with a TypeError in every
+// browser. HTTP error statuses resolve normally and never reach here;
+// our own timeout/cap/cancellation errors carry explicit markers and are
+// deliberately NOT TypeErrors, so they can never be misread as CORS.
+function isNetworkFailure(e) {
+  return e instanceof TypeError;
+}
+
+// A redirect the DIRECT backend surfaced for a side-effecting request:
+// browsers report redirect:'manual' as an opaque response (status 0),
+// non-browser runtimes surface the plain 3xx.
+function isRedirectResponse(res) {
+  return res.status === 0 || (res.status >= 300 && res.status < 400);
+}
+
+// The FINAL URL after any followed redirects must still be http(s).
+// Browsers enforce this per hop, but the harness re-checks what it can
+// see (res.url / X-Locus-Final-URL).
+function assertFinalScheme(finalUrl) {
+  try {
+    const u = new URL(finalUrl);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      throw makeNetError('network_redirect_blocked',
+        'redirect blocked: the final URL is not http(s)');
+    }
+  } catch (e) {
+    if (e && e.networkCode) throw e; // else: unparseable final URL — leave to caller's fallback
+  }
+}
+
+function pageProtocol() {
+  try {
+    return (typeof window !== 'undefined' && window.location && window.location.protocol) || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function isHostedPage() {
+  const p = pageProtocol();
+  return p === 'http:' || p === 'https:';
+}
+
+// Build the lowercase object form AND the duplicate-preserving pair
+// list in one pass (Set-Cookie style duplicates must survive).
+function headersFromResponse(headers) {
+  const object = {};
+  const list = [];
+  try {
+    headers.forEach((v, k) => {
+      object[k.toLowerCase()] = v;
+      list.push([k.toLowerCase(), v]);
+    });
+  } catch (e) {}
+  return { object: object, list: list };
+}
 
 // fetch + FULL body consumption + cleanup in ONE lifecycle: the deadline
 // and the external abort listener stay armed until the body has been read
@@ -219,71 +749,12 @@ function raceAbort(promise, signal) {
   });
 }
 
-function makeNetTimeoutError(timeoutMs) {
-  const e = new Error('network request timed out after ' + timeoutMs + 'ms');
-  e.name = 'NetworkTimeoutError';
-  e.timeout = true;
-  return e;
-}
-
-function makeNetTooLargeError(maxBytes) {
-  const e = new Error('response too large (limit ' + maxBytes + ' bytes)');
-  e.name = 'NetworkTooLargeError';
-  e.tooLarge = true;
-  return e;
-}
-
-function makeNetCancelledError() {
-  const e = new Error('network request cancelled');
-  e.name = 'AbortError';
-  e.cancelled = true;
-  return e;
-}
-
-// Only HTTPS URLs are accepted; credentials embedded in the URL
-// (https://user:pass@host/…) are rejected — requests must be anonymous.
-// Returns a URL or throws.
-function parseHttpsUrl(url) {
-  let parsed;
-  try {
-    parsed = new URL(String(url || ''));
-  } catch (e) {
-    throw new Error('invalid URL: ' + url);
+// Chunked base64 (btoa's string argument has practical call-size limits).
+function bytesToBase64(bytes) {
+  let out = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    out += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
   }
-  if (parsed.protocol !== 'https:') {
-    throw new Error('only HTTPS URLs are supported');
-  }
-  if (parsed.username || parsed.password) {
-    throw new Error('credentials in URLs are not allowed (anonymous requests only)');
-  }
-  return parsed;
-}
-
-// Genuine network/CORS failures reject fetch() with a TypeError in every
-// browser. HTTP error statuses resolve normally and never reach here;
-// our own timeout/cap/cancellation errors carry explicit markers and are
-// deliberately NOT TypeErrors, so they can never be misread as CORS.
-function isNetworkFailure(e) {
-  return e instanceof TypeError;
-}
-
-function pageProtocol() {
-  try {
-    return (typeof window !== 'undefined' && window.location && window.location.protocol) || '';
-  } catch (e) {
-    return '';
-  }
-}
-
-function isHostedPage() {
-  const p = pageProtocol();
-  return p === 'http:' || p === 'https:';
-}
-
-function headersToObject(headers) {
-  const out = {};
-  try {
-    headers.forEach((v, k) => { out[k.toLowerCase()] = v; });
-  } catch (e) {}
-  return out;
+  return btoa(out);
 }

@@ -34,10 +34,22 @@ async function run() {
   const r1 = await onRequestGet({ request: req(''), env: {} });
   check('F1 missing url → 400', r1.status === 400 && r1.headers.get('x-locus-relay-error') === '1');
 
-  // ---------- F2. http:// target → 403 ----------
+  // ---------- F2. http:// target is now supported (v1) ----------
   reset();
+  on((u) => u === 'http://example.com/x', () => new Response('plain', { status: 200 }));
   const r2 = await onRequestGet({ request: req('?url=' + encodeURIComponent('http://example.com/x')), env: {} });
-  check('F2 http target → 403', r2.status === 403 && calls.length === 0, 'status=' + r2.status + ' calls=' + calls.length);
+  check('F2 http target fetched', r2.status === 200 && calls.length === 1, 'status=' + r2.status + ' calls=' + calls.length);
+
+  // ---------- F2b. private targets refused before any upstream call ----------
+  reset();
+  on(() => { throw new Error('no upstream fetch allowed'); });
+  for (const host of ['127.0.0.1', 'localhost', '[::1]', '169.254.169.254', '10.0.0.1', '192.168.1.1', '172.16.0.1']) {
+    const rr = await onRequestGet({ request: req('?url=' + encodeURIComponent('http://' + host + '/x')), env: {} });
+    const j = await rr.json();
+    check('F2b private target refused: ' + host,
+      rr.status === 403 && j.error.code === 'network_private_address_blocked' && calls.length === 0,
+      'status=' + rr.status);
+  }
 
   // ---------- F3. no credentials forwarded upstream ----------
   reset();
@@ -71,12 +83,21 @@ async function run() {
     'status=' + r5.status + ' hops=' + calls.length);
   check('F5b cap bounds hop count', calls.length === 6, 'calls=' + calls.length); // initial + 5
 
-  // ---------- F6. redirect to http → 403 ----------
+  // ---------- F6. redirect to http:// is followed (v1); non-http refused ----------
   reset();
   on((u) => u === 'https://example.test/down', () =>
     new Response(null, { status: 302, headers: { location: 'http://insecure.test/x' } }));
+  on((u) => u === 'http://insecure.test/x', () => new Response('downgraded', { status: 200 }));
   const r6 = await onRequestGet({ request: req('?url=' + encodeURIComponent('https://example.test/down')), env: {} });
-  check('F6 http redirect target → 403', r6.status === 403 && calls.length === 1, 'status=' + r6.status);
+  check('F6 http redirect target followed', r6.status === 200 && (await r6.text()) === 'downgraded'
+    && r6.headers.get('x-locus-final-url') === 'http://insecure.test/x', 'status=' + r6.status);
+  // a redirect to a NON-http(s) scheme is still refused
+  reset();
+  on((u) => u === 'https://example.test/ftp', () =>
+    new Response(null, { status: 302, headers: { location: 'ftp://files.test/x' } }));
+  const r6b = await onRequestGet({ request: req('?url=' + encodeURIComponent('https://example.test/ftp')), env: {} });
+  check('F6b ftp redirect target refused', r6b.status === 403
+    && (await r6b.json()).error.code === 'network_unsupported_scheme', 'status=' + r6b.status);
 
   // ---------- F7. binary passthrough byte-perfect ----------
   reset();

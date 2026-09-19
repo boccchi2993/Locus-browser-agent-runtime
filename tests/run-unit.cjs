@@ -13,6 +13,7 @@ const SUITES = [
   'proxy.test.mjs',
   'fetch.test.mjs',
   'network.test.cjs',
+  'network-runtime.test.cjs',
   'workspace.test.cjs',
   'vfs.test.cjs',
   'shell.test.cjs',

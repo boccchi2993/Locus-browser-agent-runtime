@@ -112,18 +112,33 @@ async function run() {
     && t4.output.includes('use curl -o') && !t4.output.includes('PNG\r\n'),
     JSON.stringify(t4.output));
 
-  // ---------- 5. only HTTPS ----------
+  // ---------- 5. scheme policy: http(s) only ----------
   reset();
-  const t5 = await M.executeTool('bash', 'curl http://example.com', ws);
-  check('N5 http rejected', !t5.success && t5.output.includes('only HTTPS URLs are supported'), t5.output);
-  check('N5b no fetch attempted', calls.length === 0);
+  on(() => { throw new Error('no fetch allowed for unsupported schemes'); });
+  const t5 = await M.executeTool('bash', 'curl file:///etc/passwd', ws);
+  check('N5 file: rejected', !t5.success && t5.output.includes('unsupported URL scheme: file:'), t5.output);
+  const t5b = await M.executeTool('bash', 'curl ftp://example.com/x', ws);
+  check('N5b-1 ftp: rejected', !t5b.success && t5b.output.includes('unsupported URL scheme: ftp:'), t5b.output);
+  const t5c = await M.executeTool('bash', 'curl data:text/html,hello', ws);
+  check('N5b-2 data: rejected', !t5c.success && t5c.output.includes('unsupported URL scheme: data:'), t5c.output);
+  check('N5b no fetch attempted for unsupported schemes', calls.length === 0, 'calls=' + calls.length);
+  // http: is a supported scheme in v1 — an ordinary request is attempted.
+  reset();
+  on((u) => u === 'http://example.com/', () => jsonResponse('{"plain":1}'));
+  const t5d = await M.executeTool('bash', 'curl http://example.com', ws);
+  check('N5c http: is an ordinary request now', t5d.success && t5d.output.includes('{"plain":1}'), t5d.output);
 
-  // ---------- 6. unsupported option ----------
+  // ---------- 6. headers are sent; methods need an approval consumer ----------
   reset();
-  const t6 = await M.executeTool('bash', 'curl -H "X-Test: 1" https://example.com', ws);
-  check('N6 -H rejected', !t6.success && t6.output === 'curl: option not supported in local browser runtime: -H', t6.output);
+  on((u) => u === 'https://example.com/h', () => jsonResponse('{"ok":1}'));
+  const t6 = await M.executeTool('bash', 'curl -H "X-Test: 1" https://example.com/h', ws);
+  check('N6 -H accepted and forwarded', t6.success && calls[0].opts.headers && calls[0].opts.headers['x-test'] === '1',
+    JSON.stringify(t6.output) + ' | ' + JSON.stringify(calls[0].opts.headers));
+  reset();
   const t6b = await M.executeTool('bash', 'curl -X POST https://example.com', ws);
-  check('N6b -X rejected', !t6b.success && t6b.output.includes('option not supported'), t6b.output);
+  check('N6b side-effecting without approval consumer fails closed',
+    !t6b.success && t6b.output.includes('require an approval consumer') && calls.length === 0,
+    t6b.output + ' | calls=' + calls.length);
 
   // ---------- 7/8. network/CORS failure → transparent edge relay ----------
   reset();
