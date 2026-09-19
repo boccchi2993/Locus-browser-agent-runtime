@@ -111,6 +111,15 @@ async function presentationE2e() {
   }
 }
 
+// ---------- 4. network runtime e2e (own servers + Chrome) ----------
+function networkE2e() {
+  console.log('=== network e2e (tests/e2e-network.cjs) ===');
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'e2e-network.cjs')], {
+    stdio: 'inherit', env: process.env,
+  });
+  return r.status === 0;
+}
+
 async function main() {
   const results = [];
   results.push(['runtime', await runtimeE2e()]);
@@ -118,6 +127,7 @@ async function main() {
   const pres = await presentationE2e();
   if (Array.isArray(pres)) results.push(...pres);
   else results.push(['presentation', !!pres], ['responsive', false]);
+  results.push(['network', networkE2e()]);
   console.log('===');
   let failed = 0;
   for (const [name, ok] of results) {
