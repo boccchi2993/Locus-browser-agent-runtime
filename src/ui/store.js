@@ -112,6 +112,11 @@ export const store = reactive({
   storageStatus: { mode: 'memory', dbName: 'locus', schemaVersion: 2, opfs: false, persistent: null, usage: null, quota: null, error: null, persistenceHealth: 'healthy', lastPersistenceError: null },
   storageNotice: null,
 
+  // Read-only projection of the image-capability registry for Settings
+  // (docs/IMAGE-INPUT.md): { state: supported|unsupported|unknown,
+  // source: user|probe|builtin|provider-rejection|none } or null.
+  imageCapability: null,
+
   plusMenuOpen: false,
   rightRailCollapsed: false,
   // Drawer open/close is PURE presentation state: it never enters
@@ -146,8 +151,25 @@ export const isViewingLive = computed(() =>
 
 function wiredModelClient(body, opts) {
   const h = hooks();
-  if (h && typeof h.modelClient === 'function') return h.modelClient(body, opts);
-  return callModel(Object.assign({ model: Model.model }, body), opts);
+  const invoke = () => (h && typeof h.modelClient === 'function')
+    ? h.modelClient(body, opts)
+    : callModel(Object.assign({ model: Model.model }, body), opts);
+  return invoke().catch(async (e) => {
+    // Authoritative provider rejection of IMAGE input (docs/IMAGE-INPUT.md):
+    // only an explicit pre-inference request-validation rejection (400/422
+    // naming image content) downgrades the registry. Auth/quota/5xx/
+    // timeouts/parse failures never do. The error is rethrown unchanged —
+    // the agent's conservative fallback policy applies (no automatic
+    // image-less resend, no double inference).
+    try {
+      if (typeof isImageUnsupportedProviderError === 'function' && isImageUnsupportedProviderError(e)) {
+        const identity = imageInputIdentity();
+        const s = ensureImageStores();
+        if (identity && s) await s.registry.recordProviderRejection(identity, e && e.message);
+      }
+    } catch (ignored) { /* registry best-effort on the error path */ }
+    throw e;
+  });
 }
 
 function wiredToolExecutor(tool, input, workspace, opts) {
@@ -350,8 +372,13 @@ function makePersistenceContext(conv, providerSession) {
   let frameSequence = providerSession.nextFrameSequence || 0;
   let normalizedSequence = providerSession.nextNormalizedSequence || 0;
   return {
-    async onUserMessage(text) {
-      const raw = { role: 'user', content: text };
+    async onUserMessage(text, userContent) {
+      // Rich user content (docs/IMAGE-INPUT.md): the raw provider frame
+      // and the normalized row keep SEMANTIC image parts (attachmentId +
+      // sha256 refs into the durable store) — never base64. Replay
+      // materializes the bytes at request time through the gate.
+      const parts = Array.isArray(userContent) && userContent.length ? userContent : null;
+      const raw = { role: 'user', content: parts || text };
       await PersistenceServiceInstance.appendProviderFrame({
         sessionId: providerSession.id, conversationId: conv.id,
         sequence: ++frameSequence, turnId: providerSession.id,
@@ -360,6 +387,7 @@ function makePersistenceContext(conv, providerSession) {
       await PersistenceServiceInstance.saveNormalizedMessage({
         conversationId: conv.id, sequence: ++normalizedSequence,
         role: 'user', kind: 'message', text: text,
+        contentParts: parts || null,
       });
       providerSession.nextFrameSequence = frameSequence;
       providerSession.nextNormalizedSequence = normalizedSequence;
@@ -493,10 +521,18 @@ export function resolveApproval(requestId, decision) {
   return approvals.resolve(requestId, decision);
 }
 
-// Escape-path deny: refuse the current action only. Never cancels the task.
+// Escape-path resolution, kind-aware (docs/APPROVALS.md + docs/IMAGE-INPUT.md):
+//   permission  → deny the current action only; the task keeps running.
+//   capability  → CANCEL the decision, never answer it. Escape means "not
+//                 now", not "No, this model is text-only" — nothing is
+//                 written to the capability registry; the gate treats the
+//                 image as unsent for this run and does not re-ask.
 export function denyApproval() {
   const pending = store.pendingApproval;
   if (!pending) return false;
+  if (pending.kind === 'capability') {
+    return approvals.cancel(pending.id, 'escape');
+  }
   return approvals.resolve(pending.id, { outcome: 'deny', scope: 'once' });
 }
 
@@ -505,6 +541,102 @@ export function cancelApproval(requestId) {
   const pending = store.pendingApproval;
   if (!pending || (requestId && pending.id !== requestId)) return false;
   return approvals.cancel(pending.id, 'dismissed');
+}
+
+// ---------- image feedback wiring (docs/IMAGE-INPUT.md) ----------
+// AttachmentStore + ModelCapabilityRegistry are lazy: Node test harnesses
+// and minimal deployments load store.js without the image modules and
+// simply get a text-only runtime. In the app both modules are loaded by
+// index.html before this file executes.
+let attachmentStoreInstance = null;
+let capabilityRegistryInstance = null;
+
+function ensureImageStores() {
+  if (typeof AttachmentStore === 'undefined' || typeof ModelCapabilityRegistry === 'undefined') return null;
+  if (typeof PersistenceServiceInstance === 'undefined') return null;
+  if (!attachmentStoreInstance) {
+    attachmentStoreInstance = new AttachmentStore({ persistence: PersistenceServiceInstance });
+  }
+  if (!capabilityRegistryInstance) {
+    capabilityRegistryInstance = new ModelCapabilityRegistry({ persistence: PersistenceServiceInstance });
+  }
+  return { store: attachmentStoreInstance, registry: capabilityRegistryInstance };
+}
+
+export function getAttachmentStore() { return ensureImageStores() ? attachmentStoreInstance : null; }
+export function getCapabilityRegistry() { return ensureImageStores() ? capabilityRegistryInstance : null; }
+
+function imageInputIdentity() {
+  if (typeof getProviderAdapter !== 'function' || typeof createProviderIdentity !== 'function') return null;
+  try {
+    return createProviderIdentity(providerConfig());
+  } catch (e) {
+    return null;
+  }
+}
+
+// The ImageInputGate (docs/IMAGE-INPUT.md): consults the registry, asks
+// via the Approval Framework (kind 'capability') when unknown, and runs
+// the synthetic visual probe on "I don't know" — through the production
+// callModel path. Per-run askCache is supplied by AgentSession.run.
+async function ensureImageCapability(opts) {
+  const s = ensureImageStores();
+  const gate = createImageInputGate({
+    registry: s.registry,
+    approvals: approvals,
+    runProbe: (probeOpts) => runImageInputProbe({ signal: probeOpts.signal }),
+    identityOf: imageInputIdentity,
+  });
+  return gate.ensure({
+    signal: opts.signal,
+    taskGeneration: opts.taskGeneration,
+    askCache: opts.askCache,
+    conversationId: runningConversationId !== null ? runningConversationId : store.liveConversationId,
+  });
+}
+
+if (typeof createImageInputGate === 'function' && typeof runImageInputProbe === 'function') {
+  session.imageInput = {
+    ensureCapability: ensureImageCapability,
+    resolveAttachment: (attachmentId) => {
+      const s = ensureImageStores();
+      return s ? s.store.resolveForWire(attachmentId) : Promise.resolve(null);
+    },
+    unavailableNotice: (result) => imageInputUnavailableNotice(result),
+  };
+}
+
+// Exact base64 expansion estimate (identical formula to agent.js) for the
+// submit-time transport-budget pre-check.
+function imageWireEstimate(size) {
+  return Math.ceil(Number(size || 0) / 3) * 4 + 256;
+}
+
+// "Recheck image capability" (docs/IMAGE-INPUT.md): the user-facing path
+// to correct a mistaken Yes/No — clears the persisted override for the
+// CURRENT provider identity only. The next image turn falls back to the
+// builtin seed or the interactive ask.
+export async function recheckImageCapability() {
+  const s = ensureImageStores();
+  const identity = imageInputIdentity();
+  if (!s || !identity) return false;
+  const status = await s.registry.forget(identity);
+  store.imageCapability = status;
+  return true;
+}
+
+export async function refreshImageCapability() {
+  const s = ensureImageStores();
+  const identity = imageInputIdentity();
+  if (!s || !identity) {
+    store.imageCapability = null;
+    return null;
+  }
+  const status = await s.registry.lookup(identity);
+  store.imageCapability = status;
+  // Plain snapshot (not the reactive proxy): safe to serialize for
+  // callers outside Vue.
+  return { state: status.state, source: status.source, checkedAt: status.checkedAt || null, lastProbeAt: status.lastProbeAt || null, lastProbeFailure: status.lastProbeFailure || null, recorded: status.recorded };
 }
 
 // The VFS (declared at module scope above) replaces the raw adapter in
@@ -621,6 +753,57 @@ export function openConversation(id) {
 
 // ---------- task submission ----------
 
+// Build the durable snapshot + semantic parts for image attachments on
+// the submit path (docs/IMAGE-INPUT.md): each image File at /mnt/upload
+// is snapshotted into the AttachmentStore BEFORE the user frame is
+// persisted, so persisted history references durable bytes, never the
+// ephemeral File. Files stay in /mnt/upload regardless — a rejected or
+// unsent image never deletes the user's upload.
+async function buildImageUserContent(input) {
+  const images = store.attachments.filter((a) => a && String(a.type || '').toLowerCase().startsWith('image/'));
+  if (!images.length) return { parts: null, blocked: false };
+  const s = ensureImageStores();
+  const warn = (message) => {
+    const conv = store.conversations.find((c) => c.id === store.liveConversationId);
+    if (conv) {
+      LocusProjector.projectEvent(conv, { type: 'warning', code: 'image_attachment_rejected', message });
+    }
+  };
+  if (!s) {
+    warn('Images cannot be attached in this runtime (attachment store unavailable); the text was sent without them.');
+    return { parts: null, blocked: false };
+  }
+  const parts = [textContentPart(input)];
+  for (const a of images) {
+    try {
+      const bytes = await vfs.readBytes(a.path);
+      const record = await s.store.ingestImage({ bytes, name: a.name, declaredType: a.type });
+      parts.push(imageContentPart(record));
+    } catch (e) {
+      warn('Image "' + a.name + '" was not attached: ' + (e && e.message ? e.message : String(e)));
+    }
+  }
+  if (parts.length === 1) return { parts: null, blocked: false };
+  // Submit-time transport-budget pre-check: resolved base64 must fit the
+  // same budget enforceHistoryBudget enforces (exact arithmetic, not a
+  // guess). Over budget → explicit error, no task, no silent dropping.
+  const budget = (typeof HISTORY_BUDGET_BYTES === 'number') ? HISTORY_BUDGET_BYTES : 768 * 1024;
+  let imageBytes = 0;
+  for (const p of parts) if (p.type === 'image') imageBytes += imageWireEstimate(p.size);
+  const projected = session.historyRequestBytes(vfs) + imageBytes + new TextEncoder().encode(JSON.stringify({ role: 'user', content: parts })).byteLength + 16;
+  if (projected > budget) {
+    const conv = store.conversations.find((c) => c.id === store.liveConversationId);
+    if (conv) {
+      LocusProjector.projectEvent(conv, {
+        type: 'error', code: 'history_budget',
+        message: 'This task exceeds the request transport budget (' + budget + ' bytes) with the attached image(s) included. Remove an image or start a new task.',
+      });
+    }
+    return { parts: null, blocked: true };
+  }
+  return { parts, blocked: false };
+}
+
 export async function submit(text) {
   const input = String(text || '').trim();
   if (!input) return;
@@ -671,6 +854,13 @@ export async function submit(text) {
   // archived conversation, snap back to the live one first — presentation
   // history is never replayed into provider history.
   store.activeConversationId = store.liveConversationId;
+  // Image attachments (docs/IMAGE-INPUT.md): durable snapshot + semantic
+  // parts BEFORE any task state moves. Budget overflow blocks the submit
+  // with an explicit error; individual rejected images degrade to a
+  // warning and the text still goes out.
+  const imageBuild = await buildImageUserContent(input);
+  if (imageBuild.blocked) return;
+  const userContent = imageBuild.parts;
   store.plusMenuOpen = false;
   store.busy = true;
   store.cancelling = false;
@@ -740,7 +930,9 @@ export async function submit(text) {
       await persistConversation(boundConversation, { required: true });
       // Durable ordering: user presentation/semantic/provider state is
       // committed before AgentSession can make the first model request.
-      await persistenceContext.onUserMessage(input);
+      // Rich content (image attachment refs) rides in the same frame —
+      // base64 never enters persistence (docs/IMAGE-INPUT.md).
+      await persistenceContext.onUserMessage(input, userContent);
       if (finishPreRunSessionSwitch()) return;
       if (typeof session.setPersistenceContext === 'function') session.setPersistenceContext(persistenceContext);
     }
@@ -753,7 +945,10 @@ export async function submit(text) {
     // /mnt/workspace provider on the live VFS) can never rebind this task's
     // filesystem routing — its late async operations keep touching the OLD
     // provider, and the generation/abort guards drop its results.
-    await session.run(input, { workspace: vfs.fork() });
+    // One user turn: text + selected image attachments bind into a single
+    // provider turn (never a separate image turn, never a duplicate
+    // bubble). run() emits ONE task_start for it.
+    await session.run(input, { workspace: vfs.fork(), userContent });
   } catch (e) {
     // run() threw without a normal task lifecycle (e.g. the concurrent-run
     // guard): no task_end will arrive, so release the binding here instead
@@ -1073,11 +1268,16 @@ export function addUploadFiles(fileList) {
   for (const f of fileList || []) {
     try {
       const finalName = provider.addFile(f);
+      const type = String(f.type || '').toLowerCase();
       store.attachments.push({
         name: finalName,
         path: UPLOAD_ROOT + '/' + finalName,
         size: f.size || 0,
         type: f.type || 'file',
+        // Lightweight visual metadata only — capability is NEVER decided
+        // here. Whether an image crosses the model boundary is judged at
+        // that boundary (docs/IMAGE-INPUT.md).
+        image: type.startsWith('image/'),
       });
     } catch (e) {
       skipped.push((f && f.name ? f.name : 'file')

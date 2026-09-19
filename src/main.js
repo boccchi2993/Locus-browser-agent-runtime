@@ -166,6 +166,17 @@ if (e2eMode) {
       }, { signal });
     },
   };
+  // Image Feedback v1 seams (never exposed outside ?e2e=1): registry
+  // preseed/inspection and attachment-store introspection for durable
+  // bytes and no-base64-persisted assertions.
+  window.__locus.capabilities = {
+    registry: () => ui.getCapabilityRegistry(),
+    status: () => ui.refreshImageCapability(),
+    forget: () => ui.recheckImageCapability(),
+  };
+  window.__locus.attachments = {
+    store: () => ui.getAttachmentStore(),
+  };
 }
 
 // Python worker status is owned by the runtime (plain object); mirror it

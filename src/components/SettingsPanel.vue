@@ -39,6 +39,21 @@
       </label>
 
       <section class="storage-controls">
+        <div class="section-label">Image input</div>
+        <div class="hint">
+          {{ imageCapabilitySummary }}
+          <span v-if="store.imageCapability && store.imageCapability.lastProbeFailure">Last check: {{ store.imageCapability.lastProbeFailure }}</span>
+        </div>
+        <button
+          class="rail-btn"
+          type="button"
+          :disabled="store.busy || store.cancelling || !store.imageCapability"
+          data-testid="recheck-image-capability"
+          @click="recheckCapability"
+        >Forget &amp; recheck image capability</button>
+      </section>
+
+      <section class="storage-controls">
         <div class="section-label">Local storage</div>
         <div class="hint">
           {{ storageSummary }}
@@ -76,14 +91,35 @@ import {
   keepDataOnThisDevice, clearConversations as clearConversationData,
   clearHome as clearHomeData, clearPlugins as clearPluginData,
   forgetApiKeys as forgetStoredApiKeys, resetAllData as resetLocalData,
+  refreshImageCapability, recheckImageCapability,
 } from '../ui/store.js';
-import { computed } from 'vue';
+import { computed, onMounted } from 'vue';
 
 const storageSummary = computed(() => {
   const s = store.storageStatus;
   const mb = (n) => n == null ? '?' : (n / (1024 * 1024)).toFixed(1);
   return `${s.mode === 'indexeddb' ? 'IndexedDB' : 'Memory-only'} · OPFS ${s.opfs ? 'available' : 'unavailable'} · ${mb(s.usage)} MB used / ${mb(s.quota)} MB available`;
 });
+
+// Read-only capability projection (docs/IMAGE-INPUT.md). Source labels:
+// user / probe / built-in / provider / unknown origin.
+const imageCapabilitySummary = computed(() => {
+  const c = store.imageCapability;
+  if (!c) return 'Unavailable in this runtime.';
+  const sourceLabel = { user: 'your answer', probe: 'visual check', builtin: 'built-in table', 'provider-rejection': 'provider' }[c.source] || c.source;
+  return `Image input: ${c.state} · source: ${sourceLabel}`;
+});
+
+onMounted(() => { refreshImageCapability(); });
+
+async function recheckCapability() {
+  try {
+    await recheckImageCapability();
+    store.storageNotice = 'Image capability was reset for the current provider; Locus will ask again next time an image is sent.';
+  } catch (e) {
+    store.storageNotice = 'Recheck failed: ' + (e && e.message ? e.message : String(e));
+  }
+}
 
 async function keepStorage() { await keepDataOnThisDevice(); }
 async function clearConversations() { try { await clearConversationData(); } catch (e) { store.storageNotice = e.message || String(e); } }

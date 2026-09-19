@@ -153,6 +153,59 @@ function isNeutralToolResult(m) {
   return !!m && m.role === 'tool_result' && typeof m.toolCallId === 'string';
 }
 
+// ---------- rich user content (Image Feedback v1) ----------
+// User messages may carry provider-neutral rich content parts:
+//   { type: 'text', text }                                  — semantic
+//   { type: 'image', mimeType, dataBase64 }                 — resolved
+// Unresolved semantic refs ({ type:'image', attachmentId }) must NEVER
+// reach serialization: the harness resolver materializes them first, so
+// their presence here is an internal wiring bug and fails loudly
+// instead of silently sending an image-less request.
+function assertResolvedImagePart(part) {
+  if (typeof part.dataBase64 !== 'string' || !part.dataBase64) {
+    throw new Error('internal: an unresolved image attachment reached request serialization (missing dataBase64)');
+  }
+  if (typeof part.mimeType !== 'string' || !part.mimeType) {
+    throw new Error('internal: resolved image part is missing mimeType');
+  }
+}
+
+function isSemanticRichContent(m) {
+  return !!m && m.role === 'user' && Array.isArray(m.content);
+}
+
+function openaiRichContentParts(parts) {
+  return parts.map(function (part) {
+    if (part && part.type === 'text' && typeof part.text === 'string') {
+      return { type: 'text', text: part.text };
+    }
+    if (part && part.type === 'image') {
+      assertResolvedImagePart(part);
+      return {
+        type: 'image_url',
+        image_url: { url: 'data:' + part.mimeType + ';base64,' + part.dataBase64 },
+      };
+    }
+    throw new Error('internal: unsupported rich content part "' + String(part && part.type) + '"');
+  });
+}
+
+function anthropicRichContentParts(parts) {
+  return parts.map(function (part) {
+    if (part && part.type === 'text' && typeof part.text === 'string') {
+      return { type: 'text', text: part.text };
+    }
+    if (part && part.type === 'image') {
+      assertResolvedImagePart(part);
+      return {
+        type: 'image',
+        source: { type: 'base64', media_type: part.mimeType, data: part.dataBase64 },
+      };
+    }
+    throw new Error('internal: unsupported rich content part "' + String(part && part.type) + '"');
+  });
+}
+
 function neutralResultText(m) {
   return typeof m.content === 'string' ? m.content : String(m.content == null ? '' : m.content);
 }
@@ -239,9 +292,18 @@ const OpenAIAdapter = {
   // tool_call_id. Reasoning_content and any provider-specific
   // continuation fields ride along unchanged.
   prepareHistory(messages) {
-    return (messages || []).map((m) => isNeutralToolResult(m)
-      ? { role: 'tool', tool_call_id: m.toolCallId, content: neutralResultText(m) }
-      : m);
+    return (messages || []).map((m) => {
+      if (isNeutralToolResult(m)) {
+        return { role: 'tool', tool_call_id: m.toolCallId, content: neutralResultText(m) };
+      }
+      // Rich user content → Chat Completions content parts. Assistant
+      // rawMessages (including array payloads from some providers) pass
+      // through verbatim.
+      if (isSemanticRichContent(m)) {
+        return Object.assign({}, m, { content: openaiRichContentParts(m.content) });
+      }
+      return m;
+    });
   },
 
   serializeRequest(input) {
@@ -415,7 +477,14 @@ const AnthropicAdapter = {
         });
       } else {
         pendingResults = null;
-        out.push(m);
+        // Rich user content → Messages API content blocks. Assistant
+        // rawMessages keep their EXACT provider block arrays (thinking,
+        // tool_use, opaque state) — replay fidelity is untouched.
+        if (isSemanticRichContent(m)) {
+          out.push(Object.assign({}, m, { content: anthropicRichContentParts(m.content) }));
+        } else {
+          out.push(m);
+        }
       }
     }
     return out;
@@ -561,6 +630,21 @@ function projectNormalizedHistory(messages, dialect) {
           return { id: c.id || '', type: 'function', function: { name: c.name || '', arguments: JSON.stringify(c.input || {}) } };
         }) });
       }
+      continue;
+    }
+    // Rich user content survives cross-provider projection as SEMANTIC
+    // parts (attachment refs, no base64). The target provider's
+    // image-input gate decides per request whether the image crosses
+    // its boundary — a text-only target gets the deterministic textual
+    // notice, never a silent drop and never foreign wire shapes.
+    if (Array.isArray(m.contentParts) && m.contentParts.length) {
+      out.push({
+        role: m.role || 'user',
+        content: m.contentParts.map(function (p) {
+          if (p && p.type === 'image') return p;
+          return { type: 'text', text: String(p && p.text || '') };
+        }),
+      });
       continue;
     }
     out.push({ role: m.role || 'user', content: typeof m.text === 'string' ? m.text : (typeof m.content === 'string' ? m.content : '') });

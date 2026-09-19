@@ -225,6 +225,15 @@ input, select, textarea { font-family: inherit; font-size: inherit; color: inher
   padding: 10px 16px; font-size: 14.5px; line-height: 1.6;
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
+/* Image-attachment count chip inside the user bubble (Image Feedback v1).
+   Metadata only — pixels are never rendered into the timeline. */
+.user-image-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-right: 8px; padding: 2px 9px;
+  border-radius: 999px; font-size: 12px; font-weight: 600;
+  background: var(--code-bg); color: inherit;
+  white-space: nowrap; vertical-align: 1px;
+}
 
 .item-assistant .assistant-text {
   font-family: var(--serif); font-size: 15.5px; line-height: 1.7;
@@ -358,6 +367,12 @@ input, select, textarea { font-family: inherit; font-size: inherit; color: inher
 .attach-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attach-x { color: var(--faint); font-size: 13px; padding: 0 2px; flex-shrink: 0; }
 .attach-x:hover { color: var(--error); }
+/* lightweight image marker on the chip (display metadata only — capability
+   is decided at the model-input boundary, never at upload time) */
+.attach-kind {
+  flex-shrink: 0; font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--accent);
+}
 
 .composer {
   position: relative;
@@ -475,6 +490,11 @@ input, select, textarea { font-family: inherit; font-size: inherit; color: inher
 .approval-btn.secondary:hover { background: var(--accent-soft); }
 .approval-btn.deny { color: var(--muted); }
 .approval-btn.deny:hover { color: var(--error); border-color: var(--error); background: transparent; }
+/* capability variant: probe disclosure under the action row */
+.approval-note {
+  flex: 0 0 auto; margin-top: 8px;
+  font-size: 11.5px; color: var(--faint); overflow-wrap: anywhere;
+}
 
 /* plus menu */
 .plus-backdrop { position: fixed; inset: 0; z-index: 30; }

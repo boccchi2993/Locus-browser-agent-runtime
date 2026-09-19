@@ -98,7 +98,15 @@ var LocusProjector = (function () {
         conv.status = 'running';
         conv.runState = 'running';
         if (typeof event.input === 'string' && event.input.trim()) {
-          push(conv, { kind: 'user', content: event.input });
+          push(conv, {
+            kind: 'user',
+            content: event.input,
+            // Display metadata only ("N images" chip). The images themselves
+            // are never projected into the timeline — attachment refs live
+            // in provider history, pixels never leave the store boundary
+            // except into one provider request.
+            imageCount: Number.isFinite(event.images) && event.images > 0 ? event.images : 0,
+          });
           if (conv.title === 'New task') {
             conv.title = event.input.trim().split(/\r?\n/)[0].slice(0, 60);
           }

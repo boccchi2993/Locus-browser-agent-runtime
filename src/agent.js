@@ -103,6 +103,32 @@ function agentToolNames() {
   return defs ? defs.map((t) => t.name) : ['bash', 'cloud_bash'];
 }
 
+// ---------- rich user content (Image Feedback v1) ----------
+// History stays SEMANTIC: image parts carry attachmentId refs, never
+// base64 (docs/IMAGE-INPUT.md, "Rich content"). Materialization happens
+// per request, at the model-input boundary, via the injected imageInput
+// dependency:
+//   ensureCapability({ signal, conversationId, taskGeneration, askCache })
+//       → { state: 'supported'|'unsupported'|'unknown', source, decision? }
+//   resolveAttachment(attachmentId) → { mimeType, dataBase64 } (one request)
+//   unavailableNotice(gateResult) → deterministic model-facing text
+function historyImageParts(messages) {
+  const found = [];
+  for (const m of messages || []) {
+    if (m && m.role === 'user' && Array.isArray(m.content)) {
+      for (const p of m.content) if (p && p.type === 'image') found.push(p);
+    }
+  }
+  return found;
+}
+
+// Upper bound of one resolved image part's wire cost: base64 expands
+// bytes by 4/3 (ceil(size/3)*4) plus data-URL/block framing. Used by the
+// transport budget so resolved payloads cannot silently exceed it.
+function estimateImageWireBytes(size) {
+  return Math.ceil(Number(size || 0) / 3) * 4 + 256;
+}
+
 // Validate ONE normalized native tool call (docs/MODEL-PROTOCOL.md).
 // Returns { id, name, inputString } for an executable call, or
 // { id, name, error } — invalid calls are NEVER executed and NEVER
@@ -241,6 +267,10 @@ class AgentSession {
     this.task = null;     // { controller: AbortController } while a task is running
     this.replayBlocked = false;
     this.persistence = d.persistence || null;
+    // Image Feedback v1 (docs/IMAGE-INPUT.md): the model-input boundary
+    // gate + attachment resolver. Optional — registry-less harnesses and
+    // text-only deployments leave it null and nothing changes.
+    this.imageInput = d.imageInput && typeof d.imageInput === 'object' ? d.imageInput : null;
   }
 
   setPersistenceContext(context) { this.persistence = context || null; }
@@ -292,11 +322,19 @@ class AgentSession {
   // system prompt + every message with ALL provider-native fields
   // (reasoning_content, opaque state, …) + structural overhead. Counting
   // chars would under-count multibyte text (e.g. Chinese ≈ 3 bytes/char).
+  // Semantic image parts count at their RESOLVED wire size (base64 = 4/3
+  // of the exact attachment bytes + framing) — metadata JSON alone would
+  // under-count by megabytes (docs/IMAGE-INPUT.md, "Request budget").
   historyRequestBytes(workspace) {
     const enc = new TextEncoder();
     let n = REQUEST_OVERHEAD_BYTES + enc.encode(this.buildSystemPrompt({ workspace: workspace || null })).byteLength;
     for (const m of stripInternalFields(this.history)) {
       n += enc.encode(JSON.stringify(m)).byteLength + 16;
+      if (m.role === 'user' && Array.isArray(m.content)) {
+        for (const part of m.content) {
+          if (part && part.type === 'image') n += estimateImageWireBytes(part.size);
+        }
+      }
     }
     return n;
   }
@@ -323,6 +361,63 @@ class AgentSession {
     }
   }
 
+  // Materialize semantic image parts into one-request provider payloads
+  // at the model-input boundary (docs/IMAGE-INPUT.md). The gate decision
+  // is already resolved by the caller; this only shapes messages:
+  //   supported   → resolve attachmentId to temporary base64 (never
+  //                  persisted, never logged, never emitted)
+  //   otherwise   → replace the image part with the deterministic
+  //                  domain notice (tool failure is NOT implied; the
+  //                  image simply does not cross this boundary)
+  // Returns new message objects — history keeps its semantic refs.
+  async _materializeImageContent(messages, gateResult) {
+    const imageInput = this.imageInput;
+    let out = null; // lazily copy-on-write
+    let missingAttachment = false;
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (!(m && m.role === 'user' && Array.isArray(m.content) && m.content.some((p) => p && p.type === 'image'))) continue;
+      const parts = [];
+      for (const part of m.content) {
+        if (!(part && part.type === 'image')) {
+          parts.push(part);
+          continue;
+        }
+        if (gateResult.state === 'supported') {
+          let resolved = null;
+          try {
+            resolved = typeof imageInput.resolveAttachment === 'function'
+              ? await imageInput.resolveAttachment(part.attachmentId) : null;
+          } catch (e) { resolved = null; }
+          if (resolved && resolved.dataBase64) {
+            parts.push({ type: 'image', mimeType: resolved.mimeType || part.mimeType, dataBase64: resolved.dataBase64 });
+          } else {
+            // Durable bytes vanished (e.g. cleared storage): degrade
+            // honestly — the model is told, never shown a phantom image.
+            parts.push({ type: 'text', text: 'The image attachment for this message is no longer available and was not sent to the model.' });
+            missingAttachment = true;
+          }
+        } else {
+          parts.push({
+            type: 'text',
+            text: typeof imageInput.unavailableNotice === 'function'
+              ? imageInput.unavailableNotice(gateResult)
+              : 'The image was not sent to the model.',
+          });
+        }
+      }
+      if (!out) out = messages.slice();
+      out[i] = Object.assign({}, m, { content: parts });
+    }
+    if (missingAttachment) {
+      this.emit({
+        type: 'warning', code: 'image_attachment_missing',
+        message: 'One image attachment could no longer be read from durable storage; the model was told it is unavailable.',
+      });
+    }
+    return out || messages;
+  }
+
   // One full user task → agent loop. Emits runtime events; never renders.
   // The task binds the CURRENT workspace and session generation at start:
   // if the user switches workspace or resets the session mid-flight, every
@@ -337,7 +432,12 @@ class AgentSession {
     if (this.task) {
       throw new Error('AgentSession already has a running task');
     }
-    const workspace = opts && 'workspace' in opts ? opts.workspace : null;
+    const o = opts || {};
+    const workspace = 'workspace' in o ? o.workspace : null;
+    // Optional semantic rich content for the FIRST user turn (text +
+    // image attachment refs). Absent → the historical string form.
+    const userContent = Array.isArray(o.userContent) && o.userContent.length ? o.userContent : null;
+    const imageCount = userContent ? userContent.filter((p) => p && p.type === 'image').length : 0;
     const generation = this.generation;
     const controller = new AbortController();
     this.task = { controller };
@@ -360,9 +460,14 @@ class AgentSession {
     };
     const end = (reason) => emit({ type: 'task_end', reason: reason });
 
-    emit({ type: 'task_start', input: userText });
+    emit({ type: 'task_start', input: userText, images: imageCount || undefined });
+    this.history.push(userContent
+      ? { role: 'user', content: userContent, _taskStart: true }
+      : { role: 'user', content: userText, _taskStart: true });
+    // Per-run image-gate cache (docs/IMAGE-INPUT.md): one identity is
+    // asked/probed at most once per task run — no same-run loops.
+    const imageAskCache = new Map();
     try {
-      this.history.push({ role: 'user', content: userText, _taskStart: true });
       const tools = agentToolDefinitions(); // null in registry-less harnesses
       // Total tool calls processed this task. A native batch counts every
       // call (not every model turn): 32 turns × 10 calls must never
@@ -390,16 +495,65 @@ class AgentSession {
           end('error');
           return;
         }
+        // Image Feedback v1 boundary (docs/IMAGE-INPUT.md): the gate runs
+        // here — exactly where an image is about to enter a model request —
+        // never at tool registration, tool execution or upload time. Pure
+        // text tasks never touch the gate. After the gate (approval +
+        // registry writes are the safe preparation) the task's AbortSignal
+        // is re-checked before serialization, and again immediately before
+        // the provider request (docs/APPROVALS.md, consumer contract).
+        let requestMessages = stripInternalFields(this.history);
+        if (this.imageInput && historyImageParts(requestMessages).length) {
+          let gate = null;
+          try {
+            gate = await this.imageInput.ensureCapability({
+              signal: controller.signal,
+              taskGeneration: generation,
+              askCache: imageAskCache,
+            });
+          } catch (e) {
+            emit({ type: 'error', code: 'image_gate_failed', message: '图片能力判定失败: ' + (e && e.message ? e.message : String(e)) });
+            end('error');
+            return;
+          }
+          if (isStale()) {
+            noteDiscarded();
+            end(sessionChanged() ? 'session_changed' : 'cancelled');
+            return;
+          }
+          if (gate.decision === 'cancelled') {
+            // A cancelled capability question is NOT a "No": nothing is
+            // written to the registry; the task continues without the
+            // image and the model receives the deterministic notice.
+            emit({
+              type: 'warning', code: 'image_capability_cancelled',
+              message: '图片能力询问已取消，本次图片不会发送给模型。',
+            });
+          }
+          requestMessages = await this._materializeImageContent(requestMessages, gate);
+          if (isStale()) {
+            noteDiscarded();
+            end(sessionChanged() ? 'session_changed' : 'cancelled');
+            return;
+          }
+        }
         let envelope;
         try {
           const request = {
             max_tokens: 2000,
             system: this.buildSystemPrompt({ workspace: workspace }),
-            messages: stripInternalFields(this.history),
+            messages: requestMessages,
           };
           // Model-visible tool definitions come from the provider-neutral
           // registry; the adapter maps them onto the provider wire shape.
           if (tools) request.tools = tools;
+          // FINAL liveness check before the provider side effect — no
+          // await may sit between this check and the model call.
+          if (controller.signal.aborted) {
+            noteDiscarded();
+            end('cancelled');
+            return;
+          }
           envelope = await this.modelClient(request, { signal: controller.signal });
         } catch (e) {
           if (isStale() || (e && (e.cancelled || e.name === 'AbortError'))) {

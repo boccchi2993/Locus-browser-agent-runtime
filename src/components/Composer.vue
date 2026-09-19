@@ -5,6 +5,7 @@
          final VFS path -->
     <div v-if="store.attachments.length" class="attach-row">
       <span v-for="(a, i) in store.attachments" :key="i" class="attach-chip" :title="a.path">
+        <span v-if="a.image" class="attach-kind">Image</span>
         <span class="attach-name">{{ a.name }}</span>
         <button type="button" class="attach-x" :aria-label="'Remove ' + a.name" @click="removeAttachment(i)">×</button>
       </span>

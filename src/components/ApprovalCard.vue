@@ -5,11 +5,11 @@
     class="approval-card"
     tabindex="-1"
     role="group"
-    :aria-label="'Approval required: ' + (pending.action.summary || '')"
+    :aria-label="cardText.title + ': ' + (pending.action.summary || '')"
     data-testid="approval-card"
   >
-    <div class="approval-title">Approval required</div>
-    <p class="approval-lead">Locus wants permission to:</p>
+    <div class="approval-title">{{ cardText.title }}</div>
+    <p class="approval-lead">{{ cardText.lead }}</p>
     <!-- Vertical containment (docs/APPROVALS.md): the card is height-capped
          and this body is its only scrollable region, so no summary/detail
          length can push the action row (or the composer's Cancel task)
@@ -33,6 +33,7 @@
         @click="choose(b)"
       >{{ b.label }}</button>
     </div>
+    <div v-if="probeNote" class="approval-note">{{ probeNote }}</div>
   </div>
 </template>
 
@@ -43,19 +44,39 @@ import { store, resolveApproval, cancelApproval } from '../ui/store.js';
 const pending = computed(() => store.pendingApproval);
 const cardEl = ref(null);
 
-// Fixed choice sets per approval kind. The card never renders
-// caller/model-supplied buttons, labels or HTML. Kinds without a v1 UI
-// (capability / confirmation) fall back to a single dismiss that resolves
-// the request as 'cancelled' — they have no production consumer yet.
+// Fixed per-kind copy + choice sets. The card never renders
+// caller/model-supplied buttons, labels or HTML. capability (Image
+// Feedback v1, docs/IMAGE-INPUT.md) is a KNOWLEDGE question about the
+// model, not a permission: its outcomes are confirm/decline/unsure, it
+// has no session grants, and Escape cancels the decision instead of
+// answering "No" (docs/APPROVALS.md).
+const KIND_TEXT = {
+  permission: { title: 'Approval required', lead: 'Locus wants permission to:' },
+  capability: {
+    title: 'Image capability',
+    lead: 'Locus does not know whether the current model supports image input. Is this an image-capable model?',
+  },
+};
 const KIND_BUTTONS = {
   permission: [
     { label: 'Deny', style: 'deny', decision: { outcome: 'deny', scope: 'once' } },
     { label: 'Allow once', style: 'primary', decision: { outcome: 'allow', scope: 'once' } },
     { label: 'Allow for this session', style: 'secondary', decision: { outcome: 'allow', scope: 'session' } },
   ],
+  capability: [
+    { label: 'No', style: 'deny', decision: { outcome: 'decline' } },
+    { label: 'Yes', style: 'primary', decision: { outcome: 'confirm' } },
+    { label: "I don't know", style: 'secondary', decision: { outcome: 'unsure' } },
+  ],
 };
 const FALLBACK_BUTTONS = [{ label: 'Dismiss', style: 'secondary', cancel: true }];
 const buttons = computed(() => KIND_BUTTONS[pending.value.kind] || FALLBACK_BUTTONS);
+const cardText = computed(() => KIND_TEXT[pending.value.kind] || { title: 'Approval required', lead: 'Locus wants your input:' });
+// Small probe disclosure on the unsure path — no "Recommended", no
+// preselection: every choice is equal until the user picks one.
+const probeNote = computed(() => pending.value.kind === 'capability'
+  ? "Choosing \"I don't know\" runs a small visual check with a generated test image."
+  : null);
 
 const resourceLine = computed(() => {
   const r = pending.value.resource;
@@ -79,9 +100,9 @@ function choose(b) {
 }
 
 // Focus discipline (docs/APPROVALS.md): the card container gets focus —
-// NEVER an Allow button, so muscle-memory Enter can never approve. Tab
-// walks Deny → Allow once → Allow for this session in DOM order; on close,
-// focus returns to the composer instead of dropping to <body>.
+// NEVER the Yes/Allow button, so muscle-memory Enter can never approve
+// or answer. Tab walks the buttons in DOM order; on close, focus returns
+// to the composer instead of dropping to <body>.
 function focusCard() {
   nextTick(() => {
     const el = cardEl.value || document.querySelector('.approval-card');
