@@ -29,8 +29,11 @@ const AGENT_TOOL_DEFINITIONS = [
   },
   {
     name: 'cloud_bash',
-    description: 'Expensive remote execution fallback. It is currently NOT configured, so calls fail. ' +
-      'Do not use it unless the user explicitly asks for cloud execution.',
+    // Legacy/debug compatibility path (docs/NETWORK-RUNTIME.md): NOT a
+    // network path — ordinary network work uses the local bash tool and
+    // NetworkRuntime never needs it.
+    description: 'Legacy remote execution fallback (debug/compatibility tool, not a network path). ' +
+      'It is currently NOT configured, so calls fail. Ordinary shell and network work uses the local bash tool.',
     inputSchema: {
       type: 'object',
       properties: {

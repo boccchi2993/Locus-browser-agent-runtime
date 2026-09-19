@@ -749,8 +749,8 @@ const SHELL_COMMANDS = {
     stdin: false, run: shPython,
   },
   curl: {
-    usage: 'curl <https-url> | curl -o <file> <https-url>',
-    summary: 'anonymous HTTPS GET — text to stdout, or binary-safe download with -o',
+    usage: 'curl <url> | curl -o <file> <url> | curl -I <url> | curl -X <method> [-H "Name: value"] [-d <data>] <url>',
+    summary: 'HTTP/HTTPS requests — GET/HEAD are anonymous reads; POST/PUT/PATCH/DELETE ask for user approval',
     stdin: false, run: shCurl,
   },
   help: {
@@ -844,13 +844,19 @@ function shellSystemPromptSection() {
     '  * in command arguments stays literal — use find -name "*.tmp" to locate files.',
     '  ' + SHELL_UNSUPPORTED_NOTE,
     '  Run `help` at runtime to see this contract again.',
-    '  curl usage (public HTTPS resources only):',
-    '    curl <https-url>                  fetches a URL; text/JSON/XML responses are printed directly.',
-    '    curl -o <file> <https-url>        downloads binary-safe into a writable file (use this for images,',
-    '                                    PDFs, archives, or any data you want to keep or process, e.g. under /mnt/download).',
-    '  curl supports NO other flags (no -H/-X/-d/-u/cookies). URLs must be https://.',
-    '  Network access may be served by a direct browser fetch or a transparent relay — you do not need to',
-    '  know or care which. If curl fails, report the error; do NOT switch to cloud_bash for network access.',
+    '  curl usage (this environment has ordinary HTTP/HTTPS internet access; use curl for network requests):',
+    '    curl <url>                  fetches a URL (GET); text/JSON/XML responses are printed directly.',
+    '    curl -o <file> <url>        downloads binary-safe into a writable file (use this for images, PDFs,',
+    '                              archives, or any data you want to keep or process, e.g. under /mnt/download).',
+    '    curl -I <url>               HEAD request — response headers only.',
+    '    curl -X <method> <url>      sends an explicit method (POST/PUT/PATCH/DELETE); combine with request',
+    '    curl -H "Name: value"       headers (-H, repeatable) and/or a request body: -d <data> implies POST,',
+    '    curl -d <data>              --data-binary @file sends a file\'s bytes as the body. Side-effecting',
+    '                              requests may require the user\'s approval before anything is sent; if the',
+    '                              user denies one, that request was not made — continue another way.',
+    '  Requests are anonymous by construction: browser cookies are never attached, and Cookie / Sec-* /',
+    '  hop-by-hop headers are not sent. Arbitrary TCP/UDP, raw sockets and non-HTTP protocols are unavailable.',
+    '  If curl fails, report the error; do NOT switch to cloud_bash for network access.',
     '  python usage: for short one-liners use python -c "<code>"; for anything multi-line or containing mixed quotes,',
     '  prefer the heredoc form — the code between the markers is passed to Python verbatim:',
     '    python <<\'PY\'',
@@ -2195,12 +2201,22 @@ async function runPythonCode(code, vfs, opts) {
 }
 
 // ---------- curl (NetworkRuntime) ----------
-// Deliberately NOT full curl. Supported forms only:
-//   curl <https-url>                 → text responses printed to stdout
-//   curl -o <file> <https-url>       → binary-safe download into workspace
-//   curl --output <file> <https-url> → same as -o
-// Everything else (headers, methods, POST bodies, cookies, auth) is out of
-// scope for the browser runtime and fails with a clear message.
+// Deliberately NOT full curl. The shell layer is CLI-only: argument
+// parsing, stdout/stderr formatting, -o file output, exit semantics.
+// ALL network execution — transport, routing, approval, bounds — lives
+// in NetworkRuntime.request(); the shell never fetches, never sees
+// backends and never reasons about CORS.
+//
+// Supported forms:
+//   curl <url>                      → GET; text printed, binary hint
+//   curl -o <file> <url>            → binary-safe download (-o/--output)
+//   curl -I <url>                   → HEAD (-I/--head)
+//   curl -X <method> <url>          → explicit method (-X/--request)
+//   curl -H "Name: value" <url>     → request header (-H/--header, repeatable)
+//   curl -d <data> <url>            → request body (-d/--data/--data-binary
+//                                     imply POST; --data-raw never reads
+//                                     files; @file reads VFS bytes)
+// Everything else (-u, cookies, -L, -G, …) fails with a clear message.
 
 const TEXT_LIKE_MIMES = new Set([
   'application/json',
@@ -2230,14 +2246,35 @@ async function runCurl(args, ctx, opts) {
     network: net ? { backend: net.backend } : null,
   });
 
-  // Parse: exactly one URL positional; only -o/--output takes a value.
+  // Parse: exactly one URL positional; value-taking options below.
   let outFile = null;
   let url = null;
+  let methodArg = null;
+  let head = false;
+  const headerArgs = [];
+  const dataArgs = []; // { raw: string, allowFile: boolean }
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '-o' || a === '--output') {
       outFile = args[++i];
       if (!outFile) return netResult('curl: -o requires a file path', false);
+    } else if (a === '-X' || a === '--request') {
+      methodArg = args[++i];
+      if (!methodArg) return netResult('curl: -X requires a method', false);
+    } else if (a === '-I' || a === '--head') {
+      head = true;
+    } else if (a === '-H' || a === '--header') {
+      const h = args[++i];
+      if (h == null) return netResult('curl: -H requires a header ("Name: value")', false);
+      headerArgs.push(h);
+    } else if (a === '-d' || a === '--data' || a === '--data-binary') {
+      const d = args[++i];
+      if (d == null) return netResult('curl: ' + a + ' requires data', false);
+      dataArgs.push({ raw: d, allowFile: true });
+    } else if (a === '--data-raw') {
+      const d = args[++i];
+      if (d == null) return netResult('curl: --data-raw requires data', false);
+      dataArgs.push({ raw: d, allowFile: false });
     } else if (a.startsWith('-')) {
       return netResult('curl: option not supported in local browser runtime: ' + a, false);
     } else if (url) {
@@ -2246,7 +2283,30 @@ async function runCurl(args, ctx, opts) {
       url = a;
     }
   }
-  if (!url) return netResult('usage: curl <https-url> | curl -o <file> <https-url>', false);
+  if (!url) {
+    return netResult('usage: curl <url> | curl -o <file> <url> | curl -I <url> | curl -X <method> [-H <header>] [-d <data>] <url>', false);
+  }
+
+  // Method: explicit -X wins; -I means HEAD; -d implies POST (curl
+  // semantics); otherwise GET.
+  let method = 'GET';
+  if (methodArg) method = methodArg;
+  else if (head) method = 'HEAD';
+  else if (dataArgs.length) method = 'POST';
+
+  // Headers: "Name: value" (first colon splits); invalid names fail
+  // before anything else happens.
+  const headers = {};
+  for (const h of headerArgs) {
+    const idx = h.indexOf(':');
+    if (idx <= 0) return netResult('curl: invalid header (expected "Name: value"): ' + h, false);
+    const name = h.slice(0, idx).trim();
+    const value = h.slice(idx + 1).trim();
+    if (!name || /\s/.test(name)) {
+      return netResult('curl: invalid header name: ' + name, false);
+    }
+    headers[name] = value;
+  }
 
   // A download with an unwritable target must fail BEFORE any network
   // request: resolve the absolute path, enforce mount authority, check the
@@ -2279,11 +2339,79 @@ async function runCurl(args, ctx, opts) {
     }
   }
 
+  // Materialize the request body from the local VFS (local-only, no side
+  // effect): @file parts read bytes, inline parts are UTF-8 encoded;
+  // parts are joined with '&' (curl semantics). NetworkRuntime enforces
+  // the request-byte cap BEFORE approval, but a huge @file is bounded
+  // here too so it is never materialized just to be refused.
+  let body = null;
+  if (dataArgs.length && method !== 'GET' && method !== 'HEAD') {
+    const parts = [];
+    for (const d of dataArgs) {
+      if (d.raw.startsWith('@') && d.allowFile) {
+        const display = d.raw;
+        let abs;
+        try {
+          abs = resolveShellPath(ctx, d.raw.slice(1));
+        } catch (e) {
+          return netResult('curl: ' + e.message, false);
+        }
+        try {
+          const st = await vfs.stat(abs);
+          if (st && Number.isFinite(st.size) && st.size > NetworkRuntime.maxRequestBytes) {
+            return netResult('curl: request body too large (limit '
+              + NetworkRuntime.maxRequestBytes + ' bytes): ' + display, false);
+          }
+        } catch (e) {
+          if (!e || e.name !== 'NotFoundError') {
+            return netResult('curl: cannot read ' + display + ': ' + (e && e.message ? e.message : String(e)), false);
+          }
+        }
+        try {
+          parts.push(await vfs.readBytes(abs));
+        } catch (e) {
+          return netResult('curl: cannot read ' + display + ': ' + (e && e.message ? e.message : String(e)), false);
+        }
+      } else if (d.raw.startsWith('@')) {
+        return netResult('curl: --data-raw does not support @file (use --data-binary)', false);
+      } else {
+        parts.push(new TextEncoder().encode(d.raw));
+      }
+    }
+    const total = parts.reduce((n, p) => n + p.byteLength, 0) + (parts.length - 1);
+    body = new Uint8Array(total);
+    let off = 0;
+    parts.forEach((p, i) => {
+      if (i) body[off++] = 0x26; // '&'
+      body.set(p, off);
+      off += p.byteLength;
+    });
+  }
+
   let res;
   try {
-    res = await NetworkRuntime.fetch(url, { signal: opts && opts.signal });
+    res = await NetworkRuntime.request({
+      method: method,
+      url: url,
+      headers: headers,
+      body: body,
+      signal: opts && opts.signal,
+      // Approval Framework consumer context (docs/NETWORK-RUNTIME.md):
+      // the approval provider is injected by the tool wiring — the shell
+      // neither constructs approvals nor knows their internals.
+      policyContext: {
+        approvals: opts && opts.approvals,
+        conversationId: opts && opts.conversationId,
+        taskGeneration: opts && opts.taskGeneration,
+      },
+    });
   } catch (e) {
     if (isCancelledError(e)) return netResult('curl: cancelled', false);
+    // A denial is a deterministic, ordinary result (docs/NETWORK-RUNTIME.md):
+    // the request was NOT made; the model may continue another way.
+    if (e && e.networkCode === 'network_denied') {
+      return netResult('curl: network request denied by user', false);
+    }
     return netResult('curl: ' + (e && e.message ? e.message : String(e)), false);
   }
 
