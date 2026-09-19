@@ -8,7 +8,7 @@
 //  APIs themselves.
 // ============================================================
 
-var PERSISTENCE_SCHEMA_VERSION = 2;
+var PERSISTENCE_SCHEMA_VERSION = 3;
 var PERSISTENCE_DB_NAME = 'locus';
 
 // One canonical home layout.  The VFS consumes the same value when it
@@ -22,7 +22,7 @@ var LOCUS_HOME_SKELETON = [
 var PERSISTENCE_STORES = [
   'conversations', 'presentationEvents', 'providerSessions',
   'providerFrames', 'normalizedMessages', 'settings', 'secrets',
-  'workspaceHandles', 'meta',
+  'workspaceHandles', 'meta', 'attachments', 'capabilities',
 ];
 
 function persistenceUuid(prefix) {
@@ -140,6 +140,12 @@ function persistenceUpgrade(db, oldVersion, newVersion, tx) {
     // belongs; migration deliberately removes it and asks the user again.
     var secrets = tx.objectStore('secrets');
     secrets.delete('apiKey');
+  }
+  if (oldVersion < 3) {
+    // Image Feedback v1: durable attachment metadata + the Harness-owned
+    // model capability registry. Attachment BYTES live in OPFS, never here.
+    db.createObjectStore('attachments', { keyPath: 'id' }).createIndex('sha256', 'sha256', { unique: false });
+    db.createObjectStore('capabilities', { keyPath: 'key' });
   }
 }
 
@@ -305,6 +311,9 @@ class PersistenceService {
     this.opfsAvailable = false;
     this.initializationError = null;
     this.secrets = new Set();
+    // Memory-mode backing for content-addressed attachment bytes (the OPFS
+    // path is unavailable). Keyed by storageKey (sha256 hex).
+    this.memoryAttachmentBytes = new Map();
     this.persistenceHealth = 'healthy'; // healthy | degraded | unavailable
     this.lastPersistenceError = null;
     this.ready = this.init();
@@ -720,6 +729,10 @@ class PersistenceService {
       } else {
         for (var j = 0; j < names.length; j++) this.memory[names[j]].clear();
       }
+      // Durable attachment snapshots exist only to serve conversations —
+      // clearing conversations clears their bytes too. The capability
+      // registry is Harness control-plane state and is deliberately kept.
+      await this.clearAttachments();
     } catch (e) { this._throwPersistenceError(e, 'clear conversations'); }
   }
 
@@ -822,12 +835,101 @@ class PersistenceService {
     return new Uint8Array(await f.arrayBuffer());
   }
 
+  // ---------- attachments (Image Feedback v1) ----------
+  // Metadata lives in the 'attachments' IDB store; exact bytes live in
+  // content-addressed OPFS files attachments/<h2>/<rest-of-sha256>. Records
+  // are small plain objects (id/sha256/mimeType/size/storageKey/…) — never
+  // base64 payloads. Memory mode keeps bytes in a Map with identical
+  // semantics so the abstraction is testable without OPFS.
+
+  async saveAttachmentMeta(record) {
+    return this.put('attachments', record);
+  }
+
+  async getAttachmentMeta(id) {
+    return this.get('attachments', id);
+  }
+
+  async findAttachmentMetaBySha256(sha256) {
+    await this.ready;
+    try {
+      if (this.db) {
+        var tx = this.db.transaction('attachments', 'readonly');
+        var req = tx.objectStore('attachments').index('sha256').get(sha256);
+        return await persistenceRequest(req);
+      }
+      for (var value of this.memory.attachments.values()) {
+        if (value && value.sha256 === sha256) return persistenceClone(value);
+      }
+      return null;
+    } catch (e) { this._throwPersistenceError(e, 'find attachment by sha256'); }
+  }
+
+  async allAttachmentMetas() {
+    return this.all('attachments');
+  }
+
+  async writeAttachmentBytes(storageKey, bytes) {
+    await this.ready;
+    var data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    try {
+      if (!this.opfsRoot) {
+        this.memoryAttachmentBytes.set(storageKey, data.slice());
+        return;
+      }
+      var dir = await this.opfsDirectory(['attachments', String(storageKey).slice(0, 2)], true);
+      var writable = await (await dir.getFileHandle(String(storageKey), { create: true })).createWritable();
+      await writable.write(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+      await writable.close();
+    } catch (e) { this._throwPersistenceError(e, 'write attachment bytes'); }
+  }
+
+  async readAttachmentBytes(storageKey) {
+    await this.ready;
+    try {
+      if (!this.opfsRoot) {
+        var cached = this.memoryAttachmentBytes.get(storageKey);
+        if (!cached) throw new Error('attachment bytes not found: ' + storageKey);
+        return cached.slice();
+      }
+      var dir = await this.opfsDirectory(['attachments', String(storageKey).slice(0, 2)], false);
+      var f = await (await dir.getFileHandle(String(storageKey), { create: false })).getFile();
+      return new Uint8Array(await f.arrayBuffer());
+    } catch (e) { this._throwPersistenceError(e, 'read attachment bytes'); }
+  }
+
+  async hasAttachmentBytes(storageKey) {
+    await this.ready;
+    try {
+      if (!this.opfsRoot) return this.memoryAttachmentBytes.has(storageKey);
+      var dir = await this.opfsDirectory(['attachments', String(storageKey).slice(0, 2)], false);
+      await dir.getFileHandle(String(storageKey), { create: false });
+      return true;
+    } catch (e) {
+      if (e && (e.name === 'NotFoundError' || e.cause && e.cause.name === 'NotFoundError')) return false;
+      this._throwPersistenceError(e, 'has attachment bytes');
+    }
+  }
+
+  async clearAttachments() {
+    await this.ready;
+    try {
+      await this.clear('attachments');
+      if (this.opfsRoot) await this._clearOpfsDir(['attachments']);
+      this.memoryAttachmentBytes.clear();
+    } catch (e) { this._throwPersistenceError(e, 'clear attachments'); }
+  }
+
   async reset() {
     await this.clearConversations();
     await this.clear('settings');
     await this.clear('secrets');
     await this.clear('workspaceHandles');
     await this.clear('meta');
+    // Full wipe includes the durable attachment snapshots (they only exist
+    // to serve conversations) and the Harness capability registry.
+    await this.clearAttachments();
+    await this.clear('capabilities');
     this.secrets.clear();
     await this.clearHome();
     await this.clearPlugins();
