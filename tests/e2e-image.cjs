@@ -486,6 +486,165 @@ async function main() {
       callsG.length === 1 && callsG[0].body.messages.some((m) => m.role === 'user' && JSON.stringify(m).includes(SENTINEL_PNG_B64)),
       JSON.stringify(callsG.map((c) => c.url)));
 
+    // ============ CASE H: corrupt durable blob → fail closed, ZERO provider requests ============
+    await evaluate(cdp, `window.__img.reset()`);
+    await evaluate(cdp, `(async () => {
+      await window.__img.configure('vision-model-h');
+      const id = createProviderIdentity({ provider: 'openai', adapterId: 'openai-compatible', dialect: 'openai', apiBase: ${JSON.stringify(BASE)}, model: 'vision-model-h' });
+      await window.__locus.capabilities.registry().setUserDecision(id, 'supported');
+    })()`);
+    await evaluate(cdp, `window.__img.upload('shot-h.png')`);
+    await evaluate(cdp, `window.__locusWire.responses.push(${literal({
+      choices: [{ message: { role: 'assistant', content: 'case h seed ok' }, finish_reason: 'stop' }],
+    })}); window.__locus.actions.submit('case h seed'); 'submitted'`);
+    await waitCond(`(() => {
+      const c = window.__locus.store.conversations.find(x => x.title === 'case h seed');
+      return !!c && c.status === 'completed';
+    })()`, 'case-h-seed', 15000);
+    const corruptResult = await evaluate(cdp, `(async () => {
+      const metas = await window.PersistenceServiceInstance.allAttachmentMetas();
+      if (metas.length !== 1) return 'metas=' + metas.length;
+      const sha = metas[0].storageKey;
+      const root = await navigator.storage.getDirectory();
+      const dir = await (await root.getDirectoryHandle('attachments')).getDirectoryHandle(sha.slice(0, 2));
+      const fh = await dir.getFileHandle(sha, { create: false });
+      const bytes = new Uint8Array(await (await fh.getFile()).arrayBuffer());
+      bytes[10] ^= 0xFF; // flip one byte behind live metadata
+      const w = await fh.createWritable();
+      await w.write(bytes.buffer);
+      await w.close();
+      return 'corrupted';
+    })()`);
+    check('I-E32 the durable blob was mutated in place (audit repro setup)', corruptResult === 'corrupted', String(corruptResult));
+    await evaluate(cdp, `window.__img.calls.length = 0; window.__locusWire.responses.length = 0; window.__locus.actions.submit('case h corrupt'); 'submitted'`);
+    // The follow-up continues the SAME conversation ('case h seed'): the
+    // restored history carries the image part, so resolution must fail.
+    await waitCond(`(() => {
+      const c = window.__locus.store.conversations.find(x => x.title === 'case h seed');
+      return !!c && c.items.some(i => i.kind === 'error' && i.code === 'image_attachment_integrity');
+    })()`, 'case-h-corrupt', 15000);
+    const callsH = await evaluate(cdp, `window.__img.calls`);
+    const integrityItem = await evaluate(cdp, `(() => {
+      const c = window.__locus.store.conversations.find(x => x.title === 'case h seed');
+      const item = c && c.items.filter(i => i.kind === 'error').pop();
+      return item ? { code: item.code || null, text: String(item.message || '') } : null;
+    })()`);
+    check('I-E33 corrupted OPFS blob → ZERO provider requests (audit HIGH repro closed)',
+      callsH.length === 0, 'calls=' + callsH.length);
+    check('I-E34 truthful integrity feedback distinguishes corrupt from missing',
+      !!integrityItem && /verification \(hash_mismatch\)/i.test(integrityItem.text)
+        && !/no longer available/i.test(integrityItem.text),
+      JSON.stringify(integrityItem));
+    const statusH = await evaluate(cdp, `window.__locus.capabilities.status()`);
+    check('I-E35 integrity failure did not touch the capability registry',
+      statusH && statusH.state === 'supported' && statusH.source === 'user', JSON.stringify(statusH));
+
+    // ============ CASE I: provider rejects the image INSTANCE → registry UNCHANGED ============
+    // invalid_image: valid magic locally, provider says the file is corrupt.
+    await evaluate(cdp, `window.__img.reset()`);
+    await evaluate(cdp, `(async () => {
+      await window.__img.configure('vision-model-i');
+      const id = createProviderIdentity({ provider: 'openai', adapterId: 'openai-compatible', dialect: 'openai', apiBase: ${JSON.stringify(BASE)}, model: 'vision-model-i' });
+      await window.__locus.capabilities.registry().setUserDecision(id, 'supported');
+    })()`);
+    await evaluate(cdp, `window.__img.upload('shot-i.png')`);
+    await evaluate(cdp, `window.__locusWire.responses.push(${literal({
+      __status: 400,
+      json: { error: { code: 'invalid_image', message: 'Invalid image: the image file is corrupted or missing data.', param: 'content' } },
+    })}); window.__img.calls.length = 0; window.__locus.actions.submit('case i corrupt'); 'submitted'`);
+    await waitCond(`(() => {
+      const c = window.__locus.store.conversations.find(x => x.title === 'case i corrupt');
+      return !!c && c.status === 'error';
+    })()`, 'case-i-invalid', 15000);
+    const callsI = await evaluate(cdp, `window.__img.calls`);
+    const statusI = await evaluate(cdp, `window.__locus.capabilities.status()`);
+    check('I-E36 invalid_image 400 → exactly ONE request, registry stays supported/user',
+      callsI.length === 1 && statusI.state === 'supported' && statusI.source === 'user',
+      JSON.stringify({ calls: callsI.length, status: statusI }));
+    // mime_unsupported: unsupported media_type must likewise never downgrade.
+    await evaluate(cdp, `window.__img.reset()`);
+    await evaluate(cdp, `(async () => {
+      await window.__img.configure('vision-model-i2');
+      const id = createProviderIdentity({ provider: 'openai', adapterId: 'openai-compatible', dialect: 'openai', apiBase: ${JSON.stringify(BASE)}, model: 'vision-model-i2' });
+      await window.__locus.capabilities.registry().setUserDecision(id, 'supported');
+    })()`);
+    await evaluate(cdp, `window.__img.upload('shot-i2.png')`);
+    await evaluate(cdp, `window.__locusWire.responses.push(${literal({
+      __status: 400,
+      json: { error: { message: 'Unsupported media_type: image/gif. Supported formats: image/png, image/jpeg, image/webp.', param: 'messages' } },
+    })}); window.__img.calls.length = 0; window.__locus.actions.submit('case i mime'); 'submitted'`);
+    await waitCond(`(() => {
+      const c = window.__locus.store.conversations.find(x => x.title === 'case i mime');
+      return !!c && c.status === 'error';
+    })()`, 'case-i-mime', 15000);
+    const callsI2 = await evaluate(cdp, `window.__img.calls`);
+    const statusI2 = await evaluate(cdp, `window.__locus.capabilities.status()`);
+    check('I-E37 unsupported media_type 400 → ONE request, registry stays supported/user',
+      callsI2.length === 1 && statusI2.state === 'supported' && statusI2.source === 'user',
+      JSON.stringify({ calls: callsI2.length, status: statusI2 }));
+
+    // ============ CASE J: memory-only durability warning (honest, out of provider history) ============
+    await evaluate(cdp, `window.__img.reset()`);
+    await evaluate(cdp, `(async () => {
+      await window.__img.configure('vision-model-j');
+      const id = createProviderIdentity({ provider: 'openai', adapterId: 'openai-compatible', dialect: 'openai', apiBase: ${JSON.stringify(BASE)}, model: 'vision-model-j' });
+      await window.__locus.capabilities.registry().setUserDecision(id, 'supported');
+      // Simulate OPFS unavailability at the persistence layer (the same
+      // state a browser without OPFS reports). Memory Map takes over.
+      window.PersistenceServiceInstance.opfsRoot = null;
+      window.PersistenceServiceInstance.opfsAvailable = false;
+      return 'memory-only';
+    })()`);
+    await evaluate(cdp, `window.__img.upload('shot-j.png')`);
+    await evaluate(cdp, `window.__locusWire.responses.push(${literal({
+      choices: [{ message: { role: 'assistant', content: 'case j done' }, finish_reason: 'stop' }],
+    })}); window.__img.calls.length = 0; window.__locus.actions.submit('case j memory only'); 'submitted'`);
+    await waitCond(`(() => {
+      const c = window.__locus.store.conversations.find(x => x.title === 'case j memory only');
+      return !!c && c.status === 'completed';
+    })()`, 'case-j-complete', 15000);
+    const callsJ = await evaluate(cdp, `window.__img.calls`);
+    check('I-E38 memory-only: the current image task still works (never disabled)',
+      callsJ.length === 1 && JSON.stringify(callsJ[0].body).includes(SENTINEL_PNG_B64), 'calls=' + callsJ.length);
+    const warnJ = await evaluate(cdp, `(() => {
+      const c = window.__locus.store.conversations.find(x => x.title === 'case j memory only');
+      const item = c && c.items.find(i => i.kind === 'warning' && /memory-only/i.test(String(i.message || '')));
+      return item ? String(item.message) : null;
+    })()`);
+    check('I-E39 memory-only: the user explicitly sees the durability warning',
+      !!warnJ && /will not survive a page reload/i.test(warnJ), String(warnJ));
+    const historyJ = await evaluate(cdp, `(async () => {
+      const frames = JSON.stringify(await window.__img.idbAll('providerFrames'));
+      const normalized = JSON.stringify(await window.__img.idbAll('normalizedMessages'));
+      return [frames, normalized].some(s => s.includes('memory-only'));
+    })()`);
+    check('I-E40 the durability warning never enters provider-visible history',
+      historyJ === false, String(historyJ));
+    // Restore OPFS for the remaining cases.
+    await evaluate(cdp, `(async () => {
+      window.PersistenceServiceInstance.opfsRoot = await navigator.storage.getDirectory();
+      window.PersistenceServiceInstance.opfsAvailable = true;
+      return 'restored';
+    })()`);
+
+    // ============ CASE K: concurrent same-bytes ingest canonicalizes (browser OPFS/IDB) ============
+    await evaluate(cdp, `window.__img.reset()`);
+    const concK = await evaluate(cdp, `(async () => {
+      const store = window.__locus.attachments.store();
+      const bytes = Uint8Array.from(atob(window.__img.pngB64), c => c.charCodeAt(0));
+      const results = await Promise.all(Array.from({ length: 10 }, (_, i) =>
+        store.ingestImage({ bytes, name: 'conc-' + i + '.png', declaredType: 'image/png' })));
+      const metas = await window.PersistenceServiceInstance.allAttachmentMetas();
+      return {
+        uniqueIds: Array.from(new Set(results.map((r) => r.id))).length,
+        metas: metas.length,
+        sameSha: results.every((r) => r.sha256 === results[0].sha256),
+      };
+    })()`);
+    check('I-E41 (CASE 5) 10 concurrent same-bytes ingests → one canonical attachment, one blob',
+      concK.uniqueIds === 1 && concK.metas === 1 && concK.sameSha === true, JSON.stringify(concK));
+
+
     // ============ viewport matrix + Escape/Cancel semantics ============
     const VIEWPORTS = [
       { name: '360x800', width: 360, height: 800, mobile: true },
