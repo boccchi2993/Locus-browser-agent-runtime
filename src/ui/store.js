@@ -156,13 +156,18 @@ function wiredModelClient(body, opts) {
     : callModel(Object.assign({ model: Model.model }, body), opts);
   return invoke().catch(async (e) => {
     // Authoritative provider rejection of IMAGE input (docs/IMAGE-INPUT.md):
-    // only an explicit pre-inference request-validation rejection (400/422
-    // naming image content) downgrades the registry. Auth/quota/5xx/
-    // timeouts/parse failures never do. The error is rethrown unchanged —
-    // the agent's conservative fallback policy applies (no automatic
-    // image-less resend, no double inference).
+    // ONLY an explicit model-level capability rejection (classifier kind
+    // 'model_unsupported' — e.g. "this model does not support image input")
+    // downgrades the registry. A rejected/corrupt IMAGE INSTANCE
+    // ('invalid_image') or an unsupported FORMAT ('mime_unsupported') is an
+    // input failure, never capability evidence: the registry keeps its
+    // previous state. Auth/quota/404/5xx/timeouts/parse failures and any
+    // other ambiguous error never do either. The error is rethrown
+    // unchanged — the agent's conservative fallback policy applies (no
+    // automatic image-less resend, no double inference).
     try {
-      if (typeof isImageUnsupportedProviderError === 'function' && isImageUnsupportedProviderError(e)) {
+      if (typeof classifyImageProviderError === 'function'
+        && classifyImageProviderError(e).kind === 'model_unsupported') {
         const identity = imageInputIdentity();
         const s = ensureImageStores();
         if (identity && s) await s.registry.recordProviderRejection(identity, e && e.message);
@@ -800,6 +805,18 @@ async function buildImageUserContent(input) {
       });
     }
     return { parts: null, blocked: true };
+  }
+  // Durability honesty (docs/IMAGE-INPUT.md, "Memory-only durability"):
+  // when OPFS is unavailable the snapshot lives only in the page-lifetime
+  // memoryAttachmentBytes Map even though the metadata may persist in
+  // IndexedDB. The current task may still send the image, but the user
+  // must KNOW it will not survive a reload — no silent durability lie.
+  // This reuses the PersistenceService's own OPFS state (no per-submit
+  // probe); the warning is a presentation event only and never enters
+  // provider-visible history (frames / normalized messages / replay).
+  if (typeof PersistenceServiceInstance !== 'undefined'
+      && PersistenceServiceInstance && PersistenceServiceInstance.opfsAvailable === false) {
+    warn('Image attachment storage is memory-only in this browser session; the attached image will not survive a page reload.');
   }
   return { parts, blocked: false };
 }
