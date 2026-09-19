@@ -42,18 +42,45 @@ function capabilityIdentityKey(identity) {
   ].join('|'));
 }
 
+// ---------- endpoint identity (F-I21) ----------
+// Builtin seeds may only ever match OFFICIAL provider endpoints. Matching
+// happens on the URL-PARSED hostname — never on raw substring/regex
+// contains, because strings like "https://api.deepseek.com@evil.com" or
+// "https://evil.com/api.deepseek.com/v1" embed a trusted-looking host in
+// a URL whose REAL hostname is attacker-controlled. `new URL()` resolves
+// userinfo, paths and ports for us; the host must then be an EXACT
+// case-insensitive match of the official hostname (default port only).
+// Returns null for anything that is not an absolute http(s) URL.
+function parseEndpointIdentity(endpoint) {
+  var raw = String(endpoint || '').trim();
+  if (!raw) return null;
+  var url;
+  try { url = new URL(raw); } catch (e) { return null; }
+  var scheme = String(url.protocol || '').toLowerCase();
+  if (scheme !== 'http:' && scheme !== 'https:') return null;
+  if (url.username || url.password) return null; // userinfo = never official
+  if (url.port) return null; // official seeds match the default port only
+  return { hostname: String(url.hostname || '').toLowerCase() };
+}
+
+function isOfficialProviderEndpoint(endpoint, officialHostname) {
+  var parsed = parseEndpointIdentity(endpoint);
+  return !!parsed && parsed.hostname === String(officialHostname || '').toLowerCase();
+}
+
 // ---------- builtin seed ----------
 // A small, deliberately conservative seed so common configurations skip
 // the interactive ask. Bound to known provider families + OFFICIAL
-// endpoint families + known model id patterns (verified against current
-// vendor docs, see docs/IMAGE-INPUT.md). It is a fallback ONLY: any
-// persisted user decision, probe result or provider rejection outranks
-// it, and unknown models fall through to the lazy ask. Never a bare
-// substring heuristic like /vision/.
+// hostnames (exact URL-host match via parseEndpointIdentity) + known
+// model id patterns (verified against current vendor docs, see
+// docs/IMAGE-INPUT.md). It is a fallback ONLY: any persisted user
+// decision, probe result or provider rejection outranks it, and unknown
+// models fall through to the lazy ask. Never a bare substring heuristic
+// like /vision/, and never a hostname CONTAINS test.
 var BUILTIN_MODEL_CAPABILITIES = [
   {
     family: 'deepseek',
-    endpointPattern: /api\.deepseek\.com/i,
+    officialHostname: 'api.deepseek.com',
     // Official DeepSeek API docs: the deepseek-flash model accepts image
     // input (PNG/JPEG/GIF/WebP); the V3-series deepseek-chat /
     // deepseek-reasoner models are text-only.
@@ -64,7 +91,7 @@ var BUILTIN_MODEL_CAPABILITIES = [
   },
   {
     family: 'openai',
-    endpointPattern: /\/\/api\.openai\.com(?::\d+)?(?:$|[/?])/i,
+    officialHostname: 'api.openai.com',
     // Official OpenAI vision-capable model families (image_url content
     // parts on Chat Completions): GPT-4o family, GPT-4.1 family, the
     // reasoning o-series and the legacy GPT-4 vision variants. The
@@ -76,7 +103,7 @@ var BUILTIN_MODEL_CAPABILITIES = [
   },
   {
     family: 'anthropic',
-    endpointPattern: /\/\/api\.anthropic\.com(?::\d+)?(?:$|[/?])/i,
+    officialHostname: 'api.anthropic.com',
     // Official Anthropic vision docs: the Claude 3+ generations accept
     // base64 image blocks on Messages API.
     models: [
@@ -86,14 +113,19 @@ var BUILTIN_MODEL_CAPABILITIES = [
 ];
 
 // First matching rule wins; no match → null (the lazy flow decides).
+// Builtin seed invariant: known provider family + OFFICIAL hostname
+// (exact URL-host match) + known model rule. A third-party compatible
+// endpoint never inherits the official builtin, no matter what model
+// string or path it carries — those stay unknown.
 function builtinImageCapability(identity) {
   var i = identity || {};
   var model = String(i.model || '');
-  var endpoint = String(i.endpointIdentity || '');
-  if (!model || !endpoint) return null;
+  if (!model) return null;
+  var parsed = parseEndpointIdentity(i.endpointIdentity || '');
+  if (!parsed) return null;
   for (var r = 0; r < BUILTIN_MODEL_CAPABILITIES.length; r++) {
     var rule = BUILTIN_MODEL_CAPABILITIES[r];
-    if (!rule.endpointPattern.test(endpoint)) continue;
+    if (parsed.hostname !== rule.officialHostname) continue;
     for (var m = 0; m < rule.models.length; m++) {
       if (rule.models[m].pattern.test(model)) return rule.models[m].state;
     }
@@ -471,20 +503,92 @@ function probeColorWords(text) {
   return m || [];
 }
 
-// ---------- provider image-rejection classification ----------
-// Conservative: only an EXPLICIT request-validation rejection naming
-// image content (HTTP 400/422) counts as capability evidence. Auth,
-// quota, 5xx, timeouts, network failures, generic parse failures and
-// size limits NEVER downgrade capability (docs/IMAGE-INPUT.md).
+// ---------- provider image-rejection classification (F-I56) ----------
+// CONSERVATIVE PRINCIPLE (docs/IMAGE-INPUT.md): a FALSE NEGATIVE in
+// capability detection is acceptable — a missed downgrade only means the
+// human is asked again. A FALSE POSITIVE persistent downgrade is not: a
+// healthy vision model must never be permanently marked text-only. When
+// a rejection cannot be attributed with confidence → 'ambiguous'.
+//
+// Categories:
+//   'model_unsupported' — an explicit MODEL/path capability attribution
+//     ("this model does not support image input"). The ONLY category
+//     that may persist unsupported/provider-rejection.
+//   'mime_unsupported' — the image's FORMAT/media type was rejected
+//     ("unsupported media_type image/gif"). Input-instance failure:
+//     the request fails, the model's overall image capability is NOT
+//     changed (no per-MIME registry in v1).
+//   'invalid_image' — the image BYTES were rejected (corrupt, truncated,
+//     undecodable, oversized, bad base64). Input-instance failure;
+//     capability NOT changed.
+//   'ambiguous' — everything else: auth (401/403), model-not-found
+//     (404), quota (429), 5xx, timeouts, network, parse errors,
+//     tool-schema rejections, generic 400/422 validation and any text
+//     without explicit image semantics. Never capability evidence.
+//
+// HTTP status is a HINT only: non-400/422 can never be evidence, and a
+// 400/422 becomes evidence solely through the explicit model-level
+// semantics below — never through the status code alone. A bad image
+// must not read as "no image support".
+//
+// `detail` is a truncated debug/UI summary. It is never returned to the
+// model and never contains payload bytes.
+function classifyImageProviderError(e) {
+  var status = e && typeof e.status === 'number' ? e.status : null;
+  var pe = (e && e.providerError) || {};
+  var raw = [e && e.message, pe.message, pe.param, pe.type, pe.code]
+    .filter(function (v) { return v !== undefined && v !== null && v !== ''; })
+    .map(function (v) { return String(v); }).join(' | ');
+  var detail = raw.slice(0, 300);
+  if (status !== 400 && status !== 422) return { kind: 'ambiguous', detail: detail };
+  var text = raw.toLowerCase();
+  if (!text) return { kind: 'ambiguous', detail: detail };
+
+  // 1) Format/media-type failures FIRST: they may name the model too
+  //    ("model does not support image/gif" is a format fact), and must
+  //    never be read as a whole-model capability rejection.
+  var formatNoun = /(image ?formats?|media ?_?types?|image\/[a-z0-9.+-]+|\b(gif|jpe?g|png|webp|bmp|tiff|heic|heif|avif)\b)/.test(text);
+  if (formatNoun && /(unsupported|not\s+support|invalid|unexpected|unknown|bad|wrong)/.test(text)) {
+    return { kind: 'mime_unsupported', detail: detail };
+  }
+
+  // 2) The image BYTES themselves are bad (input-instance failure).
+  if (/\binvalid[ _-]?image/.test(text)
+    || /image[^.\n]{0,60}(corrupt|truncat|malformed|unparsable|undecodable|decod|damaged|missing data|cannot be read|failed to (process|decode|parse)|is not valid)/.test(text)
+    || /(corrupt|truncat|malformed|unparsable|decod|damaged)[^.\n]{0,60}image/.test(text)
+    || /(bad|invalid|malformed)[^.\n]{0,20}base64/.test(text)
+    || /image[^.\n]{0,40}(too large|exceeds)/.test(text)
+    || /dimensions?[^.\n]{0,30}(invalid|too large|exceed)/.test(text)) {
+    return { kind: 'invalid_image', detail: detail };
+  }
+
+  // 3) Explicit MODEL/path capability attribution. Every pattern demands
+  //    BOTH a model-level subject AND image-input semantics in the same
+  //    clause; anything looser stays 'ambiguous' (conservative).
+  var modelImageUnsupported = [
+    /\b(model|deployment|endpoint)\b[^.\n]{0,80}\b(does\s?not|doesn'?t|do not|cannot|can'?t|can not|unable to|won'?t|will not)\b[^.\n]{0,60}\b(support|accept|process|handle|ingest|take)\b[^.\n]{0,80}\b(image|vision|multimodal|visual|picture|photo)/,
+    /\bimage[s]?\b[^.\n]{0,60}\b(is|are)\s+(not\s+supported|unsupported|not\s+accepted|not\s+available|no longer supported)\b[^.\n]{0,80}\b(by|for|on|with|in)\b[^.\n]{0,40}\b(this|the|that|selected|current|chosen|target|requested)\b[^.\n]{0,40}\b(model|deployment)/,
+    /\bvision\b[^.\n]{0,60}\bnot\s+available\b[^.\n]{0,60}\b(model|deployment)\b/,
+    /\b(model|deployment)\b[^.\n]{0,80}\bonly\s+supports?\b[^.\n]{0,60}\btext\b/,
+    /\btext[-\s]only\b[^.\n]{0,60}\b(model|deployment)\b/,
+    /\bnot\s+(a|an)\s+(vision|multimodal|image-capable|image)\b/,
+    /\bimage[ _]?(url|input|content|part)s?\b[^.\n]{0,80}\bonly\b[^.\n]{0,60}\b(supported|accepted|available)\b[^.\n]{0,80}\b(vision|multimodal|image)/,
+  ];
+  for (var i = 0; i < modelImageUnsupported.length; i++) {
+    if (modelImageUnsupported[i].test(text)) return { kind: 'model_unsupported', detail: detail };
+  }
+
+  // 4) Everything else — "tools not supported", generic "invalid
+  //    request", model-not-found, token errors, … — stays ambiguous.
+  return { kind: 'ambiguous', detail: detail };
+}
+
+// Boolean seam over the classifier (kept for the probe + error paths):
+// TRUE only for an explicit model-level capability rejection. Corrupt
+// images and unsupported MIME types are NOT model capability evidence
+// (F-I56): they never downgrade the registry.
 function isImageUnsupportedProviderError(e) {
-  if (!e || (e.status !== 400 && e.status !== 422)) return false;
-  var pe = e.providerError || {};
-  var text = [e.message, pe.param, pe.type, pe.code]
-    .map(function (v) { return String(v || ''); }).join(' ').toLowerCase();
-  if (!text) return false;
-  if (/(too large|size limit|too many|maximum (image|file|request) size|payload too large)/.test(text)) return false;
-  return /(image|content part|content_type|media ?type|multimodal|modalit|vision)/.test(text)
-    && /(unsupported|not supported|does not support|unknown|unrecognized|unexpected|invalid|not allowed|cannot)/.test(text);
+  return classifyImageProviderError(e).kind === 'model_unsupported';
 }
 
 function classifyProbeFailure(e) {

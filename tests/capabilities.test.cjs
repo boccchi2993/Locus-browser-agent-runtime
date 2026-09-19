@@ -20,7 +20,7 @@ const A = eval(
 );
 const C = eval(
   fs.readFileSync(path.join(__dirname, '..', 'src', 'capabilities.js'), 'utf8') +
-  '\n;({ ModelCapabilityRegistry, createImageInputGate, capabilityIdentityKey, builtinImageCapability, imageInputUnavailableNotice, runImageInputProbe, isImageUnsupportedProviderError });'
+  '\n;({ ModelCapabilityRegistry, createImageInputGate, capabilityIdentityKey, builtinImageCapability, imageInputUnavailableNotice, runImageInputProbe, isImageUnsupportedProviderError, classifyImageProviderError, parseEndpointIdentity, isOfficialProviderEndpoint });'
 );
 
 let passed = 0, failed = 0;
@@ -228,6 +228,116 @@ async function main() {
     && !C.isImageUnsupportedProviderError({ status: 500, message: 'internal error' })
     && !C.isImageUnsupportedProviderError({ status: 400, message: 'image too large: 9 MB exceeds the 5 MB limit' })
     && !C.isImageUnsupportedProviderError({ status: 400, message: 'tools payload is unsupported' }));
+
+  // ============================================================
+  //  F-I21 — builtin endpoint identity: URL-parsed hostname, exact match
+  // ============================================================
+  const OPENAI_ID = (endpoint, model) => identity({
+    provider: 'openai', adapterId: 'openai-compatible', dialect: 'openai',
+    endpointIdentity: endpoint, model: model || 'gpt-4o',
+    protocolVersion: 'chat-completions-v1',
+  });
+  const ANTHROPIC_ID = (endpoint, model) => identity({
+    endpointIdentity: endpoint, model: model || 'claude-sonnet-4-5',
+  });
+
+  check('E1 official DeepSeek hostname matches exactly (bare + /v1 + path variants)',
+    C.isOfficialProviderEndpoint('https://api.deepseek.com', 'api.deepseek.com')
+    && (await registry.lookup(OPENAI_ID('https://api.deepseek.com/v1', 'deepseek-flash'))).state === 'supported'
+    && (await registry.lookup(DEEPSEEK_FLASH)).state === 'supported');
+  check('E1b OpenAI/Anthropic official hostnames still seed',
+    (await registry.lookup(OPENAI_ID('https://api.openai.com/v1'))).state === 'supported'
+    && (await registry.lookup(ANTHROPIC_ID('https://api.anthropic.com'))).state === 'supported');
+
+  // The audit's exact repro set — all three must stay unknown.
+  check('E2 (T5) deepseek lookalike SUBDOMAIN is unknown',
+    (await registry.lookup(DEEPSEEK_FLASH, ) && true)
+    && (await registry.lookup(identity({ endpointIdentity: 'https://api.deepseek.com.evil.com', model: 'deepseek-flash' }))).state === 'unknown'
+    && (await registry.lookup(identity({ endpointIdentity: 'https://evil-api.deepseek.com', model: 'deepseek-flash' }))).state === 'unknown');
+  check('E3 (T6) deepseek PATH-EMBEDDED host is unknown',
+    (await registry.lookup(identity({ endpointIdentity: 'https://evil.com/api.deepseek.com/v1', model: 'deepseek-flash' }))).state === 'unknown'
+    && (await registry.lookup(identity({ endpointIdentity: 'https://attacker.example/api.deepseek.com', model: 'deepseek-chat' }))).state === 'unknown');
+  check('E4 (T7) deepseek USERINFO attack is unknown (userinfo is rejected outright; real hostname is evil.com)',
+    C.parseEndpointIdentity('https://api.deepseek.com@evil.com/v1') === null
+    && (await registry.lookup(identity({ endpointIdentity: 'https://api.deepseek.com@evil.com/v1', model: 'deepseek-flash' }))).state === 'unknown'
+    && (await registry.lookup(identity({ endpointIdentity: 'https://deepseek-flash@api.deepseek.com.evil.com', model: 'deepseek-flash' }))).state === 'unknown');
+  check('E5 near-miss hostnames never official-match: apex / typo / port',
+    (await registry.lookup(identity({ endpointIdentity: 'https://deepseek.com', model: 'deepseek-flash' }))).state === 'unknown'
+    && (await registry.lookup(identity({ endpointIdentity: 'https://api.deepseek.co', model: 'deepseek-flash' }))).state === 'unknown'
+    && (await registry.lookup(OPENAI_ID('https://api.openai.com:8080/v1'))).state === 'unknown');
+  check('E6 (T8) OpenAI lookalikes stay unknown',
+    (await registry.lookup(OPENAI_ID('https://api.openai.com.evil.com/v1'))).state === 'unknown'
+    && (await registry.lookup(OPENAI_ID('https://evil.com/api.openai.com/v1'))).state === 'unknown'
+    && (await registry.lookup(OPENAI_ID('https://api.openai.com@evil.com/v1'))).state === 'unknown'
+    && (await registry.lookup(OPENAI_ID('https://api.openai.com.evil.com', 'gpt-4o-2024-08-06'))).state === 'unknown');
+  check('E7 Anthropic lookalikes stay unknown',
+    (await registry.lookup(ANTHROPIC_ID('https://api.anthropic.com.evil.com'))).state === 'unknown'
+    && (await registry.lookup(ANTHROPIC_ID('https://evil.com/api.anthropic.com/v1'))).state === 'unknown'
+    && (await registry.lookup(ANTHROPIC_ID('https://api.anthropic.com@evil.com'))).state === 'unknown');
+  check('E8 non-http(s) or garbage endpoints never match',
+    C.parseEndpointIdentity('ftp://api.deepseek.com') === null
+    && C.parseEndpointIdentity('api.deepseek.com') === null
+    && C.parseEndpointIdentity('') === null
+    && (await registry.lookup(identity({ endpointIdentity: 'not a url', model: 'deepseek-flash' }))).state === 'unknown');
+  check('E9 the seed never matches on a substring of the model name (prefix anchoring kept)',
+    (await registry.lookup(OPENAI_ID('https://api.openai.com/v1', 'my-gpt-4o-clone'))).state === 'unknown'
+    && (await registry.lookup(identity({ model: 'xdeepseek-flash' }))).state === 'unknown');
+
+  // ============================================================
+  //  F-I56 — classifyImageProviderError: conservative categories
+  // ============================================================
+  const kindOf = (e) => C.classifyImageProviderError(e).kind;
+
+  check('K1 (T9) explicit model-level rejections → model_unsupported',
+    kindOf({ status: 400, message: 'this model does not support image input' }) === 'model_unsupported'
+    && kindOf({ status: 400, message: 'Image input is not supported by this model.' }) === 'model_unsupported'
+    && kindOf({ status: 400, message: 'vision is not available for this model' }) === 'model_unsupported'
+    && kindOf({ status: 400, message: 'This model only supports text input.' }) === 'model_unsupported'
+    && kindOf({ status: 400, message: 'image content is unsupported for the selected model' }) === 'model_unsupported'
+    && kindOf({ status: 400, message: "Invalid 'messages[0].content[1].image_url': image input is only supported by models that support vision" }) === 'model_unsupported'
+    && kindOf({ status: 422, message: 'this is a text-only model' }) === 'model_unsupported');
+
+  check('K2 (T10) corrupt/bad image rejections → invalid_image, capability evidence NO',
+    kindOf({ status: 400, code: 'invalid_image', message: 'Invalid image: the image file is corrupted or missing data.' }) === 'invalid_image'
+    && kindOf({ status: 400, message: 'failed to decode truncated image' }) === 'invalid_image'
+    && kindOf({ status: 400, message: 'bad base64 in image data' }) === 'invalid_image'
+    && kindOf({ status: 400, message: 'image too large: 9 MB exceeds the 5 MB limit' }) === 'invalid_image'
+    && kindOf({ status: 400, message: 'invalid image dimensions' }) === 'invalid_image'
+    && kindOf({ status: 422, message: 'malformed image payload' }) === 'invalid_image');
+
+  check('K3 (T11) format/media-type rejections → mime_unsupported, capability evidence NO',
+    kindOf({ status: 400, message: 'Unsupported media_type: image/gif' }) === 'mime_unsupported'
+    && kindOf({ status: 400, message: 'unsupported image format' }) === 'mime_unsupported'
+    && kindOf({ status: 400, message: 'this image format is unsupported' }) === 'mime_unsupported'
+    && kindOf({ status: 400, message: 'GIF not supported' }) === 'mime_unsupported'
+    && kindOf({ status: 422, message: 'invalid media type' }) === 'mime_unsupported'
+    && kindOf({ status: 400, message: 'this model does not support image/gif' }) === 'mime_unsupported');
+
+  check('K4 (T12) auth/quota/model/server/timeout/network/tools → ambiguous',
+    kindOf({ status: 401, message: 'invalid api key' }) === 'ambiguous'
+    && kindOf({ status: 403, message: 'forbidden' }) === 'ambiguous'
+    && kindOf({ status: 404, message: 'model not found: gpt-nonexistent' }) === 'ambiguous'
+    && kindOf({ status: 429, message: 'rate limited' }) === 'ambiguous'
+    && kindOf({ status: 500, message: 'internal server error' }) === 'ambiguous'
+    && kindOf(Object.assign(new Error('timed out'), { timeout: true })) === 'ambiguous'
+    && kindOf(new TypeError('failed to fetch')) === 'ambiguous'
+    && kindOf({ status: 400, message: 'tools payload is not supported by this endpoint' }) === 'ambiguous'
+    && kindOf({ status: 422, message: 'invalid request: max_tokens is too large' }) === 'ambiguous');
+
+  check('K5 status alone is NEVER evidence; generic 400 stays ambiguous',
+    kindOf({ status: 400, message: 'invalid request' }) === 'ambiguous'
+    && kindOf({ status: 400, message: 'the request could not be processed' }) === 'ambiguous'
+    && kindOf({ status: 400 }) === 'ambiguous'
+    && kindOf({ status: 400, message: 'image', providerError: {} }) === 'ambiguous');
+
+  check('K6 the boolean seam is true ONLY for model_unsupported',
+    C.isImageUnsupportedProviderError({ status: 400, message: 'this model does not support image input' })
+    && !C.isImageUnsupportedProviderError({ status: 400, code: 'invalid_image', message: 'Invalid image: the image file is corrupted or missing data.' })
+    && !C.isImageUnsupportedProviderError({ status: 400, message: 'Unsupported media_type: image/gif' }));
+
+  check('K7 classification detail is a bounded debug summary (no payload semantics change)',
+    C.classifyImageProviderError({ status: 400, message: 'x'.repeat(1000) }).detail.length <= 300
+    && typeof C.classifyImageProviderError({ status: 400, message: 'boom' }).detail === 'string');
 
   console.log('---');
   console.log('capabilities.test.cjs: ' + passed + ' passed, ' + failed + ' failed');
