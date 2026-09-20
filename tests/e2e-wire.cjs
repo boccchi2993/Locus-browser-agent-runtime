@@ -143,6 +143,14 @@ async function main() {
     await waitForRuntimeCondition(cdp, `window.__locus.store.conversations.some(c => c.title === 'seed openai raw tool transcript' && c.status === 'completed')`, {
       process: chrome, phase: 'wire-c01-openai-seed', timeoutMs: 15000,
     });
+    const openAiSeedCalls = await evaluate(cdp, 'window.__locusWire.calls');
+    const openAiToolBody = JSON.stringify(
+      (openAiSeedCalls.find((c) => JSON.stringify(c?.body || {}).includes('seeded tool output')) || {}).body || {});
+    check('BE-E1 OpenAI native tool result omits execution backend (R-NF05A\u2032)',
+      openAiToolBody.includes('seeded tool output')
+      && !openAiToolBody.includes('backend:')
+      && !openAiToolBody.includes('browser-direct') && !openAiToolBody.includes('edge-relay'),
+      openAiToolBody.slice(0, 200));
     const openAiAttackId = await evaluate(cdp, `window.__locus.store.conversations.find(c => c.title === 'seed openai raw tool transcript').id`);
     const openAiAttackSession = await evaluate(cdp, `window.__locus.store.conversations.find(c => c.id === ${literal(openAiAttackId)}).activeProviderSessionId`);
     await evaluate(cdp, `(async () => {
@@ -176,7 +184,7 @@ async function main() {
     check('C01 wire OpenAI raw dangling tool call sends zero requests', afterOpenAiCorrupt === beforeOpenAiCorrupt, 'before=' + beforeOpenAiCorrupt + ',after=' + afterOpenAiCorrupt);
 
     // The same metadata corruption must be rejected for Anthropic tool_use.
-    await evaluate(cdp, `(async () => { await window.__locus.actions.resetAllData(); const s = window.__locus.store.settings; s.apiBase = 'https://gateway.example/tenant-b'; s.dialect = 'anthropic'; s.model = 'audit-model'; s.apiKey = 'KEY_B'; s.remember = false; window.__locus.actions.applySettings(); })()`);
+    await evaluate(cdp, `(async () => { await window.__locus.actions.resetAllData(); const s = window.__locus.store.settings; s.apiBase = 'https://gateway.example/tenant-b'; s.dialect = 'anthropic'; s.model = 'audit-model'; s.apiKey = 'KEY_B'; s.remember = false; window.__locus.actions.applySettings(); window.__e2eToolExecutor = async () => ({ output: 'seeded tool output', success: true, backend: 'browser' }); })()`);
     await evaluate(cdp, `(async () => {
       window.__locusWire.responses.push(${literal({
         content: [{ type: 'tool_use', id: 'wire-c01-anthropic', name: 'bash', input: { input: 'pwd' } }], stop_reason: 'tool_use',
@@ -188,6 +196,15 @@ async function main() {
     await waitForRuntimeCondition(cdp, `window.__locus.store.conversations.some(c => c.title === 'seed anthropic raw tool transcript' && c.status === 'completed')`, {
       process: chrome, phase: 'wire-c01-anthropic-seed', timeoutMs: 15000,
     });
+    const anthropicSeedCalls = await evaluate(cdp, 'window.__locusWire.calls');
+    const anthropicToolBody = JSON.stringify(
+      (anthropicSeedCalls.find((c) => String(c?.url || '').includes('tenant-b')
+        && JSON.stringify(c?.body || {}).includes('seeded tool output')) || {}).body || {});
+    check('BE-E2 Anthropic projection of the tool result omits execution backend (R-NF05A\u2032)',
+      anthropicToolBody.includes('seeded tool output')
+      && !anthropicToolBody.includes('backend:')
+      && !anthropicToolBody.includes('browser-direct') && !anthropicToolBody.includes('edge-relay'),
+      anthropicToolBody.slice(0, 200));
     const anthropicAttackId = await evaluate(cdp, `window.__locus.store.conversations.find(c => c.title === 'seed anthropic raw tool transcript').id`);
     const anthropicAttackSession = await evaluate(cdp, `window.__locus.store.conversations.find(c => c.id === ${literal(anthropicAttackId)}).activeProviderSessionId`);
     await evaluate(cdp, `(async () => {

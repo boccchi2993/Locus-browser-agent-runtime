@@ -14,6 +14,7 @@ const SUITES = [
   'fetch.test.mjs',
   'network.test.cjs',
   'network-runtime.test.cjs',
+  'runtime-visibility.test.cjs',
   'workspace.test.cjs',
   'vfs.test.cjs',
   'shell.test.cjs',

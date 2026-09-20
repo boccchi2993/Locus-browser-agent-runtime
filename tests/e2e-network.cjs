@@ -107,6 +107,9 @@ function startTargetServer(port) {
         return res.end('hostile-secret-body');
       }
       if (p === '/target/notfound') {
+        // N17d: record what the wire ACTUALLY delivered — query-string
+        // redaction is display-only, the request itself is untouched.
+        authSeen.notfoundQuery = req.url;
         return json(res, 404, { error: 'not found' }, cors);
       }
       if (p === '/target/echo' && (req.method === 'POST' || req.method === 'PUT')) {
@@ -515,6 +518,10 @@ const PAGE_SCRIPT = String.raw`
       r.output.includes('/target/notfound'), JSON.stringify(r.output));
     const tele = typeof Telemetry !== 'undefined' && Telemetry.records ? JSON.stringify(Telemetry.records) : '[]';
     check('N17c telemetry records hide the query secret', !tele.includes('SECRET_QUERY_123'), 'leaked');
+    const c17 = await counts();
+    check('N17d wire kept the query secret (display-only redaction)',
+      ((c17.auth && c17.auth.notfoundQuery) || '').includes('SECRET_QUERY_123'),
+      JSON.stringify(c17.auth));
   }
 
   // ---------- N18 mid-body TypeError after Response → no relay fallback (N-F06) ----------
@@ -550,6 +557,46 @@ const PAGE_SCRIPT = String.raw`
     check('N19c one relay leg, upstream saw method HEAD',
       c.relay - s.relay === 1 && c.auth && c.auth.headMethod === 'HEAD',
       'relayDelta=' + (c.relay - s.relay) + ' headMethod=' + (c.auth && c.auth.headMethod));
+  }
+
+  // ---------- N20 malformed URL is never echoed raw (R-NF04C) ----------
+  {
+    const s = await snapshot();
+    const r = await exec('curl "ht tp://example.com/?token=SECRET_BROWSER_E2E"');
+    const c = await snapshot();
+    check('N20 malformed URL fails bounded without echoing raw input',
+      !r.success && r.output.includes('invalid URL')
+      && !r.output.includes('SECRET_BROWSER_E2E') && !r.output.includes('ht tp'),
+      JSON.stringify(r.output));
+    check('N20b zero network attempts (no relay leg, no target hit)',
+      c.relay - s.relay === 0
+      && (c.hits['/target/cors-ok'] || 0) === (s.hits['/target/cors-ok'] || 0)
+      && (c.hits['/target/hostile'] || 0) === (s.hits['/target/hostile'] || 0),
+      'relayDelta=' + (c.relay - s.relay));
+    const tele = typeof Telemetry !== 'undefined' && Telemetry.records ? JSON.stringify(Telemetry.records) : '[]';
+    check('N20c telemetry hides the malformed sentinel', !tele.includes('SECRET_BROWSER_E2E'), 'leaked');
+  }
+
+  // ---------- N21 substrate metadata stays out of model-visible output (R-NF05A′) ----------
+  {
+    const direct = await exec('curl ' + TARGET + '/target/cors-ok');
+    check('N21 browser-direct route: output names no backend',
+      direct.success && !direct.output.includes('backend:')
+      && !direct.output.includes('browser-direct') && !direct.output.includes('edge-relay'),
+      JSON.stringify(direct.output));
+    const relayed = await exec('curl -I ' + API + '/target/head');
+    check('N21b edge-relay route: output names no backend',
+      relayed.success && relayed.output.includes('HTTP 200')
+      && !relayed.output.includes('backend:')
+      && !relayed.output.includes('browser-direct') && !relayed.output.includes('edge-relay'),
+      JSON.stringify(relayed.output));
+    check('N21c internal tool result still carries the backend',
+      direct.backend === 'browser-direct' && relayed.backend === 'edge-relay',
+      JSON.stringify({ direct: direct.backend, relayed: relayed.backend }));
+    const tele = typeof Telemetry !== 'undefined' && Telemetry.records ? JSON.stringify(Telemetry.records) : '[]';
+    check('N21d telemetry still records the backend substrate',
+      tele.includes('"backend":"browser-direct"') && tele.includes('"backend":"edge-relay"')
+      && !tele.includes('backend:'), 'telemetry backend missing or envelope text leaked');
   }
 
   return out.join('\n');
