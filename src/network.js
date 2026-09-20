@@ -272,8 +272,10 @@ const NetworkRuntime = {
         throw e;
       }
       if (readLike && isNetworkFailure(e)) {
+        // The fetch TypeError text embeds the full request URL — never
+        // reuse it: report the failure with the bounded constant instead.
         throw makeNetError('network_relay_failed',
-          'network request failed: ' + (e && e.message ? e.message : String(e)));
+          'network request failed: the request could not be dispatched');
       }
       throw mapWriteDispatchError(e, 'network_relay_failed');
     }
@@ -433,7 +435,10 @@ function parseHttpUrl(url) {
   try {
     parsed = new URL(String(url || ''));
   } catch (e) {
-    throw makeNetError('network_invalid_url', 'invalid URL: ' + String(url == null ? '' : url));
+    // UNPARSEABLE USER INPUT IS NOT SAFE DIAGNOSTIC TEXT: the raw input is
+    // never echoed (it may carry secrets, may be megabytes, and has no
+    // reliable structure to redact) — the message is a bounded constant.
+    throw makeNetError('network_invalid_url', 'invalid URL');
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw makeNetError('network_unsupported_scheme',
@@ -653,7 +658,12 @@ function makeNetError(code, message) {
 // are never wrapped, so they can never re-enter a backend fallback.
 class DirectTransportFailure extends Error {
   constructor(cause) {
-    super(cause && cause.message ? cause.message : 'network transport failure');
+    // The browser's TypeError text embeds the full request URL (e.g.
+    // "Failed to parse URL from <url>"), so it is NEVER reused as this
+    // error's message — the message stays a bounded constant. The cause
+    // is kept on the object only; no model-visible, telemetry or
+    // persistence path serializes it.
+    super('network transport failure');
     this.name = 'DirectTransportFailure';
     this.cause = cause;
   }
