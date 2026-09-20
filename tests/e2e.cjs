@@ -94,6 +94,9 @@ async function presentationE2e() {
     const image = spawnSync(process.execPath, [path.join(__dirname, 'e2e-image.cjs')], {
       stdio: 'inherit', env,
     });
+    const grep = spawnSync(process.execPath, [path.join(__dirname, 'e2e-grep.cjs')], {
+      stdio: 'inherit', env,
+    });
     return [
       ['presentation', ui.status === 0],
       ['responsive', resp.status === 0],
@@ -101,6 +104,7 @@ async function presentationE2e() {
       ['wire', wire.status === 0],
       ['approval', approval.status === 0],
       ['image', image.status === 0],
+      ['grep', grep.status === 0],
     ];
   } catch (error) {
     console.error(error && error.stack || error);

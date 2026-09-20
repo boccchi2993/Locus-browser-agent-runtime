@@ -31,6 +31,15 @@
     wtag.type = 'text/worker';
     wtag.textContent = m[1];
     document.body.appendChild(wtag);
+    // Same for the grep regex worker: extract the shipped source so the
+    // isolation boundary is exercised for real on the file:// harness.
+    const gm = html.match(/<script type="text\/worker" id="grep-worker-src">([\s\S]*?)<\/script>/);
+    if (!gm) throw new Error('grep worker source not found in index.html');
+    const gtag = document.createElement('script');
+    gtag.id = 'grep-worker-src';
+    gtag.type = 'text/worker';
+    gtag.textContent = gm[1];
+    document.body.appendChild(gtag);
 
     // Test-only in-memory workspace implementing the adapter interface.
     class MemWS extends WorkspaceAdapter {

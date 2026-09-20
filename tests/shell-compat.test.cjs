@@ -14,8 +14,11 @@ const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js',
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
 const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, normalizeVfsPath, VirtualWorkspace, UploadWorkspace,'
-  + ' PythonRuntime, runShellCommand, executeTool,'
+  + ' PythonRuntime, GrepRegexRuntime, runShellCommand, executeTool,'
   + ' Telemetry, SHELL_COMMANDS, shellHelpText, shellSystemPromptSection, SHELL_PIPE_MAX_BYTES });');
+// Node has no real Worker: grep regex execution runs through the TEST-ONLY deterministic fake.
+const { installGrepFakeWorker } = require('./helpers/grep-fake-worker.cjs');
+installGrepFakeWorker(M);
 
 // A bare VFS (no /mnt/workspace) or one wrapping a legacy adapter.
 function bareVfs() {

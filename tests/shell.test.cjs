@@ -14,7 +14,10 @@ global.document = { getElementById: () => null }; // PythonRuntime._setStatus to
 const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js', 'tools.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
-const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, normalizeVfsPath, VirtualWorkspace, SHELL_COMMANDS, PythonRuntime, runShellCommand, executeTool, shellSystemPromptSection, shellHelpText, Telemetry });');
+const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, normalizeVfsPath, VirtualWorkspace, SHELL_COMMANDS, PythonRuntime, GrepRegexRuntime, runShellCommand, executeTool, shellSystemPromptSection, shellHelpText, Telemetry });');
+// Node has no real Worker: grep regex execution runs through the TEST-ONLY deterministic fake.
+const { installGrepFakeWorker } = require('./helpers/grep-fake-worker.cjs');
+installGrepFakeWorker(M);
 
 // Wrap a legacy adapter the way asVfs does internally, but keep a handle on
 // the VFS so tests can assert through absolute paths.

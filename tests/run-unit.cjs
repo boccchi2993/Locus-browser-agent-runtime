@@ -21,6 +21,7 @@ const SUITES = [
   'shell-compat.test.cjs',
   'shell-compat2.test.cjs',
   'shell-compat3.test.cjs',
+  'grep-worker.test.cjs',
   'agent.test.cjs',
   'approval.test.cjs',
   'agent-approval.test.cjs',
