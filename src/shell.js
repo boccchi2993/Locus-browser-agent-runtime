@@ -2294,6 +2294,15 @@ async function runCurl(args, ctx, opts) {
   else if (head) method = 'HEAD';
   else if (dataArgs.length) method = 'POST';
 
+  // A GET/HEAD request with a body is an unsupported combination, not a
+  // silent data loss: `-X GET -d` / `-I -d` fails locally BEFORE any
+  // network attempt (curl's real behavior of discarding the body is
+  // deliberately NOT imitated).
+  if (dataArgs.length && (method === 'GET' || method === 'HEAD')) {
+    return netResult('curl: unsupported request combination: '
+      + method + ' cannot carry a request body (-d/--data with -X GET or -I)', false);
+  }
+
   // Headers: "Name: value" (first colon splits); invalid names fail
   // before anything else happens.
   const headers = {};
@@ -2415,10 +2424,27 @@ async function runCurl(args, ctx, opts) {
     return netResult('curl: ' + (e && e.message ? e.message : String(e)), false);
   }
 
+  // HEAD (-I): show the response headers — never a body (a non-conforming
+  // server that sends one on HEAD must not surface through the shell).
+  // Real HTTP statuses (including 404) are reported through their headers
+  // with the usual success/failure flag. x-locus-* wire markers are relay
+  // plumbing, not upstream information.
+  if (method === 'HEAD') {
+    const lines = ['HTTP ' + res.status + (res.statusText ? ' ' + res.statusText : '')];
+    for (const pair of (res.headerList || [])) {
+      if (String(pair[0]).startsWith('x-locus-')) continue;
+      lines.push(pair[0] + ': ' + pair[1]);
+    }
+    return netResult(lines.join('\n'), res.status < 400, res);
+  }
+
   // An HTTP error status is an authoritative response, not a transport
   // failure — report the status (with a text body preview when sensible).
+  // The URL is rendered through the safe display form (origin + path):
+  // query strings can carry secrets and are never shown, and the wire
+  // request itself is untouched.
   if (res.status >= 400) {
-    let output = 'curl: HTTP ' + res.status + ' from ' + res.finalUrl;
+    let output = 'curl: HTTP ' + res.status + ' from ' + safeNetworkUrlForDisplay(res.finalUrl);
     if (isTextLikeMime(res.headers['content-type']) && res.bytes.byteLength) {
       const preview = new TextDecoder().decode(res.bytes.slice(0, 500)).replace(/\n$/, '');
       if (preview.trim()) output += '\n' + preview;

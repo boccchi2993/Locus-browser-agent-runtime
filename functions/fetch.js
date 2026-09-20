@@ -46,10 +46,10 @@
 // - responses are de-privileged for direct rendering: X-Content-Type-Options:
 //   nosniff on every response, plus Content-Security-Policy: sandbox on
 //   active content types
-// - POST envelope: a present Origin header must match the deployment
-//   origin (blocks other web pages from driving the relay; not an auth
-//   system for non-browser clients — docs/NETWORK-RUNTIME.md, "Relay
-//   openness")
+// - POST envelope AND legacy GET form: a present Origin header must
+//   match the deployment origin (blocks other web pages — including the
+//   legacy GET form — from driving the relay; not an auth system for
+//   non-browser clients — docs/NETWORK-RUNTIME.md, "Relay openness")
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -144,34 +144,111 @@ function parseTarget(rawTarget) {
   return { target };
 }
 
-// Hostname-string SSRF validation. Literal IPs arrive WHATWG-canonicalized
-// (the URL parser reduced decimal/octal/hex IPv4 spellings), so obfuscated
-// literals do not slip through. See the header comment for the documented
-// DNS-rebinding limitation.
+// Hostname-string SSRF validation — the SAME classifier as
+// src/network.js (the two implementations MUST stay in sync; both are
+// tested against the SAME attack-vector tables in tests/fetch.test.mjs
+// and tests/network-runtime.test.cjs). Per hostname: strip brackets /
+// trailing dot → localhost family → IP-family parse → numeric
+// normalization → range classification. IPv4-mapped IPv6
+// (::ffff:0:0/96) is decoded to its IPv4 form and classified as IPv4,
+// so [::ffff:127.0.0.1] and its WHATWG-canonical spelling
+// [::ffff:7f00:1] are both loopback. Literal IPs arrive
+// WHATWG-canonicalized (the URL parser reduced decimal/octal/hex IPv4
+// spellings); the parser below also normalizes those scalar forms
+// directly. See the header comment for the documented DNS-rebinding
+// limitation.
 function isPrivateHostname(hostname) {
-  let h = String(hostname || '').toLowerCase();
+  let h = String(hostname || '').toLowerCase().trim();
   if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1); // IPv6 literal
   if (h.endsWith('.')) h = h.slice(0, -1); // FQDN trailing dot
+  if (!h) return false;
   if (h === 'localhost' || h.endsWith('.localhost')) return true;
-  if (h === '::1' || h === '::') return true;
-  if (h.startsWith('::ffff:')) h = h.slice(7); // IPv4-mapped IPv6
-  const v4 = h.split('.');
-  if (v4.length === 4 && v4.every((p) => /^\d+$/.test(p) && Number(p) <= 255)) {
-    const [a, b] = v4.map(Number);
-    return a === 0 || a === 10 || a === 127
-      || (a === 169 && b === 254)
-      || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 168);
-  }
-  if (h.includes(':')) {
-    const first = h.split(':')[0] || '0';
-    const n = parseInt(first, 16);
-    if (Number.isFinite(n)) {
-      if ((n & 0xfe00) === 0xfc00) return true; // fc00-feff: unique local
-      if ((n & 0xffc0) === 0xfe80) return true; // fe80-febf: link local
+  if (h === 'localhost.localdomain' || h.endsWith('.localhost.localdomain')) return true;
+  if (h.indexOf(':') !== -1) return isPrivateIpv6Literal(h);
+  const v4 = parseIpv4Host(h);
+  return v4 !== null && isPrivateIpv4Value(v4);
+}
+
+// Classify a colon-containing IPv6 literal (canonical WHATWG form).
+function isPrivateIpv6Literal(h) {
+  if (h === '::' || h === '::1') return true; // unspecified / loopback
+  const mapped = /^::ffff:(.+)$/.exec(h); // IPv4-mapped ::ffff:0:0/96
+  if (mapped) {
+    const rest = mapped[1];
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(rest)) return isPrivateHostname(rest); // dotted form
+    const groups = rest.split(':');
+    // Canonical mapped form: exactly two 16-bit hex groups, e.g. 7f00:1.
+    if (groups.length === 2 && groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) {
+      const hi = parseInt(groups[0], 16);
+      const lo = parseInt(groups[1], 16);
+      const ipv4 = [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff].join('.');
+      return isPrivateHostname(ipv4);
     }
+    return false;
+  }
+  const first = h.split(':')[0] || '';
+  if (/^[0-9a-f]{1,4}$/.test(first)) {
+    const n = parseInt(first, 16);
+    if ((n & 0xfe00) === 0xfc00) return true; // fc00::/7 unique local
+    if ((n & 0xffc0) === 0xfe80) return true; // fe80::/10 link local
   }
   return false;
+}
+
+// Parse a hostname as an IPv4 address the way the WHATWG URL parser does:
+// 1-4 dot-separated numeric parts (decimal / 0x hex / leading-0 octal),
+// the last part carrying the remaining magnitude (e.g. 127.1 → 127.0.0.1,
+// 2130706433 and 0x7f000001 → 127.0.0.1). Returns the 32-bit value, or
+// null when the hostname is a domain name rather than an IPv4 literal.
+function parseIpv4Host(h) {
+  const parts = h.split('.');
+  if (parts.length > 1 && parts[parts.length - 1] === '') parts.pop();
+  if (parts.length === 0 || parts.length > 4) return null;
+  const numbers = [];
+  for (let i = 0; i < parts.length; i++) {
+    const n = parseIpv4Number(parts[i]);
+    if (n === null) return null;
+    const isLast = i === parts.length - 1;
+    if (!isLast && n > 255) return null;
+    if (isLast && n >= Math.pow(256, 5 - parts.length)) return null;
+    numbers.push(n);
+  }
+  let value = 0;
+  for (let i = 0; i < parts.length - 1; i++) value = value * 256 + numbers[i];
+  value = value * Math.pow(256, 5 - parts.length) + numbers[parts.length - 1];
+  return value >>> 0;
+}
+
+// One IPv4 part with WHATWG radix detection. Non-numeric → null (the
+// whole hostname is then a domain, not an address).
+function parseIpv4Number(s) {
+  if (!s) return null;
+  let radix = 10;
+  let digits = s;
+  if (s.length >= 2 && s[0] === '0' && (s[1] === 'x' || s[1] === 'X')) {
+    radix = 16;
+    digits = s.slice(2);
+  } else if (s.length >= 2 && s[0] === '0') {
+    radix = 8;
+    digits = s.slice(1);
+  }
+  if (digits === '') return 0;
+  const ok = radix === 16 ? /^[0-9a-fA-F]+$/
+    : radix === 8 ? /^[0-7]+$/
+      : /^[0-9]+$/;
+  if (!ok.test(digits)) return null;
+  return Number.parseInt(digits, radix);
+}
+
+// IPv4 range policy: 0.0.0.0/8, 10/8, 127/8, 169.254/16, 172.16/12,
+// 192.168/16. Nothing wider (no full bogon table).
+function isPrivateIpv4Value(value) {
+  const a = (value >>> 24) & 0xff;
+  const b = (value >>> 16) & 0xff;
+  return a === 0 || a === 10 || a === 127
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168);
 }
 
 // Envelope header filter — mirrors the client-side policy exactly.
@@ -193,24 +270,44 @@ function filterForwardHeaders(rawHeaders) {
   return { headers: out };
 }
 
+// Origin-bound credentials belong to the origin they were granted for.
+// When a followed redirect leaves the current origin, these headers are
+// removed BEFORE the next hop is dispatched; a stripped credential never
+// returns on a later hop (stripping is monotonic — each hop dispatches
+// with the PREVIOUS hop's headers). Request-headers only: the response
+// header path uses its own strip lists. Cookie is unreachable here (the
+// forbidden-header filter already drops it).
+const ORIGIN_BOUND_CREDENTIAL_HEADERS = new Set(['authorization', 'proxy-authorization']);
+
+function headersWithoutOriginBoundCredentials(headers) {
+  const out = {};
+  for (const key of Object.keys(headers || {})) {
+    if (ORIGIN_BOUND_CREDENTIAL_HEADERS.has(String(key).toLowerCase())) continue;
+    out[key] = headers[key];
+  }
+  return out;
+}
+
 // Execute the upstream request with manual redirect handling: every hop
 // is re-validated for scheme and private addresses. Read-like requests
-// follow redirects to any origin; side-effecting requests follow
-// same-origin hops only (307/308 keep method+body; 301/302/303 downgrade
-// to a body-less GET — the side effect is never replayed against another
+// follow redirects to any origin, with origin-bound credentials stripped
+// on every cross-origin hop; side-effecting requests follow same-origin
+// hops only (307/308 keep method+body; 301/302/303 downgrade to a
+// body-less GET — the side effect is never replayed against another
 // origin) and a cross-origin hop is refused. `controller` is owned by the
 // caller and governs fetch AND the body-read lifecycle.
 async function executeUpstream({ method, target, headers, body, maxRedirects, sideEffecting, controller }) {
   let current = target.href;
   let currentMethod = method;
   let currentBody = body;
+  let currentHeaders = headers || {};
   let upstream = null;
 
   for (let hop = 0; hop <= maxRedirects; hop++) {
     try {
       upstream = await fetch(current, {
         method: currentMethod,
-        headers: headers,
+        headers: currentHeaders,
         body: currentMethod === 'GET' || currentMethod === 'HEAD' ? undefined : currentBody,
         redirect: 'manual',
         signal: controller.signal,
@@ -219,7 +316,7 @@ async function executeUpstream({ method, target, headers, body, maxRedirects, si
       if (controller.signal.aborted) {
         return { error: relayError(504, 'Upstream timed out after ' + (controller._locusTimeoutMs || 30000) + 'ms', 'network_timeout') };
       }
-      return { error: relayError(502, 'fetch: upstream request failed') };
+      return { error: relayError(502, 'Upstream request failed') };
     }
 
     if (upstream.status >= 300 && upstream.status < 400) {
@@ -240,8 +337,17 @@ async function executeUpstream({ method, target, headers, body, maxRedirects, si
       if (isPrivateHostname(next.hostname)) {
         return { error: relayError(403, 'Private and loopback redirect targets are not allowed', 'network_private_address_blocked') };
       }
-      if (sideEffecting && next.origin !== new URL(current).origin) {
+      const currentOrigin = new URL(current).origin;
+      if (sideEffecting && next.origin !== currentOrigin) {
         return { error: relayError(403, 'Cross-origin redirect blocked for side-effecting requests', 'network_redirect_blocked') };
+      }
+      // CREDENTIAL AUTHORITY IS ORIGIN-BOUND: before dispatching a hop to
+      // a different origin, strip Authorization / Proxy-Authorization from
+      // the NEXT hop's headers. Never mutate the previous hop's object —
+      // each hop keeps its own header set, so stripping is monotonic
+      // (A → B → A does NOT restore the credential).
+      if (next.origin !== currentOrigin) {
+        currentHeaders = headersWithoutOriginBoundCredentials(currentHeaders);
       }
       if (sideEffecting && currentMethod !== 'GET' && currentMethod !== 'HEAD'
         && (upstream.status === 301 || upstream.status === 302 || upstream.status === 303)) {
@@ -255,7 +361,7 @@ async function executeUpstream({ method, target, headers, body, maxRedirects, si
     break; // final, authoritative HTTP response
   }
 
-  if (!upstream) return { error: relayError(502, 'fetch: upstream request failed') };
+  if (!upstream) return { error: relayError(502, 'Upstream request failed') };
   return { upstream, finalUrl: current };
 }
 
@@ -305,33 +411,46 @@ async function readResponseCapped(upstream, maxBytes, controller) {
 
 // Frame the authoritative upstream response for the client: filtered
 // headers, byte-exact body, final-URL exposure, de-privileged rendering.
-async function buildUpstreamResponse(upstream, finalUrl, maxBytes, controller, timeoutMs) {
-  let bytes, bodyError, timedOut;
-  try {
-    ({ bytes, error: bodyError, timedOut } = await readResponseCapped(upstream, maxBytes, controller));
-  } catch (e) {
-    if (controller.signal.aborted) {
-      return relayError(504, 'Upstream timed out after ' + timeoutMs + 'ms', 'network_timeout');
+// HEAD requests never carry a body: the declared entity length is
+// forwarded when the upstream provided one, and nothing is read.
+async function buildUpstreamResponse(upstream, finalUrl, maxBytes, controller, timeoutMs, method) {
+  let bytes = new Uint8Array(0), bodyError, timedOut;
+  if (method !== 'HEAD') {
+    try {
+      ({ bytes, error: bodyError, timedOut } = await readResponseCapped(upstream, maxBytes, controller));
+    } catch (e) {
+      if (controller.signal.aborted) {
+        return relayError(504, 'Upstream timed out after ' + timeoutMs + 'ms', 'network_timeout');
+      }
+      return relayError(502, 'Upstream body read failed');
     }
-    return relayError(502, 'Upstream body read failed');
+    if (timedOut) return relayError(504, 'Upstream timed out after ' + timeoutMs + 'ms', 'network_timeout');
+    if (bodyError) return bodyError;
   }
-  if (timedOut) return relayError(504, 'Upstream timed out after ' + timeoutMs + 'ms', 'network_timeout');
-  if (bodyError) return bodyError;
 
   const headers = new Headers(CORS_HEADERS);
   headers.set('X-Locus-Final-URL', finalUrl);
   // Pass the upstream's own headers through (minus hop-by-hop machinery,
   // the ambient-credential channel and the recomputed length) so the
-  // client sees ordinary HTTP response headers.
+  // client sees ordinary HTTP response headers. append() — never set() —
+  // so genuinely duplicated upstream headers are never collapsed by THIS
+  // code; where the underlying Fetch implementation has already combined
+  // duplicates into one comma-joined value, that observable
+  // representation is forwarded as-is (docs/NETWORK-RUNTIME.md).
   upstream.headers.forEach((value, name) => {
     const n = name.toLowerCase();
     if (STRIPPED_RESPONSE_HEADERS.has(n)
       || STRIPPED_RESPONSE_HEADER_PREFIXES.some((p) => n.startsWith(p))) {
       return;
     }
-    headers.set(name, value);
+    headers.append(name, value);
   });
-  if (NULL_BODY_STATUSES.has(upstream.status)) {
+  if (NULL_BODY_STATUSES.has(upstream.status) || method === 'HEAD') {
+    if (method === 'HEAD') {
+      const declared = upstream.headers.get('content-length');
+      headers.set('Content-Length',
+        declared && /^\d+$/.test(declared) ? declared : '0');
+    }
     return new Response(null, { status: upstream.status, headers });
   }
   const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
@@ -360,7 +479,7 @@ async function handleRelayRequest({ method, target, headers, body, env }) {
       method, target, headers, body, maxRedirects, sideEffecting, controller,
     });
     if (executed.error) return executed.error;
-    return await buildUpstreamResponse(executed.upstream, executed.finalUrl, maxBytes, controller, timeoutMs);
+    return await buildUpstreamResponse(executed.upstream, executed.finalUrl, maxBytes, controller, timeoutMs, method);
   } finally {
     clearTimeout(timer);
   }
@@ -371,7 +490,7 @@ async function handleRelayRequest({ method, target, headers, body, env }) {
 async function readRequestCapped(request, maxBytes) {
   const contentLength = Number.parseInt(request.headers.get('content-length') || '', 10);
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    return { error: relayError(413, 'Relay request body too large', 'network_request_too_large') };
+    return { error: relayError(413, 'Request body too large', 'network_request_too_large') };
   }
   if (!request.body) return { bytes: new Uint8Array(0) };
   const reader = request.body.getReader();
@@ -384,7 +503,7 @@ async function readRequestCapped(request, maxBytes) {
       received += value.byteLength;
       if (received > maxBytes) {
         await reader.cancel().catch(() => {});
-        return { error: relayError(413, 'Relay request body too large', 'network_request_too_large') };
+        return { error: relayError(413, 'Request body too large', 'network_request_too_large') };
       }
       chunks.push(value);
     }
@@ -411,12 +530,37 @@ function decodeBase64(b64) {
   }
 }
 
+// Same-origin enforcement shared by BOTH request forms (the legacy GET
+// form and the POST envelope): a present Origin header must match the
+// deployment origin — parsed with the URL/origin parser, never string
+// matching, so lookalike suffix/prefix hosts and scheme/port variants
+// are refused. A browser never sends Origin on a same-origin GET, so the
+// internal legacy fallback is unaffected; other web pages cannot forge
+// Origin. Non-browser clients sending no Origin remain the documented,
+// bounded openness of this relay (not an auth system —
+// docs/NETWORK-RUNTIME.md, "Relay openness").
+function originEnforcementError(req) {
+  const origin = req.headers.get('origin');
+  if (!origin) return null;
+  let deploymentOrigin = null;
+  try {
+    deploymentOrigin = new URL(req.url).origin;
+  } catch { /* request URL is always absolute in Pages */ }
+  if (deploymentOrigin && origin !== deploymentOrigin) {
+    return relayError(403, 'Cross-origin use of this endpoint is not allowed', 'network_relay_failed');
+  }
+  return null;
+}
+
 // ------------------------------------------------------------
 //  GET /fetch (legacy form: GET-only, no header/body channel)
 // ------------------------------------------------------------
 export async function onRequestGet(context) {
   const req = context.request;
   const env = context.env || {};
+
+  const originError = originEnforcementError(req);
+  if (originError) return originError;
 
   const pageUrl = new URL(req.url);
   const { target, error: targetError } = parseTarget(pageUrl.searchParams.get('url'));
@@ -432,20 +576,10 @@ export async function onRequestPost(context) {
   const req = context.request;
   const env = context.env || {};
 
-  // Same-origin enforcement for the envelope form: a present Origin must
-  // match the deployment (browser callers always send it on POST; other
-  // web pages cannot forge it). Non-browser clients sending no Origin are
-  // the documented, bounded openness of this relay.
-  const origin = req.headers.get('origin');
-  if (origin) {
-    let deploymentOrigin = null;
-    try {
-      deploymentOrigin = new URL(req.url).origin;
-    } catch { /* request URL is always absolute in Pages */ }
-    if (deploymentOrigin && origin !== deploymentOrigin) {
-      return relayError(403, 'Cross-origin relay use is not allowed', 'network_relay_failed');
-    }
-  }
+  // Same-origin enforcement for the envelope form (shared with the
+  // legacy GET form above): a present Origin must match the deployment.
+  const originError = originEnforcementError(req);
+  if (originError) return originError;
 
   const maxRequestBytes = getMaxRequestBytes(env);
   let raw;
@@ -466,7 +600,7 @@ export async function onRequestPost(context) {
 
   const method = String(envelope.method || '').trim().toUpperCase();
   if (!RELAY_METHODS.has(method)) {
-    return relayError(405, 'Unsupported relay method: ' + (method || '(empty)'), 'network_unsupported_method');
+    return relayError(405, 'Unsupported HTTP method: ' + (method || '(empty)'), 'network_unsupported_method');
   }
 
   const { target, error: targetError } = parseTarget(envelope.url);
@@ -483,7 +617,7 @@ export async function onRequestPost(context) {
     body = decodeBase64(envelope.bodyBase64);
     if (!body) return relayError(400, 'Invalid base64 body', 'network_invalid_url');
     if (body.byteLength > maxRequestBytes) {
-      return relayError(413, 'Relay request body too large', 'network_request_too_large');
+      return relayError(413, 'Request body too large', 'network_request_too_large');
     }
   }
 

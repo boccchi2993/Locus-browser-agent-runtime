@@ -40,8 +40,13 @@
 //    redirect — a 3xx whose Location leaves the approved origin
 //    fails with network_redirect_blocked
 //  - SSRF: the edge relay refuses loopback/private/link-local
-//    targets; the client pre-checks every relay leg with the same
-//    policy. The direct backend keeps the browser's own boundary.
+//    targets (including IPv4-mapped IPv6 spellings); the client
+//    pre-checks every relay leg with the same policy. The direct
+//    backend keeps the browser's own boundary.
+//  - redirect credentials: origin-bound credentials (Authorization,
+//    Proxy-Authorization) belong to the origin they were granted for.
+//    The relay strips them before dispatching a cross-origin redirect
+//    hop; a stripped credential never returns on a later hop.
 //
 //  Approval integration: side-effecting methods are the Approval
 //  Framework's first production consumer — the Harness constructs
@@ -227,7 +232,12 @@ const NetworkRuntime = {
         return await this._direct(method, targetUrl, headers, body,
           externalSignal, opts.timeoutMs || DIRECT_TIMEOUT_MS);
       } catch (e) {
-        if (!readLike || !isNetworkFailure(e)) {
+        // FALLBACK BOUNDARY: only a failure of the initial fetch()
+        // transport invocation itself (DirectTransportFailure) may hand a
+        // GET/HEAD over to the relay. Everything after a Response exists —
+        // header handling, status handling, body reads, size accounting —
+        // is a post-Response failure and is NEVER re-sent elsewhere.
+        if (!readLike || !(e instanceof DirectTransportFailure)) {
           throw mapWriteDispatchError(e, 'network_direct_failed');
         }
         // GET/HEAD safe fallback: reads duplicate harmlessly. The relay
@@ -239,17 +249,17 @@ const NetworkRuntime = {
         }
         if (!isHostedPage()) {
           throw new Error(
-            'network request failed: the target could not be reached and no edge relay is available ' +
-            'when the page is opened from ' + pageProtocol() + ' — host the app over HTTP(S) to enable the relay');
+            'network request failed: the target could not be reached and no request-forwarding '
+            + 'service is available when the app is not served over HTTP(S)');
         }
       }
     }
     try {
-      // Legacy GET ?url= form for headerless read-like requests (kept
-      // for wire compatibility); everything else — GET/HEAD with
+      // Legacy GET ?url= form for headerless GET requests (kept for wire
+      // compatibility); everything else — headerless HEAD, GET/HEAD with
       // headers and all side-effecting methods — uses the POST /fetch
-      // JSON envelope.
-      if (readLike && !Object.keys(headers).length) {
+      // JSON envelope, which preserves the method exactly.
+      if (method === 'GET' && !Object.keys(headers).length) {
         return await this._relayGet(targetUrl, externalSignal, opts.relayTimeoutMs);
       }
       return await this._relayRequest(method, targetUrl, headers, body,
@@ -263,7 +273,7 @@ const NetworkRuntime = {
       }
       if (readLike && isNetworkFailure(e)) {
         throw makeNetError('network_relay_failed',
-          'edge relay unreachable: ' + (e && e.message ? e.message : String(e)));
+          'network request failed: ' + (e && e.message ? e.message : String(e)));
       }
       throw mapWriteDispatchError(e, 'network_relay_failed');
     }
@@ -271,17 +281,39 @@ const NetworkRuntime = {
 
   async _direct(method, url, headers, body, externalSignal, timeoutMs) {
     const readLike = isReadLikeMethod(method);
-    return fetchWithDeadline(url, {
-      method: method,
-      // Side-effecting requests must not follow redirects: the browser
-      // reports redirect:'manual' as an opaque response whose target
-      // cannot be inspected, so it is blocked outright instead of
-      // replaying an approved body somewhere else.
-      redirect: readLike ? 'follow' : 'manual',
-      credentials: 'omit', // anonymous by construction — never send ambient cookies
-      headers: Object.keys(headers || {}).length ? headers : undefined,
-      body: readLike ? undefined : (body || undefined),
-    }, timeoutMs, externalSignal, async (res, signal) => {
+    if (externalSignal && externalSignal.aborted) throw makeNetCancelledError();
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+    const onExternalAbort = () => controller.abort();
+    if (externalSignal) externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    try {
+      let res;
+      try {
+        // TRANSPORT PHASE — the only fallback-eligible failure of the
+        // direct attempt. Abort (cancel/timeout) is not a transport
+        // TypeError and is classified below instead.
+        res = await fetch(url, {
+          method: method,
+          // Side-effecting requests must not follow redirects: the browser
+          // reports redirect:'manual' as an opaque response whose target
+          // cannot be inspected, so it is blocked outright instead of
+          // replaying an approved body somewhere else.
+          redirect: readLike ? 'follow' : 'manual',
+          credentials: 'omit', // anonymous by construction — never send ambient cookies
+          headers: Object.keys(headers || {}).length ? headers : undefined,
+          body: readLike ? undefined : (body || undefined),
+          signal: controller.signal,
+        });
+      } catch (e) {
+        if (externalSignal && externalSignal.aborted) throw makeNetCancelledError();
+        if (timedOut) throw makeNetTimeoutError(timeoutMs);
+        if (e instanceof TypeError) throw new DirectTransportFailure(e);
+        throw e;
+      }
+      // A Response exists. From here on NO backend fallback is possible:
+      // the request reached the HTTP layer, so any failure is a
+      // post-Response failure of THIS attempt.
       if (!readLike && isRedirectResponse(res)) {
         throw makeNetError('network_redirect_blocked',
           'redirect blocked: side-effecting requests cannot be redirected to another origin');
@@ -294,11 +326,18 @@ const NetworkRuntime = {
         statusText: res.statusText || '',
         headers: headersAndList.object,
         headerList: headersAndList.list,
-        bytes: await readBytesCapped(res, NETWORK_MAX_RESPONSE_BYTES, signal),
+        bytes: await readBytesCapped(res, NETWORK_MAX_RESPONSE_BYTES, controller.signal),
         finalUrl: finalUrl,
         backend: 'browser-direct',
       };
-    });
+    } catch (e) {
+      if (externalSignal && externalSignal.aborted) throw makeNetCancelledError();
+      if (timedOut) throw makeNetTimeoutError(timeoutMs);
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
+    }
   },
 
   // Relay fallback for READ-LIKE requests (legacy GET ?url= form).
@@ -341,7 +380,7 @@ async function consumeRelayResponse(res, signal, targetUrl) {
   // classification; never treat them as upstream content.
   if (res.headers.get('x-locus-relay-error')) {
     let code = null;
-    let msg = 'edge relay error (HTTP ' + res.status + ')';
+    let msg = 'network request failed (HTTP ' + res.status + ')';
     try {
       const j = await raceAbort(res.json(), signal);
       if (j && j.error && j.error.message) msg = j.error.message;
@@ -349,7 +388,7 @@ async function consumeRelayResponse(res, signal, targetUrl) {
     } catch (e) {
       if (e && (e.cancelled || e.timeout)) throw e;
     }
-    throw makeNetError(code || 'network_relay_failed', 'edge relay: ' + msg);
+    throw makeNetError(code || 'network_relay_failed', 'network request failed: ' + msg);
   }
   const headersAndList = headersFromResponse(res.headers);
   const finalUrl = res.headers.get('x-locus-final-url') || targetUrl;
@@ -432,46 +471,124 @@ function selectBackend(readLike, canonicalOrigin) {
 }
 
 // ------------------------------------------------------------
-//  SSRF pre-check (client-side mirror of the relay's own guard): the
-//  relay must never be driven against loopback/private/link-local
+//  SSRF pre-check (client-side mirror of the relay's own guard —
+//  functions/fetch.js carries the SAME classifier and both are tested
+//  against the SAME attack-vector tables in tests/network-runtime.test.cjs
+//  and tests/fetch.test.mjs; keep the two implementations in sync).
+//  The relay must never be driven against loopback/private/link-local
 //  targets, so the client refuses them before choosing the relay.
-//  Literal IPs are compared in WHATWG-canonicalized form (the URL
-//  parser already reduced decimal/octal/hex IPv4 spellings), so
-//  obfuscated literals do not slip through. A public DNS name that
-//  RESOLVES to a private address cannot be detected here — a
-//  documented limitation, re-checked server-side by the relay where
-//  possible (docs/NETWORK-RUNTIME.md, "Known limitation").
+//
+//  Classification flow per hostname: strip IPv6 brackets / trailing dot →
+//  named-host policy (localhost family) → IP-family parse (IPv6 literal vs
+//  IPv4 scalar) → numeric normalization → range classification.
+//  IPv4-mapped IPv6 (::ffff:0:0/96) is decoded to its IPv4 form and
+//  classified as IPv4, so [::ffff:127.0.0.1] and its WHATWG-canonical
+//  spelling [::ffff:7f00:1] are both loopback. Literal IPs arrive
+//  WHATWG-canonicalized (the URL parser already reduced decimal/octal/hex
+//  IPv4 spellings); the parser below also normalizes those scalar forms
+//  directly so non-URL callers cannot bypass. A public DNS name that
+//  RESOLVES to a private address cannot be detected here — a documented
+//  limitation, re-checked server-side by the relay where possible
+//  (docs/NETWORK-RUNTIME.md, "Known limitation").
 // ------------------------------------------------------------
 function isPrivateHostname(hostname) {
-  let h = String(hostname || '').toLowerCase();
+  let h = String(hostname || '').toLowerCase().trim();
   if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1); // IPv6 literal
   if (h.endsWith('.')) h = h.slice(0, -1); // FQDN trailing dot
+  if (!h) return false;
   if (h === 'localhost' || h.endsWith('.localhost')) return true;
-  if (h === '::1' || h === '::') return true;
-  if (h.startsWith('::ffff:')) h = h.slice(7); // IPv4-mapped IPv6
-  const v4 = h.split('.');
-  if (v4.length === 4 && v4.every((p) => /^\d+$/.test(p) && Number(p) <= 255)) {
-    const [a, b] = v4.map(Number);
-    return a === 0 || a === 10 || a === 127
-      || (a === 169 && b === 254)
-      || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 168);
-  }
-  if (h.indexOf(':') !== -1) { // remaining IPv6: fc00::/7 and fe80::/10
-    const first = h.split(':')[0] || '0';
-    const n = parseInt(first, 16);
-    if (Number.isFinite(n)) {
-      if ((n & 0xfe00) === 0xfc00) return true; // fc00-feff: unique local
-      if ((n & 0xffc0) === 0xfe80) return true; // fe80-febf: link local
+  if (h === 'localhost.localdomain' || h.endsWith('.localhost.localdomain')) return true;
+  if (h.indexOf(':') !== -1) return isPrivateIpv6Literal(h);
+  const v4 = parseIpv4Host(h);
+  return v4 !== null && isPrivateIpv4Value(v4);
+}
+
+// Classify a colon-containing IPv6 literal (canonical WHATWG form).
+function isPrivateIpv6Literal(h) {
+  if (h === '::' || h === '::1') return true; // unspecified / loopback
+  const mapped = /^::ffff:(.+)$/.exec(h); // IPv4-mapped ::ffff:0:0/96
+  if (mapped) {
+    const rest = mapped[1];
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(rest)) return isPrivateHostname(rest); // dotted form
+    const groups = rest.split(':');
+    // Canonical mapped form: exactly two 16-bit hex groups, e.g. 7f00:1.
+    if (groups.length === 2 && groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) {
+      const hi = parseInt(groups[0], 16);
+      const lo = parseInt(groups[1], 16);
+      const ipv4 = [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff].join('.');
+      return isPrivateHostname(ipv4);
     }
+    return false;
+  }
+  const first = h.split(':')[0] || '';
+  if (/^[0-9a-f]{1,4}$/.test(first)) {
+    const n = parseInt(first, 16);
+    if ((n & 0xfe00) === 0xfc00) return true; // fc00::/7 unique local
+    if ((n & 0xffc0) === 0xfe80) return true; // fe80::/10 link local
   }
   return false;
+}
+
+// Parse a hostname as an IPv4 address the way the WHATWG URL parser does:
+// 1-4 dot-separated numeric parts (decimal / 0x hex / leading-0 octal),
+// the last part carrying the remaining magnitude (e.g. 127.1 → 127.0.0.1,
+// 2130706433 and 0x7f000001 → 127.0.0.1). Returns the 32-bit value, or
+// null when the hostname is a domain name rather than an IPv4 literal.
+function parseIpv4Host(h) {
+  const parts = h.split('.');
+  if (parts.length > 1 && parts[parts.length - 1] === '') parts.pop();
+  if (parts.length === 0 || parts.length > 4) return null;
+  const numbers = [];
+  for (let i = 0; i < parts.length; i++) {
+    const n = parseIpv4Number(parts[i]);
+    if (n === null) return null;
+    const isLast = i === parts.length - 1;
+    if (!isLast && n > 255) return null;
+    if (isLast && n >= Math.pow(256, 5 - parts.length)) return null;
+    numbers.push(n);
+  }
+  let value = 0;
+  for (let i = 0; i < parts.length - 1; i++) value = value * 256 + numbers[i];
+  value = value * Math.pow(256, 5 - parts.length) + numbers[parts.length - 1];
+  return value >>> 0;
+}
+
+// One IPv4 part with WHATWG radix detection. Non-numeric → null (the
+// whole hostname is then a domain, not an address).
+function parseIpv4Number(s) {
+  if (!s) return null;
+  let radix = 10;
+  let digits = s;
+  if (s.length >= 2 && s[0] === '0' && (s[1] === 'x' || s[1] === 'X')) {
+    radix = 16;
+    digits = s.slice(2);
+  } else if (s.length >= 2 && s[0] === '0') {
+    radix = 8;
+    digits = s.slice(1);
+  }
+  if (digits === '') return 0;
+  const ok = radix === 16 ? /^[0-9a-fA-F]+$/
+    : radix === 8 ? /^[0-7]+$/
+      : /^[0-9]+$/;
+  if (!ok.test(digits)) return null;
+  return Number.parseInt(digits, radix);
+}
+
+// IPv4 range policy: 0.0.0.0/8, 10/8, 127/8, 169.254/16, 172.16/12,
+// 192.168/16. Nothing wider (no full bogon table).
+function isPrivateIpv4Value(value) {
+  const a = (value >>> 24) & 0xff;
+  const b = (value >>> 16) & 0xff;
+  return a === 0 || a === 10 || a === 127
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168);
 }
 
 function assertRelayTargetAllowed(parsed) {
   if (isPrivateHostname(parsed.hostname)) {
     throw makeNetError('network_private_address_blocked',
-      'refusing to reach a private or loopback address through the network relay: ' + parsed.hostname);
+      'refusing to reach a private or loopback address: ' + parsed.hostname);
   }
 }
 
@@ -526,6 +643,34 @@ function makeNetError(code, message) {
   const e = new Error(message);
   e.networkCode = code;
   return e;
+}
+
+// Internal control-flow marker, deliberately NOT part of the public
+// error taxonomy: the initial fetch() invocation itself failed with a
+// genuine transport TypeError. Only this error may trigger the GET/HEAD
+// relay fallback (see _perform). Errors after a Response exists — header
+// parsing, status handling, body reads, size accounting, internal JS —
+// are never wrapped, so they can never re-enter a backend fallback.
+class DirectTransportFailure extends Error {
+  constructor(cause) {
+    super(cause && cause.message ? cause.message : 'network transport failure');
+    this.name = 'DirectTransportFailure';
+    this.cause = cause;
+  }
+}
+
+// Model/telemetry-safe URL summary: origin + pathname only. Query
+// strings, fragments and userinfo routinely carry secrets and are never
+// rendered into tool output, errors or telemetry (they still go on the
+// wire untouched — this is display isolation, not request mutation).
+// IPv6 hosts render bracketed via the WHATWG origin. Unparseable input
+// degrades to a bounded placeholder — raw input is never echoed back.
+function safeNetworkUrlForDisplay(url) {
+  try {
+    const u = new URL(String(url || ''));
+    if (u.origin && u.origin !== 'null') return u.origin + (u.pathname || '/');
+  } catch (e) { /* fall through */ }
+  return '(unparseable URL)';
 }
 
 function makeNetTimeoutError(timeoutMs) {
