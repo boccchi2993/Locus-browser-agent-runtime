@@ -586,6 +586,15 @@ const FIND_MAX_RESULTS = 1000;            // paths emitted per find run
 const GREP_MAX_FILES = 500;               // files searched per recursive grep
 const GREP_MAX_FILE_BYTES = 2 * 1024 * 1024;
 const GREP_MAX_MATCHES = 500;
+// head/tail: INPUT size and TERMINAL OUTPUT size are different bounds. A
+// `head -n 3` over a 2.5 MiB log only needs to read it — the answer is tiny.
+// The read is capped at 16 MiB (matching the per-file provider cap); the
+// output stays bounded by CAT_MAX_FILE_BYTES regardless.
+const HEAD_TAIL_MAX_INPUT_BYTES = 16 * 1024 * 1024;
+const HEAD_TAIL_MAX_OUTPUT_BYTES = CAT_MAX_FILE_BYTES;
+// sort holds every input line in memory at once, so its total input is
+// bounded separately (all operands + stdin combined).
+const SORT_MAX_INPUT_BYTES = 8 * 1024 * 1024;
 
 // Tokenize one command line, keeping quote/operator information.
 // Returns [{text, quoted, op, pos}] — quoted text is DATA, never syntax, so
@@ -714,24 +723,29 @@ const SHELL_COMMANDS = {
     stdin: false, run: shFind,
   },
   grep: {
-    usage: 'grep [-n] [-i] [-r|-R] <pattern> [path...]',
-    summary: 'print lines matching a JavaScript regex; reads stdin when no path is given',
+    usage: 'grep [-c] [-n] [-i] [-r|-R] [-E] <pattern> [path...]',
+    summary: 'print lines matching a JavaScript regex, or count matching lines with -c; reads stdin when no path is given',
     stdin: true, run: shGrep,
   },
   head: {
-    usage: 'head [-n N] [file]',
-    summary: 'first N lines (default 10); reads stdin when no file is given',
+    usage: 'head [-n N|-c N|-N] [file]',
+    summary: 'first N lines (default 10) or first N bytes (-c); reads stdin when no file is given',
     stdin: true, run: shHead,
   },
   tail: {
-    usage: 'tail [-n N] [file]',
-    summary: 'last N lines (default 10); -n +N starts at line N; reads stdin when no file is given',
+    usage: 'tail [-n N|-n +N|-c N|-N] [file]',
+    summary: 'last N lines (default 10), -n +N starts at line N, -c N for bytes; reads stdin when no file is given',
     stdin: true, run: shTail,
   },
   wc: {
     usage: 'wc [-l] [-w] [-c] [file...]',
     summary: 'count lines / words / UTF-8 bytes; reads stdin when no file is given',
     stdin: true, run: shWc,
+  },
+  sort: {
+    usage: 'sort [-n] [-r] [-u] [file...]',
+    summary: 'sort lines (-n numeric-first, -r reverse, -u unique); reads stdin when no file is given',
+    stdin: true, run: shSort,
   },
   mv: {
     usage: 'mv <src>... <dest>',
@@ -753,11 +767,22 @@ const SHELL_COMMANDS = {
     summary: 'HTTP/HTTPS requests — GET/HEAD are anonymous reads; POST/PUT/PATCH/DELETE ask for user approval',
     stdin: false, run: shCurl,
   },
+  which: {
+    usage: 'which <command>...',
+    summary: 'print the /usr/bin path of supported commands (registry lookup only — no external PATH)',
+    stdin: false, run: shWhich,
+  },
   help: {
     usage: 'help',
     summary: 'show this shell contract',
     stdin: false, run: shHelp,
   },
+};
+
+// Command-name aliases resolved by the executor and by `which`. Not a
+// second registry — every target must exist in SHELL_COMMANDS.
+const SHELL_ALIASES = {
+  python3: 'python',
 };
 
 const SHELL_OPERATORS = [
@@ -773,12 +798,16 @@ const SHELL_REDIRECTS = [
   { op: '2> file', summary: 'write stderr to file (truncate/create)' },
   { op: '2>> file', summary: 'append stderr to file' },
   { op: '2>&1', summary: 'send stderr to wherever stdout currently goes (order matters: > all.txt 2>&1 merges both into the file)' },
+  { op: '> /dev/null', summary: 'discard output — /dev/null is only a redirection sink, not a file (cat /dev/null fails)' },
 ];
 
 const SHELL_UNSUPPORTED_NOTE =
-  'Not supported: &, $(...), backticks, subshells, variables/export, '
+  'Not supported: control structures (for / while / if / case / shell functions — use Python for complex logic), '
+  + '&, $(...), backticks, subshells, variables/export, '
   + 'glob expansion (* stays literal — use find -name instead), input redirect (<), '
-  + 'heredocs other than python, file descriptors other than 2>&1 (no 1>&2 / 3> / &>). '
+  + 'heredocs other than python (a python heredoc must be a standalone bash invocation; '
+  + 'run later commands in a separate bash call), file descriptors other than 2>&1 (no 1>&2 / 3> / &>). '
+  + '/dev/null works only as a redirect target, never as a readable file. '
   + 'rm -rf / (and every protected mount root: /usr /home /home/locus /mnt /mnt/workspace '
   + '/mnt/upload /mnt/download /mnt/plugins) is always refused.';
 
@@ -811,6 +840,11 @@ function shellHelpText() {
 // The bash section of the agent system prompt, generated from the same
 // registry as the runtime and `help`.
 function shellSystemPromptSection() {
+  // Derived, never hand-maintained: the pipeline line lists exactly the
+  // commands that declare stdin:true, so adding a command updates the prompt.
+  const stdinConsumers = Object.keys(SHELL_COMMANDS)
+    .filter((n) => SHELL_COMMANDS[n].stdin)
+    .join(' ');
   const head = [
     '  This is a Unix-like compatibility shell, NOT full POSIX bash, on a small Linux-like browser machine.',
     '  HOME=/home/locus. Every bash invocation starts at the default cwd: /mnt/workspace when a workspace',
@@ -831,7 +865,7 @@ function shellSystemPromptSection() {
     '    cmd1 ; cmd2     run commands in sequence',
     '    cmd1 && cmd2    run cmd2 only if cmd1 succeeded',
     '    cmd1 || cmd2    run cmd2 only if cmd1 failed',
-    '    cmd1 | cmd2     pipe stdout of cmd1 into stdin of cmd2 (stdin consumers: cat grep head tail wc);',
+    '    cmd1 | cmd2     pipe stdout of cmd1 into stdin of cmd2 (stdin consumers: ' + stdinConsumers + ');',
     '                    stderr is NOT piped unless merged with 2>&1',
     '  Supported redirects (applied left to right; order matters for 2>&1):',
     '    cmd > file      write stdout to file (truncate/create)',
@@ -839,6 +873,8 @@ function shellSystemPromptSection() {
     '    cmd 2> file     write stderr to file (truncate/create)',
     '    cmd 2>> file    append stderr to file',
     '    cmd 2>&1        merge stderr into stdout\'s current destination',
+    '    cmd > /dev/null discard output (also 2> / 2>>); /dev/null is a redirection sink only —',
+    '                    it is not a file: cat /dev/null and ls /dev fail',
     '  Redirection never turns a failed command into a successful one.',
     '  rm -rf / (and every protected mount root) is always refused. Shell glob expansion is not supported:',
     '  * in command arguments stays literal — use find -name "*.tmp" to locate files.',
@@ -866,6 +902,8 @@ function shellSystemPromptSection() {
     '  python has the standard library and pandas available. Python sees the SAME filesystem as the shell',
     '  (/mnt/workspace, /mnt/upload, /mnt/download, /tmp, /home/locus) and runs with the shell cwd as its',
     '  working directory. /mnt/upload is read-only, also from Python. python and curl do not read pipeline stdin.',
+    '  The python heredoc must be a STANDALONE bash invocation — nothing may follow the closing marker;',
+    '  run subsequent commands in a separate bash call.',
   ];
   return head.concat(cmds, tail).join('\n');
 }
@@ -1248,7 +1286,7 @@ async function shFind(ctx, args) {
 }
 
 async function shGrep(ctx, args, stdin) {
-  let flagN = false, flagI = false, flagR = false;
+  let flagN = false, flagI = false, flagR = false, flagC = false;
   let pattern = null;
   const paths = [];
   for (const t of args) {
@@ -1257,8 +1295,9 @@ async function shGrep(ctx, args, stdin) {
         if (ch === 'n') flagN = true;
         else if (ch === 'i') flagI = true;
         else if (ch === 'r' || ch === 'R') flagR = true;
+        else if (ch === 'c') flagC = true;
         else if (ch === 'E') { /* alias for the regex semantics already in use */ }
-        else return shErr('grep: unsupported option: -' + ch + ' (supported options: -n -i -r -R -E)');
+        else return shErr('grep: unsupported option: -' + ch + ' (supported options: -c -n -i -r -R -E)');
       }
     } else if (pattern === null) {
       pattern = t.text;
@@ -1266,7 +1305,7 @@ async function shGrep(ctx, args, stdin) {
       paths.push(t.text);
     }
   }
-  if (pattern === null) return shErr('usage: grep [-n] [-i] [-r|-R] <pattern> [path...]');
+  if (pattern === null) return shErr('usage: grep [-c] [-n] [-i] [-r|-R] [-E] <pattern> [path...]');
   let re;
   try {
     re = new RegExp(pattern, flagI ? 'i' : '');
@@ -1278,12 +1317,25 @@ async function shGrep(ctx, args, stdin) {
   }
   const signal = ctx.opts && ctx.opts.signal;
   const matches = [];
+  // -c counts MATCHING LINES per searched source. Counting is decoupled from
+  // the output-line cap: a file with 1000 matches answers 1000, never the
+  // GREP_MAX_MATCHES presentation bound.
+  const counts = [];
+  let countedFromDir = false;
   const skipped = [];
   const state = { truncated: false, filesSeen: 0 };
   const showPathDefault = paths.length > 1;
 
   function grepText(text, disp, showPath) {
     const lines = splitLines(text);
+    if (flagC) {
+      let c = 0;
+      for (let i = 0; i < lines.length; i++) {
+        if (re.test(lines[i])) c++;
+      }
+      counts.push({ disp: disp, count: c, showPath: showPath });
+      return;
+    }
     for (let i = 0; i < lines.length; i++) {
       if (matches.length >= GREP_MAX_MATCHES) { state.truncated = true; return; }
       if (re.test(lines[i])) {
@@ -1311,6 +1363,7 @@ async function shGrep(ctx, args, stdin) {
   async function grepDir(abs, disp) {
     if (state.truncated) return;
     throwIfCancelled(signal, 'grep');
+    countedFromDir = true;
     const entries = await ctx.vfs.list(abs);
     for (const e of entries) {
       if (state.truncated) return;
@@ -1348,7 +1401,17 @@ async function shGrep(ctx, args, stdin) {
     }
   }
 
-  let output = matches.join('\n');
+  let output;
+  if (flagC) {
+    // Count mode: `<number>` for stdin, `<number>` for a single file operand,
+    // `path:count` for multiple operands or a recursive directory search
+    // (matching GNU presentation). Zero matches are a successful answer.
+    const showPath = paths.length > 1 || countedFromDir
+      || counts.some((c) => c.showPath);
+    output = counts.map((c) => (showPath ? c.disp + ':' : '') + c.count).join('\n');
+  } else {
+    output = matches.join('\n');
+  }
   if (skipped.length) {
     output += (output ? '\n' : '') + '[grep: skipped ' + skipped.length + ' file(s): '
       + skipped.slice(0, 5).join('; ') + (skipped.length > 5 ? '; …' : '') + ']';
@@ -1362,68 +1425,147 @@ async function shGrep(ctx, args, stdin) {
 }
 
 async function shHead(ctx, args, stdin) {
-  const parsed = parseLineCountArgs('head', args);
+  const parsed = parseCountArgs('head', args);
   if (parsed.error) return shErr(parsed.error);
-  const text = await readHeadTailInput(ctx, 'head', parsed.paths, stdin);
-  if (text === null) return shErr('head: missing file operand (or pipe input into head)');
-  if (text.error) return shErr(text.error);
-  const lines = splitLines(text.text).slice(0, parsed.n);
-  return shOk(lines.join('\n'));
+  const input = await readHeadTailInput(ctx, 'head', parsed.paths, stdin);
+  if (input === null) return shErr('head: missing file operand (or pipe input into head)');
+  if (input.error) return shErr(input.error);
+  if (parsed.mode === 'bytes') {
+    return headTailResult('head', input.bytes.slice(0, parsed.count), null);
+  }
+  const text = splitLines(new TextDecoder('utf-8').decode(input.bytes))
+    .slice(0, parsed.count).join('\n');
+  return headTailResult('head', null, text);
 }
 
 async function shTail(ctx, args, stdin) {
-  const parsed = parseLineCountArgs('tail', args);
+  const parsed = parseCountArgs('tail', args);
   if (parsed.error) return shErr(parsed.error);
-  const text = await readHeadTailInput(ctx, 'tail', parsed.paths, stdin);
-  if (text === null) return shErr('tail: missing file operand (or pipe input into tail)');
-  if (text.error) return shErr(text.error);
-  const lines = splitLines(text.text);
-  const out = parsed.from !== null ? lines.slice(parsed.from - 1) : lines.slice(Math.max(0, lines.length - parsed.n));
-  return shOk(out.join('\n'));
+  const input = await readHeadTailInput(ctx, 'tail', parsed.paths, stdin);
+  if (input === null) return shErr('tail: missing file operand (or pipe input into tail)');
+  if (input.error) return shErr(input.error);
+  if (parsed.mode === 'bytes') {
+    const b = input.bytes;
+    return headTailResult('tail', b.slice(Math.max(0, b.byteLength - parsed.count)), null);
+  }
+  const lines = splitLines(new TextDecoder('utf-8').decode(input.bytes));
+  const out = parsed.fromLine !== null
+    ? lines.slice(parsed.fromLine - 1)
+    : lines.slice(Math.max(0, lines.length - parsed.count));
+  return headTailResult('tail', null, out.join('\n'));
 }
 
-function parseLineCountArgs(cmd, args) {
-  let n = 10, from = null;
+// Final head/tail answer: byte-mode output is measured in real UTF-8 bytes
+// (matching `wc -c`), line-mode output in the encoded text. Either way the
+// terminal cap applies to the RESULT — never silently truncated.
+function headTailResult(cmd, outBytes, outText) {
+  const over = outBytes
+    ? outBytes.byteLength > HEAD_TAIL_MAX_OUTPUT_BYTES
+    : utf8ByteLength(outText) > HEAD_TAIL_MAX_OUTPUT_BYTES;
+  if (over) {
+    return shErr(cmd + ': output exceeds the ' + HEAD_TAIL_MAX_OUTPUT_BYTES
+      + '-byte terminal limit; use a smaller -n/-c or python');
+  }
+  return shOk(outBytes ? new TextDecoder('utf-8').decode(outBytes) : outText);
+}
+
+// Parse head/tail arguments into one explicit shape:
+//   { mode: 'lines'|'bytes', count, fromLine, paths }   — or { error }
+// `-n`/`-nN` (and tail's `-n +N`/`-n+N`) select lines, `-c`/`-cN` select
+// bytes, a bare unquoted `-N` is the classic shorthand for `-n N`. `-n` and
+// `-c` together are a loud error — never last-option-wins. Quoted "-5" stays
+// a file operand.
+function parseCountArgs(cmd, args) {
+  let mode = 'lines';
+  let count = 10;
+  let fromLine = null;
+  let lineCountGiven = false; // explicit -n / -nN / -N / -n +N seen (conflict guard for -c)
   const paths = [];
+  const fail = (m) => ({ error: cmd + ': ' + m });
+  const wantCount = (text, what) => {
+    if (!/^[0-9]+$/.test(text)) return fail('invalid ' + what + ': ' + text);
+    if (text.length > 15 || !Number.isSafeInteger(Number(text))) {
+      return fail(what + ' too large: ' + text);
+    }
+    return { value: parseInt(text, 10) };
+  };
   for (let i = 0; i < args.length; i++) {
     const t = args[i];
     if (!t.quoted && t.text === '-n') {
+      if (mode === 'bytes') return fail('cannot combine line and byte count modes');
       const v = args[++i];
-      if (!v) return { error: cmd + ': -n requires a line count' };
+      if (!v) return fail('-n requires a line count');
       if (/^\+[0-9]+$/.test(v.text)) {
-        if (cmd !== 'tail') return { error: cmd + ': -n +N is only supported by tail' };
-        from = parseInt(v.text.slice(1), 10);
-      } else if (/^[0-9]+$/.test(v.text)) {
-        n = parseInt(v.text, 10);
+        if (cmd !== 'tail') return fail('-n +N is only supported by tail');
+        const n = wantCount(v.text.slice(1), 'line count');
+        if (n.error) return n;
+        fromLine = n.value;
       } else {
-        return { error: cmd + ': invalid line count: ' + v.text };
+        const n = wantCount(v.text, 'line count');
+        if (n.error) return n;
+        count = n.value;
       }
+      lineCountGiven = true;
     } else if (!t.quoted && /^-n[0-9]+$/.test(t.text)) {
-      n = parseInt(t.text.slice(2), 10);
+      if (mode === 'bytes') return fail('cannot combine line and byte count modes');
+      const n = wantCount(t.text.slice(2), 'line count');
+      if (n.error) return n;
+      count = n.value;
+      lineCountGiven = true;
     } else if (!t.quoted && cmd === 'tail' && /^-n\+[0-9]+$/.test(t.text)) {
-      from = parseInt(t.text.slice(3), 10);
+      const n = wantCount(t.text.slice(3), 'line count');
+      if (n.error) return n;
+      fromLine = n.value;
+      lineCountGiven = true;
+    } else if (!t.quoted && t.text === '-c') {
+      if (lineCountGiven) return fail('cannot combine line and byte count modes');
+      const v = args[++i];
+      if (!v) return fail('-c requires a byte count');
+      const n = wantCount(v.text, 'byte count');
+      if (n.error) return n;
+      count = n.value;
+      mode = 'bytes';
+    } else if (!t.quoted && /^-c[0-9]+$/.test(t.text)) {
+      if (lineCountGiven) return fail('cannot combine line and byte count modes');
+      const n = wantCount(t.text.slice(2), 'byte count');
+      if (n.error) return n;
+      count = n.value;
+      mode = 'bytes';
+    } else if (!t.quoted && /^-[0-9]+$/.test(t.text)) {
+      if (mode === 'bytes') return fail('cannot combine line and byte count modes');
+      const n = wantCount(t.text.slice(1), 'line count');
+      if (n.error) return n;
+      count = n.value;
+      lineCountGiven = true;
     } else if (!t.quoted && t.text.charAt(0) === '-' && t.text.length > 1) {
-      return { error: cmd + ': unsupported option: ' + t.text + ' (supported: -n N' + (cmd === 'tail' ? ', -n +N' : '') + ')' };
+      return fail('unsupported option: ' + t.text + ' (supported: -n N'
+        + (cmd === 'tail' ? ', -n +N' : '') + ', -c N, -N)');
     } else {
       paths.push(t.text);
     }
   }
-  return { n: n, from: from, paths: paths };
+  return { mode: mode, count: count, fromLine: fromLine, paths: paths };
 }
 
 // head/tail read exactly one file or stdin (multiple files are rejected
-// instead of inventing header semantics).
+// instead of inventing header semantics). The INPUT cap is the generous
+// head/tail read bound — only the FINAL OUTPUT is held to the terminal cap.
 async function readHeadTailInput(ctx, cmd, paths, stdin) {
   if (!paths.length) {
-    if (stdin !== null && stdin !== undefined) return { text: stdin };
+    if (stdin !== null && stdin !== undefined) {
+      return { bytes: new TextEncoder().encode(stdin) };
+    }
     return null;
   }
   if (paths.length > 1) return { error: cmd + ': exactly one file operand is supported' };
   const abs = resolveShellPath(ctx, paths[0]);
   const st = await statShellPath(ctx, paths[0], abs);
   if (st.kind !== 'file') return { error: cmd + ': ' + paths[0] + ': is a directory' };
-  if (st.size > CAT_MAX_FILE_BYTES) return { error: cmd + ': ' + paths[0] + ': file too large for terminal output (use python)' };
-  return { text: await ctx.vfs.read(abs) };
+  if (st.size > HEAD_TAIL_MAX_INPUT_BYTES) {
+    return { error: cmd + ': ' + paths[0] + ': input exceeds the ' + HEAD_TAIL_MAX_INPUT_BYTES
+      + '-byte head/tail input limit (' + st.size + ' bytes); use python' };
+  }
+  return { bytes: await ctx.vfs.readBytes(abs) };
 }
 
 async function shWc(ctx, args, stdin) {
@@ -1479,6 +1621,128 @@ async function shWc(ctx, args, stdin) {
   }
   if (paths.length > 1) lines.push(format(total, 'total'));
   return shOk(lines.join('\n'));
+}
+
+// ---------- sort ----------
+// Deterministic line sort over bounded input (all operands + stdin combined).
+// Lexical comparison is plain `<`/`>` on code units — never localeCompare —
+// so results cannot drift with browser locale.
+
+// Leading numeric value for -n: optional sign, decimals and exponent.
+// Non-numeric lines have no numeric key (null), which the comparator orders
+// deterministically (numeric lines first, then lexical among themselves).
+function sortLeadingNumber(line) {
+  const m = String(line).match(/^[ \t]*[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?/);
+  if (!m) return null;
+  const v = Number(m[0]);
+  return Number.isFinite(v) ? v : null;
+}
+
+function compareLexical(a, b) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function compareNumericLines(a, b) {
+  const na = sortLeadingNumber(a);
+  const nb = sortLeadingNumber(b);
+  if (na !== null && nb !== null) {
+    if (na < nb) return -1;
+    if (na > nb) return 1;
+    return compareLexical(a, b); // equal keys: stable, deterministic tie-break
+  }
+  if (na !== null) return -1;
+  if (nb !== null) return 1;
+  return compareLexical(a, b);
+}
+
+async function shSort(ctx, args, stdin) {
+  let flagN = false, flagR = false, flagU = false;
+  const paths = [];
+  for (const t of args) {
+    if (!t.quoted && t.text.charAt(0) === '-' && t.text.length > 1) {
+      for (const ch of t.text.slice(1)) {
+        if (ch === 'n') flagN = true;
+        else if (ch === 'r') flagR = true;
+        else if (ch === 'u') flagU = true;
+        else return shErr('sort: unsupported option: -' + ch + ' (supported options: -n -r -u)');
+      }
+    } else {
+      paths.push(t.text);
+    }
+  }
+  const signal = ctx.opts && ctx.opts.signal;
+  const texts = [];
+  let totalBytes = 0;
+  if (!paths.length) {
+    if (stdin === null || stdin === undefined) {
+      return shErr('sort: missing file operand (or pipe input into sort)');
+    }
+    totalBytes = utf8ByteLength(stdin);
+    if (totalBytes > SORT_MAX_INPUT_BYTES) {
+      return shErr('sort: input exceeds the ' + SORT_MAX_INPUT_BYTES + '-byte sort limit ('
+        + totalBytes + ' bytes); use python');
+    }
+    texts.push(stdin);
+  } else {
+    for (const p of paths) {
+      throwIfCancelled(signal, 'sort');
+      let abs;
+      try {
+        abs = resolveShellPath(ctx, p);
+      } catch (e) {
+        return shErr('sort: ' + e.message);
+      }
+      const st = await statShellPath(ctx, p, abs);
+      if (st.kind !== 'file') return shErr('sort: ' + p + ': is a directory');
+      totalBytes += st.size;
+      if (totalBytes > SORT_MAX_INPUT_BYTES) {
+        return shErr('sort: input exceeds the ' + SORT_MAX_INPUT_BYTES + '-byte sort limit ('
+          + totalBytes + ' bytes); use python');
+      }
+      let text;
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(await ctx.vfs.readBytes(abs));
+      } catch (e) {
+        return shErr('sort: ' + p + ': input is not UTF-8 text');
+      }
+      texts.push(text);
+    }
+  }
+  // All input is in memory; a cancel between reading and sorting still lands.
+  throwIfCancelled(signal, 'sort');
+  let lines = [];
+  for (const t of texts) lines = lines.concat(splitLines(t));
+  const cmp = flagN ? compareNumericLines : compareLexical;
+  lines.sort((a, b) => (flagR ? -cmp(a, b) : cmp(a, b)));
+  if (flagU) {
+    const unique = [];
+    for (const l of lines) {
+      if (!unique.length || unique[unique.length - 1] !== l) unique.push(l);
+    }
+    lines = unique;
+  }
+  return shOk(lines.join('\n'));
+}
+
+// ---------- which ----------
+// Pure registry lookup: resolves through SHELL_COMMANDS + SHELL_ALIASES only.
+// It never executes the command, never touches the network and never inspects
+// a host PATH. Paths are reported as /usr/bin/<name> because /usr/bin is the
+// capability view of exactly this registry.
+async function shWhich(ctx, args) {
+  if (!args.length) return shErr('usage: which <command>...');
+  const found = [];
+  const errors = [];
+  for (const t of args) {
+    const name = SHELL_ALIASES[t.text] || t.text;
+    if (Object.prototype.hasOwnProperty.call(SHELL_COMMANDS, name)) {
+      found.push('/usr/bin/' + name);
+    } else {
+      errors.push('which: ' + t.text + ': command not found');
+    }
+  }
+  if (errors.length) return shErrAt(errors.join('\n'), found.join('\n'));
+  return shOk(found.join('\n'));
 }
 
 // ---------- mv / rm ----------
@@ -1981,12 +2245,12 @@ async function runPipeline(pipeline, ctx) {
 // run the command, then deliver its stdout/stderr through the routing state.
 async function runSimpleCommand(cmd, ctx, stdin) {
   const argv = cmd.argv;
-  let name = argv[0].text;
-  if (name === 'python3') name = 'python'; // alias
+  const rawName = argv[0].text;
+  const name = SHELL_ALIASES[rawName] || rawName;
   const spec = SHELL_COMMANDS[name];
 
   // ---- redirection routing state ----
-  // stdout: {kind:'capture'} | {kind:'file', path, append}
+  // stdout: {kind:'capture'} | {kind:'file', path, append} | {kind:'null'}
   // stderr: same, plus {kind:'merge-stdout'} (2>&1 while stdout was captured)
   const args = [];
   const route = { stdout: { kind: 'capture' }, stderr: { kind: 'capture' } };
@@ -1995,10 +2259,14 @@ async function runSimpleCommand(cmd, ctx, stdin) {
     if (!t.op) { args.push(t); continue; }
     if (t.text === '2>&1') {
       // stderr inherits stdout's CURRENT destination — a snapshot, so a later
-      // `> file` does not retroactively move stderr.
+      // `> file` does not retroactively move stderr. All three destination
+      // kinds (capture / file / null) snapshot correctly: with stdout already
+      // discarded, stderr is discarded too.
       route.stderr = route.stdout.kind === 'file'
         ? { kind: 'file', path: route.stdout.path, append: route.stdout.append }
-        : { kind: 'merge-stdout' };
+        : route.stdout.kind === 'null'
+          ? { kind: 'null' }
+          : { kind: 'merge-stdout' };
       continue;
     }
     const target = argv[++i];
@@ -2008,6 +2276,15 @@ async function runSimpleCommand(cmd, ctx, stdin) {
       abs = resolveShellPath(ctx, target.text);
     } catch (e) {
       return shErr('bash: ' + e.message);
+    }
+    // /dev/null is a redirection SINK, not a filesystem node: output routed
+    // here is discarded without touching the VFS (there is deliberately no
+    // /dev — `cat /dev/null` still fails like any missing file).
+    if (abs === '/dev/null') {
+      const dest = { kind: 'null' };
+      if (t.text.charAt(0) === '2') route.stderr = dest;
+      else route.stdout = dest;
+      continue;
     }
     if (abs === '/') return shErr('bash: redirect target must be a file path, not the filesystem root');
     // Unwritable targets (read-only mounts, structural paths, unmounted
@@ -2042,17 +2319,20 @@ async function runSimpleCommand(cmd, ctx, stdin) {
 
   // ---- deliver streams through the routing state ----
   // Redirection changes WHERE output goes, never the command's success.
+  // A 'null' destination discards its stream silently (and is not a
+  // filesystem write); 'merge-stdout' folds stderr into the PRESENT stdout.
   const out = {
     success: res.success,
     stdout: '',
-    stderr: route.stderr.kind === 'capture' ? (res.stderr || '') : '',
+    stderr: '',
     network: res.network || null,
     fs: !!res.fs,
   };
   const writes = [];
-  if (route.stdout.kind === 'file') writes.push({ dest: route.stdout, text: res.stdout || '' });
-  else out.stdout = res.stdout || '';
-  if (route.stderr.kind === 'file') writes.push({ dest: route.stderr, text: res.stderr || '' });
+  if (route.stdout.kind === 'capture') out.stdout = res.stdout || '';
+  else if (route.stdout.kind === 'file') writes.push({ dest: route.stdout, text: res.stdout || '' });
+  if (route.stderr.kind === 'capture') out.stderr = res.stderr || '';
+  else if (route.stderr.kind === 'file') writes.push({ dest: route.stderr, text: res.stderr || '' });
   else if (route.stderr.kind === 'merge-stdout') {
     out.stdout = [out.stdout, res.stderr].filter(Boolean).join('\n');
   }
