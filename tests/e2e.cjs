@@ -97,6 +97,9 @@ async function presentationE2e() {
     const grep = spawnSync(process.execPath, [path.join(__dirname, 'e2e-grep.cjs')], {
       stdio: 'inherit', env,
     });
+    const pythonAuthority = spawnSync(process.execPath, [path.join(__dirname, 'e2e-python-authority.cjs')], {
+      stdio: 'inherit', env,
+    });
     return [
       ['presentation', ui.status === 0],
       ['responsive', resp.status === 0],
@@ -105,6 +108,7 @@ async function presentationE2e() {
       ['approval', approval.status === 0],
       ['image', image.status === 0],
       ['grep', grep.status === 0],
+      ['python-authority', pythonAuthority.status === 0],
     ];
   } catch (error) {
     console.error(error && error.stack || error);

@@ -32,6 +32,7 @@ const SUITES = [
   'submit-presentation.test.mjs',
   'worker-init.test.cjs',
   'worker-output.test.cjs',
+  'python-authority.test.cjs',
   'vfs-audit.test.cjs',
   'attachments.test.cjs',
   'capabilities.test.cjs',
