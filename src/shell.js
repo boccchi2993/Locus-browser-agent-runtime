@@ -1285,6 +1285,156 @@ async function shFind(ctx, args) {
   return shOk(output);
 }
 
+// ---------- grep regex worker isolation ----------
+// The grep pattern is MODEL-CONTROLLED: its RegExp is compiled and every
+// match is executed ONLY inside a dedicated Web Worker (source:
+// #grep-worker-src in index.html). A catastrophic-backtracking pattern can
+// therefore never hold the UI event loop — the session TERMINATES the
+// worker at the hard timeout, on cancellation, on worker death and at the
+// command boundary. There is deliberately NO main-thread fallback: when a
+// worker cannot be created or dies mid-command, grep fails closed with a
+// bounded error.
+const GREP_REGEX_TIMEOUT_MS = 1000;
+
+const GrepRegexRuntime = {
+  // TEST-ONLY seam: Node unit tests inject a deterministic fake worker.
+  // Production never sets this and always constructs a real Blob Worker.
+  _workerFactory: null,
+
+  // Throws when the environment cannot provide a Worker; the caller must
+  // fail the grep command — never fall back to main-thread regex.
+  createWorker() {
+    if (this._workerFactory) return this._workerFactory();
+    const el = document.getElementById('grep-worker-src');
+    if (!el || !el.textContent) throw new Error('grep worker source not found');
+    const blob = new Blob([el.textContent], { type: 'text/javascript' });
+    // Same construction pattern as PythonRuntime: the Blob URL exists only
+    // to construct the Worker and is revoked immediately.
+    const url = URL.createObjectURL(blob);
+    try {
+      return new Worker(url);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  },
+};
+
+function grepRegexError(message, kind) {
+  const e = new Error(message);
+  e.grepFailure = kind;
+  return e;
+}
+
+// One session per grep command: the pattern is compiled once in the worker
+// and reused for every searched source (stdin, file operands, recursive
+// walk). Timeout, cancellation, worker death and command completion all
+// TERMINATE the worker, so no regex state or stale reply survives the
+// command. Every request settles exactly once; the first of
+// { reply, timeout, abort, worker death } wins and the losers clean up.
+function createGrepRegexSession(pattern, flags) {
+  let worker = null;
+  try {
+    worker = GrepRegexRuntime.createWorker();
+  } catch (e) {
+    throw grepRegexError('grep: regex worker unavailable', 'worker_unavailable');
+  }
+
+  let reqSeq = 0;
+  let pending = null; // the single in-flight request: { id, cmd, signal, onAbort, timer, settle, active }
+
+  const workerFailedError = () => grepRegexError('grep: regex worker failed', 'worker_failed');
+
+  function terminate() {
+    if (!worker) return;
+    const w = worker;
+    worker = null;
+    try { w.terminate(); } catch (e) {}
+    w.onmessage = null;
+    w.onerror = null;
+    w.onmessageerror = null;
+  }
+
+  function failPending(err) {
+    const p = pending;
+    if (!p) return;
+    pending = null;
+    p.settle(err);
+  }
+
+  worker.onmessage = (ev) => {
+    const msg = (ev && ev.data) || {};
+    const p = pending;
+    // Correlate by request id: a reply for an already-settled request
+    // (timed out / cancelled / terminated) is stale and ignored.
+    if (!p || msg.id !== p.id) return;
+    if (msg.type === 'result' || (p.cmd === 'init' && msg.type === 'ready')) {
+      p.settle(null, msg);
+    } else {
+      // invalid_pattern and internal_error arrive as bounded verdicts —
+      // the raw pattern and any engine detail never leave the worker.
+      p.settle(msg.type === 'invalid_pattern'
+        ? grepRegexError('grep: invalid pattern (patterns use JavaScript regex syntax)', 'invalid_pattern')
+        : workerFailedError());
+    }
+  };
+  worker.onerror = () => { terminate(); failPending(workerFailedError()); };
+  worker.onmessageerror = () => { terminate(); failPending(workerFailedError()); };
+
+  function request(cmd, body, signal) {
+    throwIfCancelled(signal, 'grep');
+    if (!worker) return Promise.reject(workerFailedError());
+    return new Promise((resolve, reject) => {
+      const p = { id: ++reqSeq, cmd: cmd, signal: signal || null, onAbort: null, timer: null, settle: null, active: true };
+      p.settle = (err, val) => {
+        if (!p.active) return; // settle exactly once
+        p.active = false;
+        if (pending === p) pending = null;
+        clearTimeout(p.timer);
+        if (p.onAbort && p.signal) p.signal.removeEventListener('abort', p.onAbort);
+        if (err) reject(err); else resolve(val);
+      };
+      p.timer = setTimeout(() => {
+        // A timeout TERMINATES the worker instead of merely stop waiting:
+        // the pattern has proven unfit to keep running for this command.
+        terminate();
+        p.settle(grepRegexError(
+          'grep: regex evaluation timed out (the pattern may cause excessive backtracking; simplify it)',
+          'timeout'));
+      }, GREP_REGEX_TIMEOUT_MS);
+      p.onAbort = () => {
+        terminate();
+        p.settle(makeCancelledError('grep'));
+      };
+      if (p.signal) p.signal.addEventListener('abort', p.onAbort, { once: true });
+      pending = p;
+      worker.postMessage(Object.assign({ id: p.id, cmd: cmd }, body));
+    });
+  }
+
+  return {
+    // Compile (validate) the pattern inside the worker. Resolves with the
+    // 'ready' verdict; rejects with a bounded grepFailure-tagged error.
+    init(signal) {
+      return request('init', { pattern: pattern, flags: flags }, signal);
+    },
+    // Scan ONE already-decoded text source in the worker.
+    // opts.countOnly — count every matching line (never capped);
+    // opts.maxMatches — cap the returned matches (presentation budget).
+    scan(text, opts, signal) {
+      return request('scan', {
+        text: text,
+        countOnly: !!(opts && opts.countOnly),
+        maxMatches: opts && typeof opts.maxMatches === 'number' ? opts.maxMatches : null,
+      }, signal);
+    },
+    // Command boundary: kill the worker and drop all session state.
+    destroy() {
+      terminate();
+      failPending(workerFailedError());
+    },
+  };
+}
+
 async function shGrep(ctx, args, stdin) {
   let flagN = false, flagI = false, flagR = false, flagC = false;
   let pattern = null;
@@ -1306,122 +1456,133 @@ async function shGrep(ctx, args, stdin) {
     }
   }
   if (pattern === null) return shErr('usage: grep [-c] [-n] [-i] [-r|-R] [-E] <pattern> [path...]');
-  let re;
-  try {
-    re = new RegExp(pattern, flagI ? 'i' : '');
-  } catch (e) {
-    return shErr('grep: invalid pattern: ' + e.message + ' (patterns use JavaScript regex syntax)');
-  }
-  if (!paths.length && (stdin === null || stdin === undefined)) {
-    return shErr('grep: missing file operand (or pipe input into grep)');
-  }
+  // The pattern is model-controlled: it is compiled and matched ONLY inside
+  // the grep worker session, never on this thread. The session terminates
+  // the worker at the hard timeout, on cancellation, on worker death and at
+  // this command's boundary; a worker that cannot be created fails the
+  // command — there is no main-thread fallback.
   const signal = ctx.opts && ctx.opts.signal;
-  const matches = [];
-  // -c counts MATCHING LINES per searched source. Counting is decoupled from
-  // the output-line cap: a file with 1000 matches answers 1000, never the
-  // GREP_MAX_MATCHES presentation bound.
-  const counts = [];
-  let countedFromDir = false;
-  const skipped = [];
-  const state = { truncated: false, filesSeen: 0 };
-  const showPathDefault = paths.length > 1;
+  let session = null;
+  try {
+    session = createGrepRegexSession(pattern, flagI ? 'i' : '');
+    await session.init(signal);
+    if (!paths.length && (stdin === null || stdin === undefined)) {
+      return shErr('grep: missing file operand (or pipe input into grep)');
+    }
+    const matches = [];
+    // -c counts MATCHING LINES per searched source. Counting is decoupled from
+    // the output-line cap: a file with 1000 matches answers 1000, never the
+    // GREP_MAX_MATCHES presentation bound.
+    const counts = [];
+    let countedFromDir = false;
+    const skipped = [];
+    const state = { truncated: false, filesSeen: 0 };
+    const showPathDefault = paths.length > 1;
 
-  function grepText(text, disp, showPath) {
-    const lines = splitLines(text);
-    if (flagC) {
-      let c = 0;
-      for (let i = 0; i < lines.length; i++) {
-        if (re.test(lines[i])) c++;
+    async function grepText(text, disp, showPath) {
+      const remaining = GREP_MAX_MATCHES - matches.length;
+      if (!flagC && remaining <= 0) { state.truncated = true; return; }
+      const r = await session.scan(text, { countOnly: flagC, maxMatches: remaining }, signal);
+      if (flagC) {
+        counts.push({ disp: disp, count: r.count, showPath: showPath });
+        return;
       }
-      counts.push({ disp: disp, count: c, showPath: showPath });
-      return;
-    }
-    for (let i = 0; i < lines.length; i++) {
-      if (matches.length >= GREP_MAX_MATCHES) { state.truncated = true; return; }
-      if (re.test(lines[i])) {
-        matches.push((showPath ? disp + ':' : '') + (flagN ? (i + 1) + ':' : '') + lines[i]);
+      // The worker stops at the remaining match budget and reports whether
+      // it hit the cap — matching here would reintroduce the main-thread
+      // regex execution F03 removes.
+      if (r.hitMatchLimit) state.truncated = true;
+      for (const m of r.matches) {
+        matches.push((showPath ? disp + ':' : '') + (flagN ? m.lineNumber + ':' : '') + m.line);
       }
     }
-  }
 
-  async function grepFile(abs, disp, showPath) {
-    const st = await ctx.vfs.stat(abs);
-    if (st.size > GREP_MAX_FILE_BYTES) {
-      skipped.push(disp + ' (over ' + GREP_MAX_FILE_BYTES + '-byte grep limit)');
-      return;
+    async function grepFile(abs, disp, showPath) {
+      const st = await ctx.vfs.stat(abs);
+      if (st.size > GREP_MAX_FILE_BYTES) {
+        skipped.push(disp + ' (over ' + GREP_MAX_FILE_BYTES + '-byte grep limit)');
+        return;
+      }
+      let text;
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(await ctx.vfs.readBytes(abs));
+      } catch (e) {
+        skipped.push(disp + ' (not UTF-8 text)');
+        return;
+      }
+      await grepText(text, disp, showPath);
     }
-    let text;
-    try {
-      text = new TextDecoder('utf-8', { fatal: true }).decode(await ctx.vfs.readBytes(abs));
-    } catch (e) {
-      skipped.push(disp + ' (not UTF-8 text)');
-      return;
-    }
-    grepText(text, disp, showPath);
-  }
 
-  async function grepDir(abs, disp) {
-    if (state.truncated) return;
-    throwIfCancelled(signal, 'grep');
-    countedFromDir = true;
-    const entries = await ctx.vfs.list(abs);
-    for (const e of entries) {
+    async function grepDir(abs, disp) {
       if (state.truncated) return;
       throwIfCancelled(signal, 'grep');
-      const childAbs = joinAbs(abs, e.name);
-      const childDisp = joinDisplay(disp, e.name);
-      if (e.kind === 'directory') {
-        await grepDir(childAbs, childDisp);
-      } else {
-        state.filesSeen++;
-        if (state.filesSeen > GREP_MAX_FILES) { state.truncated = true; return; }
-        await grepFile(childAbs, childDisp, true);
+      countedFromDir = true;
+      const entries = await ctx.vfs.list(abs);
+      for (const e of entries) {
+        if (state.truncated) return;
+        throwIfCancelled(signal, 'grep');
+        const childAbs = joinAbs(abs, e.name);
+        const childDisp = joinDisplay(disp, e.name);
+        if (e.kind === 'directory') {
+          await grepDir(childAbs, childDisp);
+        } else {
+          state.filesSeen++;
+          if (state.filesSeen > GREP_MAX_FILES) { state.truncated = true; return; }
+          await grepFile(childAbs, childDisp, true);
+        }
       }
     }
-  }
 
-  if (!paths.length) {
-    grepText(stdin, '', false);
-  } else {
-    for (const p of paths) {
-      if (state.truncated) break;
-      let abs;
-      try {
-        abs = resolveShellPath(ctx, p);
-      } catch (e) {
-        return shErr('grep: ' + e.message);
-      }
-      const st = await statShellPath(ctx, p, abs);
-      if (st.kind === 'directory') {
-        if (!flagR) return shErr('grep: ' + p + ': is a directory (use -r to search recursively)');
-        await grepDir(abs, p.replace(/\/+$/, '') || '.');
-      } else {
-        await grepFile(abs, p, showPathDefault);
+    if (!paths.length) {
+      await grepText(stdin, '', false);
+    } else {
+      for (const p of paths) {
+        if (state.truncated) break;
+        let abs;
+        try {
+          abs = resolveShellPath(ctx, p);
+        } catch (e) {
+          return shErr('grep: ' + e.message);
+        }
+        const st = await statShellPath(ctx, p, abs);
+        if (st.kind === 'directory') {
+          if (!flagR) return shErr('grep: ' + p + ': is a directory (use -r to search recursively)');
+          await grepDir(abs, p.replace(/\/+$/, '') || '.');
+        } else {
+          await grepFile(abs, p, showPathDefault);
+        }
       }
     }
-  }
 
-  let output;
-  if (flagC) {
-    // Count mode: `<number>` for stdin, `<number>` for a single file operand,
-    // `path:count` for multiple operands or a recursive directory search
-    // (matching GNU presentation). Zero matches are a successful answer.
-    const showPath = paths.length > 1 || countedFromDir
-      || counts.some((c) => c.showPath);
-    output = counts.map((c) => (showPath ? c.disp + ':' : '') + c.count).join('\n');
-  } else {
-    output = matches.join('\n');
+    let output;
+    if (flagC) {
+      // Count mode: `<number>` for stdin, `<number>` for a single file operand,
+      // `path:count` for multiple operands or a recursive directory search
+      // (matching GNU presentation). Zero matches are a successful answer.
+      const showPath = paths.length > 1 || countedFromDir
+        || counts.some((c) => c.showPath);
+      output = counts.map((c) => (showPath ? c.disp + ':' : '') + c.count).join('\n');
+    } else {
+      output = matches.join('\n');
+    }
+    if (skipped.length) {
+      output += (output ? '\n' : '') + '[grep: skipped ' + skipped.length + ' file(s): '
+        + skipped.slice(0, 5).join('; ') + (skipped.length > 5 ? '; …' : '') + ']';
+    }
+    if (state.truncated) {
+      output += (output ? '\n' : '') + '[grep: results truncated at traversal limits; narrow the pattern or path]';
+    }
+    // A search with zero matches is a successful empty answer (diverges from
+    // the GNU exit code) so pipelines like `grep x | wc -l` keep working.
+    return shOk(output);
+  } catch (e) {
+    if (isCancelledError(e)) throw e;
+    // Bounded worker verdicts (invalid pattern / regex timeout / worker
+    // failure / worker unavailable) are ordinary grep failures.
+    if (e && e.grepFailure) return shErr(e.message);
+    throw e;
+  } finally {
+    if (session) session.destroy();
   }
-  if (skipped.length) {
-    output += (output ? '\n' : '') + '[grep: skipped ' + skipped.length + ' file(s): '
-      + skipped.slice(0, 5).join('; ') + (skipped.length > 5 ? '; …' : '') + ']';
-  }
-  if (state.truncated) {
-    output += (output ? '\n' : '') + '[grep: results truncated at traversal limits; narrow the pattern or path]';
-  }
-  // A search with zero matches is a successful empty answer (diverges from
-  // the GNU exit code) so pipelines like `grep x | wc -l` keep working.
-  return shOk(output);
 }
 
 async function shHead(ctx, args, stdin) {

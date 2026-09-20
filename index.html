@@ -321,6 +321,86 @@ self.onmessage = async (ev) => {
 };
 </script>
 
+<script type="text/worker" id="grep-worker-src">
+// ============================================================
+//  GREP REGEX WORKER — untrusted-pattern compute containment.
+//  The grep pattern is model-controlled: RegExp compilation and
+//  every match run HERE, never on the main thread, so a
+//  catastrophic-backtracking pattern burns this worker (which the
+//  shell terminates at the hard timeout, on cancellation, and at
+//  the command boundary) instead of freezing the UI event loop.
+//  Pure compute: no network, no filesystem, no DOM, no persistence.
+//
+//  Message in:  { id, cmd: 'init', pattern, flags }
+//  Reply out:   { id, type: 'ready' } | { id, type: 'invalid_pattern' }
+//
+//  Message in:  { id, cmd: 'scan', text, countOnly, maxMatches }
+//  Reply out:   countOnly → { id, type: 'result', count }
+//               otherwise → { id, type: 'result',
+//                             matches: [{ lineNumber, line }],
+//                             hitMatchLimit }
+//  Every request gets exactly one reply carrying the same id; a
+//  request that cannot be honored replies 'internal_error'. Raw
+//  patterns and error strings never leave this worker.
+// ============================================================
+
+let re = null;
+
+// Line-splitting parity with the shell's splitLines(): '\n' separators,
+// and a trailing newline is a terminator, not an empty final line.
+function splitLines(text) {
+  const lines = String(text).split('\n');
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+
+self.onmessage = (ev) => {
+  const msg = (ev && ev.data) || {};
+  try {
+    if (msg.cmd === 'init') {
+      try {
+        re = new RegExp(String(msg.pattern), msg.flags ? String(msg.flags) : '');
+      } catch (e) {
+        re = null;
+        self.postMessage({ id: msg.id, type: 'invalid_pattern' });
+        return;
+      }
+      self.postMessage({ id: msg.id, type: 'ready' });
+      return;
+    }
+    if (msg.cmd === 'scan') {
+      if (!re) {
+        self.postMessage({ id: msg.id, type: 'internal_error' });
+        return;
+      }
+      const lines = splitLines(msg.text);
+      if (msg.countOnly) {
+        // Count mode answers the TRUE number of matching lines: the
+        // GREP_MAX_MATCHES presentation cap never applies here.
+        let count = 0;
+        for (let i = 0; i < lines.length; i++) {
+          if (re.test(lines[i])) count++;
+        }
+        self.postMessage({ id: msg.id, type: 'result', count: count });
+        return;
+      }
+      const budget = typeof msg.maxMatches === 'number' ? msg.maxMatches : Infinity;
+      const matches = [];
+      let hitMatchLimit = false;
+      for (let i = 0; i < lines.length; i++) {
+        if (matches.length >= budget) { hitMatchLimit = true; break; }
+        if (re.test(lines[i])) matches.push({ lineNumber: i + 1, line: lines[i] });
+      }
+      self.postMessage({ id: msg.id, type: 'result', matches: matches, hitMatchLimit: hitMatchLimit });
+      return;
+    }
+    self.postMessage({ id: msg.id, type: 'internal_error' });
+  } catch (e) {
+    self.postMessage({ id: msg.id, type: 'internal_error' });
+  }
+};
+</script>
+
 <!-- Runtime: framework-independent classic scripts (globals). Never bundled. -->
 <script src="./src/telemetry.js"></script>
 <script src="./src/persistence.js"></script>
