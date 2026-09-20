@@ -15,7 +15,7 @@ global.window = { location: { protocol: 'https:' } }; // hosted page → relay a
 const src = ['network.js', 'approval.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
-const M = eval(src + '\n;({ NetworkRuntime, ApprovalController, NETWORK_MAX_REQUEST_BYTES, NETWORK_MAX_RESPONSE_BYTES, RELAY_CLIENT_TIMEOUT_MS });');
+const M = eval(src + '\n;({ NetworkRuntime, ApprovalController, NETWORK_MAX_REQUEST_BYTES, NETWORK_MAX_RESPONSE_BYTES, RELAY_CLIENT_TIMEOUT_MS, isPrivateHostname, safeNetworkUrlForDisplay });');
 
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });
@@ -489,6 +489,175 @@ async function run() {
     const leg = await RT.fetch('https://example.test/legacy');
     check('B8 legacy fetch() shape (bytes + headers object)',
       leg.backend === 'browser-direct' && leg.bytes && leg.headers['content-type'] === 'application/json', '');
+  }
+
+  // ============ 11. private-address classification (N-F02/N-F07) ============
+  // The SAME attack-vector table runs against the relay in
+  // tests/fetch.test.mjs (F2c) — keep the two tables in sync.
+  {
+    const PRIVATE = [
+      'localhost', 'localhost.', 'sub.localhost', 'localhost.localdomain',
+      'sub.localhost.localdomain', '127.0.0.1', '127.254.9.9', '0.0.0.0', '0.1.2.3',
+      '10.0.0.1', '169.254.169.254', '172.16.0.1', '172.31.255.255', '192.168.1.1',
+      '::1', '::',
+      // IPv4-mapped IPv6, dotted and WHATWG-canonical hex spellings
+      '::ffff:127.0.0.1', '::ffff:10.0.0.1', '::ffff:192.168.1.1', '::ffff:169.254.169.254',
+      '::ffff:7f00:1', '::ffff:a00:1', '::ffff:c0a8:101', '::ffff:a9fe:a9fe',
+      '[::ffff:7f00:1]', '[::ffff:c0a8:101]',
+      // WHATWG scalar normalizations
+      '2130706433', '0x7f000001', '0177.0.0.1', '127.1', '127.9.9.9',
+      '0xC0A80101', // 192.168.1.1
+    ];
+    for (const v of PRIVATE) {
+      check('S private: ' + v, M.isPrivateHostname(v) === true, 'classified public');
+    }
+    const PUBLIC = [
+      'example.com', 'api.example.test', 'localhost.com', 'notlocalhost',
+      '93.184.216.34', '172.32.0.1', '172.15.255.255', '192.169.0.1', '11.0.0.1',
+      '2606:2800:220:1:248:1893:25c8:1946',
+      'fe00::1', 'fec0::1', // start with fe/fc hex but OUTSIDE fc00::/7 and fe80::/10
+      '::ffff:93.184.216.34', '::ffff:5dc8:d822', // mapped PUBLIC address stays public
+    ];
+    for (const v of PUBLIC) {
+      check('S public: ' + v, M.isPrivateHostname(v) === false, 'classified private');
+    }
+    // request-level: a mapped-IPv6 loopback target is refused on the relay
+    // leg (direct attempt first for reads, then the fallback pre-check)
+    reset();
+    on((u) => u === 'http://[::ffff:7f00:1]:9/x', () => { throw new TypeError('Failed to fetch'); });
+    on(() => { throw new Error('relay must NOT be called for mapped-private targets'); });
+    e = await errOf(RT.request({ url: 'http://[::ffff:7f00:1]:9/x' }));
+    check('S mapped-IPv6 loopback request → network_private_address_blocked, no relay leg',
+      e && e.networkCode === 'network_private_address_blocked' && calls.length === 1,
+      e && e.networkCode + ' calls=' + calls.length);
+    // side-effecting mapped-IPv6 target: refused BEFORE the approval
+    reset();
+    const approvalsS = fakeApprovals();
+    e = await errOf(RT.request({ method: 'POST', url: 'http://[::ffff:a00:1]/x',
+      body: 'x', policyContext: { approvals: approvalsS } }));
+    check('S mapped-IPv6 POST refused pre-approval, zero attempts',
+      e && e.networkCode === 'network_private_address_blocked' && approvalsS.asks.length === 0
+      && calls.length === 0, e && e.networkCode + ' asks=' + approvalsS.asks.length);
+    // safe URL display: origin + path only, secrets dropped, bounded fallback
+    check('SD query dropped', M.safeNetworkUrlForDisplay('https://example.test/p?token=x') === 'https://example.test/p',
+      M.safeNetworkUrlForDisplay('https://example.test/p?token=x'));
+    check('SD userinfo+fragment dropped',
+      M.safeNetworkUrlForDisplay('https://user:pw@example.test:8443/p#frag') === 'https://example.test:8443/p',
+      M.safeNetworkUrlForDisplay('https://user:pw@example.test:8443/p#frag'));
+    check('SD IPv6 bracketed', M.safeNetworkUrlForDisplay('http://[::1]:8080/p?q=1') === 'http://[::1]:8080/p',
+      M.safeNetworkUrlForDisplay('http://[::1]:8080/p?q=1'));
+    check('SD unparseable input never echoed', M.safeNetworkUrlForDisplay('http://exa mple') === '(unparseable URL)'
+      && M.safeNetworkUrlForDisplay(null) === '(unparseable URL)', M.safeNetworkUrlForDisplay('http://exa mple'));
+  }
+
+  // ============ 12. fallback boundary (N-F06): only the initial fetch()
+  // transport failure may hand GET/HEAD to the relay ============
+  {
+    // F1: fetch() itself throws TypeError → GET relay exactly once
+    reset();
+    on((u) => u === 'https://blocked.test/b', () => { throw new TypeError('Failed to fetch'); });
+    on((u) => u.startsWith('/fetch?'), () => jsonResponse('{"via":"relay"}'));
+    const rF1 = await RT.request({ url: 'https://blocked.test/b' });
+    check('F1 transport TypeError → relay once', rF1.backend === 'edge-relay' && calls.length === 2,
+      'calls=' + calls.length);
+
+    // F2: header processing throws TypeError AFTER the Response exists → no fallback
+    reset();
+    on((u) => u === 'https://example.test/badhdr', () => {
+      const res = new Response('ok');
+      Object.defineProperty(res, 'headers', { get() { throw new TypeError('boom'); } });
+      return res;
+    });
+    on(() => { throw new Error('relay must NOT be called for post-Response failures'); });
+    e = await errOf(RT.request({ url: 'https://example.test/badhdr' }));
+    check('F2 post-Response header TypeError → no relay (calls=1)', calls.length === 1
+      && !(e && e.message && /unreachable/.test(e.message)), 'calls=' + calls.length + ' ' + (e && e.networkCode));
+
+    // F3: body reader constructor throws TypeError → no fallback
+    reset();
+    on((u) => u === 'https://example.test/badbody', () => ({
+      status: 200, statusText: '', url: 'https://example.test/badbody',
+      headers: new Headers({ 'content-type': 'text/plain' }),
+      get body() { throw new TypeError('reader boom'); },
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+    }));
+    on(() => { throw new Error('relay must NOT be called for post-Response failures'); });
+    e = await errOf(RT.request({ url: 'https://example.test/badbody' }));
+    check('F3 body-reader TypeError → network_direct_failed, no relay',
+      e && e.networkCode === 'network_direct_failed' && calls.length === 1,
+      (e && e.networkCode) + ' calls=' + calls.length);
+
+    // F4: mid-stream body read rejects with TypeError → no fallback
+    reset();
+    on((u) => u === 'https://example.test/midstream', () => new Response(
+      new ReadableStream({
+        start(ctrl) { ctrl.enqueue(new TextEncoder().encode('half')); },
+        pull() { throw new TypeError('network error'); },
+      }),
+      { status: 200, headers: { 'content-type': 'text/plain' } }));
+    on(() => { throw new Error('relay must NOT be called for post-Response failures'); });
+    e = await errOf(RT.request({ url: 'https://example.test/midstream' }));
+    check('F4 mid-stream TypeError → network_direct_failed, no relay',
+      e && e.networkCode === 'network_direct_failed' && calls.length === 1,
+      (e && e.networkCode) + ' calls=' + calls.length);
+
+    // F5: POST fetch TypeError → no fallback (side effect is never re-sent)
+    pageLoc({ protocol: 'https:', host: 'app.test' });
+    reset();
+    on((u, o) => u === 'https://app.test/pay' && o.method === 'POST', () => { throw new TypeError('Failed to fetch'); });
+    on(() => { throw new Error('relay must NOT be called for side effects'); });
+    e = await errOf(RT.request({ method: 'POST', url: 'https://app.test/pay',
+      policyContext: { approvals: fakeApprovals() } }));
+    check('F5 POST transport TypeError → network_direct_failed, one attempt',
+      e && e.networkCode === 'network_direct_failed' && e.ambiguous === true && calls.length === 1,
+      (e && e.networkCode) + ' calls=' + calls.length);
+    pageLoc({ protocol: 'https:' });
+  }
+
+  // ============ 13. HEAD method fidelity (N-F09) ============
+  {
+    // H1: direct HEAD is exact
+    reset();
+    on((u, o) => u === 'https://example.test/h' && o.method === 'HEAD', () =>
+      new Response(null, { status: 200, headers: { 'content-type': 'text/plain', 'x-head': 'direct' } }));
+    const rH1 = await RT.request({ method: 'HEAD', url: 'https://example.test/h' });
+    check('H1 direct HEAD exact: headers present, body empty, one call',
+      rH1.status === 200 && rH1.headers['x-head'] === 'direct' && rH1.bytes.byteLength === 0
+      && rH1.backend === 'browser-direct' && calls.length === 1,
+      JSON.stringify({ s: rH1.status, b: rH1.bytes.byteLength, c: calls.length }));
+
+    // H2: HEAD transport failure falls back with method HEAD (never GET)
+    reset();
+    on((u, o) => u === 'https://blocked.test/h' && o.method === 'HEAD', () => { throw new TypeError('Failed to fetch'); });
+    on((u, o) => u === '/fetch' && o.method === 'POST', (u, o) => {
+      const envelope = JSON.parse(o.body);
+      check('H2 fallback envelope preserves method HEAD', envelope.method === 'HEAD', JSON.stringify(envelope));
+      return new Response(null, { status: 200, headers: { 'content-type': 'text/plain', 'x-head': 'relay' } });
+    });
+    const rH2 = await RT.request({ method: 'HEAD', url: 'https://blocked.test/h' });
+    check('H2b HEAD fallback result: headers kept, body empty, exactly two calls',
+      rH2.backend === 'edge-relay' && rH2.headers['x-head'] === 'relay' && rH2.bytes.byteLength === 0
+      && calls.length === 2, 'calls=' + calls.length + ' bytes=' + rH2.bytes.byteLength);
+
+    // H3: HEAD 404 is authoritative — no fallback
+    reset();
+    on((u, o) => u === 'https://example.test/h' && o.method === 'HEAD', () =>
+      new Response(null, { status: 404 }));
+    on(() => { throw new Error('relay must NOT be called for a HEAD 404'); });
+    const rH3 = await RT.request({ method: 'HEAD', url: 'https://example.test/h' });
+    check('H3 HEAD 404 authoritative, no fallback', rH3.status === 404 && calls.length === 1,
+      'calls=' + calls.length);
+
+    // H4: a buggy server sends a BODY on HEAD — the platform hands the
+    // Response to the runtime (unavoidable at the transport boundary), and
+    // every consumer surface (shell -I, relay leg) keeps it non-content.
+    // Here: one call only, status authoritative, no relay re-send.
+    reset();
+    on((u, o) => u === 'https://example.test/h' && o.method === 'HEAD', () =>
+      new Response('SHOULD-NOT-SURFACE', { status: 200, headers: { 'content-type': 'text/plain' } }));
+    const rH4 = await RT.request({ method: 'HEAD', url: 'https://example.test/h' });
+    check('H4 HEAD response reported without a relay re-send',
+      rH4.status === 200 && calls.length === 1, 'calls=' + calls.length);
   }
 
   await tick();

@@ -157,7 +157,9 @@ async function run() {
   global.window.location.protocol = 'file:';
   on((u) => u === 'https://blocked.test/x', () => { throw new TypeError('Failed to fetch'); });
   const t8 = await M.executeTool('bash', 'curl https://blocked.test/x', ws);
-  check('N8b file:// clear error', !t8.success && t8.output.includes('no edge relay is available'), t8.output);
+  check('N8b file:// clear error (no backend internals in the wording)',
+    !t8.success && t8.output.includes('no request-forwarding service is available')
+    && !/relay|browser|Cloudflare|CORS/i.test(t8.output), t8.output);
   check('N8c no relay attempted from file://', calls.length === 1, calls.map((c) => c.url).join(','));
   global.window.location.protocol = 'https:';
 
@@ -190,6 +192,8 @@ async function run() {
       { status: 504, headers: { 'content-type': 'application/json', 'x-locus-relay-error': '1' } }));
   const t11 = await M.executeTool('bash', 'curl https://blocked.test/slow', ws);
   check('N11 relay error surfaced', !t11.success && t11.output.includes('Upstream timed out after 30000ms'), t11.output);
+  check('N11b model-facing wording hides the backend topology',
+    !/relay|browser|Cloudflare|CORS/i.test(t11.output), t11.output);
 
   // ---------- 13. cloud_bash still unsuccessful ----------
   reset();
@@ -415,6 +419,88 @@ async function run() {
   check('N28 external cancel + hanging cleanup → AbortError, not blocked',
     t28Err && t28Err.name === 'AbortError' && t28elapsed < 5000,
     (t28Err && t28Err.name) + ' after ' + t28elapsed + 'ms');
+
+  // ---------- 30. GET/HEAD + body is an explicit local error (no silent drop) ----------
+  reset();
+  on(() => { throw new Error('no fetch allowed for GET/HEAD + body'); });
+  const t30 = await M.executeTool('bash', "curl -X GET -d 'x=1' https://example.test/x", ws);
+  check('G1 -X GET -d → explicit local error, zero attempts',
+    !t30.success && t30.output.includes('unsupported request combination')
+    && t30.output.includes('GET') && calls.length === 0, t30.output + ' calls=' + calls.length);
+  const t30b = await M.executeTool('bash', "curl -I -d 'x=1' https://example.test/x", ws);
+  check('G2 -I -d → explicit local error, zero attempts',
+    !t30b.success && t30b.output.includes('unsupported request combination')
+    && t30b.output.includes('HEAD') && calls.length === 0, t30b.output + ' calls=' + calls.length);
+  const t30c = await M.executeTool('bash', "curl -d 'x=1' https://example.test/x", ws);
+  check('G3 POST -d is NOT caught by the GET-body guard (fails later at approvals)',
+    !t30c.success && t30c.output.includes('require an approval consumer'), t30c.output);
+
+  // ---------- 31. curl -I shows HEAD response headers ----------
+  reset();
+  on((u) => u === 'https://example.test/h', () => new Response(null, {
+    status: 200,
+    headers: { 'content-type': 'text/plain', 'x-test-header': 'yes', 'content-length': '123' },
+  }));
+  const t31 = await M.executeTool('bash', 'curl -I https://example.test/h', ws);
+  check('H1 direct HEAD → headers shown, backend browser-direct',
+    t31.success && t31.output.includes('HTTP 200') && t31.output.includes('x-test-header: yes')
+      && t31.output.includes('content-length: 123') && t31.backend === 'browser-direct',
+    JSON.stringify(t31.output) + ' backend=' + t31.backend);
+  check('H1b no body fetch round-trips beyond the HEAD', calls.length === 1, 'calls=' + calls.length);
+
+  reset();
+  on((u) => u === 'https://example.test/h', () => new Response(null, { status: 404, headers: {} }));
+  on(() => { throw new Error('relay must NOT be called for a HEAD 404'); });
+  const t31b = await M.executeTool('bash', 'curl -I https://example.test/h', ws);
+  check('H3 HEAD 404 → headers reported, no fallback',
+    !t31b.success && t31b.output.includes('HTTP 404') && calls.length === 1, t31b.output + ' calls=' + calls.length);
+
+  reset();
+  on((u) => u === 'https://blocked.test/h', () => { throw new TypeError('Failed to fetch'); });
+  on((u) => u === '/fetch', () => {
+    const sent = JSON.parse(calls[calls.length - 1].opts.body);
+    check('H2 HEAD fallback keeps method HEAD in the envelope', sent.method === 'HEAD',
+      JSON.stringify(sent));
+    return new Response(null, { status: 200, headers: { 'content-type': 'text/plain', 'x-head': 'relay' } });
+  });
+  const t31c = await M.executeTool('bash', 'curl -I https://blocked.test/h', ws);
+  check('H2b HEAD fallback shows headers via the envelope leg', t31c.success
+    && t31c.output.includes('HTTP 200') && t31c.output.includes('x-head: relay')
+    && t31c.backend === 'edge-relay', JSON.stringify(t31c.output) + ' backend=' + t31c.backend);
+
+  reset();
+  // A non-conforming server sends a BODY on HEAD: the shell must not output it.
+  on((u) => u === 'https://example.test/h', () => new Response('SHOULD-NOT-SHOW', {
+    status: 200, headers: { 'content-type': 'text/plain' },
+  }));
+  const t31d = await M.executeTool('bash', 'curl -I https://example.test/h', ws);
+  check('H5 HEAD body from a buggy server is never output',
+    t31d.success && t31d.output.includes('HTTP 200') && !t31d.output.includes('SHOULD-NOT-SHOW'),
+    JSON.stringify(t31d.output));
+
+  // ---------- 32. query secrets never reach output/telemetry (N-F04) ----------
+  reset();
+  on((u) => u === 'https://example.test/missing?token=SECRET_QUERY_123', () =>
+    new Response('{"error":"nf"}', { status: 404, headers: { 'content-type': 'application/json' } }));
+  const t32 = await M.executeTool('bash', 'curl "https://example.test/missing?token=SECRET_QUERY_123"', ws);
+  check('N-F04a wire request still carries the query', calls.length === 1
+    && calls[0].url.includes('token=SECRET_QUERY_123'), calls[0] && calls[0].url);
+  check('N-F04b tool output hides the query secret',
+    !t32.output.includes('SECRET_QUERY_123') && t32.output.includes('HTTP 404')
+    && t32.output.includes('https://example.test/missing'), t32.output);
+  check('N-F04c telemetry records hide the query secret',
+    !JSON.stringify(M.Telemetry.records).includes('SECRET_QUERY_123'),
+    JSON.stringify(M.Telemetry.records.slice(-1)));
+
+  reset();
+  on((u) => u === 'https://blocked.test/s?token=SECRET_QUERY_123', () => { throw new TypeError('Failed to fetch'); });
+  on((u) => u.startsWith('/fetch?'), () =>
+    new Response(JSON.stringify({ error: { message: 'Upstream timed out after 30000ms' } }),
+      { status: 504, headers: { 'content-type': 'application/json', 'x-locus-relay-error': '1' } }));
+  const t32b = await M.executeTool('bash', 'curl "https://blocked.test/s?token=SECRET_QUERY_123"', ws);
+  check('N-F04d relay-leg error output/telemetry hide the query secret',
+    !t32b.output.includes('SECRET_QUERY_123')
+    && !JSON.stringify(M.Telemetry.records).includes('SECRET_QUERY_123'), t32b.output);
 
   await new Promise((r) => setTimeout(r, 50)); // let any stray rejection surface
   check('N29 no unhandled rejections from stream cleanup', unhandled.length === 0,

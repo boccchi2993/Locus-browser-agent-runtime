@@ -44,6 +44,7 @@ const BIG_BYTES = 17 * 1024 * 1024; // > 16 MiB response cap
 // ---------- shared counters (both servers live in this process) ----------
 const hits = Object.create(null);
 let relayCalls = 0;
+const authSeen = Object.create(null); // origin A's view of a redirected credential
 function hit(p) { hits[p] = (hits[p] || 0) + 1; }
 
 function readBody(req) {
@@ -69,11 +70,36 @@ function startTargetServer(port) {
       const p = req.url.split('?')[0];
       const cors = { 'access-control-allow-origin': '*' };
       if (p === '/target/counts') {
-        return json(res, 200, { hits, relay: relayCalls }, cors);
+        return json(res, 200, { hits, relay: relayCalls, auth: authSeen }, cors);
       }
       hit(p);
       if (p === '/target/cors-ok') {
         return json(res, 200, { cors: 'ok' }, cors);
+      }
+      if (p === '/target/cred-check') {
+        // redirect landing origin (B): reports what credentials it received
+        return json(res, 200, { authorization: req.headers.authorization || null }, cors);
+      }
+      if (p === '/target/redirect-away') {
+        // origin A: records its own view, then 302s to a DIFFERENT origin
+        authSeen.redirectAway = req.headers.authorization || null;
+        res.writeHead(302, { location: 'http://api2.test.local:' + port + '/target/cred-check' });
+        return res.end();
+      }
+      if (p === '/target/redirect-mapped') {
+        res.writeHead(302, { location: 'http://[::ffff:127.0.0.1]:' + port + '/target/mapped-catch' });
+        return res.end();
+      }
+      if (p === '/target/mapped-catch') {
+        return json(res, 200, { reached: true }, cors);
+      }
+      if (p === '/target/head') {
+        // deliberately NO CORS headers: the direct HEAD attempt must fail
+        // so the relay HEAD fallback is exercised; the method seen here is
+        // recorded for the fidelity assertion.
+        authSeen.headMethod = req.method;
+        res.writeHead(200, { 'content-type': 'text/plain', 'x-head': 'yes' });
+        return res.end();
       }
       if (p === '/target/hostile') {
         // deliberately NO CORS headers: the page cannot read the response
@@ -419,8 +445,117 @@ const PAGE_SCRIPT = String.raw`
     check('N12b no approval left pending', !document.querySelector('.approval-card'), 'card present');
   }
 
+  // ---------- N13 cross-origin redirect strips Authorization (N-F01) ----------
+  {
+    const s = await snapshot();
+    const r = await exec('curl -H \'Authorization: Bearer N13\' ' + API + '/target/redirect-away');
+    const c = await snapshot();
+    check('N13 origin A received the credential',
+      c.auth && c.auth.redirectAway === 'Bearer N13', JSON.stringify(c.auth));
+    check('N13b landing origin B did NOT receive it',
+      r.success && r.output.includes('"authorization":null'), JSON.stringify(r.output));
+    check('N13c one relay leg (the direct leg only adds a preflight OPTIONS hit)',
+      c.relay - s.relay === 1
+      && (c.hits['/target/redirect-away'] || 0) - (s.hits['/target/redirect-away'] || 0) === 2
+      && (c.hits['/target/cred-check'] || 0) - (s.hits['/target/cred-check'] || 0) === 1,
+      'relayDelta=' + (c.relay - s.relay) + ' hits=' + JSON.stringify(c.hits));
+  }
+
+  // ---------- N14 mapped IPv6 private target blocked pre-approval (N-F02) ----------
+  {
+    const s = await snapshot();
+    const p = exec('curl -X POST "http://[::ffff:127.0.0.1]:' + TARGET_PORT + '/target/echo" -d \'n14\'');
+    const card = await waitCard(1000);
+    let r = null;
+    if (card) { clickBtn('Allow once'); r = await p; }
+    else r = await p;
+    const c = await snapshot();
+    check('N14 mapped-IPv6 loopback POST blocked before any send',
+      !r.success && r.output.includes('private or loopback'), JSON.stringify(r));
+    check('N14b no approval asked, no relay call, no echo hit',
+      !card && c.relay === s.relay && (c.hits['/target/echo'] || 0) === (s.hits['/target/echo'] || 0),
+      'card=' + card + ' relayDelta=' + (c.relay - s.relay) + ' echoDelta='
+      + ((c.hits['/target/echo'] || 0) - (s.hits['/target/echo'] || 0)));
+  }
+
+  // ---------- N15 public → mapped-private redirect blocked (N-F02) ----------
+  {
+    const s = await snapshot();
+    const r = await exec('curl ' + API + '/target/redirect-mapped');
+    const c = await snapshot();
+    check('N15 redirect to mapped-IPv6 loopback refused by the relay leg',
+      !r.success && r.output.includes('Private and loopback redirect targets are not allowed'),
+      JSON.stringify(r));
+    check('N15b the private hop was never attempted',
+      (c.hits['/target/mapped-catch'] || 0) === 0 && c.relay - s.relay === 1,
+      'mappedHits=' + (c.hits['/target/mapped-catch'] || 0) + ' relayDelta=' + (c.relay - s.relay));
+  }
+
+  // ---------- N16 legacy GET relay still reachable from the app origin (N-F03) ----------
+  {
+    const s = await snapshot();
+    // browser same-origin GET /fetch carries no mismatched Origin: the
+    // legacy path must keep working (the target is the mapped
+    // api.test.local name — literal 127.0.0.1 is refused by the relay's
+    // private-address policy). Evil-Origin rejection is proven
+    // server-side in main() against the real handler.
+    const lr = await fetch('/fetch?url=' + encodeURIComponent(API + '/target/cors-ok'));
+    check('N16 legacy GET relay works from the app origin', lr.status === 200, 'status=' + lr.status);
+    check('N16b same-origin legacy leg made exactly one relay call',
+      (await counts()).relay - s.relay === 1, 'relayDelta=' + ((await counts()).relay - s.relay));
+  }
+
+  // ---------- N17 query secret absent from output and telemetry (N-F04) ----------
+  {
+    const r = await exec('curl "' + TARGET + '/target/notfound?token=SECRET_QUERY_123"');
+    check('N17 404 reported without the query secret',
+      !r.success && r.output.includes('HTTP 404') && !r.output.includes('SECRET_QUERY_123'),
+      JSON.stringify(r.output));
+    check('N17b safe display keeps the path',
+      r.output.includes('/target/notfound'), JSON.stringify(r.output));
+    const tele = typeof Telemetry !== 'undefined' && Telemetry.records ? JSON.stringify(Telemetry.records) : '[]';
+    check('N17c telemetry records hide the query secret', !tele.includes('SECRET_QUERY_123'), 'leaked');
+  }
+
+  // ---------- N18 mid-body TypeError after Response → no relay fallback (N-F06) ----------
+  {
+    const s = await snapshot();
+    const orig = window.fetch;
+    window.fetch = async function (u, o) {
+      window.fetch = orig; // wrap only the next call: the direct attempt
+      const res = await orig.call(window, u, o);
+      const bad = new ReadableStream({
+        start(ctrl) { ctrl.enqueue(new TextEncoder().encode('half')); },
+        pull() { throw new TypeError('simulated mid-body failure'); },
+      });
+      return new Response(bad, { status: res.status, statusText: res.statusText, headers: res.headers });
+    };
+    const r = await exec('curl ' + TARGET + '/target/cors-ok');
+    const c = await snapshot();
+    check('N18 post-Response body TypeError fails the direct leg without a relay retry',
+      !r.success && r.output.includes('NOT retried'), JSON.stringify(r));
+    check('N18b zero relay calls (a real Response existed)',
+      c.relay === s.relay && (c.hits['/target/cors-ok'] || 0) - (s.hits['/target/cors-ok'] || 0) === 1,
+      'relayDelta=' + (c.relay - s.relay));
+  }
+
+  // ---------- N19 HEAD fallback remains HEAD (N-F09) ----------
+  {
+    const s = await snapshot();
+    const r = await exec('curl -I ' + API + '/target/head');
+    const c = await snapshot();
+    check('N19 curl -I shows real response headers via the fallback',
+      r.success && r.output.includes('HTTP 200') && r.output.includes('x-head: yes'), JSON.stringify(r.output));
+    check('N19b no HEAD body surfaced', !r.output.includes('hostile-secret'), JSON.stringify(r.output));
+    check('N19c one relay leg, upstream saw method HEAD',
+      c.relay - s.relay === 1 && c.auth && c.auth.headMethod === 'HEAD',
+      'relayDelta=' + (c.relay - s.relay) + ' headMethod=' + (c.auth && c.auth.headMethod));
+  }
+
   return out.join('\n');
 })()`;
+// TARGET_PORT: injected numeric port for mapped-IPv6 literals (the origin
+// string form 'http://127.0.0.1:<port>' cannot be reused inside a URL host).
 
 
 async function main() {
@@ -480,6 +615,7 @@ async function main() {
       + '    const TARGET = ' + JSON.stringify(targetOrigin) + ';\n'
       + '    const API = ' + JSON.stringify('http://api.test.local:' + targetPort) + ';\n'
       + '    const API2 = ' + JSON.stringify('http://api2.test.local:' + targetPort) + ';\n'
+      + '    const TARGET_PORT = ' + JSON.stringify(String(targetPort)) + ';\n'
       + '    const PNG_BYTES_ARRAY = ' + JSON.stringify(Array.from(PNG_BYTES)) + ';');
     const result = await cdp.send('Runtime.evaluate', {
       expression: script,
@@ -494,6 +630,29 @@ async function main() {
     } else {
       console.log(report);
       if (report.includes('NET-FAIL')) failed = true;
+    }
+
+    // N16 server-side (against the REAL handler): a hostile browser Origin
+    // cannot drive the legacy GET relay; no Origin still can.
+    {
+      const evil = await relay.onRequestGet({
+        request: new Request('http://127.0.0.1:' + appPort + '/fetch?url='
+          + encodeURIComponent(targetOrigin + '/target/cors-ok'),
+        { headers: { origin: 'https://evil.test' } }),
+        env: {},
+      });
+      console.log((evil.status === 403 ? 'PASS ' : 'NET-FAIL ')
+        + 'N16c evil Origin legacy GET rejected (got ' + evil.status + ')');
+      if (evil.status !== 403) failed = true;
+      const lookalike = await relay.onRequestGet({
+        request: new Request('http://127.0.0.1:' + appPort + '/fetch?url='
+          + encodeURIComponent(targetOrigin + '/target/cors-ok'),
+        { headers: { origin: 'https://127.0.0.1.evil.test' } }),
+        env: {},
+      });
+      console.log((lookalike.status === 403 ? 'PASS ' : 'NET-FAIL ')
+        + 'N16d lookalike Origin legacy GET rejected (got ' + lookalike.status + ')');
+      if (lookalike.status !== 403) failed = true;
     }
   } catch (error) {
     console.error(error && error.stack || error);
