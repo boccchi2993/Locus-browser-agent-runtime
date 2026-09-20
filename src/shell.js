@@ -31,6 +31,15 @@ const PythonRuntime = {
   status: 'cold', // cold | loading | ready
   _reqId: 0,
   _pending: new Map(),
+  // Run serialization (F04a-A2): the worker answers messages one at a time
+  // but its onmessage is ASYNC — overlapping run() calls would interleave
+  // runPythonAsync/setStdout inside the worker and cross-contaminate stdout
+  // (measured: run A's output landed in run B's result). _queue is the
+  // tail of the run chain; every run() call appends one exclusive turn.
+  _queue: Promise.resolve(),
+  // Queued-but-unstarted runs, drainable by reset() (a session boundary
+  // must not let a pre-reset run execute on a post-reset worker).
+  _queuedRuns: new Set(),
 
   _ensureWorker() {
     if (this.worker) return;
@@ -90,6 +99,15 @@ const PythonRuntime = {
     if (this.worker || this._pending.size) {
       this._killWorker('python runtime reset (session boundary)');
     }
+    // Drain queued-but-unstarted runs too: the boundary is the queue's
+    // boundary. Timeouts, cancellations and worker crashes kill the worker
+    // but deliberately do NOT drain — the next queued run proceeds on a
+    // fresh worker (its own timer starts when it gets the seat).
+    for (const entry of this._queuedRuns) {
+      entry.killed = true;
+      entry.reason = 'python runtime reset (session boundary)';
+    }
+    this._queuedRuns.clear();
   },
 
   _failAllPending(errorMessage) {
@@ -107,6 +125,28 @@ const PythonRuntime = {
       el.textContent = 'Python: ' + status;
       el.className = status;
     }
+  },
+
+  // Run Python code with every VFS data mount mirrored in — serialized:
+  // concurrent callers queue up and each gets the interpreter exclusively
+  // for its whole transaction (mirror-in → worker execution → commit).
+  // See _runOnce for the per-run contract.
+  async run(code, vfs, opts) {
+    const entry = { killed: false, reason: null };
+    this._queuedRuns.add(entry);
+    const turn = this._queue.then(() => {
+      // Seat acquired. delete() returning false means reset() drained this
+      // entry while it was queued — the session boundary already won.
+      if (!this._queuedRuns.delete(entry)) {
+        throw new Error(entry.reason || 'python runtime reset (session boundary)');
+      }
+      return this._runOnce(code, vfs, opts);
+    });
+    // A failed or killed run must not poison the callers queued behind it;
+    // the chain always advances, so timeouts/cancellations/releases cannot
+    // wedge the queue.
+    this._queue = turn.then(() => {}, () => {});
+    return turn;
   },
 
   // Run Python code with every VFS data mount mirrored in.
@@ -129,7 +169,7 @@ const PythonRuntime = {
   //   uncollected: [paths],             — python outputs over the worker caps (changeset incomplete)
   //   stdoutTruncated, stderrTruncated, — output notice flags (NOT commit failures)
   // }
-  async run(code, vfs, opts) {
+  async _runOnce(code, vfs, opts) {
     const signal = opts && opts.signal;
     this._ensureWorker();
     this._setStatus('loading');

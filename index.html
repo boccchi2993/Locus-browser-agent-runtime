@@ -108,15 +108,21 @@ const DENY_NAMES = ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource',
   'importScripts', 'caches', 'fetchLater', 'eval', 'loadPyodide'];
 const REQUIRED_LOCKED = ['fetch', 'XMLHttpRequest', 'WebSocket', 'importScripts', 'eval', 'loadPyodide'];
 
-// Nearest object in the prototype chain that OWNS a property — the WebIDL
-// accessors live on the scope prototype, not on the global instance.
-function ownerOf(obj, name) {
+// EVERY object in the prototype chain of `obj` that OWNS `name` as an own
+// property. WHICH level owns a given primitive differs between engines and
+// browser versions (audited Chrome 153 worker: fetch/importScripts/caches/
+// timers live on WorkerGlobalScope.prototype, XHR/WebSocket/Worker on the
+// global instance itself) — locking only the nearest owner leaves the
+// native primitive reachable one hop up the chain
+// (Object.getPrototypeOf(self).fetch was a working native fetch — F04a-A1).
+function ownersOf(obj, name) {
+  const owners = [];
   let cur = obj;
   while (cur) {
-    if (Object.prototype.hasOwnProperty.call(cur, name)) return cur;
+    if (Object.prototype.hasOwnProperty.call(cur, name)) owners.push(cur);
     cur = Object.getPrototypeOf(cur);
   }
-  return null;
+  return owners;
 }
 
 function applyNetworkLockdown(instance) {
@@ -124,12 +130,14 @@ function applyNetworkLockdown(instance) {
   for (const name of DENY_NAMES) {
     if (!(name in g)) continue; // absent in this browser: nothing to lock
     const denied = makeDenied();
-    // Lock the global slot AND the owning prototype level: user Python
-    // reads through self, but the ORIGINAL accessor lives one level up,
-    // and Object.getPrototypeOf(js) would otherwise hand it back.
-    Object.defineProperty(g, name, { value: denied, writable: false, configurable: false });
-    const owner = ownerOf(g, name);
-    if (owner && owner !== g) {
+    // Lock EVERY prototype-chain level that owns the name with the SAME
+    // denied instance: user Python reads through self, but the ORIGINAL
+    // accessor lives further up, and Object.getPrototypeOf(js) must hand
+    // back the denial too — not a pristine native function. A level whose
+    // slot cannot be redefined throws here, which fails the whole
+    // bootstrap (fail-closed: the worker self-destructs and the shell
+    // rebuilds — Python never runs half-locked).
+    for (const owner of ownersOf(g, name)) {
       Object.defineProperty(owner, name, { value: denied, writable: false, configurable: false });
     }
   }
@@ -146,29 +154,92 @@ function applyNetworkLockdown(instance) {
   // worker — out of scope for this boundary.
   // String-compile timers are eval in disguise ("code" handlers). Real
   // function handlers keep working (Pyodide/Emscripten schedule functions).
+  // The SAME safe wrapper is installed at EVERY prototype-chain level that
+  // owns the timer — a shadow on the global alone leaves the native timer
+  // one hop up (p2.setInterval("import('…')", 0) was a real escape).
   for (const timer of ['setTimeout', 'setInterval']) {
+    if (!(timer in g)) continue;
     const orig = typeof g[timer] === 'function' ? g[timer].bind(g) : null;
     if (!orig) continue;
     const safe = function (handler) {
       if (typeof handler !== 'function') denyUserNetwork();
       return orig.apply(null, arguments);
     };
-    Object.defineProperty(g, timer, { value: safe, writable: false, configurable: false });
+    try { Object.defineProperty(safe, '__locusTimerSafe', { value: true }); } catch (e) {}
+    for (const owner of ownersOf(g, timer)) {
+      Object.defineProperty(owner, timer, { value: safe, writable: false, configurable: false });
+    }
+  }
+  // Forward defense (F04a-A5): navigator itself stays available (Pyodide
+  // and honest user code read navigator.userAgent etc.), but a sendBeacon
+  // anywhere on the navigator's prototype chain is a direct POST escape —
+  // lock it with the same walk. Browsers whose worker navigator has no
+  // sendBeacon (audited Chrome 153): nothing to do, skipped honestly.
+  const nav = g.navigator;
+  if (nav && 'sendBeacon' in nav) {
+    const deniedBeacon = makeDenied();
+    for (const owner of ownersOf(nav, 'sendBeacon')) {
+      Object.defineProperty(owner, 'sendBeacon', { value: deniedBeacon, writable: false, configurable: false });
+    }
   }
   // Event-handler ATTRIBUTES compile assigned strings as function bodies
   // (self.onmessage = "import('https://…')" is remote JS execution). Lock
   // the slots at their current values — the worker's own handler stays.
+  // Then sweep the PROTOTYPE chain: a level that owns the attribute as a
+  // WebIDL accessor (get/set) gets a set-throws accessor instead — an
+  // own-slot lock does not reach a prototype setter. Audited Chrome 153
+  // exposes no such descriptor on the worker scope prototypes, so this is
+  // forward defense: absent descriptors are skipped honestly, and a level
+  // that IS found but cannot be redefined throws (fail-closed).
   for (const handler of ['onmessage', 'onmessageerror', 'onerror', 'onlanguagechange',
     'onoffline', 'ononline', 'onrejectionhandled', 'onunhandledrejection']) {
     if (!(handler in g)) continue;
     try {
       Object.defineProperty(g, handler, { value: g[handler], writable: false, configurable: false });
     } catch (e) {}
+    for (const owner of ownersOf(Object.getPrototypeOf(g), handler)) {
+      const d = Object.getOwnPropertyDescriptor(owner, handler);
+      if (!d || typeof d.set !== 'function') continue;
+      Object.defineProperty(owner, handler, {
+        get() { return undefined; },
+        set() { denyUserNetwork(); },
+        configurable: false,
+      });
+    }
   }
+  // Fail-closed self-check, extended to the prototype chain (F04a-A1):
+  // every REQUIRED primitive must be the denial at the chain-resolved slot
+  // AND at every level that owns it; the timers must be the safe wrapper at
+  // every owning level; a present sendBeacon must be denied. ANY gap throws
+  // — the worker is then permanently failed and self-destructs (the shell
+  // rebuilds a fresh one). Python never runs half-locked.
   for (const name of REQUIRED_LOCKED) {
     const v = g[name];
     if (!v || v.__locusNetworkDenied !== true) {
       throw new Error('Python worker failed to apply the network lockdown');
+    }
+    for (const owner of ownersOf(g, name)) {
+      const d = Object.getOwnPropertyDescriptor(owner, name);
+      if (!d || !d.value || d.value.__locusNetworkDenied !== true) {
+        throw new Error('Python worker failed to apply the network lockdown');
+      }
+    }
+  }
+  for (const timer of ['setTimeout', 'setInterval']) {
+    if (!(timer in g)) continue;
+    for (const owner of ownersOf(g, timer)) {
+      const d = Object.getOwnPropertyDescriptor(owner, timer);
+      if (!d || !d.value || d.value.__locusTimerSafe !== true) {
+        throw new Error('Python worker failed to apply the network lockdown');
+      }
+    }
+  }
+  if (g.navigator && 'sendBeacon' in g.navigator) {
+    for (const owner of ownersOf(g.navigator, 'sendBeacon')) {
+      const d = Object.getOwnPropertyDescriptor(owner, 'sendBeacon');
+      if (!d || !d.value || d.value.__locusNetworkDenied !== true) {
+        throw new Error('Python worker failed to apply the network lockdown');
+      }
     }
   }
   // The bootstrap package loader must not be re-enterable from user code:
