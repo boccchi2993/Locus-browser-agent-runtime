@@ -198,12 +198,19 @@ Relay guardrails (server-side mirror of the client policy, defense in depth):
 - Scheme allowlist http/https; userinfo rejected; per-hop re-validation.
 - Method allowlist GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS. No CONNECT/TRACE.
 - **Private-address refusal (SSRF)**: literal loopback / private / link-local
-  targets refused — `localhost`, `127.0.0.0/8`, `::1`, `0.0.0.0/8`,
-  `169.254.0.0/16` (incl. metadata IPs), `10.0.0.0/8`, `172.16.0.0/12`,
-  `192.168.0.0/16`, `fc00::/7`, `fe80::/10` (incl. IPv4-mapped IPv6). The
-  client pre-checks the same list before choosing the relay
-  (`network_private_address_blocked`), so the model gets the same
-  deterministic error without a wasted round-trip.
+  targets refused — `localhost`, `*.localhost`, `localhost.localdomain`,
+  `127.0.0.0/8`, `::1`, `::`, `0.0.0.0/8`, `169.254.0.0/16` (incl. metadata
+  IPs), `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`,
+  `fe80::/10`. IPv4-mapped IPv6 (`::ffff:0:0/96`) is decoded to its IPv4
+  form and classified as IPv4, so `[::ffff:127.0.0.1]` and its
+  WHATWG-canonical spelling `[::ffff:7f00:1]` are both loopback, and scalar
+  IPv4 spellings (`127.1`, `2130706433`, `0x7f000001`, `0177.0.0.1`) are
+  normalized before classification. Both the client and the relay carry the
+  SAME classifier (src/network.js + functions/fetch.js, kept in sync and
+  tested against the SAME attack-vector tables); the client pre-checks
+  before choosing the relay (`network_private_address_blocked`), so the
+  model gets the same deterministic error without a wasted round-trip. Every
+  redirect hop is re-validated.
   - **Known limitation (documented, not hidden):** validation is on the
     HOSTNAME string, not the resolved IP. A public DNS name that resolves to
     a private address (DNS rebinding) is not currently detectable in the
@@ -212,22 +219,30 @@ Relay guardrails (server-side mirror of the client policy, defense in depth):
 - Request body cap (2 MiB default) and response cap (16 MiB default), both
   enforced server-side; upstream timeout (30 s) covering headers AND body;
   redirect cap (5).
-- Same-origin `Origin` check on the envelope form: a present Origin must
-  match the deployment (browser callers always send it; other web pages
-  cannot forge it). **Relay openness (known, bounded):** non-browser clients
-  sending no Origin are accepted — v1 does not expand this surface beyond the
-  GET relay's existing openness, and does not build a token system;
-  deployment-level protection (Cloudflare WAF/rate limiting) is the intended
-  mitigation, recorded here as a residual risk.
+- Same-origin `Origin` check on BOTH request forms (legacy GET and the POST
+  envelope): a present Origin must match the deployment origin, compared as
+  a parsed URL origin (never string prefixes), so lookalike hosts and
+  scheme/port variants are refused. **Relay openness (known, bounded):**
+  non-browser clients sending no Origin are accepted — v1 does not expand
+  this surface beyond the existing openness, and does not build a token
+  system; deployment-level protection (Cloudflare WAF/rate limiting) is the
+  intended mitigation, recorded here as a residual risk.
 - Upstream response headers pass through minus hop-by-hop machinery and
   `Set-Cookie` (the relay never writes any cookie jar); active content types
-  stay de-privileged (`nosniff` + `CSP: sandbox`).
+  stay de-privileged (`nosniff` + `CSP: sandbox`). Duplicated upstream
+  response headers are copied with `append`, never collapsed by relay code;
+  where the underlying Fetch implementation has already combined duplicates
+  into one comma-joined value, that observable representation is forwarded
+  as-is (the documented platform boundary — `headerList` preserves distinct
+  values observable from the underlying Fetch implementation).
+- A HEAD upstream response is framed with its headers and an empty body;
+  the entity length is forwarded when the upstream declared one.
 
 ## Safe fallback (GET/HEAD only)
 
 ```
-direct browser fetch
-    ↓ only on genuine network failure (TypeError), once
+direct browser fetch (initial transport invocation)
+    ↓ only on a genuine transport failure of THAT invocation, once
 edge relay
 ```
 
@@ -236,10 +251,19 @@ Max direct 1 + relay 1; no infinite retries. A REAL HTTP response — even
 through the other backend. Timeouts, size caps and user cancellation are not
 network failures and never trigger a relay retry.
 
+**Fallback boundary (exact):** only a failure of the initial `fetch()`
+transport invocation itself is fallback-eligible. Once a Response object
+exists, there is NO backend fallback for any later failure — header
+parsing, status handling, body reads, size accounting, internal JS errors
+all fail the request as `network_direct_failed` without a relay retry.
+The fallback never changes the method: a HEAD fallback sends
+`method: 'HEAD'` in the relay envelope (never the headerless legacy GET
+form), and a HEAD result always carries an empty body.
+
 The browser cannot distinguish CORS-blocked responses from DNS/TLS/offline
-failures (both reject as `TypeError`). For GET/HEAD that ambiguity is
-tolerable — reads duplicate harmlessly — and the relay retry makes CORS a
-Harness problem the model never sees.
+failures (both reject the transport as `TypeError`). For GET/HEAD that
+ambiguity is tolerable — reads duplicate harmlessly — and the relay retry
+makes CORS a Harness problem the model never sees.
 
 ## Side-effecting requests
 
@@ -256,6 +280,15 @@ Harness problem the model never sees.
 
 - GET/HEAD: followed; `finalUrl` reports the last URL; the final scheme is
   re-validated as http(s) by the Harness and per-hop by the relay.
+- **Origin-bound credentials (CREDENTIAL AUTHORITY IS ORIGIN-BOUND):** when
+  a followed redirect leaves the current origin, `Authorization` and
+  `Proxy-Authorization` are stripped from the NEXT hop's headers before it
+  is dispatched (Cookie is unreachable — the forbidden-header filter drops
+  it). Stripping is monotonic: each hop dispatches with the previous hop's
+  header set, so a credential never returns on a later hop (A → B → A does
+  NOT restore it). No guesswork header blocklists beyond these two
+  origin-bound credentials. The side-effecting cross-origin refusal below
+  is unchanged — stripping only ever applies to followed read-like chains.
 - Side-effecting requests never follow a redirect: the direct backend uses
   `redirect: 'manual'` (the browser's opaque-redirect response cannot be
   inspected, so any redirect is blocked), and the relay follows SAME-ORIGIN
@@ -330,7 +363,13 @@ The shell is CLI-only: parsing, stdout/stderr, `-o`, exit semantics. It calls
 `-H/--header` (repeatable), `-d/--data/--data-binary` (implies POST,
 `@file` reads VFS bytes, parts joined with `&`), `--data-raw` (never reads
 files). Everything else fails with the existing clear message. HTTP error
-statuses keep the existing project semantics (`curl: HTTP 404 from …`).
+statuses keep the existing project semantics (`curl: HTTP 404 from …`), with
+the URL rendered as origin + path only (query secrets are never displayed —
+the wire request itself is untouched). `-I` reports the real response
+headers (`HTTP 200`/`HTTP 404` + header lines), never a body. A GET/HEAD
+request combined with `-d/--data` is an explicit local error
+("unsupported request combination") with ZERO network attempts — the body
+is never silently discarded the way real curl does.
 Downloads are fully materialized (bounded) BEFORE the single VFS write, so a
 failed download never leaves a partial destination file.
 
@@ -338,8 +377,11 @@ failed download never leaves a partial destination file.
 
 Existing telemetry continues to record `operation: 'network'` with the
 `backend`. No schema change in v1. Never recorded: bodies, Authorization,
-Cookie, or sensitive query values (URLs are recorded as origin + path at
-most).
+Cookie, or sensitive query values. Any network-facing URL that reaches a
+tool result, error string or telemetry record is rendered through
+`safeNetworkUrlForDisplay` (origin + path only; unparseable input becomes a
+bounded placeholder, never echoed raw). The wire request itself is never
+mutated by display redaction.
 
 ## Model-facing capability text
 
