@@ -56,7 +56,9 @@ NetworkRuntime.request({
   `headerList` is the raw `[name, value]` pair list preserving duplicates
   (Set-Cookie style repeated headers are never silently overwritten).
 - `backend` is `'browser-direct' | 'edge-relay'` — telemetry/debug only. It
-  never appears in a model-facing tool result.
+  never appears in a model-facing tool result. Invariant: execution backend
+  metadata is internal runtime metadata and is never serialized into
+  provider-visible tool results (native or text-fallback path).
 - `NetworkRuntime.fetch(url, options)` remains the read-like GET convenience
   wrapper (same routing rules as `request` with `method: 'GET'`).
 
