@@ -88,6 +88,11 @@ function makeFakePy(mutate) {
       if (mutate && String(code).indexOf('os.chdir') === -1) mutate(api.FS, files);
     },
     async loadPackagesFromImports() {},
+    // F04a: the worker calls loadPackage with the DECLARED runtime packages
+    // during bootstrap (never loadPackagesFromImports with user code).
+    async loadPackage(pkgs) {
+      if (String(pkgs) !== 'pandas') throw new Error('unexpected package request: ' + pkgs);
+    },
     setStdout() {},
     setStderr() {},
   };
@@ -102,6 +107,10 @@ async function runWorkerJobs(jobs) {
   let py = null;
   const c = vm.createContext({
     self: { postMessage(msg) { if (msg.type === 'result') posted.push(msg); } },
+    // Worker-global primitives the F04a lockdown expects to find and deny.
+    fetch: function () {},
+    XMLHttpRequest: function () {},
+    WebSocket: function () {},
     importScripts() {},
     loadPyodide: async () => { if (!py) py = makeFakePy(jobs[posted.length] && jobs[posted.length].mutate); return py; },
     atob, btoa, TextEncoder, TextDecoder,

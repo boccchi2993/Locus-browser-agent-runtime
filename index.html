@@ -36,26 +36,182 @@
 // ============================================================
 const PYODIDE_BASE = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
 
+// Harness-owned runtime packages: the ONLY Pyodide packages the worker
+// ever downloads, ONCE, during bootstrap and ALWAYS before user code
+// exists. What gets fetched is a code-auditable harness decision — never
+// a side effect of a model-generated import (user-driven
+// loadPackagesFromImports is deliberately not part of this protocol).
+const PYTHON_RUNTIME_PACKAGES = ['pandas'];
+
 let py = null;
 let pyodideLoading = null;
+// Bootstrap state machine: 'cold' -> 'booting' -> 'locked'. User code
+// only ever executes in the 'locked' phase, i.e. after the interpreter,
+// the declared package set AND the network lockdown are all in place.
+let bootPhase = 'cold';
+// Set the moment a lockdown application is attempted: once true, a failed
+// bootstrap leaves the worker PERMANENTLY failed (its own bootstrap
+// primitives are no longer pristine, so a same-worker retry would run user
+// code half-locked). The worker then self-destructs and the shell rebuilds.
+let lockdownAttempted = false;
 
-async function ensurePyodide() {
+// ---- user-code authority boundary (denies, not a bridge) ----
+// Model-generated Python is LOCAL computation + filesystem. HTTP/HTTPS
+// belongs to the shell `curl` command, where NetworkRuntime owns
+// transport, approval and bounds. These denials are the technical
+// boundary; system-prompt wording only documents it.
+function denyUserNetwork() {
+  throw new Error('Python network access is disabled in Locus; use the shell curl command for HTTP/HTTPS');
+}
+function denyRuntimeBootstrap() {
+  throw new Error('Python package loading is controlled by the Locus runtime; declared runtime packages are provided automatically');
+}
+
+// A denied primitive is a callable whose every USE — call or construct —
+// raises the same bounded denial. Property READS stay readable: Pyodide's
+// own object introspection probes these global slots generically
+// (filteredHasKey while wrapping globalThis for the `js` module) and must
+// not explode, and a denied fetch's .call/.bind resolve to ordinary methods
+// whose invocation still routes through the denied [[Call]]. The ONE read
+// that would rebuild an escape hatch — .constructor, which hands back the
+// pristine Function intrinsic — is denied.
+function makeDenied() {
+  const denied = function () { denyUserNetwork(); };
+  try { Object.defineProperty(denied, '__locusNetworkDenied', { value: true }); } catch (e) {}
+  return new Proxy(denied, {
+    apply() { denyUserNetwork(); },
+    construct() { denyUserNetwork(); },
+    get(target, prop) {
+      if (prop === 'constructor') denyUserNetwork();
+      const v = target[prop];
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+}
+
+// Worker-global network and dynamic-execution primitives denied to user
+// code. Names this browser does not define are skipped (nothing to
+// lock); the REQUIRED set below must come out locked or bootstrap fails
+// closed — the worker never runs Python half-locked. `eval` is denied
+// because reachable dynamic-JS execution would otherwise rebuild network
+// primitives (js.eval / run_js) — Pyodide's own run_js routes through
+// js.eval, so it dies with it.
+//
+// KNOWN RESIDUAL (F04a-R1, measured): the global `Function` constructor is
+// deliberately NOT denied — Pyodide's own glue calls it internally and
+// runPythonAsync breaks without it (runPythonAsync then fails with
+// "globals must be a real dict"). User code can therefore still reach
+// dynamic JS via js.Function or any native function's .constructor, and a
+// dynamic import() from there performs a real GET (see README, F04a-R1).
+const DENY_NAMES = ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource',
+  'WebTransport', 'Worker', 'SharedWorker', 'RTCPeerConnection',
+  'importScripts', 'caches', 'fetchLater', 'eval', 'loadPyodide'];
+const REQUIRED_LOCKED = ['fetch', 'XMLHttpRequest', 'WebSocket', 'importScripts', 'eval', 'loadPyodide'];
+
+// Nearest object in the prototype chain that OWNS a property — the WebIDL
+// accessors live on the scope prototype, not on the global instance.
+function ownerOf(obj, name) {
+  let cur = obj;
+  while (cur) {
+    if (Object.prototype.hasOwnProperty.call(cur, name)) return cur;
+    cur = Object.getPrototypeOf(cur);
+  }
+  return null;
+}
+
+function applyNetworkLockdown(instance) {
+  const g = globalThis;
+  for (const name of DENY_NAMES) {
+    if (!(name in g)) continue; // absent in this browser: nothing to lock
+    const denied = makeDenied();
+    // Lock the global slot AND the owning prototype level: user Python
+    // reads through self, but the ORIGINAL accessor lives one level up,
+    // and Object.getPrototypeOf(js) would otherwise hand it back.
+    Object.defineProperty(g, name, { value: denied, writable: false, configurable: false });
+    const owner = ownerOf(g, name);
+    if (owner && owner !== g) {
+      Object.defineProperty(owner, name, { value: denied, writable: false, configurable: false });
+    }
+  }
+  // KNOWN RESIDUAL (measured, deliberately NOT closed here): a native
+  // function's .constructor hands back the PRISTINE Function intrinsic
+  // (js.console.log.constructor("import('https://…')") performs a real
+  // network fetch), and denying Function.prototype.constructor BREAKS
+  // Pyodide's own interop (its JS glue identity-checks .constructor while
+  // crossing the PyProxy boundary — runPythonAsync then fails with
+  // "globals must be a real dict"). The slot therefore stays intact; the
+  // global eval/Function/loadPyodide denials below still close the direct
+  // dynamic-JS paths. Fully closing the reconstruction path needs a
+  // document-level CSP (blob workers inherit it) or an isolated-origin
+  // worker — out of scope for this boundary.
+  // String-compile timers are eval in disguise ("code" handlers). Real
+  // function handlers keep working (Pyodide/Emscripten schedule functions).
+  for (const timer of ['setTimeout', 'setInterval']) {
+    const orig = typeof g[timer] === 'function' ? g[timer].bind(g) : null;
+    if (!orig) continue;
+    const safe = function (handler) {
+      if (typeof handler !== 'function') denyUserNetwork();
+      return orig.apply(null, arguments);
+    };
+    Object.defineProperty(g, timer, { value: safe, writable: false, configurable: false });
+  }
+  // Event-handler ATTRIBUTES compile assigned strings as function bodies
+  // (self.onmessage = "import('https://…')" is remote JS execution). Lock
+  // the slots at their current values — the worker's own handler stays.
+  for (const handler of ['onmessage', 'onmessageerror', 'onerror', 'onlanguagechange',
+    'onoffline', 'ononline', 'onrejectionhandled', 'onunhandledrejection']) {
+    if (!(handler in g)) continue;
+    try {
+      Object.defineProperty(g, handler, { value: g[handler], writable: false, configurable: false });
+    } catch (e) {}
+  }
+  for (const name of REQUIRED_LOCKED) {
+    const v = g[name];
+    if (!v || v.__locusNetworkDenied !== true) {
+      throw new Error('Python worker failed to apply the network lockdown');
+    }
+  }
+  // The bootstrap package loader must not be re-enterable from user code:
+  // pyodide.loadPackage / Python-side loadPackagesFromImports route here.
+  const loaderDenial = function () { denyRuntimeBootstrap(); };
+  for (const loader of ['loadPackage', 'loadPackagesFromImports']) {
+    Object.defineProperty(instance, loader, { value: loaderDenial, writable: false, configurable: false });
+  }
+}
+
+// Pyodide is loaded lazily on the first run. Bootstrap order is the
+// authority boundary: core runtime -> declared packages -> NETWORK
+// LOCKDOWN -> ready. Bootstrap traffic (CDN core + pandas closure) uses
+// the pristine primitives; no user code has executed yet.
+async function ensureLockedPyodide() {
+  if (bootPhase === 'locked' && py) return py;
   if (!pyodideLoading) {
+    bootPhase = 'booting';
     pyodideLoading = (async () => {
       importScripts(PYODIDE_BASE + 'pyodide.js');
       const instance = await loadPyodide({ indexURL: PYODIDE_BASE });
+      await instance.loadPackage(PYTHON_RUNTIME_PACKAGES);
+      lockdownAttempted = true;
+      applyNetworkLockdown(instance);
       return instance;
     })();
   }
   try {
     py = await pyodideLoading;
   } catch (e) {
-    // A failed load (CDN unreachable, WASM init error, …) must not be
-    // cached: reset so the next run retries from scratch.
+    // A failed bootstrap must not be cached or half-served. Before any
+    // lockdown attempt the worker is still pristine: reset so the next run
+    // retries from scratch (F14 semantics). AFTER a lockdown attempt the
+    // bootstrap primitives themselves are denied — the worker is marked
+    // permanently failed and self-destructs (onmessage rethrows uncaught,
+    // the shell's onerror rebuilds a fresh worker that re-bootstraps and
+    // re-locks).
     pyodideLoading = null;
     py = null;
+    bootPhase = lockdownAttempted ? 'failed' : 'cold';
     throw e;
   }
+  bootPhase = 'locked';
   return py;
 }
 
@@ -266,9 +422,13 @@ self.onmessage = async (ev) => {
   const msg = ev.data || {};
   if (msg.cmd !== 'run') return;
   const id = msg.id;
+  if (bootPhase === 'failed') {
+    self.postMessage({ id: id, type: 'result', stdout: '', stderr: '', error: 'Python worker failed to apply the network lockdown', files: [], deleted: [], createdDirs: [], deletedDirs: [], uncollectedFiles: [], stdoutTruncated: false, stderrTruncated: false });
+    return;
+  }
   try {
     self.postMessage({ id: id, type: 'status', status: 'loading' });
-    await ensurePyodide();
+    await ensureLockedPyodide();
     self.postMessage({ id: id, type: 'status', status: 'ready' });
 
     const manifest = syncIn(msg.mounts || []);
@@ -297,9 +457,12 @@ self.onmessage = async (ev) => {
 
     let error = null;
     try {
-      // Auto-install pure-python/wheel packages the code imports (e.g. pandas).
-      await py.loadPackagesFromImports(msg.code);
       // Python runs with the SAME absolute cwd as the shell invocation.
+      // Imports are deliberately NOT auto-loaded here: package downloads
+      // are a bootstrap-time harness decision (PYTHON_RUNTIME_PACKAGES),
+      // never a side effect of model-generated imports. An import the
+      // runtime does not carry fails honestly (ModuleNotFoundError) with
+      // no network attempt.
       await py.runPythonAsync('import os\nos.chdir(' + JSON.stringify(msg.cwd || '/home/locus') + ')');
       await py.runPythonAsync(msg.code);
     } catch (e) {
@@ -317,6 +480,10 @@ self.onmessage = async (ev) => {
     });
   } catch (e) {
     self.postMessage({ id: id, type: 'result', stdout: '', stderr: '', error: String(e && e.message ? e.message : e), files: [], deleted: [], createdDirs: [], deletedDirs: [], uncollectedFiles: [], stdoutTruncated: false, stderrTruncated: false });
+    if (bootPhase === 'failed') {
+      // Uncaught worker error -> shell worker.onerror -> terminate + rebuild.
+      setTimeout(() => { throw new Error('Python worker failed to apply the network lockdown'); }, 0);
+    }
   }
 };
 </script>

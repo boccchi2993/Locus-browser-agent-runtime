@@ -1,6 +1,6 @@
 // Pyodide worker init recovery test (F14): a failed first load must NOT be
 // cached forever — the next run retries. Extracts the REAL worker source
-// from index.html and drives ensurePyodide with a stubbed loadPyodide.
+// from index.html and drives ensureLockedPyodide with a stubbed loadPyodide.
 // Run: node tests/worker-init.test.cjs
 
 const fs = require('fs');
@@ -21,6 +21,10 @@ async function run() {
   let attempts = 0;
   const c = vm.createContext({
     self: {},
+    // Worker-global primitives the F04a lockdown expects to find and deny.
+    fetch: function () {},
+    XMLHttpRequest: function () {},
+    WebSocket: function () {},
     importScripts() {},
     loadPyodide: async () => {
       attempts++;
@@ -35,6 +39,7 @@ async function run() {
         },
         runPython() {}, // subtree-delete shim (shutil.rmtree of managed roots)
         setStdout() {}, setStderr() {},
+        loadPackage: async () => {},
       };
     },
   });
@@ -42,14 +47,20 @@ async function run() {
 
   // first attempt fails
   let e1 = null;
-  try { await vm.runInContext('ensurePyodide()', c); } catch (e) { e1 = e; }
+  try { await vm.runInContext('ensureLockedPyodide()', c); } catch (e) { e1 = e; }
   check('W-I1 first load fails', e1 && e1.message === 'temporary CDN failure', e1 && e1.message);
 
   // second attempt must RETRY (not reuse the rejected promise)
   let py = null, e2 = null;
-  try { py = await vm.runInContext('ensurePyodide()', c); } catch (e) { e2 = e; }
+  try { py = await vm.runInContext('ensureLockedPyodide()', c); } catch (e) { e2 = e; }
   check('W-I2 second attempt retries and succeeds', !e2 && !!py, e2 && e2.message);
   check('W-I3 loadPyodide actually attempted twice', attempts === 2, 'attempts=' + attempts);
+  check('W-I4 lockdown applied after successful bootstrap', (() => {
+    const r = vm.runInContext("(function () { try { fetch('http://127.0.0.1:9/probe'); return 'allowed'; } catch (e) { return 'denied: ' + e.message; } })()", c);
+    return r.startsWith('denied: Python network access is disabled');
+  })(), 'fetch probe result');
+  check('W-I5 runtime package load happened before lockdown (state locked)',
+    vm.runInContext('bootPhase', c) === 'locked', vm.runInContext('typeof bootPhase', c));
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);

@@ -902,6 +902,8 @@ function shellSystemPromptSection() {
     '  python has the standard library and pandas available. Python sees the SAME filesystem as the shell',
     '  (/mnt/workspace, /mnt/upload, /mnt/download, /tmp, /home/locus) and runs with the shell cwd as its',
     '  working directory. /mnt/upload is read-only, also from Python. python and curl do not read pipeline stdin.',
+    '  Python has no network access and cannot fetch URLs or install packages; Python is for local',
+    '  computation and files. Anything networked goes through curl.',
     '  The python heredoc must be a STANDALONE bash invocation — nothing may follow the closing marker;',
     '  run subsequent commands in a separate bash call.',
   ];

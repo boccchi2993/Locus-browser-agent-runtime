@@ -222,15 +222,18 @@
     check('K1 python globals isolated after reset', k1.success && k1.output.includes('var:gone'), JSON.stringify(k1.output));
     check('K2 VFS /tmp persists across interpreter reset', k1.output.includes('tmp:True'), JSON.stringify(k1.output));
 
-    // ---------- L. F06 capability check: Python CAN reach js.fetch ----------
-    // This documents the real capability boundary (declared in README):
-    // the Pyodide worker has network access via the JS bridge; the
-    // anonymous-GET policy is enforced at the curl layer, not by sandboxing
-    // Python. The check must print True — if it ever prints False the
-    // declaration in README needs revisiting.
-    const l1 = await executeTool('bash', "python <<'PY'\nimport js\nprint('js.fetch callable: ' + str(callable(js.fetch)))\nPY", ws);
-    check('L1 python js bridge exposes fetch (capability documented)',
-      l1.success && l1.output.includes('js.fetch callable: True'), JSON.stringify(l1.output));
+    // ---------- L. F04a authority check: Python direct network is denied ----------
+    // The Pyodide worker applies a network lockdown after bootstrap: the
+    // JS bridge no longer gives model-generated Python working network
+    // primitives — HTTP/HTTPS belongs to the shell curl command, where
+    // NetworkRuntime owns transport, approval and bounds. The attempt must
+    // FAIL LOCALLY at the policy layer; request-counter proof that nothing
+    // reaches the wire lives in tests/e2e-python-authority.cjs.
+    const l1 = await executeTool('bash', "python <<'PY'\nimport js\ntry:\n    js.fetch('https://locus-network-probe.invalid/probe')\n    print('js.fetch: ALLOWED')\nexcept Exception as e:\n    print('js.fetch denied: ' + str(e))\nPY", ws);
+    check('L1 python direct network attempt is denied at the policy layer',
+      l1.success && l1.output.includes('js.fetch denied:')
+      && l1.output.includes('Python network access is disabled in Locus; use the shell curl command')
+      && !l1.output.includes('ALLOWED'), JSON.stringify(l1.output));
 
     // ---------- M. cancel semantics live at the runtime boundary ----------
     // (The real UI event path — Vue cancel button click and Escape keydown —
