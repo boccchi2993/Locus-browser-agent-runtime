@@ -8,9 +8,17 @@
 //   - nested Worker and importScripts escapes are denied with ZERO requests,
 //   - micropip against a local wheel URL performs ZERO requests,
 //   - imports the runtime does not carry fail honestly with ZERO requests,
-//   - dynamic-JS escapes (js.eval, js.Function, pyodide.code.run_js, and a
-//     Function reconstructed from a surviving native object doing a dynamic
-//     import) perform ZERO requests,
+//   - dynamic-JS escapes (js.eval, pyodide.code.run_js) perform ZERO requests,
+//   - the F04a-R1 Function residual is pinned exactly: constructing a
+//     reconstructed Function fires ZERO requests; CALLING a dynamic import()
+//     from it performs exactly ONE (documented residual) and executes the
+//     cross-origin module; a same-origin import performs its GET too,
+//   - the PROTOTYPE-CHAIN family from the F04a-A1 audit (getPrototypeOf(self)
+//     at every level: fetch via Reflect.apply / descriptor.value.call / bind,
+//     importScripts, string-handler timers, a Function-recovered fetch) is
+//     denied with ZERO requests — before AND after reset and crash recovery,
+//   - real function handlers still reach the native timers at every level,
+//   - concurrent runs are serialized (no stdout cross-contamination),
 //   - reset and worker-crash recovery re-apply the lockdown,
 //   - Python-side pyodide.loadPackage / loadPackagesFromImports are denied.
 // Standalone run needs a built app served at E2E_APP_URL (default
@@ -321,8 +329,9 @@ async function main() {
       "run_js(\"fetch('" + PROBE + "/probe-hit')\")",
     ]);
     // THE critical probe: Function reconstructed from a SURVIVING native
-    // object, executing a dynamic import() — the one path that does not go
-    // through any denied global.
+    // object — the one path that does not go through any denied global.
+    // Construction alone compiles the body but performs NO request; the
+    // residual network act is the CALL (pinned by E10e below).
     const t10d = Date.now();
     const e10d = await runPy([
       'import js',
@@ -340,21 +349,67 @@ async function main() {
       e10b.success, JSON.stringify(e10b).slice(0, 200));
     check('E10c pyodide.code.run_js denied with ZERO requests',
       !e10c.success && hitsTo('/probe-hit', t10) === 0, JSON.stringify(e10c).slice(0, 240));
+    check('E10d2 constructing (never calling) the reconstructed Function performs ZERO requests',
+      e10dd === 0, 'delta=' + e10dd);
 
     // KNOWN RESIDUAL (F04a-R1, measured, deliberately not closable inside
     // the worker): dynamic JS remains reachable via the global Function
-    // constructor (js.Function or any native function's .constructor) and a
-    // dynamic import() from there performs a REAL network request. Denying
-    // Function breaks Pyodide's own glue (runPythonAsync fails with
-    // "globals must be a real dict"); denying Function.prototype.constructor
-    // breaks it the same way. This check pins the measured behavior — if it
-    // ever flips (a future Pyodide/Chrome, or the planned document-CSP /
-    // isolated-origin worker), UPDATE the expectations to denied + ZERO.
+    // constructor (js.Function or any native function's .constructor), and
+    // a CALLED dynamic import() from there performs a REAL network request
+    // and runs the fetched module. Constructing the function alone performs
+    // NO request — the residual is the call. Denying Function breaks
+    // Pyodide's own glue (runPythonAsync fails with "globals must be a real
+    // dict"); denying Function.prototype.constructor breaks it the same
+    // way. The direct dynamic paths are still denied individually (js.eval
+    // and pyodide.code.run_js route through the denied eval slot). The
+    // module's own code meets the same denials once running — with the
+    // prototype-chain lockdown that denial is now unbreakable from inside
+    // the module. Fully closing F04a-R1 needs a document-level CSP (blob
+    // workers inherit it) or an isolated-origin worker; this suite pins the
+    // measured behavior and flips when that lands.
     check('E10d KNOWN RESIDUAL F04a-R1: reconstructed Function still executes (documented escape)',
       e10d.success && e10d.output.includes('RECONSTRUCTED FUNCTION EXECUTED'),
       JSON.stringify(e10d).slice(0, 240));
-    check('E10e KNOWN RESIDUAL F04a-R1: at most the 1 documented dynamic-import request',
-      e10dd <= 1, 'delta=' + e10dd + ' (same-origin contexts fetch; cross-origin module loads may be blocked by the browser)');
+    // The called form of the residual: dynamic import() fetches + executes
+    // the cross-origin module. Deterministic with the probe server's ACAO:*:
+    // EXACTLY 1 request for the fresh module URL.
+    const e10e = await runPy([
+      'import js',
+      'F = js.Function.new("u", "return import(u).then(function(){ return \'LOADED\'; }, function(e){ return \'ERR: \' + (e && e.message || String(e)); })")',
+      "res = await F('" + PROBE + "/probe-script.js')",
+      "print('PROBE-IMPORT:', res)",
+    ]);
+    await new Promise((r) => setTimeout(r, 1000));
+    const e10ed = hitsTo('/probe-script.js', t10d);
+    check('E10e KNOWN RESIDUAL F04a-R1: the CALLED dynamic import executes the cross-origin module',
+      e10e.success && e10e.output.includes('PROBE-IMPORT: LOADED'),
+      JSON.stringify(e10e).slice(0, 240));
+    check('E10e2 the documented residual is exactly 1 request (deterministic, no double-solution)',
+      e10ed === 1, 'delta=' + e10ed);
+    // Same-origin dynamic import: the GET lands on the APP's own static
+    // server, which this suite does not own and cannot count — the
+    // deterministic oracle is the worker's own ResourceTiming (exactly one
+    // entry for that URL). The app bundle exists and is importable; its
+    // execution fails harmlessly inside the worker (no document) — the GET
+    // is the point.
+    let bundlePath = null;
+    try {
+      const idx = await fs.readFile(path.join(__dirname, '..', 'dist', 'index.html'), 'utf8');
+      const mb = idx.match(/src="\.?(\/assets\/[^"]+\.js)"/);
+      if (mb) bundlePath = mb[1];
+    } catch (e) {}
+    const e10f = await runPy([
+      'import js',
+      'origin = js.location.origin',
+      'G = js.Function.new("u", "return import(u).catch(function(e){ return null; }).then(function(){ return performance.getEntriesByType(\'resource\').filter(function(en){ return en.name === u; }).length; })")',
+      "n = await G(origin + '" + (bundlePath || '/no-bundle-in-dist') + "')",
+      "import time",
+      'time.sleep(0.3)',
+      "print('SAMEORIGIN-ENTRIES', int(n))",
+    ]);
+    check('E10f same-origin dynamic import performs the GET (worker ResourceTiming count 1)',
+      bundlePath !== null && e10f.success && e10f.output.includes('SAMEORIGIN-ENTRIES 1'),
+      JSON.stringify(e10f).slice(0, 260));
 
     // ---- E11 (CASE H): reset re-applies the lockdown ----
     await evaluate(cdp, 'PythonRuntime.reset(); "reset"');
@@ -387,6 +442,22 @@ async function main() {
     ]);
     check('E12c recovered worker still denies network with ZERO requests',
       !e12b.success && hitsTo('/probe-hit', t) === 0, JSON.stringify(e12b).slice(0, 200));
+    // The F04a-A1 escape must ALSO stay closed after the rebuild: the fresh
+    // worker re-walks the whole prototype chain under the new lockdown.
+    t = Date.now();
+    const e12d = await runPy([
+      'import js',
+      "js.Reflect.apply(js.Object.getPrototypeOf(js.Object.getPrototypeOf(js.self)).fetch, js.self, ['" + PROBE + "/probe-hit'])",
+    ]);
+    check('E12d recovered worker: prototype-level fetch denied with ZERO requests',
+      !e12d.success && e12d.output.includes('Python network access is disabled') && hitsTo('/probe-hit', t) === 0,
+      JSON.stringify(e12d).slice(0, 220));
+    const e12e = await runPy([
+      'import js',
+      "js.Reflect.apply(js.Object.getPrototypeOf(js.self).importScripts, js.self, ['" + PROBE + "/probe-script.js'])",
+    ]);
+    check('E12e recovered worker: prototype-level importScripts denied with ZERO requests',
+      !e12e.success && hitsTo('/probe-script.js', t) === 0, JSON.stringify(e12e).slice(0, 220));
 
     // ---- E13: stdlib battery (§52) + sqlite3 C-extension load after lockdown
     const e13 = await runPy([
@@ -419,6 +490,112 @@ async function main() {
     check('E14 urllib fails bounded with ZERO requests',
       !e14.success && hitsTo('/probe-hit', t) === 0, JSON.stringify(e14).slice(0, 240));
 
+    // ---- E18 (F04a-A1): the PROTOTYPE-CHAIN family — every form the audit
+    // used to recover a native primitive from getPrototypeOf(self) must be
+    // the same denial, with ZERO requests arriving. Audited Chrome layout:
+    // fetch/importScripts/caches/timers are OWNED by a scope prototype
+    // (p2), XHR/WebSocket/Worker by the global instance. ----
+    const protoPrologue = [
+      'import js',
+      'p = js.Object.getPrototypeOf(js.self)',
+      'p2 = js.Object.getPrototypeOf(p)',
+    ];
+    const DENIED = 'Python network access is disabled in Locus; use the shell curl command';
+    const e18forms = [
+      ['reflect p.fetch', "js.Reflect.apply(p.fetch, js.self, ['" + PROBE + "/probe-hit'])"],
+      ['reflect p2.fetch', "js.Reflect.apply(p2.fetch, js.self, ['" + PROBE + "/probe-hit'])"],
+      ['descriptor.value.call p2.fetch', "js.Object.getOwnPropertyDescriptor(p2, 'fetch').value.call(js.self, '" + PROBE + "/probe-hit')"],
+      ['bound p.fetch', "p.fetch.bind(js.self)('" + PROBE + "/probe-hit')"],
+    ];
+    for (const [tag, expr] of e18forms) {
+      t = Date.now();
+      const r = await runPy(protoPrologue.concat([expr]));
+      const d = hitsTo('/probe-hit', t);
+      check('E18 prototype fetch via ' + tag + ': denied + ZERO requests',
+        !r.success && r.output.includes(DENIED) && d === 0, JSON.stringify(r).slice(0, 220) + ' | delta=' + d);
+    }
+    const e18graph = await runPy(protoPrologue.concat([
+      "d = js.Object.getOwnPropertyDescriptor(p, 'fetch')",
+      "print('P-DESC', 'absent' if d is None else 'present')",
+    ]));
+    check('E18b the global owns NO own fetch descriptor (audited object graph intact)',
+      e18graph.success && e18graph.output.includes('P-DESC absent'), JSON.stringify(e18graph).slice(0, 200));
+    for (const lvl of ['p', 'p2']) {
+      t = Date.now();
+      const r = await runPy(['import js'].concat(lvl === 'p' ? [
+        'L = js.Object.getPrototypeOf(js.self)',
+      ] : [
+        'p = js.Object.getPrototypeOf(js.self)',
+        'L = js.Object.getPrototypeOf(p)',
+      ]).concat([
+        "L.importScripts('" + PROBE + "/probe-script.js')",
+      ]));
+      const d = hitsTo('/probe-script.js', t);
+      check('E18c prototype importScripts via ' + lvl + ': denied + ZERO requests',
+        !r.success && r.output.includes(DENIED) && d === 0, JSON.stringify(r).slice(0, 220) + ' | delta=' + d);
+    }
+    t = Date.now();
+    const e18d = await runPy(protoPrologue.concat([
+      "p.setTimeout(\"import('" + PROBE + "/probe-script.js')\", 0)",
+      "p2.setTimeout(\"import('" + PROBE + "/probe-script.js')\", 0)",
+      "p.setInterval(\"import('" + PROBE + "/probe-script.js')\", 0)",
+      "p2.setInterval(\"import('" + PROBE + "/probe-script.js')\", 0)",
+      "print('unreachable')",
+    ]));
+    await new Promise((r) => setTimeout(r, 1200));
+    const e18dd = hits.filter((h) => h.path === '/probe-script.js' && h.t >= t).length;
+    check('E18d prototype setTimeout/setInterval string handlers denied at every level + ZERO requests',
+      !e18d.success && e18d.output.includes(DENIED) && e18dd === 0,
+      JSON.stringify(e18d).slice(0, 220) + ' | delta=' + e18dd);
+    const e18e = await runPy(protoPrologue.concat([
+      'from pyodide.ffi import create_proxy',
+      '# create_proxy keeps the callback alive past the run boundary — a',
+      '# bare lambda would be destroyed as a borrowed proxy when the timer',
+      '# fires after the run finished (and raise an unhandled worker error).',
+      'cb = create_proxy(lambda: None)',
+      'js.setTimeout(cb, 5)',
+      'p.setTimeout(cb, 5)',
+      'p2.setTimeout(cb, 5)',
+      'import time',
+      'time.sleep(0.4)',
+      "print('TIMER-FN-OK')",
+    ]));
+    check('E18e real function handlers still accepted at the own slot and both prototype levels (Pyodide needs them)',
+      e18e.success && e18e.output.includes('TIMER-FN-OK'), JSON.stringify(e18e).slice(0, 240));
+    t = Date.now();
+    const e18f = await runPy([
+      'import js',
+      'F = js.Function.new("url", "const f = Object.getPrototypeOf(self).fetch; return Reflect.apply(f, self, [url])")',
+      "F('" + PROBE + "/probe-hit')",
+    ]);
+    check('E18f Function-generated code recovering the prototype fetch: denied + ZERO requests (audit payload, now closed)',
+      !e18f.success && e18f.output.includes(DENIED) && hitsTo('/probe-hit', t) === 0,
+      JSON.stringify(e18f).slice(0, 240));
+    for (const [tag, expr] of [
+      ['XMLHttpRequest', "js.Reflect.construct(p2.XMLHttpRequest, [])"],
+      ['WebSocket', "js.Reflect.construct(p2.WebSocket, ['ws://127.0.0.1:" + probePort + "/probe-hit'])"],
+      ['Worker', "js.Reflect.construct(p2.Worker, ['blob:probe'])"],
+    ]) {
+      t = Date.now();
+      const r = await runPy(protoPrologue.concat([expr]));
+      const d = hitsTo('/probe-hit', t);
+      check('E18g prototype-level ' + tag + ': no native survivor on the chain, denied + ZERO requests',
+        !r.success && d === 0, JSON.stringify(r).slice(0, 220) + ' | delta=' + d);
+    }
+
+    // ---- E19 (F04a-A2): concurrent runs are serialized — outputs never
+    // cross. The audit reproduced stdout cross-contamination twice. ----
+    const [e19a, e19b] = await Promise.all([
+      runPy("print('A42')"),
+      runPy(['import time', 'time.sleep(1.2)', "print('B25')"]),
+    ]);
+    check('E19 concurrent runs: the short run keeps exactly its own stdout',
+      e19a.success && e19a.output.trim().endsWith('A42') && !e19a.output.includes('B25'),
+      JSON.stringify(e19a).slice(0, 200));
+    check('E19b concurrent runs: the slow run keeps exactly its own stdout',
+      e19b.success && e19b.output.trim().endsWith('B25') && !e19b.output.includes('A42'),
+      JSON.stringify(e19b).slice(0, 200));
+
     // ---- E15: VFS write-back sanity under the lockdown (§53) ----
     await evaluate(cdp, `window.__paE2e.exec("echo pyauth-fixture > pyauth-in.txt").then(r => r.success).then(ok => { window.__paE2e.wrote = ok; })`);
     check('E15 fixture written via shell', (await evaluate(cdp, 'window.__paE2e.wrote')) === true);
@@ -434,9 +611,11 @@ async function main() {
       JSON.stringify(e15.output) + ' | ' + JSON.stringify(e15b));
 
     // ---- E16: no HIDDEN attempts — the ONLY probe-server traffic in the
-    // whole suite is the single documented F04a-R1 residual request (E10e) --
-    check('E16 probe server received only the documented F04a-R1 traffic and nothing else',
-      probeTotal() <= 1, 'total=' + probeTotal() + ' paths=' + JSON.stringify(hits.map((h) => h.path)));
+    // whole suite is the single documented F04a-R1 residual request (E10e,
+    // the called dynamic import). Everything else — every denial above,
+    // every prototype-chain probe, both recovery cycles — contributed ZERO. --
+    check('E16 probe server received ONLY the documented F04a-R1 traffic and nothing else',
+      probeTotal() === 1, 'total=' + probeTotal() + ' paths=' + JSON.stringify(hits.map((h) => h.path)));
     check('E17 browser reported no unhandled errors', (await evaluate(cdp, '(window.__e2eErrors || []).length')) === 0,
       JSON.stringify(await evaluate(cdp, '(window.__e2eErrors || []).slice(0, 3)')));
 

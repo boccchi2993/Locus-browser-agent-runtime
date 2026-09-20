@@ -16,6 +16,11 @@
 //  PA11 a fresh worker (reset/recovery path) reapplies the lockdown
 //  PA12 a retried bootstrap (fatal worker recovery path) reapplies the lockdown
 //  PA13 a worker whose required primitives cannot lock fails CLOSED
+//  PB   the same boundary under a REAL worker object graph, where the
+//       primitives are owned by the scope PROTOTYPES, not by the global
+//       (the structural blind spot that hid F04a-A1 — every owning level
+//       must be locked, unlockable levels fail closed, sendBeacon present
+//       on the navigator chain is locked too)
 //  plus: compute keeps working after the lockdown; prompt/docs contract.
 // Run: node tests/python-authority.test.cjs
 
@@ -217,6 +222,162 @@ async function run() {
   check('PA13b a lockdown-failed worker schedules self-destruct (shell rebuilds)',
     calls4.some((c) => String(c).indexOf('selfdestruct:Python worker failed to apply the network lockdown') === 0),
     JSON.stringify(calls4));
+
+  // ---------- PB: prototype-chain layout (the F04a-A1 blind spot) ----------
+  // The flat sandbox above owns every primitive as an own property of the
+  // global. A REAL Chrome dedicated worker does NOT: in the audited object
+  // graph (F04a-A1) fetch/importScripts/caches/timers live on the scope
+  // PROTOTYPES — which is exactly why the original lockdown's prototype
+  // layer was dead code and Object.getPrototypeOf(self).fetch handed back a
+  // working native fetch. This context reproduces that shape on the
+  // context's REAL prototype chain (vm exposes globalThis → p → p2):
+  // the global owns only instance-family primitives (Worker — as audited),
+  // p owns XHR/WebSocket/caches, p2 owns fetch/importScripts/caches/timers,
+  // and an onmessage WebIDL accessor (get/set) lives on p. `caches` is
+  // owned at BOTH prototype levels to pin the one-denied-instance-per-name
+  // rule across levels.
+  function makeProtoWorkerContext(loadPyodideImpl, posted, calls, opts) {
+    opts = opts || {};
+    const sandbox = {
+      self: null,
+      __calls: calls,
+      loadPyodide: loadPyodideImpl,
+      atob: atob, btoa: btoa,
+      TextEncoder: TextEncoder, TextDecoder: TextDecoder,
+      Worker: function () { calls.push('worker:RAN'); }, // instance-own family (audited Chrome)
+      postMessage: function (msg) { if (msg.type === 'result') posted.push(msg); },
+      navigator: Object.create({ sendBeacon() { calls.push('beacon:RAN'); } }),
+    };
+    const c = vm.createContext(sandbox);
+    vm.runInContext('(function () {\n' +
+      '  globalThis.self = globalThis;\n' +
+      '  const p = Object.getPrototypeOf(globalThis);\n' +
+      '  const p2 = Object.getPrototypeOf(p);\n' +
+      '  p.XMLHttpRequest = function () { __calls.push("xhr:RAN"); };\n' +
+      '  p.WebSocket = function () { __calls.push("ws:RAN"); };\n' +
+      '  p.caches = function () { __calls.push("caches:RAN"); };\n' +
+      '  p2.fetch = function () { __calls.push("fetch:RAN"); };\n' +
+      '  p2.importScripts = function () { __calls.push("importScripts:RAN"); };\n' +
+      '  p2.caches = function () { __calls.push("caches:RAN"); };\n' +
+      '  p2.setTimeout = function (fn) {\n' +
+      '    __calls.push("timer:RAN");\n' +
+      '    if (typeof fn === "function") { try { fn(); } catch (e) { __calls.push("selfdestruct:" + (e && e.message || e)); } }\n' +
+      '  };\n' +
+      '  p2.setInterval = function () { __calls.push("itimer:RAN"); };\n' +
+      '  p2.clearTimeout = function () {};\n' +
+      (opts.freezeFetch
+        ? '  Object.defineProperty(p2, "fetch", { value: p2.fetch, writable: false, configurable: false });\n'
+        : '') +
+      '  const stored = { current: null };\n' +
+      '  Object.defineProperty(p, "onmessage", { get() { return stored.current; }, set(v) { stored.current = v; }, configurable: true });\n' +
+      '})()', c);
+    vm.runInContext(workerSrc, c);
+    return c;
+  }
+
+  // For every prototype-chain level of the guest global that OWNS `name`,
+  // does its own descriptor value carry `mark`? (Structural counterpart of
+  // the worker's fail-closed self-check.)
+  function levelMarks(c, name, mark) {
+    return vm.runInContext('(function () {\n' +
+      '  const marks = [];\n' +
+      '  let cur = globalThis;\n' +
+      '  while (cur) {\n' +
+      '    if (Object.prototype.hasOwnProperty.call(cur, ' + JSON.stringify(name) + ')) {\n' +
+      '      const d = Object.getOwnPropertyDescriptor(cur, ' + JSON.stringify(name) + ');\n' +
+      '      marks.push(!!(d && d.value && d.value.' + mark + ' === true));\n' +
+      '    }\n' +
+      '    cur = Object.getPrototypeOf(cur);\n' +
+      '  }\n' +
+      '  return marks;\n' +
+      '})()', c);
+  }
+
+  const callsP = [];
+  const postedP = [];
+  const cp = makeProtoWorkerContext(async () => makeFakePy(callsP, cp), postedP, callsP);
+  await postRun(cp, "print('proto')");
+  const rp = await waitForResult(postedP);
+  check('PB1 boot succeeds on the prototype-chain layout (audited Chrome worker shape)', !rp.error, rp.error);
+
+  const escP = (expr) => guestTry(cp, expr);
+  const DENY = 'DENIED: ' + DENY_MESSAGE;
+  const p2fetch = escP("fetch('http://127.0.0.1:9/probe')");
+  check('PB2 chain-resolved fetch is the denial', p2fetch === DENY, p2fetch);
+  const p1fetch = escP("Object.getPrototypeOf(self).fetch('http://127.0.0.1:9/probe')");
+  check('PB3 prototype-level fetch is denied (the F04a-A1 escape, one hop)', p1fetch === DENY, p1fetch);
+  const p2hop = escP("Object.getPrototypeOf(Object.getPrototypeOf(self)).fetch('http://127.0.0.1:9/probe')");
+  check('PB4 prototype-level fetch two hops up is denied', p2hop === DENY, p2hop);
+  const refl = escP("Reflect.apply(Object.getPrototypeOf(self).fetch, self, ['http://127.0.0.1:9/probe'])");
+  check('PB5 Reflect.apply on the prototype fetch is denied', refl === DENY, refl);
+  const dvcall = escP("Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Object.getPrototypeOf(self)), 'fetch').value.call(self, 'http://127.0.0.1:9/probe')");
+  check('PB6 descriptor.value.call on the prototype fetch is denied', dvcall === DENY, dvcall);
+  const bound = escP("Object.getPrototypeOf(self).fetch.bind(self)('http://127.0.0.1:9/probe')");
+  check('PB7 a bound prototype fetch is denied', bound === DENY, bound);
+  const is1 = escP("Object.getPrototypeOf(self).importScripts('http://127.0.0.1:9/probe.js')");
+  const is2 = escP("Object.getPrototypeOf(Object.getPrototypeOf(self)).importScripts('http://127.0.0.1:9/probe.js')");
+  check('PB8 prototype importScripts denied at every owning level', is1 === DENY && is2 === DENY,
+    JSON.stringify([is1, is2]));
+  const xhrP = escP("new (Object.getPrototypeOf(self).XMLHttpRequest)()");
+  const wsP = escP("new (Object.getPrototypeOf(self).WebSocket)('ws://127.0.0.1:9/')");
+  const wkP = escP("new Worker('blob:probe')");
+  check('PB9 prototype XHR/WebSocket and instance-own Worker all denied (no native survivor on the chain)',
+    xhrP === DENY && wsP === DENY && wkP === DENY, JSON.stringify([xhrP, wsP, wkP]));
+  const t1 = escP("Object.getPrototypeOf(self).setTimeout(\"import('http://127.0.0.1:9/probe.js')\", 0)");
+  const t2 = escP("Object.getPrototypeOf(Object.getPrototypeOf(self)).setInterval(\"import('http://127.0.0.1:9/probe.js')\", 0)");
+  const t3 = escP("setTimeout(function () {}, 0)");
+  check('PB10 prototype timer string handlers denied; real function handler still reaches the native timer',
+    t1 === DENY && t2 === DENY && t3 === 'ALLOWED' && callsP.indexOf('timer:RAN') !== -1,
+    JSON.stringify([t1, t2, t3, callsP.slice(-3)]));
+  const fetchMarks = levelMarks(cp, 'fetch', '__locusNetworkDenied');
+  const xhrMarks = levelMarks(cp, 'XMLHttpRequest', '__locusNetworkDenied');
+  const workerMarks = levelMarks(cp, 'Worker', '__locusNetworkDenied');
+  check('PB11 every owning level carries the denial mark (fetch on p2, XHR on p, Worker own)',
+    fetchMarks.length >= 1 && fetchMarks.every(Boolean)
+    && xhrMarks.length >= 1 && xhrMarks.every(Boolean)
+    && workerMarks.length >= 1 && workerMarks.every(Boolean),
+    JSON.stringify([fetchMarks, xhrMarks, workerMarks]));
+  const cacheMarks = levelMarks(cp, 'caches', '__locusNetworkDenied');
+  const sameInstance = vm.runInContext(
+    'Object.getOwnPropertyDescriptor(Object.getPrototypeOf(globalThis), "caches").value === ' +
+    'Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Object.getPrototypeOf(globalThis)), "caches").value', cp);
+  check('PB11b a name owned at TWO prototype levels is locked at both with the SAME denied instance',
+    cacheMarks.length === 2 && cacheMarks.every(Boolean) && sameInstance === true,
+    JSON.stringify([cacheMarks, sameInstance]));
+  const timerMarksP = levelMarks(cp, 'setTimeout', '__locusTimerSafe');
+  const timerMarksI = levelMarks(cp, 'setInterval', '__locusTimerSafe');
+  check('PB12 every owning timer level carries the safe-wrapper mark',
+    timerMarksP.length >= 1 && timerMarksP.every(Boolean)
+    && timerMarksI.length >= 1 && timerMarksI.every(Boolean)
+    && levelMarks(c, 'setTimeout', '__locusTimerSafe').every(Boolean),
+    JSON.stringify([timerMarksP, timerMarksI]));
+  const beacon = escP("navigator.sendBeacon('http://127.0.0.1:9/probe', 'x')");
+  check('PB13 navigator.sendBeacon locked when the navigator chain exposes it (F04a-A5 forward defense)',
+    beacon === DENY, beacon);
+  const setter = escP("Object.getOwnPropertyDescriptor(Object.getPrototypeOf(self), 'onmessage').set.call(self, 'import(1)')");
+  check('PB14 a prototype-level onmessage WebIDL setter is replaced by a set-throws denial',
+    setter === DENY, setter);
+  postedP.length = 0;
+  await postRun(cp, "print('still-alive')");
+  const rp2 = await waitForResult(postedP);
+  check('PB15 compute keeps working after the prototype-chain lockdown', !rp2.error, rp2.error);
+
+  // PB16: an UNLOCKABLE prototype level (non-configurable own slot) must
+  // fail the whole bootstrap closed — never a half-locked worker.
+  const callsR = [];
+  const postedR = [];
+  const cr = makeProtoWorkerContext(async () => makeFakePy(callsR, cr), postedR, callsR, { freezeFetch: true });
+  await postRun(cr, 'x');
+  const rr = await waitForResult(postedR);
+  check('PB16 an unlockable prototype level fails the bootstrap closed',
+    !!rr.error && /fetch/.test(rr.error), JSON.stringify(rr.error).slice(0, 200));
+  check('PB16b the failed bootstrap schedules self-destruct (shell rebuild path)',
+    callsR.some((s) => String(s).indexOf('selfdestruct:') === 0), JSON.stringify(callsR.slice(-3)));
+  postedR.length = 0;
+  await postRun(cr, 'x');
+  const rr2 = await waitForResult(postedR);
+  check('PB16c the failed-locked worker stays failed (no half-locked retry)',
+    !!rr2.error && rr2.error.includes('Python worker failed to apply the network lockdown'), rr2.error);
 
   // ---------- prompt/docs contract (model-facing authority wording) ---------
   const shellSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'shell.js'), 'utf8');
