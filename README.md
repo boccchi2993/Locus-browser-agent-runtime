@@ -287,7 +287,7 @@ node tests/grep-worker.test.cjs  # grep regex worker isolation: real worker-sour
 node tests/agent.test.cjs        # session binding, cancellation vs session-switch semantics, byte-based history budget with whole-task trimming, 32-iteration cap
 node tests/presentation.test.cjs # runtime-event → timeline projection, markdown-lite safety, AgentSession→projector integration
 node tests/store-defaults.test.cjs # settings defaults (deepseek-flash @ DeepSeek Anthropic endpoint), user override, remembered-session precedence, test-connection model
-node tests/worker-init.test.cjs  # Pyodide init-failure recovery (real worker source from index.html)
+node tests/worker-init.test.cjs  # Pyodide init-failure recovery (real worker source from index.html, in-memory bootstrap assets)
 node tests/worker-output.test.cjs # worker diffOut limits: structured uncollected status, rename safety, real commit logic
 node tests/verify-active-content.cjs # /fetch active-content isolation through the REAL handler in headless Chrome
 ```
@@ -310,12 +310,14 @@ A separate real-browser verification proves the `/fetch` active-content isolatio
 node tests/verify-active-content.cjs
 ```
 
+The Python **browser authority** e2e (`tests/e2e-python-browser-authority.cjs`, also part of `npm run test:e2e`) proves the F04b boundary model and the in-memory bootstrap in isolation, in BOTH hosted and `file://` page modes, with two probe origins and request counters as the only oracle: a strict-CSP `srcdoc` creator iframe's Blob worker has every network primitive browser-blocked (fetch/XHR/WS/EventSource/sendBeacon/importScripts/dynamic import/`Function` dynamic import/prototype-level fetch/string-timer import/nested remote and nested blob workers) while `Function`/`eval`/WebAssembly/Promise/timers keep working; real Pyodide 0.26.4 boots entirely from harness-delivered bytes (resolver serves exactly the fixed URL set, unknown URLs and query variations fail closed); after teardown, with native fetch restored and no F04a patches at all, every escape payload is still blocked with zero requests and pandas keeps computing. A no-CSP control worker proves the counters actually observe real requests.
+
 ## Security boundaries
 
 - Only user-granted mounts are accessible beyond the built-in virtual filesystem: the external folder appears only at `/mnt/workspace`, `/mnt/upload` holds user-picked files read-only, and paths are normalized with `..` escapes rejected
 - No native shell, no `child_process`, no localhost server, no remote code execution
 - Locus does not automatically upload workspace files to any execution server; only content explicitly surfaced through the agent conversation (tool results the model chose to read) is sent to the model API
-- Model-generated Python has **no direct network path**: the worker loads its harness-declared package set once at bootstrap and then denies the browser network primitives (fetch, XMLHttpRequest, WebSocket, EventSource, WebTransport, Worker, SharedWorker, RTCPeerConnection, importScripts, caches), dynamic-JS execution (`eval`, `pyodide.code.run_js`; the `Function` constructor is deliberately reachable — see the F04a-R1 residual below) and the package loaders to user code — network belongs to `curl`/`NetworkRuntime`. Every denial is applied at the global slot AND at every prototype-chain level that owns the name, so a recovered `Object.getPrototypeOf(self).fetch` is the same denial, and string-handler `setTimeout`/`setInterval` (eval in disguise) are refused at every level while real function handlers keep working. This is a runtime authority boundary verified with request counters (`tests/e2e-python-authority.cjs`), not a hostile-code sandbox certification — see the Python capability declaration below
+- Model-generated Python has **no direct network path**: the worker is created by a strict-CSP creator iframe, so the **browser itself** blocks every network act (fetch, XMLHttpRequest, WebSocket, EventSource, WebTransport, Worker, SharedWorker, RTCPeerConnection, importScripts, caches, dynamic import) from inside it with zero requests — the `Function` constructor stays reachable because compute is not the boundary (the F04a-R1 residual this used to allow is closed; see the Python capability declaration). On top of the browser boundary the worker applies the F04a JS lockdown before any user code: every denial at the global slot AND at every prototype-chain level that owns the name, so a recovered `Object.getPrototypeOf(self).fetch` is the same denial, and string-handler `setTimeout`/`setInterval` (eval in disguise) are refused at every level while real function handlers keep working — network belongs to `curl`/`NetworkRuntime`. This is a runtime authority boundary verified with request counters (`tests/e2e-python-authority.cjs`, `tests/e2e-python-browser-authority.cjs`), not a hostile-code sandbox certification — see the Python capability declaration below
 - Network access via `curl` is anonymous HTTPS GET only: no cookies (`credentials: 'omit'`), no auth headers, no URL userinfo, no custom request headers, no POST
 - Switching workspaces or `reset` is a full session boundary: the running task is cancelled, history is cleared, and the Python interpreter is rebuilt
 - API keys are not persisted by default; explicit opt-in stores them only in this browser profile and never in history, provider frames, normalized messages, telemetry, logs or exports
@@ -325,25 +327,61 @@ node tests/verify-active-content.cjs
 
 ### Python capability declaration (read this)
 
-Model-generated Python is **local computation and filesystem only**. The worker loads Pyodide and its
-harness-declared package set (`PYTHON_RUNTIME_PACKAGES`, currently `pandas` and its dependency closure) from
-the pinned CDN once at bootstrap, then applies a network lockdown **before any user code executes**: the
-browser network primitives reachable through Pyodide's `js` bridge (fetch, XMLHttpRequest, WebSocket,
-EventSource, WebTransport, Worker, SharedWorker, RTCPeerConnection, importScripts, caches), dynamic-JS
-execution (`eval`, `pyodide.code.run_js`) and the package loaders (`loadPackage`,
-`loadPackagesFromImports`, `micropip` network paths) are denied to user code. Each denial is applied at
-the global slot AND at every prototype-chain level that owns the name — the audited F04a-A1 escape
-(`Object.getPrototypeOf(self).fetch` handed back a working native fetch because the prototype layer of
-the original lockdown was dead code) is closed and pinned by tests — and string-handler timers are
-refused at every owning level while real function handlers keep working (Pyodide/Emscripten schedule
-with them). An import the runtime does not
-carry fails with `ModuleNotFoundError` and no network attempt; HTTP/HTTPS work belongs to `curl`, where
-NetworkRuntime owns transport, approval, bounds and telemetry. Denied Python network attempts are plain
-Python compute failures — they are never recorded as network operations, because no network happened.
+Model-generated Python is **local computation and filesystem only**. The boundary is enforced in two
+layers with different authority:
 
-Two honest limits. First, this is a **runtime authority boundary, not a hostile-code sandbox certification**: ordinary model-generated Python has no supported direct network path and the known browser network primitives are denied (verified in real Chrome with server-side request counters in `tests/e2e-python-authority.cjs`), but Locus does not claim arbitrary hostile Python cannot escape — Pyodide's `js` bridge still exposes non-network browser APIs. Second, Pyodide itself still downloads its pinned core and the declared packages from the CDN during bootstrap; provenance/self-hosting of that channel is a separate concern (F04b) and intentionally out of scope for the boundary above.
+**Browser-enforced boundary (F04b, authoritative).** The Pyodide worker is created by a hidden
+strict-CSP `srcdoc` iframe (`PY_CREATOR_CSP` in `src/shell.js`) and inherits its policy:
+`default-src 'none'; connect-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; worker-src blob:`.
+Once untrusted Python execution begins, the browser itself makes arbitrary network egress impossible —
+fetch/XHR/WebSocket/EventSource/sendBeacon (`connect-src 'none'`), importScripts/dynamic
+import/script-tag loading (no loadable origin in `script-src`), and nested remote workers
+(`worker-src blob:` only) all fail at the platform level with **zero server requests**, while the
+dynamic compute Pyodide needs (`Function`, `eval`, WebAssembly) keeps working. A nested blob worker
+inherits the same restrictive policy. The worker itself never bootstraps from the network: the
+**trusted harness** (the page) fetches the fixed, harness-defined Pyodide asset set from the pinned CDN
+(`PYTHON_BOOTSTRAP_ASSETS` — core + the declared package closure), delivers the bytes by postMessage,
+and the worker boots Pyodide **entirely from memory** — `pyodide.js`/`pyodide.asm.js` are eval'd from
+text (never `importScripts`), and every loader fetch (lock file, wasm, stdlib zip, wheels) is served by
+a bootstrap-only in-memory resolver that fail-closes on every URL it does not hold exactly (no path or
+query variation, no CDN fallback). After the declared packages install, the resolver's asset map is
+dropped and cannot serve as a resource oracle. `tests/e2e-python-browser-authority.cjs` proves the
+whole model in hosted and `file://` modes with request-counter oracles.
 
-One **known residual escape (F04a-R1, measured, not closable inside the worker)**: the global `Function` constructor cannot be denied — Pyodide's own glue calls it, and `runPythonAsync` breaks without it ("globals must be a real dict"); denying `Function.prototype.constructor` breaks it the same way. Dynamic JS therefore stays reachable via `js.Function` or any native function's `.constructor`, and a **called** dynamic `import('<url>')` from there performs a real GET and runs the fetched module — constructing the function alone performs no request; the call is the residual (exactly one GET, pinned deterministically). The module's own code meets the same denials once running — with the prototype-chain lockdown above it can no longer recover a network primitive from inside the module. The direct dynamic paths are still denied individually (`js.eval` and `pyodide.code.run_js` route through the denied `eval` slot and die with it). Fully closing F04a-R1 requires a document-level CSP (Blob workers inherit it) or an isolated-origin worker; `tests/e2e-python-authority.cjs` pins the measured behavior and flips when that lands.
+**JS lockdown (F04a, defense-in-depth).** The harness-declared package set (`PYTHON_RUNTIME_PACKAGES`,
+currently `pandas` and its dependency closure) installs once at bootstrap, then a network lockdown is
+applied **before any user code executes**: the browser network primitives reachable through Pyodide's
+`js` bridge (fetch, XMLHttpRequest, WebSocket, EventSource, WebTransport, Worker, SharedWorker,
+RTCPeerConnection, importScripts, caches), dynamic-JS execution (`eval`, `pyodide.code.run_js`) and the
+package loaders (`loadPackage`, `loadPackagesFromImports`, `micropip` network paths) are denied to user
+code. Each denial is applied at the global slot AND at every prototype-chain level that owns the name —
+the audited F04a-A1 escape (`Object.getPrototypeOf(self).fetch` handed back a working native fetch
+because the prototype layer of the original lockdown was dead code) is closed and pinned by tests — and
+string-handler timers are refused at every owning level while real function handlers keep working
+(Pyodide/Emscripten schedule with them). An import the runtime does not carry fails with
+`ModuleNotFoundError` and no network attempt; HTTP/HTTPS work belongs to `curl`, where NetworkRuntime
+owns transport, approval, bounds and telemetry. Denied Python network attempts are plain Python compute
+failures — they are never recorded as network operations, because no network happened. The lockdown
+exists so honest code gets clean denial messages; even if every JS patch were bypassed, the browser
+policy still blocks the request.
+
+Two honest limits. First, this is a **runtime authority boundary, not a hostile-code sandbox
+certification**: ordinary model-generated Python has no supported direct network path and the known
+browser network primitives are denied (verified in real Chrome with server-side request counters in
+`tests/e2e-python-authority.cjs` and `tests/e2e-python-browser-authority.cjs`), but Locus does not claim
+arbitrary hostile Python cannot escape — Pyodide's `js` bridge still exposes non-network browser APIs.
+Second, the **trusted harness** still fetches the pinned Pyodide core and the declared package closure
+from the CDN during its bootstrap phase (the worker itself performs zero network requests); integrity
+attestation of those bytes is a separate concern and intentionally out of scope for this boundary.
+
+**F04a-R1 (closed history).** The global `Function` constructor cannot be denied — Pyodide's own glue
+calls it, and `runPythonAsync` breaks without it ("globals must be a real dict"); denying
+`Function.prototype.constructor` breaks it the same way. Until F04b, dynamic JS was therefore reachable
+via `js.Function` or any native function's `.constructor`, and a **called** dynamic `import('<url>')`
+from there performed a real GET and ran the fetched module (exactly one GET, pinned deterministically).
+F04b closed it: the same payload now rejects inside the strict-CSP worker and the probe server sees
+**exactly zero requests**, while `Function` local compute still works. The browser policy — not the
+absence of `Function` — is what closes the path; `tests/e2e-python-authority.cjs` E10e pins the flip.
 
 ## Telemetry
 
