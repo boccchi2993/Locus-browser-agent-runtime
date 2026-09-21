@@ -184,19 +184,20 @@ function applyNetworkLockdown(instance) {
   }
   // Event-handler ATTRIBUTES compile assigned strings as function bodies
   // (self.onmessage = "import('https://…')" is remote JS execution). Lock
-  // the slots at their current values — the worker's own handler stays.
-  // Then sweep the PROTOTYPE chain: a level that owns the attribute as a
-  // WebIDL accessor (get/set) gets a set-throws accessor instead — an
-  // own-slot lock does not reach a prototype setter. Audited Chrome 153
-  // exposes no such descriptor on the worker scope prototypes, so this is
-  // forward defense: absent descriptors are skipped honestly, and a level
-  // that IS found but cannot be redefined throws (fail-closed).
+  // the slots at their current values — the worker's own handler stays. A
+  // slot that cannot be redefined throws here, which fails the whole
+  // bootstrap (fail-closed: the same contract as the primitive levels —
+  // the worker self-destructs and the shell rebuilds; Python never runs
+  // half-locked). Then sweep the PROTOTYPE chain: a level that owns the
+  // attribute as a WebIDL accessor (get/set) gets a set-throws accessor
+  // instead — an own-slot lock does not reach a prototype setter. Audited
+  // Chrome 153 exposes no such descriptor on the worker scope prototypes,
+  // so this is forward defense: absent descriptors are skipped honestly,
+  // and a level that IS found but cannot be redefined throws (fail-closed).
   for (const handler of ['onmessage', 'onmessageerror', 'onerror', 'onlanguagechange',
     'onoffline', 'ononline', 'onrejectionhandled', 'onunhandledrejection']) {
     if (!(handler in g)) continue;
-    try {
-      Object.defineProperty(g, handler, { value: g[handler], writable: false, configurable: false });
-    } catch (e) {}
+    Object.defineProperty(g, handler, { value: g[handler], writable: false, configurable: false });
     for (const owner of ownersOf(Object.getPrototypeOf(g), handler)) {
       const d = Object.getOwnPropertyDescriptor(owner, handler);
       if (!d || typeof d.set !== 'function') continue;
