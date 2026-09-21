@@ -20,7 +20,7 @@ function check(name, cond, detail) {
 async function run() {
   let attempts = 0;
   const c = vm.createContext({
-    self: {},
+    self: { postMessage() {} }, // boot replies (protocol v3) are ignored here
     // Worker-global primitives the F04a lockdown expects to find and deny.
     fetch: function () {},
     XMLHttpRequest: function () {},
@@ -45,9 +45,21 @@ async function run() {
   });
   vm.runInContext(m[1], c);
 
+  // Protocol v3: the boot parks on the in-memory assets waiter — start the
+  // first attempt, THEN deliver the bootstrap assets (unit stubs — the
+  // sandbox provides loadPyodide) and let that attempt settle.
+  const first = vm.runInContext('ensureLockedPyodide()', c);
+  await vm.runInContext(`self.onmessage({ data: ${JSON.stringify({
+    id: 1, cmd: 'bootstrap',
+    assets: {
+      'pyodide.js': { text: '/* unit stub: loadPyodide comes from the sandbox */' },
+      'pyodide.asm.js': { text: 'var _createPyodideModule = function () {};' },
+    },
+  })} })`, c);
+
   // first attempt fails
   let e1 = null;
-  try { await vm.runInContext('ensureLockedPyodide()', c); } catch (e) { e1 = e; }
+  try { await first; } catch (e) { e1 = e; }
   check('W-I1 first load fails', e1 && e1.message === 'temporary CDN failure', e1 && e1.message);
 
   // second attempt must RETRY (not reuse the rejected promise)

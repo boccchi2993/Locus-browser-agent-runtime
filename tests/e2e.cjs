@@ -128,6 +128,18 @@ function networkE2e() {
   return r.status === 0;
 }
 
+// ---------- 5. python browser authority e2e (own servers + Chrome) ----------
+// F04b boundary model + in-memory Pyodide bootstrap, self-contained (no
+// app build needed): hosted AND file:// hosting modes, request counters as
+// the oracle, real Pyodide booted from harness-delivered bytes.
+function browserAuthorityE2e() {
+  console.log('=== python browser authority e2e (tests/e2e-python-browser-authority.cjs) ===');
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'e2e-python-browser-authority.cjs')], {
+    stdio: 'inherit', env: process.env,
+  });
+  return r.status === 0;
+}
+
 async function main() {
   const results = [];
   results.push(['runtime', await runtimeE2e()]);
@@ -136,6 +148,7 @@ async function main() {
   if (Array.isArray(pres)) results.push(...pres);
   else results.push(['presentation', !!pres], ['responsive', false]);
   results.push(['network', networkE2e()]);
+  results.push(['python-browser-authority', browserAuthorityE2e()]);
   console.log('===');
   let failed = 0;
   for (const [name, ok] of results) {

@@ -155,6 +155,16 @@ async function runWorkerJobs(jobs) {
     atob, btoa, TextEncoder, TextDecoder,
   });
   vm.runInContext(workerSrc, c);
+  // Protocol v3: deliver the in-memory bootstrap assets first (unit stubs —
+  // the sandbox provides loadPyodide; the asm stub defines the factory the
+  // real loader would skip loading for).
+  await vm.runInContext(`self.onmessage({ data: ${JSON.stringify({
+    id: 1, cmd: 'bootstrap',
+    assets: {
+      'pyodide.js': { text: '/* unit stub: loadPyodide comes from the sandbox */' },
+      'pyodide.asm.js': { text: 'var _createPyodideModule = function () {};' },
+    },
+  })} })`, c);
   const results = [];
   for (const job of jobs) {
     const msg = {

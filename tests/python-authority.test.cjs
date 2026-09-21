@@ -75,7 +75,7 @@ function makeFakePy(calls, ctx) {
 function makeWorkerContext(loadPyodideImpl, posted, calls, omit) {
   omit = omit || [];
   const sandbox = {
-    self: { postMessage(msg) { if (msg.type === 'result') posted.push(msg); } },
+    self: { postMessage(msg) { if (msg.type === 'result' || msg.type === 'boot') posted.push(msg); } },
     importScripts() { calls.push('importScripts'); },
     loadPyodide: loadPyodideImpl,
     atob, btoa, TextEncoder, TextDecoder,
@@ -98,10 +98,26 @@ async function postRun(c, code, cwd) {
   await vm.runInContext(`self.onmessage({ data: ${JSON.stringify(msg)} })`, c);
 }
 
+// Protocol v3 (F04b): the worker boots ENTIRELY from the in-memory asset
+// set delivered by the trusted harness. Unit stubs: the sandbox provides
+// loadPyodide; the asm stub defines the factory whose presence makes the
+// real loader skip its own (network) script loading.
+const BOOT_ASSETS = {
+  'pyodide.js': { text: '/* unit stub: loadPyodide comes from the sandbox */' },
+  'pyodide.asm.js': { text: 'var _createPyodideModule = function () {};' },
+};
+async function postBootstrap(c, assets) {
+  const msg = { id: 1, cmd: 'bootstrap', assets: assets || BOOT_ASSETS };
+  await vm.runInContext(`self.onmessage({ data: ${JSON.stringify(msg)} })`, c);
+}
+
 async function waitForResult(posted) {
-  for (let i = 0; i < 400 && !posted[0]; i++) await new Promise((r) => setTimeout(r, 5));
-  if (!posted[0]) throw new Error('worker posted no result');
-  return posted[0];
+  for (let i = 0; i < 400; i++) {
+    const r = posted.find((m) => m.type === 'result');
+    if (r) return r;
+    await new Promise((r2) => setTimeout(r2, 5));
+  }
+  throw new Error('worker posted no result');
 }
 
 // Guest-side probe: what does a use of the primitive do now?
@@ -132,6 +148,7 @@ async function run() {
   const calls = [];
   const posted = [];
   const c = makeWorkerContext(async () => makeFakePy(calls, c), posted, calls);
+  await postBootstrap(c);
   await postRun(c, "print('hi')");
   const r = await waitForResult(posted);
   check('PA3 boot succeeds and runs user code', !r.error, r.error);
@@ -186,6 +203,7 @@ async function run() {
   const calls2 = [];
   const posted2 = [];
   const c2 = makeWorkerContext(async () => makeFakePy(calls2, c2), posted2, calls2);
+  await postBootstrap(c2);
   await postRun(c2, 'x');
   await waitForResult(posted2);
   check('PA11 a fresh worker applies the same lockdown',
@@ -201,10 +219,14 @@ async function run() {
     if (attempts === 1) throw new Error('temporary CDN failure');
     return makeFakePy(calls3, c3);
   }, posted3, calls3);
+  await postBootstrap(c3);
   await postRun(c3, 'x');
-  const r3a = await waitForResult(posted3);
-  check('PA12 failed bootstrap reports honestly and is not cached',
-    !!r3a.error && r3a.error.includes('temporary CDN failure'), r3a.error);
+  const boot3 = posted3.find((m) => m.type === 'boot');
+  const r3a = posted3.find((m) => m.type === 'result');
+  check('PA12 failed bootstrap reports honestly at the boot boundary and is not cached',
+    !!boot3 && !!boot3.error && boot3.error.includes('temporary CDN failure'), boot3 && boot3.error);
+  check('PA12a the next run retries the bootstrap instead of reusing the failure',
+    !!r3a && !r3a.error, r3a && r3a.error);
   posted3.length = 0;
   await postRun(c3, 'x');
   await waitForResult(posted3);
@@ -215,6 +237,7 @@ async function run() {
   const calls4 = [];
   const posted4 = [];
   const c4 = makeWorkerContext(async () => makeFakePy(calls4, c4), posted4, calls4, ['fetch']);
+  await postBootstrap(c4);
   await postRun(c4, 'x');
   const r4 = await waitForResult(posted4);
   check('PA13 a worker whose required primitives cannot lock fails closed',
@@ -245,7 +268,7 @@ async function run() {
       atob: atob, btoa: btoa,
       TextEncoder: TextEncoder, TextDecoder: TextDecoder,
       Worker: function () { calls.push('worker:RAN'); }, // instance-own family (audited Chrome)
-      postMessage: function (msg) { if (msg.type === 'result') posted.push(msg); },
+      postMessage: function (msg) { if (msg.type === 'result' || msg.type === 'boot') posted.push(msg); },
       navigator: Object.create({ sendBeacon() { calls.push('beacon:RAN'); } }),
     };
     const c = vm.createContext(sandbox);
@@ -308,6 +331,7 @@ async function run() {
   const callsP = [];
   const postedP = [];
   const cp = makeProtoWorkerContext(async () => makeFakePy(callsP, cp), postedP, callsP);
+  await postBootstrap(cp);
   await postRun(cp, "print('proto')");
   const rp = await waitForResult(postedP);
   check('PB1 boot succeeds on the prototype-chain layout (audited Chrome worker shape)', !rp.error, rp.error);
@@ -379,10 +403,14 @@ async function run() {
   const callsR = [];
   const postedR = [];
   const cr = makeProtoWorkerContext(async () => makeFakePy(callsR, cr), postedR, callsR, { freezeFetch: true });
+  await postBootstrap(cr);
   await postRun(cr, 'x');
   const rr = await waitForResult(postedR);
-  check('PB16 an unlockable prototype level fails the bootstrap closed',
-    !!rr.error && /fetch/.test(rr.error), JSON.stringify(rr.error).slice(0, 200));
+  const bootR = postedR.find((m) => m.type === 'boot');
+  check('PB16 an unlockable prototype level fails the bootstrap closed (boot reply keeps the raw detail)',
+    !!bootR && !!bootR.error && /fetch/.test(bootR.error)
+      && !!rr.error && rr.error.includes('Python worker failed to apply the network lockdown'),
+    JSON.stringify([bootR && bootR.error, rr.error]).slice(0, 240));
   check('PB16b the failed bootstrap schedules self-destruct (shell rebuild path)',
     callsR.some((s) => String(s).indexOf('selfdestruct:') === 0), JSON.stringify(callsR.slice(-3)));
   postedR.length = 0;
@@ -399,10 +427,14 @@ async function run() {
   const callsE = [];
   const postedE = [];
   const ce = makeProtoWorkerContext(async () => makeFakePy(callsE, ce), postedE, callsE, { freezeOnmessageOwn: true });
+  await postBootstrap(ce);
   await postRun(ce, 'x');
   const rrE = await waitForResult(postedE);
-  check('PB17 a non-configurable own event-handler slot fails the bootstrap closed',
-    !!rrE.error && /onmessage/.test(rrE.error), JSON.stringify(rrE.error).slice(0, 200));
+  const bootE = postedE.find((m) => m.type === 'boot');
+  check('PB17 a non-configurable own event-handler slot fails the bootstrap closed (boot reply keeps the raw detail)',
+    !!bootE && !!bootE.error && /onmessage/.test(bootE.error)
+      && !!rrE.error && rrE.error.includes('Python worker failed to apply the network lockdown'),
+    JSON.stringify([bootE && bootE.error, rrE.error]).slice(0, 240));
   check('PB17b no user Python ran in the failed worker (bootstrap traffic only)',
     callsE.every((s) => String(s).indexOf('py:') !== 0), JSON.stringify(callsE));
   check('PB17c the failed bootstrap schedules self-destruct (shell rebuild path)',

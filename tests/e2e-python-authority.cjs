@@ -1,7 +1,8 @@
-// Python authority browser e2e (F04a). Real Chrome, real built app, REAL
-// Pyodide worker. Proves the worker's authority boundary against a local
-// HTTP probe server whose REQUEST COUNTERS are the oracle — error text
-// alone is never accepted as proof that no network attempt happened:
+// Python authority browser e2e (F04a + F04b). Real Chrome, real built app,
+// REAL Pyodide worker behind the strict-CSP creator iframe. Proves the
+// worker's authority boundary against a local HTTP probe server whose
+// REQUEST COUNTERS are the oracle — error text alone is never accepted as
+// proof that no network attempt happened:
 //   - basic Python and pandas keep working (compute + VFS preserved),
 //   - js.fetch / pyodide.http.pyfetch / sync XHR / WebSocket / EventSource /
 //     WebTransport attempts are denied LOCALLY with ZERO requests arriving,
@@ -9,10 +10,9 @@
 //   - micropip against a local wheel URL performs ZERO requests,
 //   - imports the runtime does not carry fail honestly with ZERO requests,
 //   - dynamic-JS escapes (js.eval, pyodide.code.run_js) perform ZERO requests,
-//   - the F04a-R1 Function residual is pinned exactly: constructing a
-//     reconstructed Function fires ZERO requests; CALLING a dynamic import()
-//     from it performs exactly ONE (documented residual) and executes the
-//     cross-origin module; a same-origin import performs its GET too,
+//   - the F04a-R1 residual is CLOSED (F04b): the reconstructed-Function
+//     dynamic import is blocked by the BROWSER's creator-iframe CSP with
+//     EXACTLY ZERO requests — Function compute itself still works,
 //   - the PROTOTYPE-CHAIN family from the F04a-A1 audit (getPrototypeOf(self)
 //     at every level: fetch via Reflect.apply / descriptor.value.call / bind,
 //     importScripts, string-handler timers, a Function-recovered fetch) is
@@ -370,8 +370,10 @@ async function main() {
     ]);
     // THE critical probe: Function reconstructed from a SURVIVING native
     // object — the one path that does not go through any denied global.
-    // Construction alone compiles the body but performs NO request; the
-    // residual network act is the CALL (pinned by E10e below).
+    // Construction alone compiles the body but performs NO request (F04a
+    // pinned this); the residual was the CALL. Under F04b the worker runs
+    // behind the strict-CSP creator iframe, so the browser itself must
+    // block the called dynamic import.
     const t10d = Date.now();
     const e10d = await runPy([
       'import js',
@@ -383,36 +385,23 @@ async function main() {
     const e10dd = hitsTo('/probe-script.js', t10d);
     check('E10 js.eval denied with ZERO requests',
       !e10.success && hitsTo('/probe-hit', t10) === 0, JSON.stringify(e10).slice(0, 240));
-    // js.Function is part of the F04a-R1 residual: the global Function
-    // constructor cannot be denied (Pyodide's own glue breaks without it).
-    check('E10b KNOWN RESIDUAL F04a-R1: js.Function stays reachable (Pyodide requires the global)',
+    // js.Function stays native ON PURPOSE: Pyodide's glue needs the global
+    // and F04b's boundary is network authority, never compute.
+    check('E10b js.Function stays reachable (Pyodide requires the global; compute is not the boundary)',
       e10b.success, JSON.stringify(e10b).slice(0, 200));
     check('E10c pyodide.code.run_js denied with ZERO requests',
       !e10c.success && hitsTo('/probe-hit', t10) === 0, JSON.stringify(e10c).slice(0, 240));
     check('E10d2 constructing (never calling) the reconstructed Function performs ZERO requests',
       e10dd === 0, 'delta=' + e10dd);
-
-    // KNOWN RESIDUAL (F04a-R1, measured, deliberately not closable inside
-    // the worker): dynamic JS remains reachable via the global Function
-    // constructor (js.Function or any native function's .constructor), and
-    // a CALLED dynamic import() from there performs a REAL network request
-    // and runs the fetched module. Constructing the function alone performs
-    // NO request — the residual is the call. Denying Function breaks
-    // Pyodide's own glue (runPythonAsync fails with "globals must be a real
-    // dict"); denying Function.prototype.constructor breaks it the same
-    // way. The direct dynamic paths are still denied individually (js.eval
-    // and pyodide.code.run_js route through the denied eval slot). The
-    // module's own code meets the same denials once running — with the
-    // prototype-chain lockdown that denial is now unbreakable from inside
-    // the module. Fully closing F04a-R1 needs a document-level CSP (blob
-    // workers inherit it) or an isolated-origin worker; this suite pins the
-    // measured behavior and flips when that lands.
-    check('E10d KNOWN RESIDUAL F04a-R1: reconstructed Function still executes (documented escape)',
+    check('E10d local compute via the reconstructed Function still executes',
       e10d.success && e10d.output.includes('RECONSTRUCTED FUNCTION EXECUTED'),
       JSON.stringify(e10d).slice(0, 240));
-    // The called form of the residual: dynamic import() fetches + executes
-    // the cross-origin module. Deterministic with the probe server's ACAO:*:
-    // EXACTLY 1 request for the fresh module URL.
+
+    // F04a-R1 CLOSED (F04b): the CALLED dynamic import from a reconstructed
+    // Function — the exact documented residual — is now blocked by the
+    // browser's creator-iframe CSP. The import() promise REJECTS (the
+    // payload's error handler turns it into 'ERR: …'), and the probe
+    // server sees EXACTLY ZERO requests: the oracle, not the text.
     const e10e = await runPy([
       'import js',
       'F = js.Function.new("u", "return import(u).then(function(){ return \'LOADED\'; }, function(e){ return \'ERR: \' + (e && e.message || String(e)); })")',
@@ -421,17 +410,17 @@ async function main() {
     ]);
     await new Promise((r) => setTimeout(r, 1000));
     const e10ed = hitsTo('/probe-script.js', t10d);
-    check('E10e KNOWN RESIDUAL F04a-R1: the CALLED dynamic import executes the cross-origin module',
-      e10e.success && e10e.output.includes('PROBE-IMPORT: LOADED'),
+    check('E10e F04a-R1 CLOSED: the called dynamic import is browser-blocked (rejection surfaced, module never loaded)',
+      e10e.success && /PROBE-IMPORT: ERR/.test(e10e.output) && !/PROBE-IMPORT: LOADED/.test(e10e.output),
       JSON.stringify(e10e).slice(0, 240));
-    check('E10e2 the documented residual is exactly 1 request (deterministic, no double-solution)',
-      e10ed === 1, 'delta=' + e10ed);
-    // Same-origin dynamic import: the GET lands on the APP's own static
-    // server, which this suite does not own and cannot count — the
-    // deterministic oracle is the worker's own ResourceTiming (exactly one
-    // entry for that URL). The app bundle exists and is importable; its
-    // execution fails harmlessly inside the worker (no document) — the GET
-    // is the point.
+    check('E10e2 the residual performs EXACTLY ZERO requests (was 1 before F04b)',
+      e10ed === 0, 'delta=' + e10ed);
+    // Same-origin dynamic import: the APP's own static server is not owned
+    // by this suite, and a CSP-BLOCKED load still creates a ResourceTiming
+    // entry — so entry count cannot distinguish blocked from loaded. The
+    // deterministic oracle is the entry's responseStatus + transferSize:
+    // blocked => status 0 and ZERO bytes received; a real GET would answer
+    // 200 with the bundle's ~130KB.
     let bundlePath = null;
     try {
       const idx = await fs.readFile(path.join(__dirname, '..', 'dist', 'index.html'), 'utf8');
@@ -441,15 +430,30 @@ async function main() {
     const e10f = await runPy([
       'import js',
       'origin = js.location.origin',
-      'G = js.Function.new("u", "return import(u).catch(function(e){ return null; }).then(function(){ return performance.getEntriesByType(\'resource\').filter(function(en){ return en.name === u; }).length; })")',
+      'G = js.Function.new("u", "return import(u).catch(function(e){ return null; }).then(function(){ var es = performance.getEntriesByType(\'resource\').filter(function(en){ return en.name === u; }); if (!es.length) return \'none\'; var e0 = es[0]; return (e0.responseStatus || 0) + \'/\' + (e0.transferSize || 0); })")',
       "n = await G(origin + '" + (bundlePath || '/no-bundle-in-dist') + "')",
       "import time",
       'time.sleep(0.3)',
-      "print('SAMEORIGIN-ENTRIES', int(n))",
+      "print('SAMEORIGIN-BYTES', n)",
     ]);
-    check('E10f same-origin dynamic import performs the GET (worker ResourceTiming count 1)',
-      bundlePath !== null && e10f.success && e10f.output.includes('SAMEORIGIN-ENTRIES 1'),
+    check('E10f same-origin dynamic import is blocked with ZERO bytes received (responseStatus 0)',
+      bundlePath !== null && e10f.success
+        && (/SAMEORIGIN-BYTES none/.test(e10f.output) || /SAMEORIGIN-BYTES 0\/0/.test(e10f.output)),
       JSON.stringify(e10f).slice(0, 260));
+
+    // ---- E10g (F04b): the worker runs behind the strict-CSP creator ----
+    const creator = await evaluate(cdp, `(() => {
+      const f = document.querySelector('iframe[data-locus-py-creator]');
+      if (!f) return { present: false };
+      return { present: true, srcdoc: f.srcdoc || '' };
+    })()`);
+    check('E10g the strict-CSP creator iframe hosts the python worker',
+      !!creator && creator.present === true
+        && /default-src 'none'/.test(creator.srcdoc)
+        && /connect-src 'none'/.test(creator.srcdoc)
+        && /worker-src blob:/.test(creator.srcdoc)
+        && /script-src 'unsafe-inline' 'unsafe-eval'/.test(creator.srcdoc),
+      JSON.stringify(String(creator && creator.srcdoc).slice(0, 160)));
 
     // ---- E11 (CASE H): reset re-applies the lockdown ----
     await evaluate(cdp, 'PythonRuntime.reset(); "reset"');
@@ -650,12 +654,12 @@ async function main() {
       && e15b.output.replace(/\n$/, '') === 'processed:pyauth-fixture',
       JSON.stringify(e15.output) + ' | ' + JSON.stringify(e15b));
 
-    // ---- E16: no HIDDEN attempts — the ONLY probe-server traffic in the
-    // whole suite is the single documented F04a-R1 residual request (E10e,
-    // the called dynamic import). Everything else — every denial above,
-    // every prototype-chain probe, both recovery cycles — contributed ZERO. --
-    check('E16 probe server received ONLY the documented F04a-R1 traffic and nothing else',
-      probeTotal() === 1, 'total=' + probeTotal() + ' paths=' + JSON.stringify(hits.map((h) => h.path)));
+    // ---- E16: no HIDDEN attempts — ZERO probe-server traffic in the whole
+    // suite. Every denial above, every prototype-chain probe, the closed
+    // F04a-R1 dynamic import, both recovery cycles — all contributed ZERO
+    // (before F04b the suite carried exactly one documented residual GET). --
+    check('E16 probe server received ZERO requests across the entire suite',
+      probeTotal() === 0, 'total=' + probeTotal() + ' paths=' + JSON.stringify(hits.map((h) => h.path)));
     check('E17 browser reported no unhandled errors', (await evaluate(cdp, '(window.__e2eErrors || []).length')) === 0,
       JSON.stringify(await evaluate(cdp, '(window.__e2eErrors || []).slice(0, 3)')));
 
