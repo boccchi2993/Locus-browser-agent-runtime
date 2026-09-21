@@ -119,6 +119,20 @@ async function presentationE2e() {
   }
 }
 
+// ---------- 3b. capability composition e2e (own build + servers + Chrome) ----------
+// Capability Composition v1: synthetic capability catalog -> manager ->
+// TaskEnvironment -> system prompt index -> lazy skill cat -> ordinary
+// python plugin import, plus MCP needs-connection semantics, snapshot
+// immutability, dedupe and read-only mounts. Self-contained.
+function capabilitiesE2e() {
+  console.log('=== capability composition e2e (tests/e2e-capabilities.cjs) ===');
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'e2e-capabilities.cjs')], {
+    stdio: 'inherit', env: process.env,
+  });
+  return r.status === 0;
+}
+
+
 // ---------- 4. network runtime e2e (own servers + Chrome) ----------
 function networkE2e() {
   console.log('=== network e2e (tests/e2e-network.cjs) ===');
@@ -161,6 +175,7 @@ async function main() {
   const pres = await presentationE2e();
   if (Array.isArray(pres)) results.push(...pres);
   else results.push(['presentation', !!pres], ['responsive', false]);
+  results.push(['capabilities', capabilitiesE2e()]);
   results.push(['network', networkE2e()]);
   results.push(['python-browser-authority', browserAuthorityE2e()]);
   results.push(['python-bootstrap-integrity', bootstrapIntegrityE2e()]);
