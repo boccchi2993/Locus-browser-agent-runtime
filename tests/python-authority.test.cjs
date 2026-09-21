@@ -268,6 +268,18 @@ async function run() {
       (opts.freezeFetch
         ? '  Object.defineProperty(p2, "fetch", { value: p2.fetch, writable: false, configurable: false });\n'
         : '') +
+      (opts.freezeOnmessageOwn
+        ? '  // PB17 fixture: an OWN non-configurable event-handler slot on the\n' +
+          '  // global itself. An ACCESSOR shape is required — a non-configurable\n' +
+          '  // WRITABLE data slot can still be locked (narrowing writable is the\n' +
+          '  // one redefinition ES allows on non-configurable properties), and a\n' +
+          '  // frozen data slot locks as a same-value redefinition. Only the\n' +
+          '  // data-over-accessor kind change is undefinable, so only it makes\n' +
+          '  // the lockdown\'s own defineProperty throw. The setter keeps\n' +
+          '  // registering the worker\'s own handler so nothing ELSE is broken.\n' +
+          '  const storedOwn = { current: null };\n' +
+          '  Object.defineProperty(globalThis, "onmessage", { get() { return storedOwn.current; }, set(v) { storedOwn.current = v; }, configurable: false });\n'
+        : '') +
       '  const stored = { current: null };\n' +
       '  Object.defineProperty(p, "onmessage", { get() { return stored.current; }, set(v) { stored.current = v; }, configurable: true });\n' +
       '})()', c);
@@ -378,6 +390,47 @@ async function run() {
   const rr2 = await waitForResult(postedR);
   check('PB16c the failed-locked worker stays failed (no half-locked retry)',
     !!rr2.error && rr2.error.includes('Python worker failed to apply the network lockdown'), rr2.error);
+
+  // PB17: an UNLOCKABLE event-handler OWN slot (non-configurable own
+  // onmessage) must fail the whole bootstrap closed — never a silent
+  // swallow-and-continue into a half-locked worker. Every OTHER lockdown
+  // target stays normally lockable, so the bootstrap fails BECAUSE of the
+  // event-handler own slot, not because some primitive tripped first.
+  const callsE = [];
+  const postedE = [];
+  const ce = makeProtoWorkerContext(async () => makeFakePy(callsE, ce), postedE, callsE, { freezeOnmessageOwn: true });
+  await postRun(ce, 'x');
+  const rrE = await waitForResult(postedE);
+  check('PB17 a non-configurable own event-handler slot fails the bootstrap closed',
+    !!rrE.error && /onmessage/.test(rrE.error), JSON.stringify(rrE.error).slice(0, 200));
+  check('PB17b no user Python ran in the failed worker (bootstrap traffic only)',
+    callsE.every((s) => String(s).indexOf('py:') !== 0), JSON.stringify(callsE));
+  check('PB17c the failed bootstrap schedules self-destruct (shell rebuild path)',
+    callsE.some((s) => String(s).indexOf('selfdestruct:Python worker failed to apply the network lockdown') === 0),
+    JSON.stringify(callsE.slice(-3)));
+  // Causality proof: every lockdown stage that runs BEFORE the event-handler
+  // own-slot sweep must have completed on the failed context — the required
+  // primitives at every owning level, the timers, the beacon. If any of
+  // these were unlocked, the test would be failing for the wrong reason.
+  const eMarks = {};
+  let earlierStagesAllLocked = true;
+  for (const n of ['fetch', 'XMLHttpRequest', 'WebSocket', 'Worker', 'importScripts', 'caches', 'eval', 'loadPyodide']) {
+    const mk = levelMarks(ce, n, '__locusNetworkDenied');
+    eMarks[n] = mk;
+    if (!(mk.length >= 1 && mk.every(Boolean))) earlierStagesAllLocked = false;
+  }
+  for (const n of ['setTimeout', 'setInterval']) {
+    const mk = levelMarks(ce, n, '__locusTimerSafe');
+    eMarks[n] = mk;
+    if (!(mk.length >= 1 && mk.every(Boolean))) earlierStagesAllLocked = false;
+  }
+  check('PB17d every earlier lockdown stage completed (failure is exactly the event-handler own slot)',
+    earlierStagesAllLocked, JSON.stringify(eMarks));
+  postedE.length = 0;
+  await postRun(ce, 'x');
+  const rrE2 = await waitForResult(postedE);
+  check('PB17e the failed worker stays failed (no half-locked retry)',
+    !!rrE2.error && rrE2.error.includes('Python worker failed to apply the network lockdown'), rrE2.error);
 
   // ---------- prompt/docs contract (model-facing authority wording) ---------
   const shellSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'shell.js'), 'utf8');
