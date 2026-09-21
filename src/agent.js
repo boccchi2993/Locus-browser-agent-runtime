@@ -172,6 +172,38 @@ function nativeResultContent(toolName, success, output) {
     truncateFor(output, TOOL_RESULT_MAX_CHARS);
 }
 
+// Capability index for the system prompt (Capability Composition v1).
+// Compact INDEX only: capability display names, on-demand skill guide
+// paths and honest availability phrasing. NEVER a skill body, a plugin
+// id, a package manifest, a hash or any Locus-internal API name — the
+// model learns what it can do and where to read more, not how the
+// harness is built. Skill guides live as read-only files in the task
+// environment; the model cats them when (and only when) relevant.
+function capabilityPromptSection(taskEnvironment) {
+  const caps = taskEnvironment && Array.isArray(taskEnvironment.capabilities)
+    ? taskEnvironment.capabilities : [];
+  const usable = caps.filter((c) => c && (c.state === 'ready' || c.state === 'needs-connection'));
+  if (!usable.length) return null;
+  const lines = [
+    '## Capabilities',
+    'Optional capabilities are enabled for this task. Their skill guides are NOT included here —',
+    'read a guide with cat only when the current task actually needs that capability.',
+  ];
+  for (const c of usable) {
+    lines.push('- ' + c.displayName);
+    for (const p of c.skillPaths || []) {
+      lines.push('  Skill guide (read with cat when relevant): ' + p);
+    }
+    if ((c.includes && c.includes.plugins > 0) || (c.pluginIds && c.pluginIds.length)) {
+      lines.push('  Local software required by this capability is already installed in the task environment.');
+    }
+    if (c.state === 'needs-connection') {
+      lines.push('  External connections required by this capability are NOT connected; anything depending on them is unavailable in this task.');
+    }
+  }
+  return lines.join('\n');
+}
+
 // System prompt builder. Pure function of its argument — no UI globals.
 // `workspace` is a VirtualWorkspace, a legacy workspace adapter ({ name, ... }), or null.
 function buildSystemPrompt(opts) {
@@ -179,6 +211,7 @@ function buildSystemPrompt(opts) {
   // Tolerate both a VirtualWorkspace (workspaceName getter) and a legacy
   // workspace adapter (name property).
   const wsName = workspace ? (workspace.workspaceName || workspace.name) : null;
+  const capabilitySection = capabilityPromptSection(opts && opts.taskEnvironment);
   // Tool names/descriptions derive from the same provider-neutral
   // registry the adapters serialize (src/tools.js) — one canonical
   // source, so the prompt can never drift from the advertised schema.
@@ -230,6 +263,7 @@ function buildSystemPrompt(opts) {
     wsName
       ? 'An external folder "' + wsName + '" is currently mounted at /mnt/workspace (the default cwd).'
       : 'No external folder is currently mounted, so /mnt/workspace is unavailable; the default cwd is /home/locus. Use /mnt/upload for user-provided inputs (read-only), /mnt/download for files the user should receive, and /tmp for scratch space.',
+    ...(capabilitySection ? [capabilitySection, ''] : []),
     '- Reply in the user\'s language.',
   ].join('\n');
 }
@@ -329,9 +363,9 @@ class AgentSession {
   // Semantic image parts count at their RESOLVED wire size (base64 = 4/3
   // of the exact attachment bytes + framing) — metadata JSON alone would
   // under-count by megabytes (docs/IMAGE-INPUT.md, "Request budget").
-  historyRequestBytes(workspace) {
+  historyRequestBytes(workspace, taskEnvironment) {
     const enc = new TextEncoder();
-    let n = REQUEST_OVERHEAD_BYTES + enc.encode(this.buildSystemPrompt({ workspace: workspace || null })).byteLength;
+    let n = REQUEST_OVERHEAD_BYTES + enc.encode(this.buildSystemPrompt({ workspace: workspace || null, taskEnvironment: taskEnvironment || null })).byteLength;
     for (const m of stripInternalFields(this.history)) {
       n += enc.encode(JSON.stringify(m)).byteLength + 16;
       if (m.role === 'user' && Array.isArray(m.content)) {
@@ -350,8 +384,8 @@ class AgentSession {
   // boundaries keeps every tool call paired with its result. If the current
   // task alone exceeds the budget, fail loudly instead of sending an
   // unbounded request or silently dropping the user's own input.
-  enforceHistoryBudget(workspace) {
-    while (this.historyRequestBytes(workspace) > HISTORY_BUDGET_BYTES) {
+  enforceHistoryBudget(workspace, taskEnvironment) {
+    while (this.historyRequestBytes(workspace, taskEnvironment) > HISTORY_BUDGET_BYTES) {
       let cut = -1;
       for (let i = 1; i < this.history.length; i++) {
         if (this.history[i]._taskStart) { cut = i; break; }
@@ -450,6 +484,10 @@ class AgentSession {
     }
     const o = opts || {};
     const workspace = 'workspace' in o ? o.workspace : null;
+    // TaskEnvironment binding (Capability Composition v1): the frozen
+    // snapshot handed to run() stays THIS task's environment for its
+    // whole lifetime — later capability changes only affect the next task.
+    const taskEnvironment = 'taskEnvironment' in o ? o.taskEnvironment : null;
     // Optional semantic rich content for the FIRST user turn (text +
     // image attachment refs). Absent → the historical string form.
     const userContent = Array.isArray(o.userContent) && o.userContent.length ? o.userContent : null;
@@ -505,7 +543,7 @@ class AgentSession {
           return;
         }
         try {
-          this.enforceHistoryBudget(workspace);
+          this.enforceHistoryBudget(workspace, taskEnvironment);
         } catch (e) {
           emit({ type: 'error', code: 'history_budget', message: e.message });
           end('error');
@@ -581,7 +619,7 @@ class AgentSession {
         try {
           const request = {
             max_tokens: 2000,
-            system: this.buildSystemPrompt({ workspace: workspace }),
+            system: this.buildSystemPrompt({ workspace: workspace, taskEnvironment: taskEnvironment }),
             messages: requestMessages,
           };
           // Model-visible tool definitions come from the provider-neutral

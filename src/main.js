@@ -177,6 +177,19 @@ if (e2eMode) {
   window.__locus.attachments = {
     store: () => ui.getAttachmentStore(),
   };
+  // Capability Composition v1 seam (never exposed outside ?e2e=1):
+  // TEST-ONLY synthetic catalog injection + manager driving. The
+  // production catalog is empty; nothing here exists in a normal run.
+  window.__locus.capabilityComposition = {
+    manager: () => ui.capabilityManager,
+    list: () => ui.capabilityList(),
+    injectTestCatalog: (catalogs) => ui.injectCapabilityCatalogs(catalogs),
+    enable: (id) => ui.enableCapability(id),
+    disable: (id) => ui.disableCapability(id),
+    connectMcp: (id) => ui.setMcpConnectionState(id, 'connected'),
+    setMcpState: (id, state) => ui.setMcpConnectionState(id, state),
+    taskEnvironment: () => ui.capabilityManager ? ui.capabilityManager.buildTaskEnvironment() : null,
+  };
 }
 
 // Python worker status is owned by the runtime (plain object); mirror it

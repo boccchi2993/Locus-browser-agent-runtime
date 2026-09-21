@@ -755,3 +755,16 @@ input, select, textarea { font-family: inherit; font-size: inherit; color: inher
   .modal-backdrop { padding: 12px; }
   .empty-brand { font-size: 28px; }
 }
+
+/* capabilities (Capability Composition v1 settings section) */
+.capability-item { padding: 8px 0; border-top: 1px solid var(--border-soft); }
+.capability-item:last-child { border-bottom: none; }
+.capability-row { display: flex; align-items: center; gap: 8px; }
+.capability-name { font-weight: 550; font-size: 13px; flex: 1; min-width: 0; }
+.capability-state {
+  flex-shrink: 0; font-size: 11px; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--faint);
+}
+.capability-state[data-state="ready"] { color: var(--ok); border-color: currentColor; }
+.capability-state[data-state="needs-connection"] { color: var(--warn); border-color: currentColor; }
+.capability-state[data-state="error"] { color: var(--error); border-color: currentColor; }

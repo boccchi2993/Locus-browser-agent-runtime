@@ -24,6 +24,7 @@ import { reactive, computed } from 'vue';
 /* global AgentSession, Model, callModel, executeTool, buildSystemPrompt,
    LocalDirectoryWorkspace, ensureWorkspacePermission, PythonRuntime,
    Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS,
+   CapabilityManager, CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
    PersistenceServiceInstance, OPFSWorkspace, ConversationHistoryWorkspace,
    getProviderAdapter, projectNormalizedHistory */
 
@@ -33,6 +34,97 @@ import { reactive, computed } from 'vue';
 // injected lazily so this module never depends on script load order.
 const vfs = new VirtualWorkspace({ listCommands: () => Object.keys(SHELL_COMMANDS) });
 export { vfs };
+
+// Capability Composition v1: page-session CapabilityManager over the
+// (empty) PRODUCTION catalogs. No persistence — a reload resets to the
+// default. Tests/e2e inject synthetic catalogs through
+// injectCapabilityCatalogs(); production code never does.
+const capabilityManager = typeof CapabilityManager === 'function'
+  ? new CapabilityManager({
+      catalogs: {
+        capabilities: CAPABILITY_CATALOG,
+        plugins: PLUGIN_CATALOG,
+        skills: SKILL_CATALOG,
+        mcps: MCP_CATALOG,
+      },
+    })
+  : null;
+export { capabilityManager };
+
+function syncCapabilityProjection() {
+  store.capabilities = capabilityManager ? capabilityManager.listCapabilities() : [];
+}
+
+export function capabilityList() {
+  syncCapabilityProjection();
+  return store.capabilities;
+}
+
+// TEST/E2E-ONLY synthetic catalog injection (production catalogs stay
+// empty). Validates loudly before swapping; enabled-state resets with
+// the new set. Rejected while a task is running.
+export function injectCapabilityCatalogs(catalogs) {
+  if (!capabilityManager) throw new Error('capability runtime unavailable');
+  if (store.busy || session.task) throw new Error('cannot change capabilities while a task is running');
+  capabilityManager.replaceCatalogs(catalogs);
+  syncCapabilityProjection();
+  return store.capabilities;
+}
+
+// Capability mutations are between-task actions: while a task runs the
+// UI disables them AND these guards reject programmatic calls. A task
+// already holds its own frozen TaskEnvironment either way — the guard
+// exists to keep manager state and user expectation aligned.
+function assertCapabilitiesIdle() {
+  if (store.busy || session.task) {
+    throw new Error('a task is running; capability changes apply between tasks');
+  }
+}
+
+export async function enableCapability(id) {
+  if (!capabilityManager) throw new Error('capability runtime unavailable');
+  assertCapabilitiesIdle();
+  const state = await capabilityManager.enable(id);
+  syncCapabilityProjection();
+  return state;
+}
+
+export function disableCapability(id) {
+  if (!capabilityManager) throw new Error('capability runtime unavailable');
+  assertCapabilitiesIdle();
+  capabilityManager.disable(id);
+  syncCapabilityProjection();
+}
+
+// The ONLY write path for external-connection state (the future MCP
+// connector uses it too). Enabling a capability NEVER flips this:
+// unconnected requirements stay needs-connection until an explicit
+// connection decision.
+export function setMcpConnectionState(id, state) {
+  if (!capabilityManager) throw new Error('capability runtime unavailable');
+  assertCapabilitiesIdle();
+  const next = capabilityManager.setMcpState(id, state);
+  syncCapabilityProjection();
+  return next;
+}
+
+// Boot the Python interpreter with the plugin payload set THIS task's
+// TaskEnvironment needs: a changed extension key means the booted
+// interpreter holds a different plugin set, so it is reset and the
+// next boot installs the new payload before READY (never a lazy
+// install-on-import). With no python plugins this is a no-op.
+async function preparePythonRuntimeForEnvironment(env) {
+  if (typeof PythonRuntime === 'undefined') return;
+  const wanted = env ? env.pythonExtensionKey : null;
+  const current = typeof PythonRuntime.extensionKey === 'function' ? PythonRuntime.extensionKey() : null;
+  if (current === wanted) return;
+  PythonRuntime.reset();
+  if (typeof PythonRuntime.configureExtensions === 'function' && capabilityManager) {
+    // A null key means the core-only runtime: clear the payload explicitly
+    // (configureExtensions validates strict shapes and rejects key: null).
+    PythonRuntime.configureExtensions(wanted === null ? null : capabilityManager.pythonExtensionPayload(env));
+  }
+}
 
 const UPLOAD_ROOT = '/mnt/upload';
 const ARTIFACTS_ROOT = '/mnt/download';
@@ -138,6 +230,12 @@ export const store = reactive({
   artifacts: [],
 
   pythonStatus: 'cold',
+
+  // Capability Composition v1: reactive projection of the (non-reactive)
+  // CapabilityManager. Mutator actions re-sync it; the manager itself
+  // stays a plain page-session object (frozen TaskEnvironments must
+  // never become Vue reactive proxies).
+  capabilities: [],
   telemetryVersion: 0, // bumped on tool_result so rails re-read Telemetry.records
 });
 
@@ -804,7 +902,7 @@ async function buildImageUserContent(input) {
   const budget = (typeof HISTORY_BUDGET_BYTES === 'number') ? HISTORY_BUDGET_BYTES : 768 * 1024;
   let imageBytes = 0;
   for (const p of parts) if (p.type === 'image') imageBytes += imageWireEstimate(p.size);
-  const projected = session.historyRequestBytes(vfs) + imageBytes + new TextEncoder().encode(JSON.stringify({ role: 'user', content: parts })).byteLength + 16;
+  const projected = session.historyRequestBytes(vfs, capabilityManager ? capabilityManager.buildTaskEnvironment() : null) + imageBytes + new TextEncoder().encode(JSON.stringify({ role: 'user', content: parts })).byteLength + 16;
   if (projected > budget) {
     const conv = store.conversations.find((c) => c.id === store.liveConversationId);
     if (conv) {
@@ -974,7 +1072,20 @@ export async function submit(text) {
     // One user turn: text + selected image attachments bind into a single
     // provider turn (never a separate image turn, never a duplicate
     // bubble). run() emits ONE task_start for it.
-    await session.run(input, { workspace: vfs.fork(), userContent });
+    // Capability Composition v1: build THIS task's immutable environment,
+    // prepare the python plugin set for it, and bind per-task mounts on
+    // the fork (skill guides + plugin/capability introspection, all
+    // read-only). The environment is deeply frozen — later capability
+    // changes can only affect the NEXT task, never this one.
+    const taskEnvironment = capabilityManager ? capabilityManager.buildTaskEnvironment() : null;
+    await preparePythonRuntimeForEnvironment(taskEnvironment);
+    const taskVfs = vfs.fork();
+    if (capabilityManager && taskEnvironment) {
+      for (const mount of capabilityManager.taskVfsMounts(taskEnvironment)) {
+        taskVfs.mount(mount.path, mount.provider, mount.authority);
+      }
+    }
+    await session.run(input, { workspace: taskVfs, taskEnvironment, userContent });
   } catch (e) {
     // run() threw without a normal task lifecycle (e.g. the concurrent-run
     // guard): no task_end will arrive, so release the binding here instead

@@ -53,6 +53,33 @@
         >Forget &amp; recheck image capability</button>
       </section>
 
+      <section class="storage-controls" data-testid="capabilities-section">
+        <div class="section-label">Capabilities</div>
+        <div v-if="!capabilities.length" class="hint" data-testid="capabilities-empty">No optional capabilities available yet.</div>
+        <div v-for="c in capabilities" :key="c.id" class="capability-item" :data-testid="'capability-' + c.id">
+          <div class="capability-row">
+            <span class="capability-name">{{ c.displayName }}</span>
+            <span class="capability-state" :data-state="c.state">{{ stateLabel(c) }}</span>
+            <button v-if="!c.enabled" class="rail-btn" type="button" :disabled="store.busy || store.cancelling"
+              :data-testid="'capability-add-' + c.id" @click="addCapability(c)">Add</button>
+            <button v-else class="rail-btn" type="button" :disabled="store.busy || store.cancelling"
+              :data-testid="'capability-remove-' + c.id" @click="removeCapability(c)">Remove</button>
+          </div>
+          <div class="hint">{{ c.description }}</div>
+          <div v-if="c.enabled" class="hint" :data-testid="'capability-includes-' + c.id">
+            Includes: {{ c.includes.plugins }} local software · {{ c.includes.skills }} guidance · {{ c.includes.mcps }} external connections
+          </div>
+          <div v-if="c.enabled && c.error" class="hint">{{ c.error }}</div>
+          <template v-if="c.enabled">
+            <div v-for="m in c.mcps" :key="m.id" class="hint" :data-testid="'capability-mcp-' + c.id">
+              External connection: {{ m.displayName }} — {{ m.state === 'connected' ? 'Connected' : 'Connection required' }}
+              <button v-if="m.state !== 'connected'" class="rail-btn" type="button" :disabled="store.busy || store.cancelling"
+                :data-testid="'capability-connect-' + c.id" @click="connectMcp(c, m)">Connect</button>
+            </div>
+          </template>
+        </div>
+      </section>
+
       <section class="storage-controls">
         <div class="section-label">Local storage</div>
         <div class="hint">
@@ -88,6 +115,7 @@
 <script setup>
 import {
   store, applySettings, persistSettingsIfNeeded, testConnection,
+  capabilityList, enableCapability, disableCapability, setMcpConnectionState,
   keepDataOnThisDevice, clearConversations as clearConversationData,
   clearHome as clearHomeData, clearPlugins as clearPluginData,
   forgetApiKeys as forgetStoredApiKeys, resetAllData as resetLocalData,
@@ -109,6 +137,42 @@ const imageCapabilitySummary = computed(() => {
   const sourceLabel = { user: 'your answer', probe: 'visual check', builtin: 'built-in table', 'provider-rejection': 'provider' }[c.source] || c.source;
   return `Image input: ${c.state} · source: ${sourceLabel}`;
 });
+
+const capabilities = computed(() => store.capabilities);
+
+function stateLabel(c) {
+  if (!c.enabled) return c.state === 'disabled' ? 'Not added' : c.state;
+  return { ready: 'Ready', 'needs-connection': 'Connection required', error: 'Error', disabled: 'Not added' }[c.state] || c.state;
+}
+
+async function refreshCapabilities() { capabilityList(); }
+
+async function addCapability(c) {
+  try {
+    await enableCapability(c.id);
+    refreshCapabilities();
+  } catch (e) {
+    store.storageNotice = e.message || String(e);
+  }
+}
+
+function removeCapability(c) {
+  try {
+    disableCapability(c.id);
+    refreshCapabilities();
+  } catch (e) {
+    store.storageNotice = e.message || String(e);
+  }
+}
+
+function connectMcp(c, m) {
+  try {
+    setMcpConnectionState(m.id, 'connected');
+    refreshCapabilities();
+  } catch (e) {
+    store.storageNotice = e.message || String(e);
+  }
+}
 
 onMounted(() => { refreshImageCapability(); });
 
