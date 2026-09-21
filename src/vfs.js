@@ -350,7 +350,7 @@ const VFS_SKELETON = {
   '/usr/lib/locus': [],
   '/usr/local': ['share'],
   '/usr/local/share': ['locus'],
-  '/usr/local/share/locus': ['skills'],
+  '/usr/local/share/locus': ['skills', 'capabilities'],
   '/usr/local/share/locus/skills': [],
   '/home': [],
   '/mnt': ['plugins'],

@@ -19,6 +19,7 @@ const RUNTIME_SCRIPTS = [
   'src/model.js',
   'src/workspace.js',
   'src/vfs.js',
+  'src/extensions.js',
   'src/attachments.js',
   'src/capabilities.js',
   'src/network.js',

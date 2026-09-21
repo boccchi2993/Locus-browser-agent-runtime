@@ -39,7 +39,10 @@
 //  the browser policy remains the authoritative boundary either way.
 //
 //  Message in:  { id, cmd: 'bootstrap',
-//                 assets: { <name>: { text | buffer, mime } } }
+//                 assets: { <name>: { text | buffer, mime } }
+//                 pluginModules?: [{ pluginId, files: { relPath: text },
+//                                   imports: [module] }]  (harness
+//                 -selected plugin payloads, installed pre-lockdown)
 //               { id, cmd: 'run', code, cwd,
 //                 mounts: [{ root, readOnly,
 //                            files: [{ path(ABS), b64 }],
@@ -87,6 +90,13 @@ let lockdownAttempted = false;
 // user code can never treat them as a resource oracle.
 let receivedAssets = null;
 let assetsWaiter = null;
+
+// Trusted-harness plugin payloads (Capability Composition v1),
+// delivered WITH the bootstrap message. Installed after the declared
+// runtime package set and BEFORE the network lockdown, so an enabled
+// plugin's import is an ordinary import of pre-installed code — never
+// a lazy install, never a runtime download, never user-driven.
+let receivedExtensions = [];
 
 function awaitAssets() {
   if (receivedAssets) return Promise.resolve(receivedAssets);
@@ -331,6 +341,47 @@ function applyNetworkLockdown(instance) {
   }
 }
 
+// ---- Capability Composition v1: plugin payload install + smoke import ----
+// Runs in the TRUSTED harness window: after the declared package set,
+// before the bootstrap asset map is dropped and the network lockdown
+// applies. Plugin code is selected by the harness from the frozen
+// TaskEnvironment — it is never reachable from a model-generated
+// import (loadPackage/loadPackagesFromImports stay denied forever).
+// Every payload path is re-validated here; any invalid path or failed
+// smoke import THROWS, which fails the whole boot closed: the
+// interpreter never reports READY with a declared plugin missing.
+async function installExtensionModules(instance) {
+  if (!receivedExtensions.length) return;
+  const siteDir = instance.runPython('import sysconfig; sysconfig.get_path("purelib")');
+  if (typeof siteDir !== 'string' || !siteDir.startsWith('/')) {
+    throw new Error('Locus plugin install: could not resolve the site-packages directory');
+  }
+  for (const mod of receivedExtensions) {
+    const files = (mod && mod.files) || {};
+    for (const rel of Object.keys(files)) {
+      if (!rel || rel.startsWith('/') || rel.indexOf('\\') !== -1 || rel.split('/').indexOf('..') !== -1) {
+        throw new Error('Locus plugin install: invalid payload path: ' + rel);
+      }
+      const full = siteDir + '/' + rel;
+      const dir = full.substring(0, full.lastIndexOf('/'));
+      if (dir && dir !== siteDir) instance.FS.mkdirTree(dir);
+      instance.FS.writeFile(full, String(files[rel]), { encoding: 'utf8' });
+    }
+    for (const name of (mod && mod.imports) || []) {
+      const moduleName = String(name);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(moduleName)) {
+        throw new Error('Locus plugin install: invalid smoke import name: ' + moduleName);
+      }
+      try {
+        instance.runPython('import ' + moduleName);
+      } catch (e) {
+        throw new Error('Locus plugin install: smoke import failed for ' + moduleName
+          + ' (plugin ' + ((mod && mod.pluginId) || '?') + '): ' + String(e && e.message ? e.message : e));
+      }
+    }
+  }
+}
+
 // Pyodide is booted lazily on the first run, entirely from the in-memory
 // asset set the trusted harness delivered. Bootstrap order is the
 // authority boundary: core runtime -> declared packages -> DROP the
@@ -359,6 +410,12 @@ async function ensureLockedPyodide() {
         stdLibURL: VIRTUAL_BASE + 'python_stdlib.zip',
       });
       await instance.loadPackage(PYTHON_RUNTIME_PACKAGES);
+      // Capability Composition v1: all enabled Python plugins are
+      // installed and smoke-imported here — BEFORE the resolver's asset
+      // map is dropped and the lockdown applies. After READY, an enabled
+      // plugin imports like any preinstalled package, with no Harness
+      // RPC and no network.
+      await installExtensionModules(instance);
       // Bootstrap authority ends here: the asset map is dropped BEFORE the
       // lockdown, in the same synchronous block — no user code can run in
       // between, and a resolver with an empty map fails closed anyway.
@@ -601,6 +658,7 @@ self.onmessage = async (ev) => {
       return;
     }
     receivedAssets = msg.assets || {};
+    receivedExtensions = Array.isArray(msg.extensionModules) ? msg.extensionModules : [];
     if (assetsResolve) { const r = assetsResolve; assetsResolve = null; assetsWaiter = null; r(receivedAssets); }
     try {
       await ensureLockedPyodide();
@@ -772,6 +830,7 @@ self.onmessage = (ev) => {
 <script src="./src/model.js"></script>
 <script src="./src/workspace.js"></script>
 <script src="./src/vfs.js"></script>
+<script src="./src/extensions.js"></script>
 <script src="./src/attachments.js"></script>
 <script src="./src/capabilities.js"></script>
 <script src="./src/network.js"></script>

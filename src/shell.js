@@ -347,6 +347,17 @@ const PythonRuntime = {
   // Queued-but-unstarted runs, drainable by reset() (a session boundary
   // must not let a pre-reset run execute on a post-reset worker).
   _queuedRuns: new Set(),
+  // Capability Composition v1: the python extension payload for the
+  // NEXT boot ({ key, modules: [{ pluginId, files, imports }] }),
+  // configured by the trusted harness from the frozen TaskEnvironment
+  // before a task runs. A changed key means the booted interpreter
+  // (if any) holds a different plugin set, so the harness resets it;
+  // the next boot installs the new payload before READY. Null = core
+  // runtime only. Plugin payloads never touch the bootstrap asset
+  // manifest (F04c) — they arrive in the bootstrap MESSAGE, are
+  // installed after the declared package set, and fail the boot
+  // closed when broken.
+  _extensions: null,
 
   // Everything below runs in the TRUSTED harness phase: creator iframe
   // spawn, verified asset acquisition, bootstrap delivery, lock
@@ -409,7 +420,7 @@ const PythonRuntime = {
             resolve({ error: pythonInitTimeoutError(b.bootstrapMs).message });
           }, remaining),
         });
-        this._postToWorker({ id: id, cmd: 'bootstrap', assets: assets });
+        this._postToWorker({ id: id, cmd: 'bootstrap', assets: assets, extensionModules: this._extensions ? this._extensions.modules : [] });
       });
       if (reply.error) throw new Error(reply.error);
       if (reply.status !== 'locked') throw new Error('python runtime bootstrap did not lock');
@@ -621,6 +632,36 @@ const PythonRuntime = {
       entry.reason = 'python runtime reset (session boundary)';
     }
     this._queuedRuns.clear();
+  },
+
+  // Current extension key of the configured python runtime (null =
+  // core only). The harness compares it with the next task's
+  // TaskEnvironment key to decide whether the interpreter must be
+  // rebuilt before that task runs.
+  extensionKey() {
+    return this._extensions ? this._extensions.key : null;
+  },
+
+  // Configure the extension payload for FUTURE boots (trusted harness
+  // only). Shape-validated and frozen; a booted interpreter is never
+  // touched here — swapping the live plugin set is the harness's
+  // explicit reset() decision, never a side effect of configuration.
+  configureExtensions(ext) {
+    if (ext === null || ext === undefined) {
+      this._extensions = null;
+      return;
+    }
+    if (!ext || typeof ext !== 'object' || typeof ext.key !== 'string' || !Array.isArray(ext.modules)) {
+      throw new Error('PythonRuntime.configureExtensions: invalid extension payload');
+    }
+    const modules = ext.modules.map((m) => {
+      if (!m || typeof m !== 'object' || typeof m.pluginId !== 'string'
+          || !m.files || typeof m.files !== 'object' || !Array.isArray(m.imports)) {
+        throw new Error('PythonRuntime.configureExtensions: invalid extension module entry');
+      }
+      return { pluginId: m.pluginId, files: Object.assign({}, m.files), imports: m.imports.slice() };
+    });
+    this._extensions = Object.freeze({ key: ext.key, modules: Object.freeze(modules) });
   },
 
   _failAllPending(errorMessage) {
