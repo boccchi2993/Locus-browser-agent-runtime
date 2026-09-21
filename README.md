@@ -253,7 +253,7 @@ Both are intentionally provider/site-agnostic for demo and development use, with
 
 ## V0.1 reliability & safety fixes
 
-- **Python timeout + recovery**: `python` executions time out after 30s (`PYTHON_TIMEOUT_MS`); the worker is terminated, all pending calls fail with `python execution timed out after 30000ms`, and the next call boots a fresh worker automatically.
+- **Python timeouts + recovery**: the 30s `PYTHON_TIMEOUT_MS` budget covers **user Python execution only** — an infinite loop fails with exactly `python execution timed out after 30000ms`, the worker is terminated, and the next call boots a fresh worker automatically. Bootstrap phases own separate, independent budgets (F04c): fixed-asset acquisition (download + integrity verification) is bounded by `PYTHON_ASSET_TIMEOUT_MS` (180s, with a 20s per-asset no-progress stall bound) and runtime initialization (creator iframe + in-memory Pyodide boot + lockdown) by `PYTHON_BOOTSTRAP_TIMEOUT_MS` (60s) — a slow CDN or slow boot fails as a labelled bootstrap timeout and is never misreported as `python execution timed out`.
 - **Workspace context isolation**: successfully selecting a new workspace resets the agent session (`AgentSession.reset()`: history cleared, generation bumped, Python state reset) so file contents from workspace A never leak into LLM context for workspace B. Cancelling the picker does not reset.
 - **File deletion sync**: Python-side `os.remove` / `os.rename` now propagate to the real workspace (`WorkspaceAdapter.remove`); previously only create/modify were synced.
 - **Python heredoc**: `python <<'PY' ... PY` passes multi-line code (any quotes, JSON, etc.) to Python verbatim; `python -c` remains for one-liners.
@@ -262,7 +262,7 @@ Both are intentionally provider/site-agnostic for demo and development use, with
 - **Hosted-mode proxy fallback**: no more forced `/proxy` on any HTTP host (see "Connection behavior" above).
 - **`verifyConnection`** tests the user-configured model instead of a hardcoded one.
 - **Telemetry bytes** are real UTF-8 bytes (`utf8ByteLength`), and `window.__telemetry` keeps array identity across log trimming.
-- **CDN pins**: Pyodide v0.26.4. (The jQuery Terminal presentation layer was removed in V0.4 in favor of the Vue app; nothing runtime-side ever depended on it.)
+- **CDN pins**: Pyodide v0.26.4, pinned with content integrity (F04c): `PYTHON_BOOTSTRAP_MANIFEST` (in `src/shell.js`) pins every asset's exact URL, byte size and SHA-256. The trusted harness verifies each download with the browser's native WebCrypto before any byte reaches the worker; truncated, oversized, tampered, stalled or cancelled acquisitions fail closed and never enter the page-session cache. Sizes and hashes were established from the official pyodide-0.26.4 release artifacts and byte-cross-checked against the CDN; `node scripts/verify-python-bootstrap-manifest.mjs` re-verifies (add `--release-dir <extracted official release>` for the artifact provenance comparison). (The jQuery Terminal presentation layer was removed in V0.4 in favor of the Vue app; nothing runtime-side ever depended on it.)
 
 ## Tests
 
@@ -288,6 +288,7 @@ node tests/agent.test.cjs        # session binding, cancellation vs session-swit
 node tests/presentation.test.cjs # runtime-event → timeline projection, markdown-lite safety, AgentSession→projector integration
 node tests/store-defaults.test.cjs # settings defaults (deepseek-flash @ DeepSeek Anthropic endpoint), user override, remembered-session precedence, test-connection model
 node tests/worker-init.test.cjs  # Pyodide init-failure recovery (real worker source from index.html, in-memory bootstrap assets)
+node tests/python-bootstrap-integrity.test.cjs # F04c bootstrap manifest structure, pandas closure vs pinned lockfile, bounded raw-byte acquisition, integrity/cancel/stall fail-closed semantics, budget independence
 node tests/worker-output.test.cjs # worker diffOut limits: structured uncollected status, rename safety, real commit logic
 node tests/verify-active-content.cjs # /fetch active-content isolation through the REAL handler in headless Chrome
 ```
@@ -311,6 +312,18 @@ node tests/verify-active-content.cjs
 ```
 
 The Python **browser authority** e2e (`tests/e2e-python-browser-authority.cjs`, also part of `npm run test:e2e`) proves the F04b boundary model and the in-memory bootstrap in isolation, in BOTH hosted and `file://` page modes, with two probe origins and request counters as the only oracle: a strict-CSP `srcdoc` creator iframe's Blob worker has every network primitive browser-blocked (fetch/XHR/WS/EventSource/sendBeacon/importScripts/dynamic import/`Function` dynamic import/prototype-level fetch/string-timer import/nested remote and nested blob workers) while `Function`/`eval`/WebAssembly/Promise/timers keep working; real Pyodide 0.26.4 boots entirely from harness-delivered bytes (resolver serves exactly the fixed URL set, unknown URLs and query variations fail closed); after teardown, with native fetch restored and no F04a patches at all, every escape payload is still blocked with zero requests and pandas keeps computing. A no-CSP control worker proves the counters actually observe real requests.
+
+The Python **bootstrap integrity** e2e (`tests/e2e-python-bootstrap.cjs`, also part of
+`npm run test:e2e`) drives the REAL production runtime (`src/shell.js` + the real worker source) in
+real Chrome against a local controllable asset server, in BOTH hosted and `file://` modes: WebCrypto
+`subtle` is proven available (a clean boot is itself the integrity proof — every byte is hashed
+against the pinned manifest before the worker may receive it); a corrupted wire byte fails the boot
+closed with the integrity error (the worker never receives bootstrap bytes) and a clean retry succeeds;
+a stalled body fails with the acquisition-stall error; a silent worker fails with the initialization
+timeout while the verified assets are retained and the next boot reuses them with ZERO asset requests
+— as does a worker crash with the asset server disabled (page-session cache, request delta 0). The
+live lockfile in the verified cache must yield a pandas dependency closure exactly equal to the
+manifest's package wheel set, and user execution keeps its untouched 30s budget (`while True: pass`).
 
 ## Security boundaries
 
@@ -339,14 +352,37 @@ import/script-tag loading (no loadable origin in `script-src`), and nested remot
 (`worker-src blob:` only) all fail at the platform level with **zero server requests**, while the
 dynamic compute Pyodide needs (`Function`, `eval`, WebAssembly) keeps working. A nested blob worker
 inherits the same restrictive policy. The worker itself never bootstraps from the network: the
-**trusted harness** (the page) fetches the fixed, harness-defined Pyodide asset set from the pinned CDN
-(`PYTHON_BOOTSTRAP_ASSETS` — core + the declared package closure), delivers the bytes by postMessage,
-and the worker boots Pyodide **entirely from memory** — `pyodide.js`/`pyodide.asm.js` are eval'd from
+**trusted harness** (the page) fetches the pinned, hash-verified Pyodide asset set from the pinned CDN
+(`PYTHON_BOOTSTRAP_MANIFEST` — core + the declared package closure, F04c), delivers only VERIFIED bytes
+by postMessage, and the worker boots Pyodide **entirely from memory** — `pyodide.js`/`pyodide.asm.js` are eval'd from
 text (never `importScripts`), and every loader fetch (lock file, wasm, stdlib zip, wheels) is served by
 a bootstrap-only in-memory resolver that fail-closes on every URL it does not hold exactly (no path or
 query variation, no CDN fallback). After the declared packages install, the resolver's asset map is
 dropped and cannot serve as a resource oracle. `tests/e2e-python-browser-authority.cjs` proves the
 whole model in hosted and `file://` modes with request-counter oracles.
+
+**Bootstrap trust (F04c, versioned + hash-pinned).** The Python runtime comes from a pinned Pyodide
+distribution: one frozen manifest (`PYTHON_BOOTSTRAP_MANIFEST` in `src/shell.js`) pins every asset's
+URL, kind, MIME type, exact byte size and SHA-256, and every loader URL, test and dependency-closure
+check derives from that single table. The harness downloads each asset as **raw entity bytes** (never
+`res.text()`), bounds the read at the manifest's exact size (streaming readers stop and cancel the
+moment a body exceeds the bound, so an oversized response cannot balloon memory), then verifies the
+SHA-256 with the browser's native WebCrypto — text decoding happens only AFTER the digest matches, and
+only a complete 10/10 verified set is delivered to the worker or written to the page-session cache.
+Byte-size, truncation, hash-mismatch, HTTP-failure, stalled-body and cancelled acquisitions all fail
+closed with distinct, labelled errors (`python_bootstrap_integrity` / `python_bootstrap_unavailable` /
+`python_asset_timeout` / `python_bootstrap_timeout`); a context without WebCrypto `subtle` cannot
+bootstrap at all — integrity is never silently skipped, on `https://` or `file://` alike. A mismatch
+never updates the manifest, never falls back to another version or CDN, and never continues the boot.
+Verified assets survive worker crashes and session resets in a page-session memory cache, so a worker
+rebuild after a crash re-boots with zero network requests. Provenance is auditable, not asserted:
+sizes/hashes were computed from the official pyodide-0.26.4 GitHub release artifacts and byte-compared
+against the jsDelivr CDN, and the pinned `pyodide-lock.json`'s own package hashes pin the pandas
+dependency closure (`scripts/verify-python-bootstrap-manifest.mjs` re-verifies all of it; a lockfile
+snapshot under `tests/fixtures/` keeps the offline unit test honest). This is **version pin + content
+pin + independently cross-checked release bytes + runtime hash enforcement** — an auditable supply-
+chain stance, not a claim that the CDN cannot be compromised; a CDN-side tamper fails the bootstrap
+closed rather than reaching the interpreter.
 
 **JS lockdown (F04a, defense-in-depth).** The harness-declared package set (`PYTHON_RUNTIME_PACKAGES`,
 currently `pandas` and its dependency closure) installs once at bootstrap, then a network lockdown is
@@ -360,7 +396,13 @@ because the prototype layer of the original lockdown was dead code) is closed an
 string-handler timers are refused at every owning level while real function handlers keep working
 (Pyodide/Emscripten schedule with them). An import the runtime does not carry fails with
 `ModuleNotFoundError` and no network attempt; HTTP/HTTPS work belongs to `curl`, where NetworkRuntime
-owns transport, approval, bounds and telemetry. Denied Python network attempts are plain Python compute
+ owns transport, approval, bounds and telemetry. Lifecycle budgets are part of the same
+contract (F04c): asset acquisition (`PYTHON_ASSET_TIMEOUT_MS`, with a per-asset no-progress stall
+bound), runtime initialization (`PYTHON_BOOTSTRAP_TIMEOUT_MS`) and user execution
+(`PYTHON_TIMEOUT_MS` = 30000, unchanged) are independent — each bootstrap failure reports the phase
+that actually failed, bootstrap cancellation aborts the real in-flight downloads (AbortController),
+and a slow CDN can never shorten the user execution budget or masquerade as
+`python execution timed out`. Denied Python network attempts are plain Python compute
 failures — they are never recorded as network operations, because no network happened. The lockdown
 exists so honest code gets clean denial messages; even if every JS patch were bypassed, the browser
 policy still blocks the request.
