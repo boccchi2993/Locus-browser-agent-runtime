@@ -5,7 +5,19 @@
 //  worker — no native shell, no server, no cloud execution.
 // ============================================================
 
+// USER PYTHON EXECUTION timeout ONLY (unchanged semantics): 30s covers the
+// worker run itself. Bootstrap phases own separate independent budgets below.
 const PYTHON_TIMEOUT_MS = 30000;
+// TRUSTED-HARNESS BOOTSTRAP budgets (F04c) - measured cold on the reference
+// machine: a full CDN acquisition of the ~51 MB set ran ~55s under network
+// contention and ~2s from a warm browser cache; the in-memory Pyodide boot
+// incl. pandas ran ~10s. The acquisition bound covers a genuinely slow link
+// (~280KB/s floor) - a HUNG bootstrap dies far earlier via the per-asset
+// no-progress stall bound. Assets are hash-pinned, so a force-cache hit is
+// always safe: wrong cached bytes fail the SHA-256 check and the boot.
+const PYTHON_ASSET_TIMEOUT_MS = 180000;    // whole-set download + integrity verification
+const PYTHON_ASSET_STALL_MS = 20000;       // one asset: no body progress for this long
+const PYTHON_BOOTSTRAP_TIMEOUT_MS = 60000; // creator ready + worker boot + lockdown
 
 function makeCancelledError(what) {
   const e = new Error((what || 'operation') + ' cancelled');
@@ -37,24 +49,45 @@ function throwIfCancelled(signal, what) {
 // Function/eval/WebAssembly compute keeps working. The F04a JS lockdown
 // inside the worker stays as defense-in-depth with clean denial semantics.
 
-// The ONLY Pyodide URLs the trusted page ever fetches. Harness-defined
-// constants — nothing user-controlled can reach this list. The exact set
-// is pinned end to end by tests/e2e-python-browser-authority.cjs: every
-// fetch the loader performs resolves against it, and anything missing
-// fails closed inside the worker (never a CDN fallback).
+// The ONLY Pyodide origin the trusted page ever fetches, plus the SINGLE
+// SOURCE OF TRUTH (F04c) for the pinned bootstrap: exact name, kind, mime,
+// EXACT byte size and SHA-256 of every asset. The loader derives its URL
+// list from THIS manifest alone; only a fully size- and hash-verified set
+// is ever delivered to the worker or cached. Sizes/hashes were established
+// from the official pyodide-0.26.4 release artifacts and cross-checked
+// byte-for-byte against this CDN (scripts/verify-python-bootstrap-manifest.mjs
+// re-verifies: jsDelivr bytes, release provenance, lockfile dependency
+// closure). A version upgrade means rewriting this one table and passing
+// every gate; nothing else in the runtime may add or change a bootstrap URL.
 const PYODIDE_BASE = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
-const PYTHON_BOOTSTRAP_ASSETS = [
-  { name: 'pyodide.js', kind: 'text', mime: 'text/javascript' },
-  { name: 'pyodide.asm.js', kind: 'text', mime: 'text/javascript' },
-  { name: 'pyodide.asm.wasm', kind: 'bytes', mime: 'application/wasm' },
-  { name: 'pyodide-lock.json', kind: 'text', mime: 'application/json' },
-  { name: 'python_stdlib.zip', kind: 'bytes', mime: 'application/zip' },
-  { name: 'pandas-2.2.0-cp312-cp312-pyodide_2024_0_wasm32.whl', kind: 'bytes', mime: 'application/octet-stream' },
-  { name: 'numpy-1.26.4-cp312-cp312-pyodide_2024_0_wasm32.whl', kind: 'bytes', mime: 'application/octet-stream' },
-  { name: 'python_dateutil-2.9.0.post0-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream' },
-  { name: 'six-1.16.0-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream' },
-  { name: 'pytz-2024.1-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream' },
-];
+const PYTHON_BOOTSTRAP_MANIFEST = Object.freeze([
+  { name: 'pyodide.js', kind: 'text', mime: 'text/javascript', size: 14761, sha256: 'c0069107621d5b942a659e737a12e774cc0451feaa2256f475d72e071d844ec7' },
+  { name: 'pyodide.asm.js', kind: 'text', mime: 'text/javascript', size: 1229099, sha256: '919560652ed3dad3707cb3a394785da1e046fb13dc0defa162058ff230cb7eed' },
+  { name: 'pyodide.asm.wasm', kind: 'bytes', mime: 'application/wasm', size: 10088051, sha256: 'b7e66a19427a55010ac3367c1b6c64b893f9826f783412945fdf0c3337f3bc94' },
+  { name: 'pyodide-lock.json', kind: 'text', mime: 'application/json', size: 106335, sha256: 'cd50b49de944c579045e122fe8628b31f9ce446379f032f36c05e273d38766e0' },
+  { name: 'python_stdlib.zip', kind: 'bytes', mime: 'application/zip', size: 2341872, sha256: '72894522b791858b9d613ac786b951d8b5094035dcf376313ea24a466810f336' },
+  { name: 'pandas-2.2.0-cp312-cp312-pyodide_2024_0_wasm32.whl', kind: 'bytes', mime: 'application/octet-stream', size: 23759073, sha256: 'ae979af0f0be1e8c482408d838ea1366d187f3f057f47b429910e66dbba60673' },
+  { name: 'numpy-1.26.4-cp312-cp312-pyodide_2024_0_wasm32.whl', kind: 'bytes', mime: 'application/octet-stream', size: 11959269, sha256: '4a2f5303a88a0747c5e6c80701e0ff4ff5667e487c0c9f9c73875e4d88f4cf9a' },
+  { name: 'python_dateutil-2.9.0.post0-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream', size: 444927, sha256: '302d74af893af51ee8b52e2c06a1fc2bc73cfe645eed3f35a17f082cdf101c7d' },
+  { name: 'six-1.16.0-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream', size: 38737, sha256: 'f359c3850331f250d1a5e394aae58193774c6358676340aba992718589b9dcf1' },
+  { name: 'pytz-2024.1-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream', size: 1083571, sha256: '561652a008b98ef7b66a6acf816e3f4d1c0e17e8ed9eb8dbb993037413cda597' },
+]);
+// Core runtime files vs the declared runtime package closure (pandas).
+// The package half must equal EXACTLY the pandas dependency closure in the
+// pinned pyodide-lock.json - no missing dependency, no undeclared extra -
+// which tests/python-bootstrap-integrity.test.cjs pins against a lockfile
+// snapshot and the browser e2e re-verifies against the real (integrity-
+// passed) lockfile bytes.
+const PYTHON_BOOTSTRAP_CORE_ASSETS = Object.freeze([
+  'pyodide.js', 'pyodide.asm.js', 'pyodide.asm.wasm', 'pyodide-lock.json', 'python_stdlib.zip',
+]);
+const PYTHON_RUNTIME_PACKAGE_FILES = Object.freeze([
+  'pandas-2.2.0-cp312-cp312-pyodide_2024_0_wasm32.whl',
+  'numpy-1.26.4-cp312-cp312-pyodide_2024_0_wasm32.whl',
+  'python_dateutil-2.9.0.post0-py2.py3-none-any.whl',
+  'six-1.16.0-py2.py3-none-any.whl',
+  'pytz-2024.1-py2.py3-none-any.whl',
+]);
 
 // The creator iframe's strict policy. No http/https/blob/data source in
 // script-src means no browser loader (script tag, importScripts, dynamic or
@@ -99,14 +132,209 @@ const PY_CREATOR_DOC = (function () {
     + '</head><body><script>' + relay.replace(/<\//g, '<\\/') + '<\/script></body></html>';
 })();
 
+// ---------- F04c: bounded, integrity-verified asset acquisition ----------
+// The trusted harness downloads the pinned Pyodide set as RAW ENTITY BYTES
+// (never res.text()), bounds every body at the manifest's exact expected
+// size, hashes it with the browser's NATIVE WebCrypto and compares against
+// PYTHON_BOOTSTRAP_MANIFEST BEFORE any decode, cache write or worker
+// delivery. Truncated, oversized, tampered, stalled or cancelled
+// acquisitions fail closed: unverified bytes never reach the worker and
+// never enter the page-session cache. Text decoding happens only AFTER the
+// digest matches. A context without WebCrypto subtle (e.g. a non-secure
+// origin) cannot bootstrap at all - integrity is never silently skipped.
+
+function bootstrapAssetError(message, code) {
+  const e = new Error(message);
+  e.code = code;
+  return e;
+}
+function pythonAssetUnavailable(message) {
+  return bootstrapAssetError(message, 'python_bootstrap_unavailable');
+}
+function pythonAssetIntegrityError(name, category, detail) {
+  return bootstrapAssetError(
+    'Python runtime asset integrity check failed: ' + name + ' (' + category + (detail ? ': ' + detail : '') + ')',
+    'python_bootstrap_integrity');
+}
+function pythonAssetTimeoutError(message) {
+  return bootstrapAssetError(message, 'python_asset_timeout');
+}
+function pythonInitTimeoutError(ms) {
+  return bootstrapAssetError('Python runtime initialization timed out after ' + ms + 'ms', 'python_bootstrap_timeout');
+}
+
+// Bootstrap budgets (F04c), independent of the 30s user-execution budget:
+// assetMs bounds the WHOLE acquisition (downloads + integrity checks),
+// assetStallMs is the per-asset no-progress bound (a hung body fails long
+// before the overall deadline), bootstrapMs bounds creator ready + worker
+// spawn + in-memory boot + lockdown. The bootstrapBudgets option is a
+// TEST-ONLY seam (run() -> _runOnce -> _ensureWorker) for deterministic
+// lifecycle tests; production always runs on the pinned constants.
+function pythonBootstrapBudgets(budgets) {
+  budgets = budgets || {};
+  const pos = (v, dflt) => (typeof v === 'number' && v > 0 ? v : dflt);
+  return {
+    assetMs: pos(budgets.assetMs, PYTHON_ASSET_TIMEOUT_MS),
+    assetStallMs: pos(budgets.assetStallMs, PYTHON_ASSET_STALL_MS),
+    bootstrapMs: pos(budgets.bootstrapMs, PYTHON_BOOTSTRAP_TIMEOUT_MS),
+  };
+}
+
+// A budget clock that can PAUSE while another budget owns the wall clock:
+// initialization (creator ready + worker boot reply) shares one clock that
+// is paused during asset acquisition, so a slow CDN can never eat the boot
+// budget (and the boot can never shorten acquisition). Bounded by design.
+function makeBudgetClock(ms) {
+  let consumed = 0;
+  let since = Date.now(); // null while paused
+  return {
+    remaining() {
+      return ms - consumed - (since !== null ? Date.now() - since : 0);
+    },
+    pause() {
+      if (since !== null) { consumed += Date.now() - since; since = null; }
+    },
+    resume() {
+      if (since === null) since = Date.now();
+    },
+  };
+}
+
+// One bootstrap attempt's cancellation plane: aborts the in-flight
+// acquisition (fetch + body reader) when the task signal cancels, a
+// bootstrap budget expires, the session resets or the worker dies. Hand-
+// rolled instead of AbortSignal.any (not universally available). The abort
+// REASON is the error the run sees, so a deadline expiry surfaces as its
+// own clearly-labelled timeout, never as a generic abort.
+function openBootstrapAbort(signal) {
+  const ac = new AbortController();
+  let listener = null;
+  const adopt = (reason) => { try { ac.abort(reason); } catch (e) {} };
+  if (signal) {
+    if (signal.aborted) adopt(signal.reason || makeCancelledError('python execution'));
+    else {
+      listener = () => adopt(signal.reason || makeCancelledError('python execution'));
+      signal.addEventListener('abort', listener, { once: true });
+    }
+  }
+  return {
+    ac,
+    fail: adopt,
+    aborted() { return ac.signal.aborted; },
+    reason() { return ac.signal.reason; },
+    dispose() {
+      if (listener && signal) signal.removeEventListener('abort', listener);
+      listener = null;
+    },
+  };
+}
+
+// The boot is dead: its abort reason is the error to surface (fall back to
+// a cancellation for reasons without one).
+function throwIfBootAborted(boot) {
+  if (boot.ac.signal.aborted) {
+    throw (boot.ac.signal.reason || makeCancelledError('python bootstrap'));
+  }
+}
+
+function raceTimeout(promise, ms, makeError) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(makeError()), ms);
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+// Race one initialization stage against its budget clock; on expiry the
+// WHOLE boot fails (any in-flight acquisition aborts with the labelled
+// reason) and the labelled timeout error is thrown.
+function raceBootStage(promise, boot, clock, makeError) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      const err = makeError();
+      boot.fail(err);
+      reject(err);
+    }, Math.max(clock.remaining(), 0));
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+function sha256Available() {
+  return typeof crypto !== 'undefined' && !!crypto.subtle
+    && typeof crypto.subtle.digest === 'function';
+}
+
+async function sha256Hex(bytes) {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  let hex = '';
+  const view = new Uint8Array(digest);
+  for (let i = 0; i < view.length; i++) hex += (view[i] < 16 ? '0' : '') + view[i].toString(16);
+  return hex;
+}
+
+// Read a response body as RAW ENTITY BYTES with an exact bound: streaming
+// reads stop (and best-effort cancel the stream) the moment the body
+// exceeds the manifest size, so an oversized response can never balloon
+// memory; a body that ends short, or even one byte over, fails the
+// acquisition. Content-Length is only an early sanity check (compression
+// and intermediaries make header semantics unreliable) - the bytes
+// actually read are the final judge.
+async function readBodyBounded(res, entry, stallMs) {
+  const expected = entry.size;
+  const lenHeader = res.headers && typeof res.headers.get === 'function'
+    ? Number(res.headers.get('content-length')) : NaN;
+  if (Number.isFinite(lenHeader) && lenHeader > expected) {
+    throw pythonAssetIntegrityError(entry.name, 'oversized body', 'content-length ' + lenHeader + ' > ' + expected);
+  }
+  if (!(res.body && typeof res.body.getReader === 'function')) {
+    const buf = await res.arrayBuffer(); // fallback: exact-size check after completion
+    if (buf.byteLength !== expected) {
+      throw pythonAssetIntegrityError(entry.name, 'size mismatch', 'expected ' + expected + ' bytes, got ' + buf.byteLength);
+    }
+    return new Uint8Array(buf);
+  }
+  const reader = res.body.getReader();
+  let received = 0;
+  let clean = false;
+  const chunks = [];
+  try {
+    while (true) {
+      const chunk = await raceTimeout(reader.read(), stallMs, () =>
+        pythonAssetTimeoutError('Python runtime asset acquisition stalled: '
+          + entry.name + ' (no body progress for ' + stallMs + 'ms)'));
+      if (chunk.done) { clean = true; break; }
+      received += chunk.value.byteLength;
+      if (received > expected) {
+        throw pythonAssetIntegrityError(entry.name, 'oversized body', 'exceeded ' + expected + ' bytes while reading');
+      }
+      chunks.push(chunk.value);
+    }
+  } finally {
+    if (!clean) { try { reader.cancel(); } catch (e) {} }
+  }
+  if (received !== expected) {
+    throw pythonAssetIntegrityError(entry.name, 'size mismatch', 'expected ' + expected + ' bytes, got ' + received);
+  }
+  const out = new Uint8Array(expected);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
+}
+
 const PythonRuntime = {
   worker: null, // facade over the creator-relayed worker (null = cold)
   status: 'cold', // cold | loading | ready
   _reqId: 0,
   _pending: new Map(),
-  // Trusted-harness bootstrap state: the fixed asset cache (bytes live on
-  // the page; every worker boot clones them) and the creator iframe.
+  // Trusted-harness bootstrap state: the VERIFIED asset cache (bytes live
+  // on the page; every worker boot clones them; written only on a complete
+  // integrity-passed set) and the creator iframe. _boot is the in-flight
+  // bootstrap's cancellation plane (null when idle).
   _assets: null,
+  _boot: null,
   _creator: null,
   _creatorReady: null,
   _windowListener: false,
@@ -121,10 +349,15 @@ const PythonRuntime = {
   _queuedRuns: new Set(),
 
   // Everything below runs in the TRUSTED harness phase: creator iframe
-  // spawn, fixed-asset fetch, bootstrap delivery, lock confirmation. A
-  // failure tears the whole stack down so the next run rebuilds from
-  // scratch (arrived assets stay cached).
-  async _ensureWorker(signal) {
+  // spawn, verified asset acquisition, bootstrap delivery, lock
+  // confirmation - each stage under its OWN budget (F04c): acquisition
+  // (download + integrity) <= PYTHON_ASSET_TIMEOUT_MS; initialization
+  // (creator ready + worker spawn + in-memory boot + lockdown) <=
+  // PYTHON_BOOTSTRAP_TIMEOUT_MS, paused while acquisition runs. Neither
+  // shares the 30s user-execution budget, and every stage's error says
+  // which phase failed. A failure tears the whole stack down so the next
+  // run rebuilds from scratch (verified assets stay cached).
+  async _ensureWorker(signal, budgets) {
     if (this.worker) return;
     throwIfCancelled(signal, 'python execution');
     this._setStatus('loading');
@@ -135,17 +368,16 @@ const PythonRuntime = {
       this._setStatus('cold');
       throw new Error('python worker source not found');
     }
-    // Race every harness-side stage against the standard budget — a hung
-    // CDN fetch or a lost creator message must fail the run loudly, never
-    // wedge the serialized queue.
-    const guard = (p) => Promise.race([p, new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(
-        'python runtime bootstrap timed out after ' + PYTHON_TIMEOUT_MS + 'ms')), PYTHON_TIMEOUT_MS);
-      p.then(() => clearTimeout(timer), () => clearTimeout(timer));
-    })]);
+    const b = pythonBootstrapBudgets(budgets);
+    const boot = openBootstrapAbort(signal);
+    this._boot = boot;
+    // Initialization budget: creator ready + worker spawn + worker boot
+    // reply. PAUSED around acquisition, which owns its own budget.
+    const initClock = makeBudgetClock(b.bootstrapMs);
     try {
-      await guard(this._creatorReady);
+      await raceBootStage(this._creatorReady, boot, initClock, () => pythonInitTimeoutError(b.bootstrapMs));
       throwIfCancelled(signal, 'python execution');
+      throwIfBootAborted(boot);
       if (!this._creator) throw new Error('python creator iframe lost');
       this._creator.contentWindow.postMessage({ type: 'spawn', workerSrc: srcEl.textContent }, '*');
       this.worker = {
@@ -153,22 +385,32 @@ const PythonRuntime = {
         onerror: (e) => this._onWorkerFatal(e),
         terminate: () => { this._destroyCreator(); },
       };
-      // TRUSTED HARNESS PHASE: fetch the FIXED asset set and hand it to
-      // the worker. The bytes travel by postMessage; the worker itself
-      // performs zero bootstrap network requests (its CSP forbids them).
-      const assets = await guard(this._loadAssets(signal));
+      // TRUSTED HARNESS PHASE: acquire the pinned asset set on its OWN
+      // budget - raw-byte bounded reads + SHA-256 verification (F04c) -
+      // then hand the VERIFIED bytes to the worker. The bytes travel by
+      // postMessage; the worker itself performs zero bootstrap network
+      // requests (its CSP forbids them).
+      initClock.pause();
+      let assets;
+      try {
+        assets = await this._loadAssets(signal, boot, b);
+      } finally {
+        initClock.resume();
+      }
       throwIfCancelled(signal, 'python execution');
+      throwIfBootAborted(boot);
       const id = ++this._reqId;
-      const reply = await guard(new Promise((resolve) => {
+      const remaining = Math.max(initClock.remaining(), 0);
+      const reply = await new Promise((resolve) => {
         this._pending.set(id, {
           resolve,
           timer: setTimeout(() => {
             this._pending.delete(id);
-            resolve({ error: 'python runtime bootstrap timed out after ' + PYTHON_TIMEOUT_MS + 'ms' });
-          }, PYTHON_TIMEOUT_MS),
+            resolve({ error: pythonInitTimeoutError(b.bootstrapMs).message });
+          }, remaining),
         });
         this._postToWorker({ id: id, cmd: 'bootstrap', assets: assets });
-      }));
+      });
       if (reply.error) throw new Error(reply.error);
       if (reply.status !== 'locked') throw new Error('python runtime bootstrap did not lock');
     } catch (e) {
@@ -176,6 +418,9 @@ const PythonRuntime = {
       this._destroyCreator();
       this._setStatus('cold');
       throw e;
+    } finally {
+      boot.dispose();
+      if (this._boot === boot) this._boot = null;
     }
   },
 
@@ -254,40 +499,99 @@ const PythonRuntime = {
     // A fatal worker error kills the interpreter: fail pending calls AND
     // destroy the creator stack so the next run boots a fresh one.
     // (Ordinary Python exceptions never reach here — they come back as
-    // result.error.)
+    // result.error.) An in-flight bootstrap is aborted first, so its
+    // acquisition stops and cannot complete into state afterwards.
     const message = 'worker error: ' + (e && e.message ? e.message : 'unknown');
+    this._failBoot(bootstrapAssetError(message, 'python_worker_fatal'));
     this._destroyCreator();
     this._failAllPending(message);
     this._setStatus('cold');
   },
 
-  // Fixed-asset fetch (trusted harness). Sequential to bound CDN pressure;
-  // the browser HTTP cache serves repeats. Cached in memory on success so
-  // worker rebuilds never re-download.
-  async _loadAssets(signal) {
+  // Fixed-asset acquisition (trusted harness, F04c). Every asset comes
+  // from its pinned URL as raw bytes bounded at the manifest's exact size
+  // and SHA-256-verified BEFORE text decoding; only the complete verified
+  // set is cached or delivered. The overall acquisition deadline aborts
+  // the whole boot (fetch + body reads) with a labelled timeout; any other
+  // failure fails the boot too, so nothing keeps downloading after a
+  // mismatch. The page-session cache survives worker crashes and resets -
+  // a verified rebuild never re-downloads (zero network).
+  async _loadAssets(signal, boot, budgets) {
     if (this._assets) return this._assets;
-    const out = {};
-    const failures = [];
-    for (const a of PYTHON_BOOTSTRAP_ASSETS) {
-      throwIfCancelled(signal, 'python execution');
-      let res = null;
-      try {
-        res = await fetch(PYODIDE_BASE + a.name, { cache: 'default' });
-      } catch (e) {
-        failures.push(a.name + ': ' + (e && e.message ? e.message : String(e)));
-        continue;
-      }
-      if (!res.ok) {
-        failures.push(a.name + ': HTTP ' + res.status);
-        continue;
-      }
-      out[a.name] = a.kind === 'text'
-        ? { text: await res.text(), mime: a.mime }
-        : { buffer: await res.arrayBuffer(), mime: a.mime };
+    if (!sha256Available()) {
+      throw pythonAssetIntegrityError('(context)', 'unavailable',
+        'WebCrypto subtle is not available here; refusing to bootstrap unverified assets');
     }
-    if (failures.length) throw new Error('Python runtime assets unavailable: ' + failures.join('; '));
-    this._assets = out;
-    return out;
+    const deadlineTimer = setTimeout(() => {
+      boot.fail(pythonAssetTimeoutError(
+        'Python runtime asset acquisition timed out after ' + budgets.assetMs + 'ms'));
+    }, Math.max(budgets.assetMs, 0));
+    try {
+      const out = {};
+      for (const entry of PYTHON_BOOTSTRAP_MANIFEST) {
+        throwIfCancelled(signal, 'python execution');
+        throwIfBootAborted(boot);
+        const bytes = await this._acquireAsset(entry, boot, budgets);
+        out[entry.name] = entry.kind === 'text'
+          ? { text: new TextDecoder('utf-8').decode(bytes), mime: entry.mime } // decode AFTER integrity passed
+          : { buffer: bytes.buffer, mime: entry.mime };
+      }
+      // Single-threaded: an abort can only land at an await boundary, so a
+      // cancelled/timed-out/mismatched acquisition cannot slip past these
+      // checks into the cache write. Only 10/10 verified bytes get here.
+      throwIfCancelled(signal, 'python execution');
+      throwIfBootAborted(boot);
+      this._assets = out;
+      return out;
+    } catch (e) {
+      boot.fail(e); // stop every remaining acquisition boundary, best effort
+      throw e;
+    } finally {
+      clearTimeout(deadlineTimer);
+    }
+  },
+
+  // Acquire ONE manifest asset: fetch from the pinned URL under the boot's
+  // abort signal, read exactly manifest-size raw entity bytes, SHA-256
+  // verify against the manifest. The URL is manifest-derived only - user
+  // input can never vary it (no path/query/fallback).
+  async _acquireAsset(entry, boot, budgets) {
+    const signal = boot.ac.signal;
+    let res;
+    try {
+      // force-cache: the manifest pins the exact content, so ANY cached copy
+      // is acceptable (a wrong one fails the SHA-256 gate downstream). The
+      // browser HTTP cache then serves warm boots with zero network even
+      // when freshness heuristics would revalidate.
+      res = await fetch(PYODIDE_BASE + entry.name, { signal, cache: 'force-cache' });
+    } catch (e) {
+      if (signal.aborted) throw (signal.reason || e); // deadline/cancel/reset reason is authoritative
+      throw pythonAssetUnavailable('Python runtime asset unavailable: ' + entry.name
+        + ' (' + (e && e.name ? e.name + ': ' : '') + (e && e.message ? e.message : String(e)) + ')');
+    }
+    if (!res.ok) {
+      throw pythonAssetUnavailable('Python runtime asset unavailable: ' + entry.name + ' (HTTP ' + res.status + ')');
+    }
+    let bytes;
+    try {
+      bytes = await readBodyBounded(res, entry, budgets.assetStallMs);
+    } catch (e) {
+      if (signal.aborted) throw (signal.reason || e);
+      throw e;
+    }
+    const hex = await sha256Hex(bytes);
+    if (hex !== entry.sha256) {
+      throw pythonAssetIntegrityError(entry.name, 'sha256 mismatch');
+    }
+    return bytes;
+  },
+
+  // Abort any in-flight bootstrap attempt: acquisition fetches and body
+  // reads stop at the next boundary, and a late completion can never
+  // mutate runtime state or the asset cache afterwards (re-checked at
+  // every await). No-op when idle.
+  _failBoot(reason) {
+    if (this._boot) this._boot.fail(reason || makeCancelledError('python bootstrap'));
   },
 
   // Terminate the worker stack (timeout, cancellation, fatal error), fail
@@ -302,6 +606,9 @@ const PythonRuntime = {
   // modules, /tmp files, pending state). Called on workspace switch and
   // on explicit session reset so no Python state leaks across sessions.
   reset() {
+    // An in-flight bootstrap belongs to the dying session: abort its
+    // acquisition (verified assets stay cached - they are stateless bytes).
+    this._failBoot(makeCancelledError('python runtime reset (session boundary)'));
     if (this.worker || this._pending.size) {
       this._killWorker('python runtime reset (session boundary)');
     }
@@ -336,7 +643,8 @@ const PythonRuntime = {
   // Run Python code with every VFS data mount mirrored in — serialized:
   // concurrent callers queue up and each gets the interpreter exclusively
   // for its whole transaction (mirror-in → worker execution → commit).
-  // See _runOnce for the per-run contract.
+  // See _runOnce for the per-run contract. opts.bootstrapBudgets is a
+  // TEST-ONLY seam shrinking the bootstrap budgets (never used in prod).
   async run(code, vfs, opts) {
     const entry = { killed: false, reason: null };
     this._queuedRuns.add(entry);
@@ -377,7 +685,7 @@ const PythonRuntime = {
   // }
   async _runOnce(code, vfs, opts) {
     const signal = opts && opts.signal;
-    await this._ensureWorker(signal);
+    await this._ensureWorker(signal, opts && opts.bootstrapBudgets);
     throwIfCancelled(signal, 'python execution');
 
     // Mirror every data mount: files are collected from each provider with
