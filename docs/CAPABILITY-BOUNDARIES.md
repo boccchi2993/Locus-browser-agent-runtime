@@ -214,9 +214,16 @@ The harness should compose the machine; it should not continuously expand the ma
 
 A useful rule is:
 
+> **Capability composes them for the user.**  
 > **Plugin adds code.**  
 > **Skill adds knowledge.**  
 > **MCP adds authority.**
+
+The user operates on **Capabilities**, never on the internal components. A Capability
+is a named bundle of local code (Plugins), on-demand knowledge (Skills) and external
+authority requirements (MCP). Advanced UI may expand the components for inspection,
+but the components are the internal composition — not three separate user-facing
+configuration systems.
 
 ### 6.1 Plugin: code
 
@@ -371,7 +378,106 @@ Before adding a new core capability, ask:
 
 If the answer is simply "this domain would be convenient to have as a dedicated tool", it probably does not belong in core.
 
-## 11. Summary
+## 11. Capability composition runtime (v1, implemented)
+
+The composition layer exists (`src/extensions.js`, `tests/capability-composition.test.cjs`,
+`tests/e2e-capabilities.cjs`). It is architecture + mechanism only: the PRODUCTION
+catalogs are deliberately empty, and no product capability (spreadsheet, DOCX, PDF,
+GitHub, ...) is decided yet. Everything proven below uses TEST-ONLY synthetic
+descriptors injected through the manager constructor / e2e seam.
+
+### 11.1 Objects
+
+```
+CapabilityRegistry / PluginRegistry / SkillRegistry
+      (one validated catalog set per CapabilityManager; invalid trusted
+       catalogs FAIL LOUDLY at load — never skip-and-continue)
+CapabilityManager
+      enable / disable / setMcpState / listCapabilities
+      resolves + dedupes components by id (shared components stay
+      active while ANY enabled capability references them)
+TaskEnvironment
+      immutable per-task snapshot built by the harness at task start:
+      { capabilities, plugins (+ prepared payloads), skills, mcps,
+        pythonExtensionKey } — deeply frozen
+```
+
+```
+User enables Capability
+        |
+CapabilityManager.resolve
+        |
+Plugins + Skills + MCP requirements   (deduped by id)
+        |
+TaskEnvironment snapshot (frozen)
+        |
+AgentSession (per task: workspace binding + TaskEnvironment binding)
+```
+
+Capability states: `disabled` (not added), `needs-connection` (enabled locally, an
+MCP authority is not connected), `ready` (all required components available),
+`error` (local resolution failed — e.g. a plugin runtime whose provider is missing).
+`needs-connection` is never disguised as `ready`.
+
+### 11.2 Plugin semantics (v1)
+
+- Descriptor authority is ALWAYS `none`; any other authority is rejected at
+  validation. Plugins never gain network, browser-credential, DOM, API-key,
+  arbitrary parent-RPC or MCP authority.
+- `PluginRuntimeProvider` is the generic runtime seam
+  (`prepare(plugin, context) -> { files, imports }`); python / javascript / wasm
+  are recognized runtimes, but v1 exercises exactly one provider kind (python,
+  tests only). A future verified wheel loader plugs in here without touching the
+  Capability / Skill / Agent model.
+- Python plugin lifecycle: TaskEnvironment snapshot -> harness configures the
+  payload -> Python worker boots -> all enabled plugin modules installed into
+  site-packages -> smoke import -> READY. After that, `import <module>` works
+  like any preinstalled package. There is NO lazy-install-on-import, no runtime
+  download, no retry loop. A broken payload fails the boot closed.
+- Plugin payloads ride the bootstrap MESSAGE (post-`loadPackage`, pre-lockdown);
+  the F04c `PYTHON_BOOTSTRAP_MANIFEST` trust boundary is untouched.
+
+### 11.3 Skill semantics (v1)
+
+- Skills are trusted harness content: descriptor + guide body supplied by the
+  catalog, mounted read-only (`system-read-only`) at the FIXED path
+  `/usr/local/share/locus/skills/<skill-id>/SKILL.md`. Workspace files, uploads
+  and URLs can never shadow or supply a skill.
+- The system prompt carries the capability INDEX only: display names, guide paths,
+  honest availability phrasing. NEVER a skill body, plugin id, package manifest,
+  hash or Locus-internal API name. The model reads a guide with `cat` when — and
+  only when — the task needs it; the body then enters history as ordinary tool
+  output inside the existing `HISTORY_BUDGET_BYTES` accounting (lazy loading is
+  the token-budget feature).
+
+### 11.4 MCP semantics (v1)
+
+- A capability references MCP requirements by id; the requirement state
+  (`connected` / `needs-connection` / `unavailable`) lives in the manager.
+- Enabling a capability NEVER authorizes anything. Until an explicit connection
+  decision, requirements are `needs-connection`; the system prompt says the
+  authority is NOT available. No connector, transport, OAuth or credential
+  storage exists in v1.
+
+### 11.5 Snapshot + VFS semantics
+
+- `AgentSession.run(text, { workspace, taskEnvironment })` binds BOTH immutably
+  per task. UI enable/disable mutates the manager only; a running task keeps
+  its snapshot; changes apply to the NEXT `buildTaskEnvironment()`.
+- Per-task VFS forks mount: skill guides, `/mnt/plugins/<id>/plugin.json`
+  (safe descriptor introspection) and
+  `/usr/local/share/locus/capabilities/<id>/capability.json` (resolved safe
+  metadata + state) — all read-only, no payload bytes, secrets or internal
+  references. An empty environment mounts nothing.
+
+### 11.6 Deliberately not in v1
+
+No real product capabilities, no marketplace / remote manifests / plugin store,
+no MCP connector or OAuth, no PyPI / micropip / wheel-solver commitment, no
+persistent capability preferences (page-session only; reload resets), no new
+model-facing tools (`AGENT_TOOL_DEFINITIONS` stays bash + cloud_bash).
+
+## 12. Summary
 
 The intended architecture is:
 

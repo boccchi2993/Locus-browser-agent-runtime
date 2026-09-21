@@ -183,7 +183,29 @@ See `docs/CAPABILITY-BOUNDARIES.md`.
 
 Goal: allow the system to grow without expanding the core tool surface.
 
-### Capability registry
+### Capability composition runtime v1
+
+Status: implemented (`src/extensions.js`; unit coverage in
+`tests/capability-composition.test.cjs`, browser coverage in
+`tests/e2e-capabilities.cjs`).
+
+The user-facing product concept is the **Capability**: a composition of Plugins
+(code), Skills (knowledge) and MCP requirements (authority). Implemented:
+
+- [x] descriptor validators + validated catalog sets (invalid trusted catalogs fail loudly at load),
+- [x] CapabilityManager with enable/disable, shared-component dedupe (reference semantics, not naive booleans), and the four capability states (`disabled` / `needs-connection` / `ready` / `error`),
+- [x] immutable TaskEnvironment snapshots bound per agent task (UI mutations affect only the next task),
+- [x] compact system-prompt capability index; skill bodies lazy-read from the read-only VFS mount (never pre-injected, marker-pinned by tests),
+- [x] read-only introspection mounts: `/usr/local/share/locus/skills`, `/mnt/plugins/<id>/plugin.json`, `/usr/local/share/locus/capabilities/<id>/capability.json`,
+- [x] PluginRuntimeProvider seam + python plugin lifecycle (pre-READY install + smoke import; ordinary import afterwards, no lazy-install-on-import; F04a/b/c boundaries untouched),
+- [x] MCP requirement semantics with explicit connection state (never auto-authorized, never disguised as ready),
+- [x] Settings UI: Capabilities list with Add/Remove, component counts, connection-required state.
+
+The production catalogs are EMPTY by design: no product capability (spreadsheet,
+DOCX, PDF, GitHub, ...) has been decided. All v1 proofs use TEST-ONLY synthetic
+descriptors injected via the manager constructor / e2e seam.
+
+### Capability registry (original plan, now the resolved design)
 
 Introduce a provider-neutral registry describing available capabilities and dependencies.
 

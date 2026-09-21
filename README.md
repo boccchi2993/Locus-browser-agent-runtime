@@ -44,6 +44,7 @@ Remote computers should be escalation providers, not the default, for lightweigh
 - Browser-local persistence: conversations, presentation events, provider-native replay frames, normalized semantic history and settings live in IndexedDB; `/home/locus` and `/mnt/plugins` use durable OPFS when available
 - Explicit recovery semantics: in-flight runs reopen as `interrupted`, dangling tool calls remain archived but are excluded from the replay checkpoint, and same-provider replay is separate from cross-provider semantic projection
 - In-memory execution telemetry (tool, backend, operation, duration, UTF-8 bytes, success/error) + debug panel
+- **Capability composition layer (v1, architecture only)**: the user enables *Capabilities* — named compositions of local code (Plugins, authority always `none`), on-demand knowledge (Skills, read-only `/usr/local/share/locus/skills/...` guides the model `cat`s only when relevant — never pre-injected into the prompt) and external authority requirements (MCP, never auto-authorized; unconnected requirements surface as `needs-connection`, never disguised as ready). Each agent task binds an immutable `TaskEnvironment` snapshot (shared components dedupe; UI changes affect only the next task). Production catalogs are intentionally empty; tests inject synthetic capabilities. See [docs/CAPABILITY-BOUNDARIES.md](docs/CAPABILITY-BOUNDARIES.md) section 11
 
 ## Architecture
 
@@ -81,7 +82,7 @@ Browser Runtime
 
 The model should not need to care whether Python is Pyodide, a command is backed by WASM, or HTTP required a relay. `bash` is the Unix-like execution facade; `edit` is the target deterministic mutation interface; execution/filesystem/network are the runtime substrate beneath them.
 
-Plugins add code, Skills add knowledge, and MCP adds external authority. Capabilities such as Excel editing, RAG, ffmpeg, LibreOffice or compilers should normally be composed above the runtime rather than becoming new core tools.
+Plugins add code, Skills add knowledge, and MCP adds external authority — **Capabilities compose them for the user**. The user operates on Capabilities; the components are internal composition. Domain capabilities such as Excel editing, RAG, ffmpeg, LibreOffice or compilers should normally be composed above the runtime rather than becoming new core tools. Each agent task runs against a frozen `TaskEnvironment` — the resolved capability snapshot for that one task.
 
 A `cloud_bash` tool exists in the current interface but is not configured and always returns `success: false` with `Cloud execution is not configured.` It represents a future escalation provider for workloads that genuinely need a remote computer.
 
@@ -100,6 +101,7 @@ src/
   network.js          NetworkRuntime: direct fetch with transparent /fetch relay fallback
   workspace.js        WorkspaceAdapter + LocalDirectoryWorkspace (File System Access API provider)
   vfs.js              Linux-like VFS: VirtualWorkspace mount table + MemoryWorkspace/UploadWorkspace/SystemBinWorkspace
+  extensions.js       Capability Composition v1: descriptor validators, catalogs, CapabilityManager, frozen TaskEnvironment, PluginRuntimeProvider seam, read-only StaticFileWorkspace
   telemetry.js        in-memory execution log
   main.js             Vue bootstrap (+ ?e2e=1 / ?demo=… QA hooks)
   App.vue             three-region workspace shell
