@@ -116,22 +116,16 @@ async function main() {
       return 'installed';
     })()`);
 
-    // ---- CDN prewarm (harness-only): the 30s PYTHON_TIMEOUT_MS budget
-    // includes the cold bootstrap downloads; on a slow jsDelivr window the
-    // first run would time out and every worker kill would cascade. Fetch
-    // the pinned core + declared pandas closure through the page first so
-    // every worker boot is served from the browser HTTP cache. ----
-    const prewarmUrls = [
-      'pyodide.js', 'pyodide.asm.js', 'pyodide.asm.wasm', 'pyodide-lock.json',
-      'python_stdlib.zip',
-      'pandas-2.2.0-cp312-cp312-pyodide_2024_0_wasm32.whl',
-      'numpy-1.26.4-cp312-cp312-pyodide_2024_0_wasm32.whl',
-      'python_dateutil-2.9.0.post0-py2.py3-none-any.whl',
-      'six-1.16.0-py2.py3-none-any.whl',
-      'pytz-2024.1-py2.py3-none-any.whl',
-    ];
+    // ---- CDN prewarm (harness-only): since F04c the 30s PYTHON_TIMEOUT_MS
+    // budget covers ONLY user execution; the bootstrap has its own
+    // independent acquisition/initialization budgets. Prewarming the
+    // browser HTTP cache keeps cold boots fast anyway. The URL set derives
+    // from the runtime's pinned manifest (single source of truth). ----
+    const { base: pyBase, manifest: pyManifest } =
+      require('./helpers/python-manifest.cjs').loadPythonManifest();
+    const prewarmUrls = pyManifest.map((a) => a.name);
     const prewarmResult = await evaluate(cdp, `(async () => {
-      const base = ${JSON.stringify('https://cdn.jsdelivr.net/pyodide/v0.26.4/full/')};
+      const base = ${JSON.stringify(pyBase)};
       const urls = ${JSON.stringify(prewarmUrls)};
       const deadline = Date.now() + 300000;
       const missing = [];

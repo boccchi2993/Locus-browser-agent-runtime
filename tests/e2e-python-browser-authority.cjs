@@ -51,27 +51,17 @@ const {
 const STRICT_CSP = "default-src 'none'; connect-src 'none'; "
   + "script-src 'unsafe-inline' 'unsafe-eval'; worker-src blob:; child-src blob:;";
 
-// The FIXED Pyodide 0.26.4 asset set (matches the runtime's pinned
-// PYODIDE_BASE + PYTHON_RUNTIME_PACKAGES closure). Harness-defined only --
-// nothing user-controlled ever reaches this list. The virtual origin keys
-// the in-memory resolver; `.invalid` is a reserved TLD that can never
-// resolve, and the resolver fail-closes on every URL it does not hold
-// EXACTLY (no path/query variation).
-const PYODIDE_VERSION = 'v0.26.4';
-const PYODIDE_CDN = 'https://cdn.jsdelivr.net/pyodide/' + PYODIDE_VERSION + '/full/';
+// The FIXED Pyodide 0.26.4 asset set — derived from the runtime's pinned
+// PYTHON_BOOTSTRAP_MANIFEST (src/shell.js, F04c single source of truth;
+// sizes/hashes verified by scripts/verify-python-bootstrap-manifest.mjs).
+// Harness-defined only -- nothing user-controlled ever reaches this list.
+// The virtual origin keys the in-memory resolver; `.invalid` is a reserved
+// TLD that can never resolve, and the resolver fail-closes on every URL it
+// does not hold EXACTLY (no path/query variation).
+const { loadPythonManifest } = require('./helpers/python-manifest.cjs');
+const { base: PYODIDE_CDN, manifest: PY_MANIFEST } = loadPythonManifest();
 const VIRTUAL_BASE = 'https://locus-bootstrap.invalid/';
-const ASSET_FILES = [
-  { name: 'pyodide.js', kind: 'text', mime: 'text/javascript' },
-  { name: 'pyodide.asm.js', kind: 'text', mime: 'text/javascript' },
-  { name: 'pyodide.asm.wasm', kind: 'bytes', mime: 'application/wasm' },
-  { name: 'pyodide-lock.json', kind: 'text', mime: 'application/json' },
-  { name: 'python_stdlib.zip', kind: 'bytes', mime: 'application/zip' },
-  { name: 'pandas-2.2.0-cp312-cp312-pyodide_2024_0_wasm32.whl', kind: 'bytes', mime: 'application/x-wheel' },
-  { name: 'numpy-1.26.4-cp312-cp312-pyodide_2024_0_wasm32.whl', kind: 'bytes', mime: 'application/x-wheel' },
-  { name: 'python_dateutil-2.9.0.post0-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/x-wheel' },
-  { name: 'six-1.16.0-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/x-wheel' },
-  { name: 'pytz-2024.1-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/x-wheel' },
-];
+const ASSET_FILES = PY_MANIFEST.map((a) => ({ name: a.name, kind: a.kind, mime: a.mime }));
 const ASSET_CACHE_DIR = path.join(__dirname, '..', 'tmp-f04b-probe', 'pyodide');
 
 async function evaluate(cdp, expression, timeoutMs) {

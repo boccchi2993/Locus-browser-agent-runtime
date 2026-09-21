@@ -140,6 +140,20 @@ function browserAuthorityE2e() {
   return r.status === 0;
 }
 
+
+// ---------- 6. python bootstrap integrity e2e (own servers + Chrome) ----------
+// F04c: verified acquisition + lifecycle budgets, driving the REAL
+// production runtime (src/shell.js + the real worker source) against a
+// local controllable asset server: hosted AND file:// modes, corrupt/stall/
+// silent-worker faults, verified-cache rebuild with zero network.
+function bootstrapIntegrityE2e() {
+  console.log('=== python bootstrap integrity e2e (tests/e2e-python-bootstrap.cjs) ===');
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'e2e-python-bootstrap.cjs')], {
+    stdio: 'inherit', env: process.env,
+  });
+  return r.status === 0;
+}
+
 async function main() {
   const results = [];
   results.push(['runtime', await runtimeE2e()]);
@@ -149,6 +163,7 @@ async function main() {
   else results.push(['presentation', !!pres], ['responsive', false]);
   results.push(['network', networkE2e()]);
   results.push(['python-browser-authority', browserAuthorityE2e()]);
+  results.push(['python-bootstrap-integrity', bootstrapIntegrityE2e()]);
   console.log('===');
   let failed = 0;
   for (const [name, ok] of results) {
