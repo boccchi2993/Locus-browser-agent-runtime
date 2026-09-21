@@ -171,15 +171,36 @@ async function main() {
       e2.success && e2.output.includes('sum=6 np=3'), JSON.stringify(e2).slice(0, 200));
 
     // ---- E3 (CASE C): js.fetch denied, ZERO requests arrive ----
+    // The denial semantic is the policy marker thrown by denyUserNetwork
+    // (index.html). The presentation copy after the marker stays pinned
+    // verbatim by the worker-source unit suite (python-authority.test.cjs
+    // DENY_MESSAGE). Measured flake: under heavy machine load Pyodide's
+    // JS->Python exception bridging can fail internally — the traceback then
+    // ends at the call site with "SystemError: error return without
+    // exception set" instead of the JsException carrying the marker, while
+    // the denial itself held (E3b stayed at ZERO requests). That
+    // presentation glitch is transient, so an attempt that failed WITHOUT
+    // presenting the marker is re-observed exactly once; the denial must be
+    // observed on the final attempt or E3 fails. E3b's window below spans
+    // every attempt.
+    const PYTHON_NETWORK_DENIED = 'Python network access is disabled in Locus';
+    const isPythonNetworkDenied = (r) => !!r && r.success === false
+      && typeof r.output === 'string' && r.output.includes(PYTHON_NETWORK_DENIED);
     let t = Date.now();
-    const e3 = await runPy([
+    const e3payload = [
       'import js',
       "js.fetch('" + PROBE + "/probe-hit')",
-    ]);
+    ];
+    let e3 = await runPy(e3payload);
+    if (!isPythonNetworkDenied(e3) && e3.success === false) {
+      console.log('# E3 attempt failed without presenting the denial; re-observing once');
+      e3 = await runPy(e3payload);
+    }
     const e3d = hitsTo('/probe-hit', t);
     check('E3 js.fetch attempt denied at the policy layer',
-      !e3.success && e3.output.includes('Python network access is disabled in Locus; use the shell curl command'),
-      JSON.stringify(e3).slice(0, 240));
+      isPythonNetworkDenied(e3),
+      JSON.stringify(e3).slice(0, 200) + ' …tail: '
+        + (e3 && typeof e3.output === 'string' ? e3.output.slice(-120) : ''));
     check('E3b js.fetch produced ZERO requests to the probe server', e3d === 0, 'delta=' + e3d);
 
     // ---- E4 (CASE D): pyodide.http.pyfetch denied, ZERO requests ----
@@ -198,6 +219,25 @@ async function main() {
     ]);
     const e4d = hitsTo('/probe-hit', t);
     check('E4 pyodide.http.pyfetch denied with ZERO requests', e4d === 0, 'delta=' + e4d);
+    // The E3 predicate is a denial semantic, not any-failure: it rejects a
+    // successful run, a SUCCESSFUL run that merely mentions the marker (E4's
+    // Python catches the pyfetch denial, so the marker lands in a success),
+    // the package-loading denial (a different policy), every
+    // infra-replaced output, and empty/non-object shapes.
+    check('E3c isPythonNetworkDenied separates the denial from every unrelated result shape',
+      isPythonNetworkDenied(e3)
+      && !isPythonNetworkDenied(e2)
+      && !isPythonNetworkDenied(e4)
+      && !isPythonNetworkDenied({ success: false, output: 'Python package loading is controlled by the Locus runtime; declared runtime packages are provided automatically' })
+      && !isPythonNetworkDenied({ success: false, output: 'python execution timed out after 30000ms' })
+      && !isPythonNetworkDenied({ success: false, output: 'worker error: simulated fatal' })
+      && !isPythonNetworkDenied({ success: false, output: 'python runtime reset (session boundary)' })
+      && !isPythonNetworkDenied({ success: true, output: PYTHON_NETWORK_DENIED })
+      && !isPythonNetworkDenied(null)
+      && !isPythonNetworkDenied(undefined)
+      && !isPythonNetworkDenied({})
+      && !isPythonNetworkDenied({ success: false, output: '' }),
+      'predicate verdicts diverged');
 
     // ---- E5 (CASE E): micropip against a LOCAL wheel URL, ZERO requests ----
     t = Date.now();
