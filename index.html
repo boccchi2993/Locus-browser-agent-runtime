@@ -17,15 +17,36 @@
 -->
 <script type="text/worker" id="py-worker-src">
 // ============================================================
-//  PYODIDE WORKER  (protocol v2.1 — adds directory semantics)
-//  Loads Pyodide lazily on first run, executes Python against an
-//  in-memory mirror of the VFS data mounts, and reports back
-//  stdout / stderr / tracebacks / changed files+dirs (ABSOLUTE paths).
+//  PYODIDE WORKER  (protocol v3 — in-memory bootstrap)
+//  Executes Python against an in-memory mirror of the VFS data
+//  mounts and reports back stdout / stderr / tracebacks / changed
+//  files+dirs (ABSOLUTE paths).
 //
-//  Message in:  { id, cmd: 'run', code, cwd,
+//  AUTHORITY MODEL (F04b): this worker is created by the strict-CSP
+//  creator iframe (src/shell.js — see PY_CREATOR_CSP), so the BROWSER
+//  enforces "no network egress" on it (connect-src 'none', script-src
+//  without any loadable origin, worker-src blob:). Pyodide therefore
+//  cannot bootstrap from the CDN inside this worker — the TRUSTED
+//  harness (the page) fetches the FIXED asset set and delivers the
+//  bytes by postMessage. The worker boots Pyodide ENTIRELY from
+//  memory: pyodide.js / pyodide.asm.js are eval'd from text (never
+//  importScripts), and every fetch the loader makes (lock file, wasm,
+//  stdlib zip, package wheels) is served by a bootstrap-only
+//  in-memory resolver that fail-closes on every URL it does not hold
+//  EXACTLY (no path or query variation, no fallback to the native
+//  fetch, no CDN). After bootstrap the resolver's asset map is
+//  dropped and the F04a JS lockdown is applied as defense-in-depth —
+//  the browser policy remains the authoritative boundary either way.
+//
+//  Message in:  { id, cmd: 'bootstrap',
+//                 assets: { <name>: { text | buffer, mime } } }
+//               { id, cmd: 'run', code, cwd,
 //                 mounts: [{ root, readOnly,
 //                            files: [{ path(ABS), b64 }],
 //                            directories: [ABS] }] }
+//  Boot out:    { id, type: 'boot', status: 'locked' }
+//             | { id, type: 'boot', error }
+//  Status out:  { id, type: 'status', status: 'loading' | 'ready' }
 //  Result out:  { id, type: 'result', stdout, stderr, error,
 //                 files: [{ path(ABS), b64 }], deleted: [ABS files],
 //                 createdDirs: [ABS], deletedDirs: [ABS],
@@ -34,11 +55,17 @@
 //  `deleted` is FILES ONLY; directory creates/removals are reported in
 //  their own fields (createdDirs parent-first, deletedDirs child-first).
 // ============================================================
-const PYODIDE_BASE = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
+
+// Virtual origin the resolver answers for. `.invalid` is a reserved TLD
+// that can never resolve; the exact-URL keys mean a typo'd or tampered
+// URL simply fails closed. No request for this origin can leave the
+// worker even if the resolver were bypassed — the creator CSP already
+// blocks every real fetch.
+const VIRTUAL_BASE = 'https://locus-bootstrap.invalid/';
 
 // Harness-owned runtime packages: the ONLY Pyodide packages the worker
-// ever downloads, ONCE, during bootstrap and ALWAYS before user code
-// exists. What gets fetched is a code-auditable harness decision — never
+// ever installs, ONCE, during bootstrap and ALWAYS before user code
+// exists. What gets installed is a code-auditable harness decision — never
 // a side effect of a model-generated import (user-driven
 // loadPackagesFromImports is deliberately not part of this protocol).
 const PYTHON_RUNTIME_PACKAGES = ['pandas'];
@@ -54,6 +81,58 @@ let bootPhase = 'cold';
 // primitives are no longer pristine, so a same-worker retry would run user
 // code half-locked). The worker then self-destructs and the shell rebuilds.
 let lockdownAttempted = false;
+
+// Bootstrap assets, delivered by the trusted harness (cmd: 'bootstrap').
+// Held until the boot succeeds or fails permanently; dropped on lock so
+// user code can never treat them as a resource oracle.
+let receivedAssets = null;
+let assetsWaiter = null;
+
+function awaitAssets() {
+  if (receivedAssets) return Promise.resolve(receivedAssets);
+  if (!assetsWaiter) {
+    assetsWaiter = new Promise((resolve) => { assetsResolve = resolve; });
+  }
+  return assetsWaiter;
+}
+let assetsResolve = null;
+
+// ---- bootstrap-only in-memory asset resolver ----
+// Installed for the bootstrap window ONLY. Serves EXACTLY the URLs it
+// holds: full-string key match against VIRTUAL_BASE + name — no path
+// normalization, no query tolerance, no delegation to the native fetch.
+// Unknown URL: reject (fail closed). After the package set installs, the
+// asset map is dropped; the F04a lockdown then replaces the fetch slot
+// with the user-facing denial.
+let bootstrapAssets = null;
+
+function installBootstrapResolver(assets) {
+  bootstrapAssets = {};
+  for (const name of Object.keys(assets || {})) {
+    bootstrapAssets[VIRTUAL_BASE + name] = assets[name];
+  }
+  self.fetch = function (url) {
+    const u = String((url && url.url) || url);
+    const hit = bootstrapAssets && bootstrapAssets[u];
+    if (!hit) {
+      return Promise.reject(new TypeError(
+        'Locus Python bootstrap: no in-memory asset for ' + u));
+    }
+    const body = hit.text !== undefined ? hit.text : hit.buffer;
+    return Promise.resolve(new Response(body, {
+      status: 200,
+      headers: { 'content-type': hit.mime || 'application/octet-stream' },
+    }));
+  };
+}
+
+function textAsset(assets, name) {
+  const a = assets[name];
+  if (!a || typeof a.text !== 'string') {
+    throw new Error('Locus Python bootstrap: missing text asset: ' + name);
+  }
+  return a.text;
+}
 
 // ---- user-code authority boundary (denies, not a bridge) ----
 // Model-generated Python is LOCAL computation + filesystem. HTTP/HTTPS
@@ -97,12 +176,15 @@ function makeDenied() {
 // primitives (js.eval / run_js) — Pyodide's own run_js routes through
 // js.eval, so it dies with it.
 //
-// KNOWN RESIDUAL (F04a-R1, measured): the global `Function` constructor is
-// deliberately NOT denied — Pyodide's own glue calls it internally and
-// runPythonAsync breaks without it (runPythonAsync then fails with
-// "globals must be a real dict"). User code can therefore still reach
-// dynamic JS via js.Function or any native function's .constructor, and a
-// dynamic import() from there performs a real GET (see README, F04a-R1).
+// The global `Function` constructor stays native ON PURPOSE: Pyodide's
+// own glue needs it (runPythonAsync breaks without it) and F04b's
+// boundary does NOT rest on denying compute. Dynamic JS built via
+// js.Function or any native function's .constructor still executes —
+// but inside this worker the BROWSER's strict CSP (inherited from the
+// creator iframe) makes every network act it could attempt
+// (fetch/dynamic import/importScripts/nested workers) fail at the
+// platform level with ZERO requests. F04a lockdown + browser policy:
+// the JS layer is defense-in-depth, the CSP is the authority.
 const DENY_NAMES = ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource',
   'WebTransport', 'Worker', 'SharedWorker', 'RTCPeerConnection',
   'importScripts', 'caches', 'fetchLater', 'eval', 'loadPyodide'];
@@ -141,17 +223,15 @@ function applyNetworkLockdown(instance) {
       Object.defineProperty(owner, name, { value: denied, writable: false, configurable: false });
     }
   }
-  // KNOWN RESIDUAL (measured, deliberately NOT closed here): a native
-  // function's .constructor hands back the PRISTINE Function intrinsic
-  // (js.console.log.constructor("import('https://…')") performs a real
-  // network fetch), and denying Function.prototype.constructor BREAKS
-  // Pyodide's own interop (its JS glue identity-checks .constructor while
-  // crossing the PyProxy boundary — runPythonAsync then fails with
-  // "globals must be a real dict"). The slot therefore stays intact; the
-  // global eval/Function/loadPyodide denials below still close the direct
-  // dynamic-JS paths. Fully closing the reconstruction path needs a
-  // document-level CSP (blob workers inherit it) or an isolated-origin
-  // worker — out of scope for this boundary.
+  // F04b: the Function/.constructor reconstruction path is closed by the
+  // creator iframe's CSP, not by denying the intrinsic (denying Function or
+  // Function.prototype.constructor breaks Pyodide's own interop — its JS
+  // glue identity-checks .constructor while crossing the PyProxy boundary
+  // and runPythonAsync then fails with "globals must be a real dict").
+  // A reconstructed Function still executes local compute; every network
+  // act it could attempt is blocked by the browser with ZERO requests
+  // (pinned by tests/e2e-python-browser-authority.cjs and the flipped
+  // F04a-R1 assertions in tests/e2e-python-authority.cjs).
   // String-compile timers are eval in disguise ("code" handlers). Real
   // function handlers keep working (Pyodide/Emscripten schedule functions).
   // The SAME safe wrapper is installed at EVERY prototype-chain level that
@@ -251,18 +331,38 @@ function applyNetworkLockdown(instance) {
   }
 }
 
-// Pyodide is loaded lazily on the first run. Bootstrap order is the
-// authority boundary: core runtime -> declared packages -> NETWORK
-// LOCKDOWN -> ready. Bootstrap traffic (CDN core + pandas closure) uses
-// the pristine primitives; no user code has executed yet.
+// Pyodide is booted lazily on the first run, entirely from the in-memory
+// asset set the trusted harness delivered. Bootstrap order is the
+// authority boundary: core runtime -> declared packages -> DROP the
+// bootstrap resolver's asset map -> NETWORK LOCKDOWN -> ready. No user
+// code has executed yet; no network request is possible from this worker
+// at any point (the creator CSP sees to that — the resolver only ever
+// served memory).
 async function ensureLockedPyodide() {
   if (bootPhase === 'locked' && py) return py;
   if (!pyodideLoading) {
     bootPhase = 'booting';
     pyodideLoading = (async () => {
-      importScripts(PYODIDE_BASE + 'pyodide.js');
-      const instance = await loadPyodide({ indexURL: PYODIDE_BASE });
+      const assets = await awaitAssets();
+      installBootstrapResolver(assets);
+      // pyodide.js assigns globalThis.loadPyodide itself.
+      (0, eval)(textAsset(assets, 'pyodide.js'));
+      // pyodide.asm.js opens with "use strict", so its var stays inside
+      // the eval scope — export it explicitly. With the factory present,
+      // loadPyodide NEVER loads a script itself (no importScripts, no
+      // dynamic import): the browser loaders are never invoked.
+      (0, eval)(textAsset(assets, 'pyodide.asm.js')
+        + '\n;globalThis._createPyodideModule = _createPyodideModule;');
+      const instance = await loadPyodide({
+        indexURL: VIRTUAL_BASE,
+        lockFileURL: VIRTUAL_BASE + 'pyodide-lock.json',
+        stdLibURL: VIRTUAL_BASE + 'python_stdlib.zip',
+      });
       await instance.loadPackage(PYTHON_RUNTIME_PACKAGES);
+      // Bootstrap authority ends here: the asset map is dropped BEFORE the
+      // lockdown, in the same synchronous block — no user code can run in
+      // between, and a resolver with an empty map fails closed anyway.
+      bootstrapAssets = null;
       lockdownAttempted = true;
       applyNetworkLockdown(instance);
       return instance;
@@ -276,8 +376,8 @@ async function ensureLockedPyodide() {
     // retries from scratch (F14 semantics). AFTER a lockdown attempt the
     // bootstrap primitives themselves are denied — the worker is marked
     // permanently failed and self-destructs (onmessage rethrows uncaught,
-    // the shell's onerror rebuilds a fresh worker that re-bootstraps and
-    // re-locks).
+    // the shell's worker-fatal handler rebuilds a fresh worker that
+    // re-bootstraps and re-locks).
     pyodideLoading = null;
     py = null;
     bootPhase = lockdownAttempted ? 'failed' : 'cold';
@@ -492,6 +592,28 @@ function diffOut(manifest, beforeDirs, mounts) {
 
 self.onmessage = async (ev) => {
   const msg = ev.data || {};
+  if (msg.cmd === 'bootstrap') {
+    // Trusted harness phase: the fixed asset set arrives by postMessage.
+    // Idempotent — a repeat delivery while locked just re-acknowledges;
+    // while booting it is ignored (the boot consumes the first set).
+    if (receivedAssets) {
+      self.postMessage({ id: msg.id, type: 'boot', status: bootPhase === 'locked' ? 'locked' : 'pending' });
+      return;
+    }
+    receivedAssets = msg.assets || {};
+    if (assetsResolve) { const r = assetsResolve; assetsResolve = null; assetsWaiter = null; r(receivedAssets); }
+    try {
+      await ensureLockedPyodide();
+      self.postMessage({ id: msg.id, type: 'boot', status: 'locked' });
+    } catch (e) {
+      self.postMessage({ id: msg.id, type: 'boot', error: String(e && e.message ? e.message : e) });
+      if (bootPhase === 'failed') {
+        // Uncaught worker error -> creator relay -> shell rebuild.
+        setTimeout(() => { throw new Error('Python worker failed to apply the network lockdown'); }, 0);
+      }
+    }
+    return;
+  }
   if (msg.cmd !== 'run') return;
   const id = msg.id;
   if (bootPhase === 'failed') {
@@ -500,6 +622,9 @@ self.onmessage = async (ev) => {
   }
   try {
     self.postMessage({ id: id, type: 'status', status: 'loading' });
+    // If the run arrived before the bootstrap message, this await holds it
+    // until the assets land (the shell always delivers bootstrap first; a
+    // lost bootstrap surfaces as the shell's run timeout).
     await ensureLockedPyodide();
     self.postMessage({ id: id, type: 'status', status: 'ready' });
 

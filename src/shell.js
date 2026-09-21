@@ -25,12 +25,91 @@ function throwIfCancelled(signal, what) {
   if (signal && signal.aborted) throw makeCancelledError(what || 'operation');
 }
 
-// ---------- Python runtime bridge (Web Worker + lazy Pyodide) ----------
+// ---------- Python runtime bridge (strict-CSP creator iframe + Pyodide) ----------
+// TRUSTED HARNESS PHASE / USER EXECUTION PHASE (F04b): the page fetches the
+// FIXED Pyodide asset set from the pinned CDN and delivers the bytes into a
+// worker created by a strict-CSP srcdoc iframe. From the moment untrusted
+// Python executes, the BROWSER — not JS monkey-patching — makes arbitrary
+// network egress impossible: the worker inherits the creator's CSP
+// (connect-src 'none', script-src with no loadable origin, worker-src
+// blob:), so fetch/XHR/WS/EventSource/importScripts/dynamic import/nested
+// remote workers all fail at the platform level with ZERO requests while
+// Function/eval/WebAssembly compute keeps working. The F04a JS lockdown
+// inside the worker stays as defense-in-depth with clean denial semantics.
+
+// The ONLY Pyodide URLs the trusted page ever fetches. Harness-defined
+// constants — nothing user-controlled can reach this list. The exact set
+// is pinned end to end by tests/e2e-python-browser-authority.cjs: every
+// fetch the loader performs resolves against it, and anything missing
+// fails closed inside the worker (never a CDN fallback).
+const PYODIDE_BASE = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
+const PYTHON_BOOTSTRAP_ASSETS = [
+  { name: 'pyodide.js', kind: 'text', mime: 'text/javascript' },
+  { name: 'pyodide.asm.js', kind: 'text', mime: 'text/javascript' },
+  { name: 'pyodide.asm.wasm', kind: 'bytes', mime: 'application/wasm' },
+  { name: 'pyodide-lock.json', kind: 'text', mime: 'application/json' },
+  { name: 'python_stdlib.zip', kind: 'bytes', mime: 'application/zip' },
+  { name: 'pandas-2.2.0-cp312-cp312-pyodide_2024_0_wasm32.whl', kind: 'bytes', mime: 'application/octet-stream' },
+  { name: 'numpy-1.26.4-cp312-cp312-pyodide_2024_0_wasm32.whl', kind: 'bytes', mime: 'application/octet-stream' },
+  { name: 'python_dateutil-2.9.0.post0-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream' },
+  { name: 'six-1.16.0-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream' },
+  { name: 'pytz-2024.1-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream' },
+];
+
+// The creator iframe's strict policy. No http/https/blob/data source in
+// script-src means no browser loader (script tag, importScripts, dynamic or
+// static import) has anything to load; connect-src 'none' kills every
+// fetch/XHR/WS/EventSource/sendBeacon; worker-src blob: allows only
+// harness-created Blob workers (a nested one inherits the same policy).
+// unsafe-eval stays because Pyodide's interop needs dynamic JS compute —
+// the boundary is network authority, never compute.
+const PY_CREATOR_CSP = "default-src 'none'; connect-src 'none'; "
+  + "script-src 'unsafe-inline' 'unsafe-eval'; worker-src blob:; child-src blob:;";
+
+// The creator document: meta CSP + a minimal relay that spawns the Blob
+// worker and pipes messages both ways. Kept printable-ASCII on purpose —
+// srcdoc is string-in-string HTML and any multi-byte character is a
+// decoding accident waiting to happen.
+const PY_CREATOR_DOC = (function () {
+  const relay = [
+    '(function () {',
+    '  var worker = null;',
+    '  window.addEventListener("message", function (ev) {',
+    '    if (ev.source !== parent) return;',
+    '    var d = ev.data || {};',
+    '    if (d.type === "spawn" && !worker) {',
+    '      var url = URL.createObjectURL(new Blob([d.workerSrc], { type: "text/javascript" }));',
+    '      try {',
+    '        worker = new Worker(url);',
+    '      } finally {',
+    '        URL.revokeObjectURL(url);',
+    '      }',
+    '      worker.onmessage = function (e2) { parent.postMessage(e2.data, "*"); };',
+    '      worker.onerror = function (e3) { parent.postMessage({ type: "worker-fatal",',
+    '        message: (e3 && e3.message) || "unknown" }, "*"); };',
+    '    } else if (worker && (d.cmd === "bootstrap" || d.cmd === "run")) {',
+    '      worker.postMessage(d);',
+    '    }',
+    '  });',
+    '  parent.postMessage({ type: "creator-ready" }, "*");',
+    '})();',
+  ].join('\n');
+  return '<!DOCTYPE html><html><head>'
+    + '<meta http-equiv="Content-Security-Policy" content="' + PY_CREATOR_CSP.replace(/"/g, '&quot;') + '">'
+    + '</head><body><script>' + relay.replace(/<\//g, '<\\/') + '<\/script></body></html>';
+})();
+
 const PythonRuntime = {
-  worker: null,
+  worker: null, // facade over the creator-relayed worker (null = cold)
   status: 'cold', // cold | loading | ready
   _reqId: 0,
   _pending: new Map(),
+  // Trusted-harness bootstrap state: the fixed asset cache (bytes live on
+  // the page; every worker boot clones them) and the creator iframe.
+  _assets: null,
+  _creator: null,
+  _creatorReady: null,
+  _windowListener: false,
   // Run serialization (F04a-A2): the worker answers messages one at a time
   // but its onmessage is ASYNC — overlapping run() calls would interleave
   // runPythonAsync/setStdout inside the worker and cross-contaminate stdout
@@ -41,53 +120,180 @@ const PythonRuntime = {
   // must not let a pre-reset run execute on a post-reset worker).
   _queuedRuns: new Set(),
 
-  _ensureWorker() {
+  // Everything below runs in the TRUSTED harness phase: creator iframe
+  // spawn, fixed-asset fetch, bootstrap delivery, lock confirmation. A
+  // failure tears the whole stack down so the next run rebuilds from
+  // scratch (arrived assets stay cached).
+  async _ensureWorker(signal) {
     if (this.worker) return;
-    const src = document.getElementById('py-worker-src').textContent;
-    const blob = new Blob([src], { type: 'text/javascript' });
-    // The Blob URL is only needed to construct the Worker; revoke it
-    // immediately so repeated worker timeout/recovery cycles do not
-    // accumulate live Blob URLs.
-    const workerUrl = URL.createObjectURL(blob);
-    try {
-      this.worker = new Worker(workerUrl);
-    } finally {
-      URL.revokeObjectURL(workerUrl);
+    throwIfCancelled(signal, 'python execution');
+    this._setStatus('loading');
+    this._ensureCreator();
+    const srcEl = document.getElementById('py-worker-src');
+    if (!srcEl || !srcEl.textContent) {
+      this._destroyCreator();
+      this._setStatus('cold');
+      throw new Error('python worker source not found');
     }
-    this.worker.onmessage = (ev) => {
-      const msg = ev.data || {};
-      const pending = this._pending.get(msg.id);
-      if (msg.type === 'status') {
-        this._setStatus(msg.status);
-        return;
+    // Race every harness-side stage against the standard budget — a hung
+    // CDN fetch or a lost creator message must fail the run loudly, never
+    // wedge the serialized queue.
+    const guard = (p) => Promise.race([p, new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(
+        'python runtime bootstrap timed out after ' + PYTHON_TIMEOUT_MS + 'ms')), PYTHON_TIMEOUT_MS);
+      p.then(() => clearTimeout(timer), () => clearTimeout(timer));
+    })]);
+    try {
+      await guard(this._creatorReady);
+      throwIfCancelled(signal, 'python execution');
+      if (!this._creator) throw new Error('python creator iframe lost');
+      this._creator.contentWindow.postMessage({ type: 'spawn', workerSrc: srcEl.textContent }, '*');
+      this.worker = {
+        postMessage: (msg) => { this._postToWorker(msg); },
+        onerror: (e) => this._onWorkerFatal(e),
+        terminate: () => { this._destroyCreator(); },
+      };
+      // TRUSTED HARNESS PHASE: fetch the FIXED asset set and hand it to
+      // the worker. The bytes travel by postMessage; the worker itself
+      // performs zero bootstrap network requests (its CSP forbids them).
+      const assets = await guard(this._loadAssets(signal));
+      throwIfCancelled(signal, 'python execution');
+      const id = ++this._reqId;
+      const reply = await guard(new Promise((resolve) => {
+        this._pending.set(id, {
+          resolve,
+          timer: setTimeout(() => {
+            this._pending.delete(id);
+            resolve({ error: 'python runtime bootstrap timed out after ' + PYTHON_TIMEOUT_MS + 'ms' });
+          }, PYTHON_TIMEOUT_MS),
+        });
+        this._postToWorker({ id: id, cmd: 'bootstrap', assets: assets });
+      }));
+      if (reply.error) throw new Error(reply.error);
+      if (reply.status !== 'locked') throw new Error('python runtime bootstrap did not lock');
+    } catch (e) {
+      this.worker = null;
+      this._destroyCreator();
+      this._setStatus('cold');
+      throw e;
+    }
+  },
+
+  _ensureCreator() {
+    if (this._creator) return;
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('data-locus-py-creator', '');
+    iframe.setAttribute('title', 'python runtime');
+    iframe.style.display = 'none';
+    iframe.srcdoc = PY_CREATOR_DOC;
+    if (!this._windowListener) {
+      this._windowListener = true;
+      window.addEventListener('message', (ev) => this._onWindowMessage(ev));
+    }
+    this._creatorReady = new Promise((resolve) => {
+      const onReady = (ev) => {
+        const d = ev.data || {};
+        if (ev.source === iframe.contentWindow && d.type === 'creator-ready') {
+          window.removeEventListener('message', onReady);
+          resolve();
+        }
+      };
+      window.addEventListener('message', onReady);
+    });
+    document.body.appendChild(iframe);
+    this._creator = iframe;
+  },
+
+  _destroyCreator() {
+    if (this._creator) {
+      try { this._creator.remove(); } catch (e) {}
+      this._creator = null;
+    }
+    this._creatorReady = null;
+    this.worker = null;
+  },
+
+  _postToWorker(msg) {
+    const creator = this._creator;
+    const ready = this._creatorReady || Promise.resolve();
+    ready.then(() => {
+      if (creator && this._creator === creator && creator.contentWindow) {
+        creator.contentWindow.postMessage(msg, '*');
       }
-      if (msg.type === 'result' && pending) {
+    });
+  },
+
+  _onWindowMessage(ev) {
+    if (!this._creator || ev.source !== this._creator.contentWindow) return;
+    const msg = ev.data || {};
+    const pending = this._pending.get(msg.id);
+    if (msg.type === 'status') {
+      this._setStatus(msg.status);
+      return;
+    }
+    if (msg.type === 'boot') {
+      if (pending) {
         this._pending.delete(msg.id);
         clearTimeout(pending.timer);
         pending.resolve(msg);
       }
-    };
-    this.worker.onerror = (e) => {
-      // A fatal worker error kills the interpreter: fail pending calls AND
-      // destroy the worker so the next run boots a fresh one. (Ordinary
-      // Python exceptions never reach here — they come back as result.error.)
-      const message = 'worker error: ' + (e && e.message ? e.message : 'unknown');
-      if (this.worker) {
-        try { this.worker.terminate(); } catch (err) {}
-        this.worker = null;
-      }
-      this._failAllPending(message);
-      this._setStatus('cold');
-    };
+      return;
+    }
+    if (msg.type === 'worker-fatal') {
+      this._onWorkerFatal({ message: msg.message });
+      return;
+    }
+    if (msg.type === 'result' && pending) {
+      this._pending.delete(msg.id);
+      clearTimeout(pending.timer);
+      pending.resolve(msg);
+    }
   },
 
-  // Terminate the worker (timeout, cancellation, fatal error), fail every
-  // pending request, and reset so the next call boots a fresh worker.
-  _killWorker(reason) {
-    if (this.worker) {
-      try { this.worker.terminate(); } catch (e) {}
-      this.worker = null;
+  _onWorkerFatal(e) {
+    // A fatal worker error kills the interpreter: fail pending calls AND
+    // destroy the creator stack so the next run boots a fresh one.
+    // (Ordinary Python exceptions never reach here — they come back as
+    // result.error.)
+    const message = 'worker error: ' + (e && e.message ? e.message : 'unknown');
+    this._destroyCreator();
+    this._failAllPending(message);
+    this._setStatus('cold');
+  },
+
+  // Fixed-asset fetch (trusted harness). Sequential to bound CDN pressure;
+  // the browser HTTP cache serves repeats. Cached in memory on success so
+  // worker rebuilds never re-download.
+  async _loadAssets(signal) {
+    if (this._assets) return this._assets;
+    const out = {};
+    const failures = [];
+    for (const a of PYTHON_BOOTSTRAP_ASSETS) {
+      throwIfCancelled(signal, 'python execution');
+      let res = null;
+      try {
+        res = await fetch(PYODIDE_BASE + a.name, { cache: 'default' });
+      } catch (e) {
+        failures.push(a.name + ': ' + (e && e.message ? e.message : String(e)));
+        continue;
+      }
+      if (!res.ok) {
+        failures.push(a.name + ': HTTP ' + res.status);
+        continue;
+      }
+      out[a.name] = a.kind === 'text'
+        ? { text: await res.text(), mime: a.mime }
+        : { buffer: await res.arrayBuffer(), mime: a.mime };
     }
+    if (failures.length) throw new Error('Python runtime assets unavailable: ' + failures.join('; '));
+    this._assets = out;
+    return out;
+  },
+
+  // Terminate the worker stack (timeout, cancellation, fatal error), fail
+  // every pending request, and reset so the next call boots a fresh one.
+  _killWorker(reason) {
+    this._destroyCreator();
     this._failAllPending(reason || ('python execution timed out after ' + PYTHON_TIMEOUT_MS + 'ms'));
     this._setStatus('cold');
   },
@@ -171,8 +377,7 @@ const PythonRuntime = {
   // }
   async _runOnce(code, vfs, opts) {
     const signal = opts && opts.signal;
-    this._ensureWorker();
-    this._setStatus('loading');
+    await this._ensureWorker(signal);
     throwIfCancelled(signal, 'python execution');
 
     // Mirror every data mount: files are collected from each provider with
