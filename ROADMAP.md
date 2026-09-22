@@ -80,14 +80,14 @@ Goal: accept the small Unix vocabulary capable models already speak, so telemetr
 
 - [x] bounded command composition parsed by Locus itself (`;`, `&&`, `||`, `|`; no eval, no system shell),
 - [x] invocation-local virtual cwd (`cd`), every bash call starts at the workspace root, confinement preserved,
-- [x] `ls -a/-l/-h` incl. combined flags; `find`/`grep`/`head`/`tail`/`wc` subsets with explicit bounds and cancellation,
+- [x] `ls -a/-l/-h` incl. combined flags; `find`/`grep`/`head`/`tail`/`wc`/`sort` subsets with explicit bounds and cancellation,
 - [x] pipeline stdin consumers (`cat`/`grep`/`head`/`tail`/`wc`); piping into non-consumers fails loudly; 1 MiB inter-stage cap fails loudly; pipelines forward stdout only,
 - [x] stdout/stderr separated inside the executor; generalized redirection (`>`, `>>`, `2>`, `2>>`, `2>&1`) applied left to right,
 - [x] `mv` / `rm` as workspace-confined, cancellation-aware filesystem commands (`rm -rf /` hard-refused),
 - [x] one canonical capability registry drives runtime dispatch, `help`, and the system prompt,
 - [x] tool iteration budget raised 15 → 32.
 
-Explicitly deferred: `&`, `$()`, backticks, subshells, variables/export, glob expansion, input redirects, arbitrary file descriptors, `sed`/`awk`/`xargs`/`jq`/`sort` and friends.
+Explicitly deferred: `&`, `$()`, backticks, subshells, variables/export, glob expansion, input redirects, arbitrary file descriptors, `sed`/`awk`/`xargs`/`jq` and many other Unix utilities.
 
 ## V0.4 — UI rebuild and runtime substrate completion
 
@@ -111,7 +111,7 @@ The UI presents:
 - busy/cancel state (composer Cancel button + Escape),
 - telemetry in the context rail.
 
-Deferred seams, honestly marked in the UI rather than faked: file-upload attachments (no runtime pipeline yet), the terminal drawer (reserved, not wired), durable cross-reload conversation persistence (recents live for the page session only).
+The original V0.4 seams have since advanced: file uploads are mounted read-only at `/mnt/upload`; image attachments have a durable integrity-checked store and provider capability gate; conversations/provider-native replay state persist across reload through IndexedDB; `/home/locus` is durable through OPFS when available. The terminal drawer remains deliberately reserved and not wired.
 
 ### JavaScript userland runtime
 
@@ -141,43 +141,38 @@ Deterministic edits should fail clearly when a requested match is absent or ambi
 
 The final decision on whether edit is exposed as a shell compatibility command or a structured tool should be based on model reliability, not aesthetics.
 
-## Core Capability Freeze
+## Core capability boundary
 
-After V0.4, the default runtime target is:
+The current core boundary is intentionally small.
 
 ```
-Runtime substrate:
+Model-visible tools:
+  bash
+  cloud_bash   (unconfigured legacy/escalation stub)
+
+Browser substrate:
   Execution
   Filesystem
   Network
+  Perception
 
-Unix-like interface:
-  bash
-  edit
-
-Userland examples:
+Current local userland:
   Python
-  JavaScript
-  curl
-  file/Unix utilities
+  curl / HTTP
+  bounded Unix-like file/text commands
 
-Escalation:
-  cloud_bash (future provider)
+Extension/product layer:
+  Capability
+    -> Plugin (code)
+    -> Skill (knowledge)
+    -> MCP (authority)
 ```
 
-Python/JavaScript are execution environments and `curl` is a network frontend; they are not separate architectural primitives.
+There is **no current model-facing `edit` tool** and no JavaScript shell command. Deterministic editing and a JS userland runtime remain possible future providers, but documentation must not describe them as implemented.
 
-At this point, new domain-specific features should normally be implemented as extensions instead of new runtime primitives.
+A new core proposal must explain why it cannot be expressed through execution + filesystem + network + perception, a Plugin, a Skill, MCP, or another explicit provider boundary.
 
-A new core proposal must explain why it cannot be expressed through:
-
-- execution + filesystem + network,
-- Plugin,
-- MCP,
-- Skill,
-- or an execution backend/provider.
-
-See `docs/CAPABILITY-BOUNDARIES.md`.
+See `docs/ARCHITECTURE.md` and `docs/CAPABILITY-BOUNDARIES.md`.
 
 ## V0.5 — Extension layer
 
@@ -209,9 +204,33 @@ The production catalogs are EMPTY by design: no product capability (spreadsheet,
 DOCX, PDF, GitHub, ...) has been decided. All v1 proofs use TEST-ONLY synthetic
 descriptors injected via the manager constructor / e2e seam.
 
-### Capability registry (original plan, now the resolved design)
+### Documentation / terminology foundation
 
-Introduce a provider-neutral registry describing available capabilities and dependencies.
+Status: implemented.
+
+The repository now has a wiki-style documentation index and explicit design contracts for architecture, terminology, runtime lifecycle, security, extensions, and testing. `docs/` is the normative documentation source; audit snapshots and candidate plugin studies are explicitly non-normative.
+
+### Trusted Plugin Runtime v1
+
+Status: next extension-layer milestone.
+
+Goal: replace the test-only source-string Python plugin proof with a real trusted artifact pipeline while preserving the closed Capability/Skill model.
+
+Target contract:
+
+- fixed trusted Plugin descriptors and artifacts;
+- bounded acquisition by the trusted harness;
+- exact size + SHA-256 verification before bytes enter the Python worker;
+- no Plugin/Python network authority;
+- offline installation into a fresh runtime before READY;
+- smoke import before task execution;
+- verified cache/rebuild semantics;
+- synthetic wheel first; no production package/capability decision until the loader contract is proven;
+- no marketplace, arbitrary remote manifests, PyPI resolver, or model-triggered install in v1.
+
+### Capability registry (resolved design)
+
+Status: implemented as the Capability Composition v1 registry/manager model described above. It provides the provider-neutral description of available capabilities and dependencies.
 
 The registry should support:
 
