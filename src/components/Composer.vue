@@ -88,7 +88,7 @@
         </button>
       </div>
     </div>
-    <div class="composer-caption">Files and Python run locally in your browser. Only the model call leaves this machine.</div>
+    <div class="composer-caption">Files and Python run locally in your browser. Model requests and explicit network calls may leave this machine.</div>
   </div>
 </template>
 
