@@ -132,6 +132,19 @@ function capabilitiesE2e() {
   return r.status === 0;
 }
 
+// ---------- 3c. mutable skill instances e2e (own build + servers + Chrome) ----------
+// SkillDefinition/SkillInstance closure: durable capability-private
+// instances, install marker lifecycle, confirmation-gated mutations
+// (shell + python), TOCTOU/cancellation, reload reuse and Remove-reset.
+// Self-contained.
+function skillInstancesE2e() {
+  console.log('=== mutable skill instances e2e (tests/e2e-skill-instances.cjs) ===');
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'e2e-skill-instances.cjs')], {
+    stdio: 'inherit', env: process.env,
+  });
+  return r.status === 0;
+}
+
 
 // ---------- 4. network runtime e2e (own servers + Chrome) ----------
 function networkE2e() {
@@ -176,6 +189,7 @@ async function main() {
   if (Array.isArray(pres)) results.push(...pres);
   else results.push(['presentation', !!pres], ['responsive', false]);
   results.push(['capabilities', capabilitiesE2e()]);
+  results.push(['skill-instances', skillInstancesE2e()]);
   results.push(['network', networkE2e()]);
   results.push(['python-browser-authority', browserAuthorityE2e()]);
   results.push(['python-bootstrap-integrity', bootstrapIntegrityE2e()]);

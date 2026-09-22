@@ -5,10 +5,10 @@
 //
 //   E1  production catalog empty: clean boot, "No optional capabilities"
 //   E2  synthetic catalog injection: UI lists the capability
-//   E3  Add -> state ready
-//   E4  system prompt contains the capability index + skill guide path
+//   E3  Add -> state ready; durable instance + install marker materialized
+//   E4  system prompt contains the capability index + skill instance path
 //   E5  system prompt does NOT contain the skill body marker
-//   E6  cat SKILL.md during the task -> body readable (lazy loading)
+//   E6  cat ~/.skills/... during the task -> body readable (lazy loading)
 //   E7  ordinary `import locus_test_plugin` inside python -> 42
 //       (pre-READY install, no lazy-install-on-import, no network)
 //   E8  Remove -> NEXT task's prompt/environment no longer carry it
@@ -18,8 +18,11 @@
 //       available; no connector call, no auto-authorization
 //   E12 explicit connect -> ready in the NEXT snapshot only
 //   E13 /mnt/plugins introspection read-only (real shell, real fork)
-//   E14 /usr/local/share/locus/skills read-only
+//   E14 the old read-only skill mount is gone; instances live under ~/.skills
 //   E15 capability introspection read-only
+//
+// Mutable-skill-instance approval/lifecycle proofs live in
+// tests/e2e-skill-instances.cjs.
 //
 // Run: node tests/e2e-capabilities.cjs
 const fs = require('fs/promises');
@@ -44,13 +47,11 @@ const ASSET_CACHE_DIRS = [
 ];
 
 const SYNTH_PLUGIN_SRC = 'def answer():\n    return 42\n';
-const SYNTH_SKILL_BODY = [
-  '# Synthetic skill (TEST ONLY)',
-  '',
-  'Marker: SHOULD_ONLY_APPEAR_AFTER_SKILL_READ_7F91',
-  '',
-  'Use the Python package `locus_test_plugin` for this capability.',
-].join('\n');
+// The skill's default Markdown source lives in a real fixture file; the
+// descriptor is metadata ONLY and the source is injected into the
+// SkillSourceStore (never inline on the catalog entry). Loaded in main().
+const FIXTURE_SKILL_PATH = path.join(__dirname, 'fixtures', 'skills', 'synthetic-skill', 'SKILL.md');
+let SYNTH_SKILL_BODY = '';
 
 const SYNTH_CATALOGS = {
   plugins: [
@@ -58,18 +59,22 @@ const SYNTH_CATALOGS = {
     { id: 'shared-plugin', version: '2', displayName: 'Shared Plugin', runtime: 'python', authority: 'none', provides: { pythonImports: [] } },
   ],
   skills: [
-    { id: 'synthetic-skill', version: '1', displayName: 'Synthetic Skill', description: 'How to use the synthetic capability.', path: '/usr/local/share/locus/skills/synthetic-skill/SKILL.md', body: SYNTH_SKILL_BODY },
+    { id: 'synthetic-skill', version: '1', displayName: 'Synthetic Skill', description: 'How to use the synthetic capability.' },
   ],
   mcps: [
     { id: 'synthetic-service', displayName: 'Synthetic Service', description: 'TEST ONLY authority' },
   ],
   capabilities: [
     { id: 'synthetic-capability', version: '1', displayName: 'Synthetic Capability', description: 'TEST ONLY composition proof.', plugins: ['synthetic-python-plugin'], skills: ['synthetic-skill'], mcps: [] },
-    { id: 'cap-a', version: '1', displayName: 'Capability A', description: 'Shares a plugin.', plugins: ['shared-plugin'], skills: [], mcps: [] },
-    { id: 'cap-b', version: '1', displayName: 'Capability B', description: 'Shares the same plugin.', plugins: ['shared-plugin'], skills: [], mcps: [] },
+    { id: 'cap-a', version: '1', displayName: 'Capability A', description: 'Shares a plugin and the skill definition.', plugins: ['shared-plugin'], skills: ['synthetic-skill'], mcps: [] },
+    { id: 'cap-b', version: '1', displayName: 'Capability B', description: 'Shares the same plugin and skill definition.', plugins: ['shared-plugin'], skills: ['synthetic-skill'], mcps: [] },
     { id: 'synthetic-mcp-capability', version: '1', displayName: 'Synthetic MCP Capability', description: 'Requires an external authority.', plugins: [], skills: ['synthetic-skill'], mcps: ['synthetic-service'] },
   ],
 };
+
+// Injected together with the catalog: immutable default sources for the
+// synthetic SkillDefinitions (body loaded in main()).
+let SYNTH_SOURCES = null;
 
 async function evaluate(cdp, expression, timeoutMs) {
   const result = await cdp.send('Runtime.evaluate', {
@@ -100,6 +105,9 @@ async function main() {
     if (condition) { passed++; console.log('PASS ' + name); }
     else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + String(detail).slice(0, 400) : '')); }
   };
+
+  SYNTH_SKILL_BODY = await fs.readFile(FIXTURE_SKILL_PATH, 'utf8');
+  SYNTH_SOURCES = { 'synthetic-skill': { version: '1', source: SYNTH_SKILL_BODY } };
 
   // ---- build (always fresh, same policy as e2e-network) ----
   console.log('# building dist (vite build)');
@@ -187,9 +195,9 @@ async function main() {
       { process: chrome, phase: 'cap-empty-ui', timeoutMs: 10000, predicate: (v) => String(v).includes('No optional capabilities available yet') });
     check('E1b empty-catalog UI message', String(e1empty).includes('No optional capabilities available yet'), e1empty);
 
-    // ---- E2: inject the TEST-ONLY synthetic catalog + python provider ----
+    // ---- E2: inject the TEST-ONLY synthetic catalog + sources + provider ----
     await evaluate(cdp,
-      'window.__locus.capabilityComposition.injectTestCatalog(' + JSON.stringify(SYNTH_CATALOGS) + ');'
+      'window.__locus.capabilityComposition.injectTestCatalog(' + JSON.stringify(SYNTH_CATALOGS) + ', ' + JSON.stringify(SYNTH_SOURCES) + ');'
       + 'registerPluginRuntimeProvider("python", { prepare: async function () {'
       + '  return { files: { "locus_test_plugin.py": ' + JSON.stringify(SYNTH_PLUGIN_SRC) + ' }, imports: ["locus_test_plugin"] };'
       + '} }); "injected"');
@@ -213,12 +221,19 @@ async function main() {
     const e3includes = await evaluate(cdp,
       '(document.querySelector(\'[data-testid="capability-includes-synthetic-capability"]\')||{}).textContent || ""');
     check('E3c component counts rendered from the resolved set', /1 local software/.test(String(e3includes)) && /1 guidance/.test(String(e3includes)), e3includes);
+    const e3inst = await evaluate(cdp,
+      '(async function () { return await window.__locus.vfs.read("/home/locus/.skills/synthetic-capability/synthetic-skill.skill"); })()');
+    check('E3d Add materialized the durable capability-private instance',
+      e3inst === SYNTH_SKILL_BODY, String(e3inst).slice(0, 120));
+    const e3marker = await evaluate(cdp,
+      '(async function () { return await window.__locus.vfs.exists("/home/locus/.skills/synthetic-capability/.locus-installed.json"); })()');
+    check('E3e install marker written', e3marker === true, String(e3marker));
 
     // ---- task 1: the full lazy-skill + ordinary-import trajectory ----
     await evaluate(cdp,
       'window.__capEnvTask1 = window.__locus.capabilityComposition.taskEnvironment();'
       + 'window.__capE2E.replies = ' + JSON.stringify([
-        '```json\n{"tool":"bash","input":"cat /usr/local/share/locus/skills/synthetic-skill/SKILL.md"}\n```',
+        '```json\n{"tool":"bash","input":"cat /home/locus/.skills/synthetic-capability/synthetic-skill.skill"}\n```',
         // The fenced JSON must escape newlines exactly like a real model
         // would — raw control characters inside a JSON string literal are
         // invalid and the strict text fallback would reject the call.
@@ -232,10 +247,13 @@ async function main() {
     console.log('# task 1 took ' + Math.round((Date.now() - t1) / 100) / 10 + 's');
 
     const sys1 = await evaluate(cdp, 'window.__capE2E.requests.length ? window.__capE2E.requests[0].system : null');
-    check('E4 system prompt contains the capability index + guide path',
+    check('E4 system prompt contains the capability index + instance path',
       typeof sys1 === 'string' && sys1.includes('Synthetic Capability')
-      && sys1.includes('/usr/local/share/locus/skills/synthetic-skill/SKILL.md')
+      && sys1.includes('/home/locus/.skills/synthetic-capability/synthetic-skill.skill')
       && sys1.includes('## Capabilities'), typeof sys1 === 'string' ? sys1.slice(-600) : sys1);
+    check('E4b prompt points at NO other skill location', typeof sys1 === 'string' && !sys1.includes('/usr/local/share/locus/skills'));
+    check('E4c prompt states the behavior-mutation rule', typeof sys1 === 'string'
+      && /customized when the user asks/i.test(sys1) && /explicit user confirmation/i.test(sys1));
     check('E5 system prompt does NOT contain the skill body marker',
       typeof sys1 === 'string' && !sys1.includes('SHOULD_ONLY_APPEAR_AFTER_SKILL_READ_7F91'));
     check('E5b system prompt does NOT leak plugin ids or internal APIs',
@@ -251,12 +269,23 @@ async function main() {
     check('E7b no network/bootstrap chatter in the plugin run',
       !!pyOut && !/loadPackage|download|pyodide/i.test(pyOut), JSON.stringify(pyOut));
 
-    // ---- E8: Remove -> only the NEXT task changes ----
+    // ---- E8: Remove (two-step: Remove -> Confirm remove) -> only the NEXT task changes ----
     await evaluate(cdp, 'document.querySelector(\'[data-testid="capability-remove-synthetic-capability"]\').click(); "clicked"');
+    await waitForRuntimeCondition(cdp,
+      '!!document.querySelector(\'[data-testid="capability-remove-confirm-synthetic-capability"]\')',
+      { process: chrome, phase: 'cap-remove-confirm', timeoutMs: 5000 });
+    const e8warn = await evaluate(cdp,
+      '(document.querySelector(\'[data-testid="capability-remove-warning"]\')||{}).textContent || ""');
+    check('E8a0 destructive removal semantics are stated in the UI',
+      /deletes its customized guidance/.test(String(e8warn)) && /restores the default guidance/.test(String(e8warn)), e8warn);
+    await evaluate(cdp, 'document.querySelector(\'[data-testid="capability-remove-confirm-synthetic-capability"]\').click(); "confirmed"');
     const e8state = await waitForRuntimeCondition(cdp,
       '(window.__locus.capabilityComposition.list().find(function (c) { return c.id === "synthetic-capability"; }) || {}).state',
       { process: chrome, phase: 'cap-removed', timeoutMs: 10000, predicate: (v) => v === 'disabled' });
     check('E8a Remove -> state disabled', e8state === 'disabled', e8state);
+    const e8dirGone = await evaluate(cdp,
+      '(async function () { return await window.__locus.vfs.exists("/home/locus/.skills/synthetic-capability"); })()');
+    check('E8a1 Remove deleted the capability skill instance directory', e8dirGone === false, String(e8dirGone));
     await evaluate(cdp, 'window.__capE2E.mark2 = window.__capE2E.requests.length; window.__capE2E.replies = ["ok."]; "armed"');
     await evaluate(cdp, 'window.__locus.actions.submit("second task")', 60000);
     const sys2 = await evaluate(cdp, 'JSON.stringify(window.__capE2E.requests[window.__capE2E.mark2] || null)');
@@ -287,7 +316,7 @@ async function main() {
     check('E10 shared plugin resolves ONCE across two capabilities',
       e10.caps === 2 && e10.plugins.length === 1 && e10.plugins[0] === 'shared-plugin', JSON.stringify(e10));
     await evaluate(cdp,
-      '(async function () { window.__locus.capabilityComposition.disable("cap-a"); window.__locus.capabilityComposition.disable("cap-b"); return "off"; })()');
+      '(async function () { await window.__locus.capabilityComposition.disable("cap-a"); await window.__locus.capabilityComposition.disable("cap-b"); return "off"; })()');
     const e10b = await evaluate(cdp, 'window.__locus.capabilityComposition.taskEnvironment().plugins.length');
     check('E10b disabling both removes the shared plugin', e10b === 0, String(e10b));
 
@@ -331,10 +360,13 @@ async function main() {
       + ' return { writeBlocked: !w.success && /read-only/i.test(w.output), read: r.success && r.output.indexOf("\\"authority\\": \\"none\\"") !== -1 }; })()', 60000);
     check('E13 /mnt/plugins introspection readable + write refused', e13.writeBlocked && e13.read, JSON.stringify(e13));
     const e14 = await evaluate(cdp, '(async function () {'
-      + ' var w = await window.executeTool("bash", "echo injected > /usr/local/share/locus/skills/synthetic-skill/SKILL.md", window.__capFork, {});'
-      + ' var r = await window.executeTool("bash", "cat /usr/local/share/locus/skills/synthetic-skill/SKILL.md", window.__capFork, {});'
-      + ' return { writeBlocked: !w.success && /read-only/i.test(w.output), read: r.success && r.output.indexOf("SHOULD_ONLY_APPEAR_AFTER_SKILL_READ_7F91") !== -1 }; })()', 60000);
-    check('E14 skill mount readable + write refused (no workspace shadow)', e14.writeBlocked && e14.read, JSON.stringify(e14));
+      + ' var mounts = window.__locus.capabilityComposition.manager().taskVfsMounts(window.__locus.capabilityComposition.taskEnvironment());'
+      + ' var paths = mounts.map(function (m) { return m.path; });'
+      + ' var r = await window.executeTool("bash", "cat /home/locus/.skills/synthetic-capability/synthetic-skill.skill", window.__capFork, {});'
+      + ' return { oldMountGone: paths.indexOf("/usr/local/share/locus/skills") === -1,'
+      + '  read: r.success && r.output.indexOf("SHOULD_ONLY_APPEAR_AFTER_SKILL_READ_7F91") !== -1 }; })()', 60000);
+    check('E14 old skill body mount is gone; instance readable under ~/.skills (read is free)',
+      e14.oldMountGone && e14.read, JSON.stringify(e14));
     const e15 = await evaluate(cdp, '(async function () {'
       + ' var r = await window.executeTool("bash", "cat /usr/local/share/locus/capabilities/synthetic-capability/capability.json", window.__capFork, {});'
       + ' var w = await window.executeTool("bash", "echo x > /usr/local/share/locus/capabilities/synthetic-capability/capability.json", window.__capFork, {});'
