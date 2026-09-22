@@ -186,8 +186,9 @@ Goal: allow the system to grow without expanding the core tool surface.
 ### Capability composition runtime v1
 
 Status: implemented (`src/extensions.js`; unit coverage in
-`tests/capability-composition.test.cjs`, browser coverage in
-`tests/e2e-capabilities.cjs`).
+`tests/capability-composition.test.cjs` and `tests/skill-instances.test.cjs`,
+browser coverage in `tests/e2e-capabilities.cjs` and
+`tests/e2e-skill-instances.cjs`).
 
 The user-facing product concept is the **Capability**: a composition of Plugins
 (code), Skills (knowledge) and MCP requirements (authority). Implemented:
@@ -195,11 +196,14 @@ The user-facing product concept is the **Capability**: a composition of Plugins
 - [x] descriptor validators + validated catalog sets (invalid trusted catalogs fail loudly at load),
 - [x] CapabilityManager with enable/disable, shared-component dedupe (reference semantics, not naive booleans), and the four capability states (`disabled` / `needs-connection` / `ready` / `error`),
 - [x] immutable TaskEnvironment snapshots bound per agent task (UI mutations affect only the next task),
-- [x] compact system-prompt capability index; skill bodies lazy-read from the read-only VFS mount (never pre-injected, marker-pinned by tests),
-- [x] read-only introspection mounts: `/usr/local/share/locus/skills`, `/mnt/plugins/<id>/plugin.json`, `/usr/local/share/locus/capabilities/<id>/capability.json`,
+- [x] SkillDefinition = immutable publisher METADATA (inline source fields rejected at validation); the default Markdown source lives in a separate SkillSourceStore, keyed by skillId + version,
+- [x] durable capability-private SkillInstances at `/home/locus/.skills/<capability-id>/<skill-id>.skill` with a Harness-owned install marker (written last), rollback on partial installs, reload/re-enable reuse and Remove = reset; shared definitions materialize per capability and are NEVER deduped,
+- [x] compact system-prompt capability index pointing at the capability-private instance paths (only present instances; bodies never pre-injected),
+- [x] read-only introspection mounts: `/mnt/plugins/<id>/plugin.json`, `/usr/local/share/locus/capabilities/<id>/capability.json` (the old read-only skill body mount is gone — instances are the one working view),
+- [x] SkillInstanceWorkspace: the task-bound approval-guarded view of `/home/locus/.skills` — reads free; every create/write/delete (echo redirect, `>>`, curl -o, rm, python write-back commit) suspends on a `confirmation` approval with a harness-built diff, TOCTOU re-verification and cancellation; `mv` involving a skill instance and `rm -r` of a capability skill directory are refused outright,
 - [x] PluginRuntimeProvider seam + python plugin lifecycle (pre-READY install + smoke import; ordinary import afterwards, no lazy-install-on-import; F04a/b/c boundaries untouched),
 - [x] MCP requirement semantics with explicit connection state (never auto-authorized, never disguised as ready),
-- [x] Settings UI: Capabilities list with Add/Remove, component counts, connection-required state.
+- [x] Settings UI: Capabilities list with Add/Remove (two-step destructive confirm stating that removing deletes customized guidance and re-adding restores defaults), component counts, connection-required state.
 
 The production catalogs are EMPTY by design: no product capability (spreadsheet,
 DOCX, PDF, GitHub, ...) has been decided. All v1 proofs use TEST-ONLY synthetic
@@ -237,6 +241,19 @@ The first plugin system should be intentionally small. Do not start with a marke
 ### Skills
 
 Skills add task knowledge and composition guidance without adding authority.
+The v1 data model is closed (see `docs/CAPABILITY-BOUNDARIES.md` section 11):
+
+- **SkillDefinition** = the publisher's immutable metadata template
+  (id, version, display name, description). No inline source, ever.
+- **SkillSourceStore** = the trusted default Markdown per
+  `(skillId, version)`; future production sources arrive via build-time
+  bundling, never runtime fetches.
+- **SkillInstance** = a capability-private durable working copy at
+  `/home/locus/.skills/<capability-id>/<skill-id>.skill`. Definitions may
+  be shared; instances are NEVER shared. Reads are free; every
+  create/write/delete needs an explicit user confirmation (a behavior
+  mutation), and removing a capability deletes its instances — re-adding
+  restores the defaults.
 
 Examples:
 

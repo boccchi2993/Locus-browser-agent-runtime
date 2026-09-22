@@ -381,7 +381,8 @@ If the answer is simply "this domain would be convenient to have as a dedicated 
 ## 11. Capability composition runtime (v1, implemented)
 
 The composition layer exists (`src/extensions.js`, `tests/capability-composition.test.cjs`,
-`tests/e2e-capabilities.cjs`). It is architecture + mechanism only: the PRODUCTION
+`tests/skill-instances.test.cjs`, `tests/e2e-capabilities.cjs`,
+`tests/e2e-skill-instances.cjs`). It is architecture + mechanism only: the PRODUCTION
 catalogs are deliberately empty, and no product capability (spreadsheet, DOCX, PDF,
 GitHub, ...) is decided yet. Everything proven below uses TEST-ONLY synthetic
 descriptors injected through the manager constructor / e2e seam.
@@ -390,16 +391,24 @@ descriptors injected through the manager constructor / e2e seam.
 
 ```
 CapabilityRegistry / PluginRegistry / SkillRegistry
-      (one validated catalog set per CapabilityManager; invalid trusted
-       catalogs FAIL LOUDLY at load — never skip-and-continue)
+      (one validated catalog set per CapabilityManager; skill entries are
+       METADATA ONLY — default sources live in the SkillSourceStore;
+       invalid trusted catalogs FAIL LOUDLY at load — never
+       skip-and-continue)
 CapabilityManager
       enable / disable / setMcpState / listCapabilities
-      resolves + dedupes components by id (shared components stay
-      active while ANY enabled capability references them)
+      resolves + dedupes plugins and MCP requirements by id (shared
+      components stay active while ANY enabled capability references
+      them); materializes capability-PRIVATE durable skill instances
+      (never deduped — one per capability × declared skill)
 TaskEnvironment
       immutable per-task snapshot built by the harness at task start:
-      { capabilities, plugins (+ prepared payloads), skills, mcps,
-        pythonExtensionKey } — deeply frozen
+      { capabilities, plugins (+ prepared payloads), skill INSTANCES
+        (metadata + capability-private path + present, never a body),
+        mcps, pythonExtensionKey } — deeply frozen
+SkillInstanceWorkspace
+      the task-bound approval-guarded view of /home/locus/.skills
+      mounted on task forks (reads free; mutations ask every time)
 ```
 
 ```
@@ -407,7 +416,8 @@ User enables Capability
         |
 CapabilityManager.resolve
         |
-Plugins + Skills + MCP requirements   (deduped by id)
+Plugins + MCP requirements   (deduped by id)
+Skills -> per-capability durable instances (materialize or reuse marker)
         |
 TaskEnvironment snapshot (frozen)
         |
@@ -437,18 +447,108 @@ MCP authority is not connected), `ready` (all required components available),
 - Plugin payloads ride the bootstrap MESSAGE (post-`loadPackage`, pre-lockdown);
   the F04c `PYTHON_BOOTSTRAP_MANIFEST` trust boundary is untouched.
 
-### 11.3 Skill semantics (v1)
+### 11.3 Skill semantics (v1): definitions, sources, mutable instances
 
-- Skills are trusted harness content: descriptor + guide body supplied by the
-  catalog, mounted read-only (`system-read-only`) at the FIXED path
-  `/usr/local/share/locus/skills/<skill-id>/SKILL.md`. Workspace files, uploads
-  and URLs can never shadow or supply a skill.
-- The system prompt carries the capability INDEX only: display names, guide paths,
-  honest availability phrasing. NEVER a skill body, plugin id, package manifest,
-  hash or Locus-internal API name. The model reads a guide with `cat` when — and
-  only when — the task needs it; the body then enters history as ordinary tool
-  output inside the existing `HISTORY_BUDGET_BYTES` accounting (lazy loading is
-  the token-budget feature).
+The skill data model has three separate concepts:
+
+```
+SkillDefinition   = publisher's immutable METADATA template
+                    { id, version, displayName, description } — and nothing
+                    else. Inline source fields (body / content / markdown /
+                    inlineSource / path) are REJECTED at validation.
+SkillSourceStore  = the trusted default Markdown per (skillId, version).
+                    Separate from the metadata registry. Production stays
+                    empty; future production sources arrive via build-time
+                    bundling (raw import into the store), never a runtime
+                    fetch. file:// keeps working: nothing fetches skills.
+SkillInstance     = a capability-PRIVATE durable working copy at
+                    /home/locus/.skills/<capability-id>/<skill-id>.skill.
+                    The path IS the identity (capabilityId + skillId).
+```
+
+**Definitions may be shared. Instances are NEVER shared.** The same
+definition referenced by two capabilities materializes two independent
+files (byte-identical at first install, freely divergent afterwards);
+TaskEnvironment carries one entry per capability × skill — never deduped
+(plugins and MCP requirements still dedupe by id).
+
+Instance lifecycle (enable = materialize, disable = reset):
+
+- **Install marker**: `/home/locus/.skills/<capability-id>/.locus-installed.json`
+  records capabilityId, capabilityVersion and each skill's
+  id/sourceVersion/sourceHash. It is written LAST, after every default
+  instance materialized and was verified. It is Harness-owned: hidden from
+  shell listings, refused for every agent write/delete (including python
+  write-backs).
+- **First install**: create the directory, write all defaults, verify,
+  write the marker. Any failure ROLLS BACK the whole first install — no
+  half-installed state can ever "look enabled" (enable reports state
+  `error`).
+- **Marker present + compatible** (same capability version, same source
+  versions/hashes) → REUSE: user customizations and deliberate deletions
+  survive re-enables AND page reloads. Capability enabled-state stays
+  page-session only, but instances are durable OPFS files.
+- **Marker present + incompatible** → enable fails loudly with state
+  `error`; user skills are never auto-overwritten (a future upgrade/merge
+  path is out of scope for v1).
+- **Marker absent** → incomplete install: leftovers are cleaned and the
+  defaults rebuilt.
+- **Remove Capability** deletes the ENTIRE capability skill directory,
+  then disables the capability — customizations included. Re-adding
+  rematerializes from the immutable definitions. This is the v1
+  "restore defaults" path. Removal is an explicit user UI action (two-step
+  destructive confirm; no Agent ApprovalCard is involved), and a failed
+  deletion leaves the capability enabled with a visible error — it is
+  never reported as removed.
+
+### 11.3b Agent mutations of skill instances (approval contract)
+
+Skill instances are guidance the agent can CUSTOMIZE — a behavior
+mutation, a higher-risk class than ordinary workspace writes:
+
+- **READ: free.** `cat`, `ls` (marker hidden) and stat need no approval.
+- **CREATE / WRITE / DELETE: an explicit `confirmation` approval EVERY
+  time** (outcome confirm/cancel; no session grant exists for this kind;
+  no-op writes with identical bytes do not ask).
+- The gate is centralized in `SkillInstanceWorkspace`, a task-bound VFS
+  provider mounted at `/home/locus/.skills` on every task fork whose
+  environment carries skills. Shell redirects (`>`, `>>`), `curl -o`,
+  `rm <file>` and python write-back commits all funnel through the same
+  guard — never through per-command checks.
+- The approval card shows the harness-computed identity (Capability /
+  Skill / Path) and a real line diff of the change; deletes spell out that
+  the file stays absent until recreated or the capability is removed and
+  re-added. Oversized changes fail closed (files ≤ 256 KiB UTF-8, diffs
+  bounded) instead of showing a truncated diff. Binary skills are refused.
+- **TOCTOU**: the approved diff is applied only if the file's current
+  hash still matches the before-state hashed when the approval opened;
+  otherwise the mutation is refused as a conflict. The task AbortSignal is
+  re-checked after the decision and again before the side effect; task
+  cancellation cancels a pending confirmation.
+- **Identity check**: a task may only mutate skills declared by a
+  capability in ITS OWN TaskEnvironment snapshot (exact path match).
+  Undeclared skill ids, foreign capability directories, the skills root,
+  install markers, `mkdir`, directory removals, `mv` involving a skill
+  instance and `rm -r` of a capability skill directory all fail closed
+  without any mutation (`mv`/`rm -r` at the shell layer, the rest in the
+  guard).
+- **Python changeset honesty**: when a python run mixes ordinary writes
+  and skill mutations, a declined skill change is reported as a `[conflict:
+  …]` refusal — ordinary paths still commit, and the run reports partial
+  persistence instead of a fake success.
+- The system prompt advertises only PRESENT instance paths (a deleted
+  skill drops out of the index; the capability stays listed — guidance
+  absence is a customization, not a runtime error) and carries one compact
+  rule: capability guidance under `~/.skills` may be customized when the
+  user asks for future behavior changes, and such mutations require
+  explicit user confirmation from Locus.
+- Skill bodies still NEVER enter persistence or the system prompt: the
+  model reads a guidance file with `cat` when — and only when — the task
+  needs it, and the body then enters history as ordinary tool output
+  inside the existing `HISTORY_BUDGET_BYTES` accounting (lazy loading is
+  the token-budget feature). Workspace files, uploads and URLs can never
+  become or shadow a skill: only declared instance paths are mutable, and
+  even a model acting on injected file content hits the confirmation gate.
 
 ### 11.4 MCP semantics (v1)
 
@@ -463,19 +563,28 @@ MCP authority is not connected), `ready` (all required components available),
 
 - `AgentSession.run(text, { workspace, taskEnvironment })` binds BOTH immutably
   per task. UI enable/disable mutates the manager only; a running task keeps
-  its snapshot; changes apply to the NEXT `buildTaskEnvironment()`.
-- Per-task VFS forks mount: skill guides, `/mnt/plugins/<id>/plugin.json`
-  (safe descriptor introspection) and
-  `/usr/local/share/locus/capabilities/<id>/capability.json` (resolved safe
-  metadata + state) — all read-only, no payload bytes, secrets or internal
-  references. An empty environment mounts nothing.
+  its snapshot; changes apply to the NEXT `buildTaskEnvironment()`. The
+  snapshot freezes instance IDENTITY (capabilityId + skillId + path), not
+  file content: an approved in-task mutation changes the file, never the
+  frozen object, and the next build re-observes `present`.
+- Per-task VFS forks mount: `/mnt/plugins/<id>/plugin.json` (safe descriptor
+  introspection), `/usr/local/share/locus/capabilities/<id>/capability.json`
+  (resolved safe metadata + state) and — when the environment carries
+  skills — the guarded `SkillInstanceWorkspace` at `/home/locus/.skills`
+  (read-write authority, every mutation approval-gated). There is
+  deliberately NO second read-only skill view: the old
+  `/usr/local/share/locus/skills` body mount is gone, so exactly one
+  working view of each skill exists. An empty environment mounts nothing.
 
 ### 11.6 Deliberately not in v1
 
 No real product capabilities, no marketplace / remote manifests / plugin store,
 no MCP connector or OAuth, no PyPI / micropip / wheel-solver commitment, no
 persistent capability preferences (page-session only; reload resets), no new
-model-facing tools (`AGENT_TOOL_DEFINITIONS` stays bash + cloud_bash).
+model-facing tools (`AGENT_TOOL_DEFINITIONS` stays bash + cloud_bash), no
+skill upgrade/migration or three-way merge (incompatible markers fail loudly
+and the reset path is Remove + Re-add), no per-skill "Restore default" button,
+no remote skill download or arbitrary user skill install.
 
 ## 12. Summary
 
