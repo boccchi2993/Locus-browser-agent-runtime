@@ -540,6 +540,20 @@ skill upgrade/migration or three-way merge (incompatible markers fail loudly
 and the reset path is Remove + Re-add), no per-skill "Restore default" button,
 no remote skill download or arbitrary user skill install.
 
+### 11.7 Capability package core (v1, implemented)
+
+`src/capability-package.js` adds the AUTHORING/PACKAGE boundary described
+in [CAPABILITY-PACKAGE.md](CAPABILITY-PACKAGE.md) section 2b: a source
+project (strict manifest schemas + graph + authority + bounds + path
+rules) validates into structured diagnostics, builds into an immutable
+logical `CapabilityBundle` (builder-computed size + SHA-256, canonical
+deterministic lock, copy-out byte reads) and inspects into a safe plain
+summary. Validation and build are READ ONLY and install NOTHING: no
+catalog mutation, no plugin install, no skill materialization, no
+registration. The production catalogs stay empty; the module ships no
+production package - only TEST-ONLY fixtures under
+`tests/fixtures/capability-package/`.
+
 ## 12. Summary
 
 The intended architecture is:

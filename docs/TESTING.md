@@ -75,3 +75,12 @@ source project
 The self-hosting E2E goes one step further: Locus creates the source project through the same public authoring contract, but an explicit user action still performs the package trust/import transition.
 
 A test-only `replaceCatalogs` seam is acceptable for composition-unit tests and **not** acceptable as evidence that authoring/import works.
+
+The implemented package core is covered from the real source-project
+boundary: `tests/capability-package.test.cjs` loads the fixture project
+`tests/fixtures/capability-package/minimal` (including a byte-verified,
+RECORD-checked synthetic pure-Python wheel) through a
+`WorkspaceAdapter` provider and proves validation, deterministic build,
+byte isolation, safe inspect, bounds, path traversal rejection and
+zero-write behavior. That is unit evidence for validate/build/inspect
+only - it is NOT evidence that import, registration or enablement works.

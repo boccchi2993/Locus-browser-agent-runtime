@@ -65,6 +65,14 @@ project -> validate -> build -> explicit user import -> CapabilityManager -> Tas
 
 A model may author package files in a user-authorized workspace, but installation remains a separate explicit user trust action.
 
+The package CORE is implemented: `src/capability-package.js` validates a
+project, builds an immutable logical bundle (builder-computed sizes +
+SHA-256, canonical lock) and inspects it - with zero writes and zero
+trust transition. Import UI, imported-package registration and the
+Trusted Plugin Runtime that consumes verified artifact bytes remain
+pending. See [CAPABILITY-PACKAGE.md](CAPABILITY-PACKAGE.md) section 2b
+for the implemented normative facts.
+
 See [CAPABILITY-PACKAGE.md](CAPABILITY-PACKAGE.md) and [CAPABILITY-AUTHORING.md](CAPABILITY-AUTHORING.md).
 
 ## 6. Skills

@@ -1,6 +1,6 @@
 # Locus Capability Authoring and Self-Hosting
 
-> Status: **workflow/acceptance specification; implementation pending.**  
+> Status: **workflow/acceptance specification.** The package core (Phase A steps 1-3) is implemented in `src/capability-package.js` with coverage in `tests/capability-package.test.cjs`; the imported-package registry, import UI, CapabilityManager integration and Plugin artifact delivery remain pending.
 > Depends on: [CAPABILITY-PACKAGE.md](CAPABILITY-PACKAGE.md), [EXTENSION-MODEL.md](EXTENSION-MODEL.md), and Trusted Plugin Runtime v1.
 
 The goal is not merely to parse `capability.json`.
@@ -76,8 +76,11 @@ The stable contract is the operation, not those exact flags.
 Implement the minimum infrastructure required for a package to exist independently of the app source:
 
 1. package/project schema parser;
+   [implemented - `src/capability-package.js`: strict source-schema layer over the existing runtime validators]
 2. validator;
+   [implemented - `validateProject`: structured diagnostics, graph/authority/bounds, zero writes]
 3. deterministic builder + generated lock manifest;
+   [implemented - `buildProject`: byte-exact bundle, builder-computed size + SHA-256, canonical lock; `inspectBundle` provides the safe summary]
 4. page-session imported-package registry;
 5. explicit Capability UI import path;
 6. integration with CapabilityManager;

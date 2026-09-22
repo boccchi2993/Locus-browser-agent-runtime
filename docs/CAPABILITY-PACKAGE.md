@@ -1,6 +1,6 @@
 # Locus Capability Package Contract
 
-> Status: **design contract for the next extension-layer milestone; not implemented on current `main`.**  
+> Status: **package core implemented** — `src/capability-package.js` implements project validate, build, inspect, the immutable logical CapabilityBundle and the generated lock. Explicit import UI, the imported-package registry and the Trusted Plugin Runtime remain contract-only (pending).
 > Scope: how a Capability project is authored, validated, built, imported, and resolved without editing Locus runtime source.
 
 This document deliberately separates **the authoring/distribution package** from the **runtime Capability object**.
@@ -76,6 +76,121 @@ The bundle contains:
 The exact physical container is **not frozen in this design contract**. V1 may first use a build directory. A later `.locuscap` archive can be a serialization of the same logical bundle without changing runtime semantics.
 
 Do not make ZIP, tar, npm, PyPI, or a remote registry part of the architecture before the import/runtime contract is proven.
+
+## 2b. Implemented core v1 (normative implementation facts)
+
+The package core lives in `src/capability-package.js` (loaded after
+`extensions.js`; classic script, one frozen namespace
+`globalThis.LocusCapabilityPackage`, zero side effects, no writes, no
+network). It depends only on the `WorkspaceAdapter` contract and the
+existing runtime descriptor validators - it never re-implements runtime
+descriptor semantics and never touches File System Access / OPFS / Node
+fs / fetch directly. Unit coverage: `tests/capability-package.test.cjs`
+over the real fixture project `tests/fixtures/capability-package/minimal`.
+
+### 2b.1 Source schemas (strict whitelist, unknown fields fail)
+
+- every manifest: `schemaVersion` exactly `1`; unknown top-level and
+  unknown nested descriptor fields are validation failures (never
+  silently ignored, even where runtime validators tolerate extras);
+- `capability.json`: `{ schemaVersion, capability }`; capability fields
+  `id, version, displayName, description, plugins, skills, mcps`, then
+  normalized by `validateCapabilityDescriptor`;
+- `plugins/<id>/plugin.json`: `{ schemaVersion, plugin, artifacts }`;
+  plugin fields `id, version, displayName, description, runtime,
+  authority, provides`, then normalized by `validatePluginDescriptor`;
+  artifact entries allow exactly `path` and `format` - source manifests
+  cannot supply `sha256`/`size` (builder-computed only);
+- `skills/<id>/skill.json`: `{ schemaVersion, skill, source }`; skill
+  fields `id, version, displayName, description`, then normalized by
+  `validateSkillDescriptor`; `source` must be exactly `"SKILL.md"`;
+  `SKILL.md` must be UTF-8 and within the 256 KiB skill contract;
+- `mcp/<id>/mcp.json`: `{ schemaVersion, mcp }`; mcp fields
+  `id, displayName, description`, then normalized by
+  `validateMcpDescriptor`. Credential-ish fields (token, auth, keys,
+  ...) are rejected by the whitelist itself - no secret blacklist.
+
+### 2b.2 Package v1 policy (narrower than the runtime surface)
+
+- plugin `runtime` is `python` only (javascript/wasm package delivery
+  is NOT claimed and is rejected with `package_runtime_unsupported`);
+- authority is `none` (enforced by the runtime validator);
+- EXACTLY ONE `python-wheel` artifact per plugin under this plugin's
+  `artifacts/` directory (no dependency closure format exists yet);
+- component directory names MUST equal descriptor ids;
+- EXACTLY ONE `capability.json` at the project root; one project is one
+  capability (unreferenced components and missing local MCP metadata
+  for referenced requirements are rejected).
+
+### 2b.3 Path rules
+
+Author-supplied paths must be POSIX-style relatives under the project:
+no absolute paths, no `..`/`.` segments, no empty segments, no drive
+letters, no backslashes, no control characters. Hostile paths are
+rejected loudly - traversal is never "normalized" into a safe path, and
+every builder read is proven to stay under the project root.
+
+### 2b.4 Bounds (package constants, no scattered magic numbers)
+
+| Bound | Value |
+|---|---|
+| manifest size | 256 KiB each |
+| skill source | 256 KiB (existing skill contract) |
+| plugin artifact | 64 MiB |
+| shipped runtime bytes | 128 MiB total |
+| components | 128 total |
+| shipped runtime files | 256 total |
+
+Oversized artifacts are bounded by `stat` before full materialization.
+
+### 2b.5 Diagnostics (author faults are data, never throws)
+
+`validateProject`/`buildProject` return `{ ok, diagnostics }` with
+structured entries `{ severity, code, path, message }`, deterministically
+sorted by (path, code, message) and de-duplicated - provider `list()`
+order never influences results. Diagnostic codes: `package_json_invalid`,
+`package_schema_version`, `package_field_missing`,
+`package_field_unknown`, `package_descriptor_invalid`,
+`package_id_invalid`, `package_id_mismatch`, `package_manifest_missing`,
+`package_manifest_unreadable`, `package_manifest_too_large`,
+`package_source_invalid`, `package_skill_source_missing`,
+`package_skill_source_invalid`, `package_skill_too_large`,
+`package_path_invalid`, `package_artifact_missing`,
+`package_artifact_unreadable`, `package_artifact_too_large`,
+`package_artifact_policy`, `package_runtime_unsupported`,
+`package_ref_missing`, `package_component_unreferenced`,
+`package_component_dir_invalid`, `package_too_many_components`,
+`package_too_many_files`, `package_total_too_large`,
+`package_duplicate`, `package_root_missing`. Programmer invariants
+(non-WorkspaceAdapter input, invalid root, `inspectBundle` on a
+non-bundle) throw instead.
+
+### 2b.6 validate / build / inspect contracts
+
+- `await LocusCapabilityPackage.validateProject({ workspace, root })` -
+  READ ONLY (list/stat/read only, zero writes); on success returns
+  `normalized: { capability, plugins, skills, mcps, sourcePlan }`;
+- `await LocusCapabilityPackage.buildProject({ workspace, root })` -
+  ALWAYS revalidates internally (never trusts a prior validate result),
+  then reads exact bytes and computes exact size + WebCrypto SHA-256
+  itself; success returns `{ ok: true, bundle }`;
+- `LocusCapabilityPackage.inspectBundle(bundle)` - zero side effects,
+  returns a SAFE plain summary (ids, versions, imports, sizes, hashes,
+  `totalBytes`, `valid: true`) and never raw bytes or skill bodies.
+
+### 2b.7 CapabilityBundle and the lock
+
+`CapabilityBundle` keeps bytes in a private map; `readBytes(path)` hands
+out copies (mutating a result can never alias the bundle), `listFiles()`
+is deterministic and sorted, `lock` is deeply frozen plain metadata, and
+`serializeLock()` emits canonical JSON (sorted keys, stable arrays, LF,
+UTF-8, no timestamps). Byte-identical projects with different provider
+list orders serialize byte-identically. The lock carries:
+`schemaVersion`, normalized `capability`, `plugins` (`descriptor` +
+`artifacts[{path, format, size, sha256}]`), `skills` (`descriptor` +
+`sourcePath`, `size`, `sha256`), normalized `mcps`, and
+`files[{path, size, sha256}]` - descriptors and integrity metadata
+only, never skill bodies, never artifact bytes, never credentials.
 
 ## 3. Identity rules
 
@@ -233,7 +348,7 @@ The builder produces a generated lock manifest. Conceptually:
 }
 ```
 
-The exact JSON field spelling may change once implementation begins. The normative part is the separation of:
+The implemented lock spelling is frozen in section 2b.7. The normative part remains the separation of:
 
 1. normalized runtime metadata;
 2. immutable content bytes;

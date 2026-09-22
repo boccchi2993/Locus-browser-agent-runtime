@@ -226,12 +226,17 @@ Target contract:
 - smoke import before task execution;
 - verified cache/rebuild semantics;
 - synthetic wheel first; no production package/capability decision until the loader contract is proven;
+- a deterministic synthetic wheel fixture already exists at
+  `tests/fixtures/capability-package/minimal/plugins/locus-test-plugin/artifacts/`
+  (regenerable via `tests/fixtures/capability-package/tools/build-wheel.py`,
+  stdlib only) plus the bundle-side artifact identity (`size` + `sha256`)
+  produced by the package core, ready for this milestone to consume;
 - no marketplace, arbitrary remote manifests, PyPI resolver, or model-triggered install in v1.
 
 ### Capability package / authoring framework
 
-Status: specification defined in `docs/CAPABILITY-PACKAGE.md` and
-`docs/CAPABILITY-AUTHORING.md`; implementation pending.
+Status: package core implemented (`src/capability-package.js`; coverage in
+`tests/capability-package.test.cjs`); import UI, imported-package registry and runtime integration pending.
 
 Goal: make a Capability an independently authorable/importable project rather
 than something that requires source edits to Locus.
@@ -239,8 +244,11 @@ than something that requires source edits to Locus.
 Planned contract:
 
 - editable Capability Project layout;
+- editable Capability Project layout; [implemented]
 - strict validator over manifests/component graph/authority;
+- strict validator over manifests/component graph/authority; [implemented]
 - deterministic builder that generates size + SHA-256 lock metadata;
+- deterministic builder that generates size + SHA-256 lock metadata; [implemented]
 - page-session imported-package registry for v1;
 - explicit user import/trust transition;
 - no runtime source edits or test-only catalog injection;
