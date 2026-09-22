@@ -4,7 +4,7 @@ Locus persistence is local to the browser profile. It remembers durable machine 
 
 ## Storage substrate
 
-The canonical database is IndexedDB named `locus`, schema version `2`. The upgrade function is explicit: `0 → 1` creates the stores below, and `1 → 2` adds the `providerFrames.conversationId` index and deletes the unscoped legacy `secrets/apiKey` record. Migration never guesses which endpoint an old key belonged to.
+The canonical database is IndexedDB named `locus`, schema version `3`. The upgrade function is explicit: `0 → 1` creates the original stores, `1 → 2` adds the `providerFrames.conversationId` index and deletes the unscoped legacy `secrets/apiKey` record, and `2 → 3` adds durable attachment metadata plus the provider/model capability registry. Migration never guesses which endpoint an old key belonged to.
 
 | Store | Purpose | Important indexes |
 | --- | --- | --- |
@@ -17,6 +17,8 @@ The canonical database is IndexedDB named `locus`, schema version `2`. The upgra
 | `secrets` | Explicitly remembered API keys only | key `key` |
 | `workspaceHandles` | User-selected external directory handles | key `key` |
 | `meta` | Small schema/runtime metadata | key `key` |
+| `attachments` | Durable image attachment metadata (bytes live in OPFS) | `sha256` |
+| `capabilities` | Provider/model input-capability evidence (currently image input) | key `key` |
 
 If IndexedDB or OPFS cannot be initialized, Locus stays usable in memory-only mode and exposes the degraded state in Settings. It never silently drops old history to recover quota. The storage estimate is informational, not a correctness decision.
 
@@ -30,6 +32,8 @@ Durable state:
 - endpoint/model/dialect settings;
 - API keys only after the user explicitly enables Remember API key;
 - `/home/locus` and `/mnt/plugins` through OPFS when the browser supports it;
+- capability-private SkillInstances under `/home/locus/.skills/...`;
+- content-addressed image attachment bytes in OPFS plus their IndexedDB metadata;
 - a selected workspace `FileSystemDirectoryHandle`, subject to browser permission.
 
 Ephemeral state:
@@ -77,9 +81,13 @@ API keys are not durable by default. Remember API key is an explicit opt-in and 
 
 Local browser-profile storage is not immune to XSS, not hardware secured and not cryptographically isolated. Locus does not claim otherwise and does not implement fake encryption by storing an AES key beside its ciphertext.
 
-## OPFS plugins and authority
+## OPFS home, skills, and plugin namespace
 
-`/mnt/plugins` is durable installed-code storage backed by OPFS. Ordinary agent VFS access is `system-read-only`; a privileged host/plugin installation integration may write plugin bytes through the persistence service. The canonical `/home/locus` skeleton is `.skills`, `.config/locus/mcp` and `.cache/locus`; it is recreated after mount, Clear home and Reset. Persisted plugin code does not imply persistent credentials, remote authority or MCP authority. Plugins add code, Skills add knowledge, and MCP adds authority.
+`/home/locus` is the durable local home when OPFS is available. Capability-private SkillInstances live under `.skills/<capability-id>/` and therefore survive reload/re-enable; removing a Capability deletes that private directory, and re-adding materializes defaults again.
+
+`/mnt/plugins` is a durable, system-controlled namespace backed by OPFS, but current `main` ships no production Plugin catalog or trusted artifact installer. The namespace and persistence plumbing exist ahead of the package-delivery milestone; their existence is not evidence that production plugin bytes are installed.
+
+The canonical `/home/locus` skeleton is `.skills`, `.config/locus/mcp`, and `.cache/locus`; it is recreated after mount, Clear home, and Reset. Local code state never implies credentials, remote authority, or MCP authority.
 
 ## Management actions
 
