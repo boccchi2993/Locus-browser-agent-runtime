@@ -24,6 +24,7 @@ const SUITES = [
   'grep-worker.test.cjs',
   'agent.test.cjs',
   'capability-composition.test.cjs',
+  'skill-instances.test.cjs',
   'approval.test.cjs',
   'agent-approval.test.cjs',
   'native-tools.test.cjs',

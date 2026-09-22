@@ -173,12 +173,13 @@ function nativeResultContent(toolName, success, output) {
 }
 
 // Capability index for the system prompt (Capability Composition v1).
-// Compact INDEX only: capability display names, on-demand skill guide
+// Compact INDEX only: capability display names, on-demand skill instance
 // paths and honest availability phrasing. NEVER a skill body, a plugin
 // id, a package manifest, a hash or any Locus-internal API name — the
 // model learns what it can do and where to read more, not how the
-// harness is built. Skill guides live as read-only files in the task
-// environment; the model cats them when (and only when) relevant.
+// harness is built. Skill guides live as capability-private files under
+// the home directory; the model cats them when (and only when) relevant,
+// and only PRESENT files are ever advertised.
 function capabilityPromptSection(taskEnvironment) {
   const caps = taskEnvironment && Array.isArray(taskEnvironment.capabilities)
     ? taskEnvironment.capabilities : [];
@@ -186,13 +187,13 @@ function capabilityPromptSection(taskEnvironment) {
   if (!usable.length) return null;
   const lines = [
     '## Capabilities',
-    'Optional capabilities are enabled for this task. Their skill guides are NOT included here —',
-    'read a guide with cat only when the current task actually needs that capability.',
+    'Optional capabilities are enabled for this task. Their capability guidance files are NOT included here —',
+    'read a file with cat only when the current task actually needs that capability.',
   ];
   for (const c of usable) {
     lines.push('- ' + c.displayName);
     for (const p of c.skillPaths || []) {
-      lines.push('  Skill guide (read with cat when relevant): ' + p);
+      lines.push('  When relevant, read: ' + p);
     }
     if ((c.includes && c.includes.plugins > 0) || (c.pluginIds && c.pluginIds.length)) {
       lines.push('  Local software required by this capability is already installed in the task environment.');
@@ -201,6 +202,8 @@ function capabilityPromptSection(taskEnvironment) {
       lines.push('  External connections required by this capability are NOT connected; anything depending on them is unavailable in this task.');
     }
   }
+  lines.push('Capability guidance files under ~/.skills may be customized when the user asks to change future behavior.');
+  lines.push('Such mutations require explicit user confirmation from Locus.');
   return lines.join('\n');
 }
 
