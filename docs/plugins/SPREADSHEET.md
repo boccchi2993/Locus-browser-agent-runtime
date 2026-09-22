@@ -1,7 +1,7 @@
 # Spreadsheet plugin requirement
 
-Status: proposed / optional  
-Working id: `spreadsheet`
+Status: exploratory candidate study; not selected for production  
+Working id (research only): `spreadsheet`
 
 ## User problems
 
