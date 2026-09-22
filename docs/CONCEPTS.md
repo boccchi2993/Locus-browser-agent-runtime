@@ -91,3 +91,23 @@ A generated file under `/mnt/download` exposed by the UI for explicit user downl
 ## Relay
 
 An optional network/model transport helper. A relay is not a remote execution sandbox and must not silently enlarge authority.
+
+## Capability Project
+
+An editable source directory containing one Capability manifest plus its local Plugin, Skill, MCP metadata, tests, and build artifacts. Merely existing in a workspace grants no install authority.
+
+## Capability Bundle
+
+The validated logical build output of a Capability Project: normalized runtime descriptors, immutable Skill default bytes, Plugin artifact bytes, and generated size/hash integrity metadata.
+
+The physical archive/container format is not frozen yet.
+
+## Package Registration
+
+The act of making an imported Capability Bundle available to CapabilityManager. Authoring v1 may keep registration page-session only.
+
+Registration is distinct from enabling a Capability.
+
+## Capability Authoring SDK
+
+The future deterministic local library that validates projects, builds bundles, and inspects generated packages. The later `capability-authoring` Capability will expose this machinery to Locus through ordinary local Python plus a Skill describing the workflow.

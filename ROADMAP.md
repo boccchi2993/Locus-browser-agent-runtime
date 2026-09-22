@@ -228,6 +228,56 @@ Target contract:
 - synthetic wheel first; no production package/capability decision until the loader contract is proven;
 - no marketplace, arbitrary remote manifests, PyPI resolver, or model-triggered install in v1.
 
+### Capability package / authoring framework
+
+Status: specification defined in `docs/CAPABILITY-PACKAGE.md` and
+`docs/CAPABILITY-AUTHORING.md`; implementation pending.
+
+Goal: make a Capability an independently authorable/importable project rather
+than something that requires source edits to Locus.
+
+Planned contract:
+
+- editable Capability Project layout;
+- strict validator over manifests/component graph/authority;
+- deterministic builder that generates size + SHA-256 lock metadata;
+- page-session imported-package registry for v1;
+- explicit user import/trust transition;
+- no runtime source edits or test-only catalog injection;
+- same authoring flow for humans and Locus.
+
+### Reference Capability E2E
+
+Status: pending after Trusted Plugin Runtime + authoring/import infrastructure.
+
+Use a deliberately small deterministic local capability (working reference:
+`reference-text-analysis`) to prove:
+
+```
+source -> validate -> build -> import -> enable
+       -> read Skill -> import real Plugin -> complete task
+       -> customize Skill -> next-task effect
+       -> Remove -> re-add defaults
+```
+
+This is infrastructure proof, not the first product Capability.
+
+### Capability Authoring Capability / self-hosting
+
+Status: pending after Reference Capability closure.
+
+Target: a `capability-authoring` Capability composed from a deterministic local
+authoring SDK Plugin plus a Skill that explains the design workflow.
+
+Final acceptance:
+
+> Starting from a plain-language request and an empty Capability project
+> directory, Locus produces a valid bundle. After explicit user import, a
+> subsequent task uses it successfully with no manual runtime-source edits.
+
+Self-hosting never grants the model authority to auto-install its own generated
+code.
+
 ### Capability registry (resolved design)
 
 Status: implemented as the Capability Composition v1 registry/manager model described above. It provides the provider-neutral description of available capabilities and dependencies.

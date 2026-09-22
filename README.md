@@ -24,6 +24,8 @@ Architecture and planning docs:
 - [Runtime model](docs/RUNTIME-MODEL.md)
 - [Security model](docs/SECURITY-MODEL.md)
 - [Extension model](docs/EXTENSION-MODEL.md)
+- [Capability package contract](docs/CAPABILITY-PACKAGE.md)
+- [Capability authoring and self-hosting](docs/CAPABILITY-AUTHORING.md)
 - [Testing philosophy and gates](docs/TESTING.md)
 - [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md)
 - [Model protocol and reasoning replay](docs/MODEL-PROTOCOL.md)

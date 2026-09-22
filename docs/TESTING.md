@@ -51,3 +51,27 @@ Test seams must be explicit and absent from ordinary production paths. Injecting
 ## 7. Documentation drift
 
 Contradictory documentation is a bug. Before closing an architecture phase, search for future features described as current, old tool names/paths, changed authority rules, and stale milestone status.
+
+## 8. Capability authoring acceptance
+
+Capability authoring must be tested from a real source project boundary, not by injecting runtime catalogs.
+
+The Reference Capability E2E should prove:
+
+```
+source project
+ -> validator
+ -> builder
+ -> explicit import
+ -> package registration
+ -> enable
+ -> verified Plugin install
+ -> Skill materialization
+ -> ordinary next-task use
+ -> Skill customization approval
+ -> Remove / re-add reset
+```
+
+The self-hosting E2E goes one step further: Locus creates the source project through the same public authoring contract, but an explicit user action still performs the package trust/import transition.
+
+A test-only `replaceCatalogs` seam is acceptable for composition-unit tests and **not** acceptable as evidence that authoring/import works.

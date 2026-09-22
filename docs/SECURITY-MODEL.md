@@ -49,14 +49,24 @@ Capability enablement does not auto-connect MCP. Plugin v1 authority is exactly 
 
 The future trusted package loader may acquire verified code through the trusted harness, but Plugin code still must not inherit network, DOM, credentials, or MCP authority.
 
-## 8. Perception
+## 8. Capability package import (planned authoring boundary)
+
+The Capability Package/Authoring design introduces an explicit trust transition: **writing/building extension code is not the same as installing it**.
+
+A future import path must require an explicit user action before model-authored or third-party code becomes registered extension code. Structural validation and SHA-256 prove coherence/identity, not benevolence.
+
+After import, Plugin authority is still `none`: package code receives only the local computation/filesystem authority of the runtime it joins and no extra network, DOM, browser credential, API-key, arbitrary parent-RPC, or MCP authority.
+
+The model must not have a hidden shell/RPC path that auto-trusts its own generated package.
+
+## 9. Perception
 
 Image support is a compatibility decision, not an authority grant. Provider/model capability evidence is scoped to full provider identity; third-party endpoints do not inherit official builtin claims by copying model names.
 
-## 9. Secrets
+## 10. Secrets
 
 API keys are not persisted by default. Opt-in storage is destination-aware and separate from conversation/provider history.
 
-## 10. Explicit non-claims
+## 11. Explicit non-claims
 
 Locus does not claim full POSIX isolation, hostile-code sandbox certification, a browser TCP/IP stack, automatic rollback of committed side effects, authenticated browser automation, a production Plugin marketplace, or a production MCP transport/auth layer on current main.

@@ -14,6 +14,8 @@ The repository keeps documentation beside code so architecture changes, tests, a
 | [RUNTIME-MODEL.md](RUNTIME-MODEL.md) | One task from user input to local execution/provider replay |
 | [SECURITY-MODEL.md](SECURITY-MODEL.md) | Authority, approval, trust zones, and explicit non-claims |
 | [EXTENSION-MODEL.md](EXTENSION-MODEL.md) | Capability / Plugin / Skill / MCP contracts |
+| [CAPABILITY-PACKAGE.md](CAPABILITY-PACKAGE.md) | Capability project, bundle, validation, and import contract |
+| [CAPABILITY-AUTHORING.md](CAPABILITY-AUTHORING.md) | End-to-end authoring, Reference Capability, and self-hosting acceptance |
 | [TESTING.md](TESTING.md) | Test philosophy, gates, and adversarial proof |
 | [CAPABILITY-BOUNDARIES.md](CAPABILITY-BOUNDARIES.md) | Detailed core-vs-extension admission rules |
 | [LINUX-LIKE-VFS.md](LINUX-LIKE-VFS.md) | Filesystem namespace and mount authority |
