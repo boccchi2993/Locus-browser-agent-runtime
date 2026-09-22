@@ -146,20 +146,29 @@ The `bash` tool is a **Unix-like compatibility shell, not full POSIX bash**. It 
 
 ## curl in the browser runtime
 
-`curl` is currently the Unix-facing frontend to Locus network capability. It is a deliberately small compatibility command, not real curl:
+`curl` is the Unix-facing frontend to `NetworkRuntime`, not a wrapper around a host curl binary.
+
+Supported shape:
 
 ```bash
-curl <https-url>               # text-like responses (text/*, JSON, XML, YAML, JS) print to stdout
-curl -o <file> <https-url>     # binary-safe download to any writable VFS path (e.g. /mnt/download) (also: --output)
+curl <url>
+curl -o <file> <url>
+curl -I <url>
+curl -X <method> [-H "Name: value"] [-d <data>] <url>
+curl --data-binary @file <url>
 ```
 
-- HTTPS URLs only; `http://` and URLs with embedded credentials (`user:pass@host`) are rejected.
-- No other flags (`-H`, `-X`, `-d`, `-u`, cookies, …) — unsupported options fail with a clear message.
-- Requests are anonymous by construction (`credentials: 'omit'`), carry a client deadline (60s direct / 45s relay, covering headers **and** body), and a 16MB response cap enforced while streaming.
-- Redirects are followed by the browser, which enforces CORS per hop; the runtime does not claim per-hop visibility it does not have — hops the browser cannot validate fail as network errors and may go through the relay (which re-validates HTTPS per hop).
-- Binary responses are never dumped to the terminal as garbage; the command tells the model to re-run with `-o`.
-- Routing is transparent: direct browser fetch first; only a genuine CORS/network failure (and only when the page is hosted over HTTP(S)) falls back to the same-origin `/fetch` relay. An HTTP error status (404/401/500/…) is an authoritative response and is never re-sent through a different backend — and neither are timeouts, size-cap rejections or user cancellations.
-- From `file://` there is no relay; blocked requests fail with a clear error.
+- Targets may be absolute HTTP or HTTPS URLs. URL-embedded credentials are rejected.
+- GET/HEAD are read-like and need no approval. Only a genuine failure of the initial direct browser transport may fall back once to the relay.
+- POST/PUT/PATCH/DELETE/OPTIONS are side-effecting: they require approval, choose their backend before dispatch, and are never ambiguously retried.
+- Explicit application headers, including `Authorization`, may be sent. Ambient browser credentials are not inherited: `credentials: 'omit'`, Cookie/Sec-/hop-by-hop/browser-controlled headers are filtered, and credential-bearing redirects are origin-bound.
+- Request bodies are bounded (2 MiB default); responses are bounded (16 MiB default); deadlines cover headers and body.
+- `-o` writes binary-safe bytes to a writable VFS path. Without `-o`, text-like content may be printed; binary payloads are not dumped into the terminal.
+- Python user code itself has no network authority. Today the model uses the outer `curl` path for HTTP.
+
+Routing is a Harness concern. The model sees ordinary HTTP semantics, not CORS/direct/relay topology.
+
+See [docs/NETWORK-RUNTIME.md](docs/NETWORK-RUNTIME.md) for the exact method, header, redirect, SSRF, retry, approval, and error contracts.
 
 ## Run
 
@@ -182,21 +191,24 @@ Connection behavior: if you configure an explicit proxy URL it is always used. O
 
 ## The two relays: /proxy vs /fetch
 
+These are transport helpers, not execution sandboxes.
+
 | | `/proxy` (`functions/proxy.js`) | `/fetch` (`functions/fetch.js`) |
 |---|---|---|
-| Purpose | LLM API CORS relay | anonymous public-HTTPS resource relay |
-| Method | POST only | GET only |
-| Credentials | forwards `Authorization` / `x-api-key` to the model API | never forwards any credentials — requests are anonymous |
-| Redirects | never followed (→ 502) | followed up to 5 hops, HTTPS re-validated per hop |
-| Response cap | 8MB (`MAX_PROXY_RESPONSE_BYTES`) | 16MB (`MAX_FETCH_RESPONSE_BYTES`) |
-| Inbound limit | 1MB body (`MAX_PROXY_BODY_BYTES`): Content-Length pre-check + stream counting, 30s inbound deadline (`PROXY_INBOUND_TIMEOUT_MS` → 408) | GET only — no request body |
-| Timeout | 30s (`PROXY_TIMEOUT_MS`), covers headers **and** full body | 30s (`FETCH_TIMEOUT_MS`), covers headers **and** full body |
-| Null-body statuses | 204/205 answered with a null body | 204/205/304 answered with a null body |
-| Payload | JSON text | binary-safe bytes; final URL in `X-Locus-Final-URL` |
-| Markers | every response carries `X-Locus-Relay: 1` (distinguishes a missing function from an authoritative relay answer) | own failures carry `X-Locus-Relay-Error: 1` |
-| Active content | n/a (model API JSON) | `X-Content-Type-Options: nosniff` on everything; `Content-Security-Policy: sandbox` on HTML/XHTML/SVG/JS so a navigated response renders in an opaque origin with scripting disabled |
+| Purpose | LLM API CORS relay | ordinary HTTP(S) resource relay for NetworkRuntime |
+| Outer request form | POST | legacy GET query form, or POST JSON envelope |
+| Upstream methods | model API POST | GET / HEAD / POST / PUT / PATCH / DELETE / OPTIONS |
+| Ambient browser credentials | none beyond explicit model API auth supplied by the caller | none; cookies are stripped and `credentials: 'omit'` semantics are preserved |
+| Explicit Authorization | forwarded to the configured model API | allowed as an explicit application header; stripped on cross-origin read redirects |
+| Redirects | never followed (relay error) | bounded and policy-checked; side-effecting cross-origin redirects are blocked |
+| Request cap | 1 MiB proxy body | 2 MiB upstream request body |
+| Response cap | 8 MiB | 16 MiB |
+| Upstream timeout | 30 s | 30 s |
+| Active-content hardening | n/a (model API JSON) | `nosniff`; sandbox CSP on active content |
 
-Both are intentionally provider/site-agnostic for demo and development use, with no domain allowlists. Neither is intended to be deployed as an unrestricted production multi-tenant relay without additional rate limiting / access policy. The `/fetch` relay marks its own failures with `X-Locus-Relay-Error: 1` so clients can distinguish relay errors from authoritative upstream HTTP responses.
+NetworkRuntime's client deadline is slightly longer than the relay upstream deadline so a structured relay timeout can arrive first. Relay errors are marked separately from authoritative upstream HTTP responses.
+
+Neither relay should be treated as an unrestricted production multi-tenant service without deployment-level access policy/rate limiting.
 
 ## V0.3 reliability, integrity and permission-boundary fixes
 
@@ -337,7 +349,7 @@ manifest's package wheel set, and user execution keeps its untouched 30s budget 
 - No native shell, no `child_process`, no localhost server, no remote code execution
 - Locus does not automatically upload workspace files to any execution server; only content explicitly surfaced through the agent conversation (tool results the model chose to read) is sent to the model API
 - Model-generated Python has **no direct network path**: the worker is created by a strict-CSP creator iframe, so the **browser itself** blocks every network act (fetch, XMLHttpRequest, WebSocket, EventSource, WebTransport, Worker, SharedWorker, RTCPeerConnection, importScripts, caches, dynamic import) from inside it with zero requests — the `Function` constructor stays reachable because compute is not the boundary (the F04a-R1 residual this used to allow is closed; see the Python capability declaration). On top of the browser boundary the worker applies the F04a JS lockdown before any user code: every denial at the global slot AND at every prototype-chain level that owns the name, so a recovered `Object.getPrototypeOf(self).fetch` is the same denial, and string-handler `setTimeout`/`setInterval` (eval in disguise) are refused at every level while real function handlers keep working — network belongs to `curl`/`NetworkRuntime`. This is a runtime authority boundary verified with request counters (`tests/e2e-python-authority.cjs`, `tests/e2e-python-browser-authority.cjs`), not a hostile-code sandbox certification — see the Python capability declaration below
-- Network access via `curl` is anonymous by construction (`credentials: 'omit'`, URL userinfo rejected, ambient cookies stripped). GET/HEAD are read-like; supported side-effecting methods such as POST/PUT/PATCH/DELETE/OPTIONS require explicit approval and are dispatched exactly once. Custom headers are bounded and filtered; browser-controlled, cookie, and hop-by-hop headers are refused.
+- Network access via `curl` has **no ambient browser credentials** (`credentials: 'omit'`, URL userinfo rejected, cookies stripped). GET/HEAD are read-like; supported side-effecting methods such as POST/PUT/PATCH/DELETE/OPTIONS require explicit approval and are dispatched exactly once. Explicit application headers such as `Authorization` may be supplied; browser-controlled, cookie, proxy, and hop-by-hop headers are refused.
 - Switching workspaces or `reset` is a full session boundary: the running task is cancelled, history is cleared, and the Python interpreter is rebuilt
 - API keys are not persisted by default; explicit opt-in stores them only in this browser profile and never in history, provider frames, normalized messages, telemetry, logs or exports
 - `/home/locus` and `/mnt/plugins` are durable local state when OPFS is available. `/tmp`, `/mnt/upload`, `/mnt/download` and active task/process state are ephemeral
