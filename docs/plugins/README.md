@@ -1,130 +1,64 @@
-# Optional plugin requirements
+# Candidate capability / plugin requirement studies
 
-Status: proposed  
-Scope: first optional plugin family for Locus
+Status: exploratory research, **not a committed product batch**.
 
-## Purpose
+These documents study possible local file-format capabilities. Their presence does not mean Locus has selected Spreadsheet, Document, or PDF as the first production Capability.
 
-Locus core should remain small. Optional plugins add reusable local code capabilities for file formats or computations that do not belong in the core runtime.
+Current `main` deliberately ships empty production Capability/Plugin/Skill/MCP catalogs. The next extension-layer milestone is Trusted Plugin Runtime v1 using a synthetic package artifact; product selection comes later from real trajectories.
 
-The boundary is:
+## Boundary
 
-> Plugin adds code. MCP adds authority. Skill adds knowledge.
+> Plugin adds code.  
+> Skill adds knowledge.  
+> MCP adds authority.  
+> Capability composes them for the user.
 
-That means:
+A future local file-format Capability may combine one or more Plugins with workflow Skills and, separately, optional MCP authority for authenticated remote services.
 
-- a plugin may parse or modify a file the user already mounted into the workspace;
-- a plugin must not silently gain credentials, authenticated SaaS access, or remote account authority;
-- a plugin may be paired with a Skill that teaches the agent how to use it reliably;
-- authenticated Google Sheets, Microsoft 365, Dropbox, email, calendars, and similar external systems belong behind MCP/connectors rather than ordinary file-format plugins.
+Local code must not silently gain credentials, browser-session authority, or remote-account access.
 
-## First batch
+## Candidate studies
 
-1. Spreadsheet — local XLSX creation, inspection, and deterministic editing.
-2. Document — local DOCX creation, extraction, and semantic editing.
-3. PDF — local PDF inspection, extraction, merge, split, and page operations.
+- [SPREADSHEET.md](SPREADSHEET.md) — local spreadsheet workflows
+- [DOCUMENT.md](DOCUMENT.md) — local DOCX workflows
+- [PDF.md](PDF.md) — local PDF workflows
 
-These three are chosen because they correspond to common office-work tasks that are not well represented by shell+Python alone unless Locus bundles heavy format-specific libraries into core. They should stay optional.
+They are candidates, not a priority ordering.
 
-## Common requirements
+## Shared requirements for any future production plugin
 
-Every first-batch plugin should be:
+A selected Plugin should be:
 
-- optional: Locus runs normally when absent;
-- lazy-loadable: code is loaded only when selected/needed;
+- optional and capability-scoped;
+- loaded/prepared before the task runtime reports READY;
 - browser-first where practical;
-- workspace-confined: no filesystem authority outside the mounted workspace;
-- no automatic upload of user files;
-- bounded in input size, output size, file count, and execution time;
+- restricted to the same local authority as the runtime it joins;
+- bounded in asset/input/output size and execution time;
 - cancellation-aware;
-- telemetry-visible;
-- failure-isolated: plugin failure must not crash AgentSession or corrupt unrelated runtime state;
+- failure-isolated;
 - explicit about fidelity limits;
-- usable without adding a new model-facing tool for every individual operation.
+- usable through familiar runtime APIs without adding dozens of narrow model tools.
 
-## Installation / loading expectations
+## Installation is separate infrastructure
 
-This document does **not** freeze a public plugin manifest yet.
+A requirements study does not define package installation.
 
-A future loader will probably need at least:
+Trusted Plugin Runtime v1 must first define:
 
-- stable plugin id,
-- plugin version,
-- compatible Locus/runtime version range,
-- runtime dependencies,
-- optional package/WASM assets,
-- declared capabilities,
-- resource limits,
-- availability check.
+- trusted descriptor/artifact identity;
+- bounded acquisition by the harness;
+- content-integrity verification;
+- offline runtime installation;
+- smoke-import/READY semantics;
+- rebuild/cache behavior;
+- failure handling.
 
-Those are requirements, not a final schema.
+No candidate document is permission to add arbitrary remote manifests, a marketplace, PyPI auto-resolution, or model-triggered installs.
 
-Installation must never imply new external authority. Package download/installation policy and integrity verification are separate design work.
+## Authority
 
-## Model-facing surface
-
-Prefer one of these patterns, chosen by evidence rather than aesthetics:
-
-1. expose the plugin through the existing local execution environment so the model can use a familiar library/API;
-2. expose a very small deterministic command/capability surface;
-3. pair the plugin with a Skill that provides workflow knowledge.
-
-Do not create dozens of narrow tools such as `xlsx_read_cell`, `xlsx_write_cell`, `xlsx_add_sheet` unless benchmark evidence shows that structured tools are materially more reliable.
-
-## Commit semantics
-
-Mutating plugins should follow the same philosophy as current workspace mutation:
-
-- validate before destructive commit where possible;
-- never claim rollback when side effects already committed;
-- cancellation must stop future writes;
-- prefer writing a new output file unless the user explicitly asks to replace an original;
-- if in-place update is supported, define conflict and overwrite behavior explicitly.
-
-## Telemetry requirements
-
-At minimum record:
-
-- plugin id/version,
-- operation family,
-- input/output bytes,
-- duration,
-- success/failure class,
-- number of files read/written,
-- cancellation,
-- committed side effects,
-- whether execution stayed local.
-
-Do not log workbook/document contents, cell values, paragraphs, real file paths, or extracted private text by default.
-
-## Security requirements
-
-Plugins must not:
-
-- read API keys/sessionStorage/application globals;
-- bypass workspace path confinement;
-- introduce unrestricted network access as an incidental side effect;
-- execute embedded macros or arbitrary active content;
-- auto-upload files;
-- claim isolation stronger than the runtime actually provides.
-
-Network access required by a plugin must route through an explicit Locus network capability or be declared unsupported.
-
-## Non-goals for the first batch
-
-- plugin marketplace,
-- auto-install based solely on model request,
-- authenticated SaaS integrations,
-- Office GUI automation,
-- perfect pixel-level fidelity,
-- arbitrary macro execution,
-- arbitrary browser automation,
-- freezing a plugin ABI before one real plugin exists.
+Authenticated Google Sheets, Microsoft 365, OneDrive/SharePoint, email, calendars, GitHub, and similar external systems require an explicit external-authority layer such as MCP. A local parser library is not that authority.
 
 ## Acceptance philosophy
 
-A plugin is not accepted because a library imports successfully.
-
-It is accepted when realistic user workflows can be completed safely and reproducibly, with deterministic final-state checks where possible.
-
-The first batch should be evaluated against realistic spreadsheet, DOCX, and PDF workspace tasks after benchmark fixtures and a runner exist.
+A real product capability is selected and accepted when realistic user workflows can be completed safely and reproducibly, with deterministic final-state checks where possible. Importing a library is not the acceptance criterion.
