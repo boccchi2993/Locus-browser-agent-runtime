@@ -4,143 +4,95 @@
 
 ## 1. The target machine
 
-Locus is not trying to reproduce the Linux kernel or full POSIX ABI inside a browser tab.
+Locus is not a Linux kernel emulator. It is a **Unix-like agent userland inside a browser tab**.
 
-The target is a **Unix-like agent userland** that is sufficient for the overwhelming majority of lightweight agent tasks.
-
-From the model's point of view, the tab should feel like a small computer with familiar interfaces:
+The model-visible tool registry on current `main` is deliberately tiny:
 
 ```
 bash
-edit
+cloud_bash
 ```
 
-Inside `bash`, familiar userland commands and runtimes may include:
+`bash` is the real local browser-machine interface. `cloud_bash` is an unconfigured legacy/escalation stub and is **not** a network fallback. There is currently no separate `edit` tool and no JavaScript shell command.
 
-```
-python
-js
-curl
-cat
-ls
-grep
-find
-...
-```
+Inside `bash`, the supported registry is discoverable with `help` and currently includes `pwd`, `cd`, `ls`, `cat`, `echo`, `find`, `grep`, `head`, `tail`, `wc`, `sort`, `mv`, `rm`, `python`, `curl`, `which`, and `help`.
 
-The model should not need to care whether those commands are implemented with Pyodide, WebAssembly, Web Workers, File System Access API, browser fetch, an edge relay, or a future cloud provider.
+The design rule is:
 
-The implementation goal is not "Linux in JavaScript".
+> **Do not make the model learn Locus. Make Locus look like a small, honest computer.**
 
-The goal is:
+## 2. Four substrate capabilities
 
-> **If a lightweight task can be expressed as computation + files + network, it should not require a cloud computer.**
-
-## 2. Three runtime substrate capabilities
-
-The browser runtime exists to make three underlying machine capabilities work reliably.
+The browser machine is easier to reason about as four substrate capabilities. These are architectural categories, not four model tools.
 
 ### 2.1 Execution
 
 Execution runs local userland computation.
 
-Current and target consumers include:
+Current implementation: Python through Pyodide in a strict-CSP worker. JavaScript/WASM execution may be added through explicit providers or Plugins later; documentation must not present them as current shell runtimes.
 
-- Python through Pyodide,
-- JavaScript in an isolated Worker,
-- WebAssembly modules,
-- future WASM ports of libraries or command-line programs.
-
-Python and JavaScript are not separate architectural primitives. They are execution environments provided by the runtime.
+Python user code has no direct network authority. The trusted harness acquires and integrity-verifies the fixed Pyodide bootstrap set, then the worker runs with browser-enforced network denial.
 
 ### 2.2 Filesystem
 
-The filesystem capability provides state.
+Filesystem provides local state and file authority through one Linux-like VFS namespace.
 
-It includes:
+Current important paths include:
 
-- the user-authorized workspace,
-- reads and writes,
-- path confinement,
-- deterministic mutation,
-- conflict detection,
-- synchronization between local runtimes and the real workspace.
+- `/home/locus` — local home, durable through OPFS when available;
+- `/home/locus/.skills/<capability>/<skill>.skill` — capability-private mutable SkillInstances;
+- `/mnt/workspace` — optional user-authorized external directory;
+- `/mnt/upload` — explicit user uploads, read-only to the agent;
+- `/mnt/download` — writable artifacts exposed for user download;
+- `/tmp` — ephemeral scratch;
+- `/usr/bin` and `/bin` — virtual views derived from the live shell registry.
 
-The model-facing `edit` capability is a reliable filesystem interface, not a separate storage system.
-
-Likewise `cat`, `ls`, Python `open()`, JavaScript file APIs, and future Unix utilities should ultimately consume the same filesystem authority.
+Shell and Python use the same model-visible paths. Python may use snapshot/diff internally; that is an implementation detail, not another filesystem namespace.
 
 ### 2.3 Network
 
-The network capability provides Internet connectivity as bounded HTTP/HTTPS
-request/response — nothing more.
+Network provides bounded HTTP/HTTPS request/response through `NetworkRuntime`.
 
-`curl` is the Unix-facing frontend to this capability. It is not the
-architectural primitive itself.
+GET/HEAD are read-like. Supported side-effecting methods are approval-gated and dispatched exactly once; ambiguous failures are never retried across backends. Routing between browser-direct and the optional `/fetch` relay belongs to the harness, not the model.
 
-**v1 status:** the primitive now exists — `NetworkRuntime`
-(src/network.js, docs/NETWORK-RUNTIME.md). It normalizes requests, enforces
-scheme/method/size policy, routes between the browser fetch backend and the
-edge relay, consumes the Approval Framework for side-effecting methods, and
-reports an explicit error taxonomy. The model experiences ordinary HTTP;
-CORS topology and backend routing are Harness-internal.
+Python itself cannot open network connections; network work goes through the outer `curl`/NetworkRuntime path today.
 
-The long-term target is unchanged:
+### 2.4 Perception
+
+Perception is the model-input boundary for non-text user data. It is not a shell command and it does not add filesystem or network authority.
+
+Current implementation is image input:
 
 ```
-                     Network Runtime
-                           |
-          +----------------+----------------+
-          |                |                |
-        curl          Python HTTP         JS fetch
-                       libraries
+user image
+  -> local attachment store
+  -> provider/model capability lookup
+  -> human decision or isolated probe when unknown
+  -> materialize provider-native image input only at request time
 ```
 
-Examples of Python-side consumers may include:
+The image capability registry in `src/capabilities.js` answers a provider/model compatibility question. It is distinct from the **user-facing Capability composition registry** in `src/extensions.js`. The shared word “capability” describes two different layers; do not conflate them.
 
-- `requests`,
-- `httpx`,
-- `urllib`,
-- `pyfetch`.
+See `IMAGE-INPUT.md`.
 
-These consumers are NOT implemented in v1. The runtime should eventually
-virtualize HTTP so they reuse the same Locus routing, policy, telemetry and
-relay behavior instead of bypassing the harness.
-
-The browser does not provide Linux raw sockets. Locus therefore virtualizes
-useful Internet access at the HTTP/runtime layer rather than pretending to
-expose a real TCP/IP stack. Arbitrary TCP/UDP, raw sockets and non-HTTP
-protocols are unavailable, and the model-facing capability text never claims
-otherwise.
-
-## 3. Model-facing interface vs runtime substrate
-
-These layers must not be confused.
-
-A useful target is:
+## 3. Model-facing interface vs substrate
 
 ```
-                Agent
-                  |
-           +------+------+
-           |             |
-         bash           edit
-           |
-   +-------+--------+
-   |       |        |
- python    js      curl
-   |       |        |
-   +-------+--------+
-           |
-  Runtime Substrate
-   execution / fs / network
+                         Agent
+                    /             \
+             model input          tools
+                 |                 |
+            Perception            bash
+                                   |
+                         compatibility userland
+                         /        |        \
+                       VFS      Python    curl
+                        |         |         |
+                   Filesystem  Execution  Network
 ```
 
-The model-facing interface is deliberately Unix-like.
+The model should learn ordinary task semantics and ordinary paths, not backend topology. The harness decides whether a filesystem operation maps to memory, OPFS, or a user-granted directory, and whether HTTP is direct or relayed.
 
-The internal substrate is deliberately browser-native.
-
-This distinction lets implementation evolve without forcing the model to learn new tool schemas.
 
 ## 4. Runtime responsibilities
 
@@ -369,7 +321,7 @@ The 1% exception should not force the other 99% of lightweight tasks into a clou
 
 Before adding a new core capability, ask:
 
-1. Can this be expressed as execution + filesystem + network?
+1. Can this be expressed as execution + filesystem + network + perception?
 2. Can a Plugin provide the missing code?
 3. Can a Skill provide the missing workflow knowledge?
 4. Is the missing piece actually external authority and therefore MCP?

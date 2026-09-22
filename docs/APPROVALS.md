@@ -6,7 +6,7 @@ architecture of Codex approvals and Claude Code permission modes
 (ideas only; no product behavior is copied).
 
 ```
-Harness (future tool executor / image gate / network layer)
+Harness consumer (NetworkRuntime / ImageInputGate / SkillInstanceWorkspace)
   ↓  approvals.request(spec, { signal })
 current async execution PAUSES   ← the Promise stays pending
   ↓
@@ -43,40 +43,61 @@ actions that are already inside the runtime's authority.
 
 ## Current v1
 
-- Decision set for `permission` requests: **Allow once**,
-  **Allow for this session**, **Deny**.
-- Structured decisions, never booleans:
-  `{ outcome: 'allow' | 'deny' | 'cancelled', scope: 'once' | 'session', requestId }`.
-- **Allow once** resolves exactly the current request id. The next request
-  with the same policy key asks again.
-- **Allow for this session** records an in-memory grant for the exact
-  normalized `policyKey`. Later requests with that key auto-allow with no
-  UI. Session = this Locus page session: survives new tasks and
-  conversation switches; cleared by `resetAllData()` and by page reload.
-  Never persisted (no IndexedDB), no "always allow".
-- **Deny** refuses the CURRENT action only. It does not cancel the task,
-  reset the session, bump the generation, or end the conversation. The
-  caller decides how to feed the denial back to the model (e.g. a failed
-  tool result).
-- **Cancel / abort** (task cancel, `Esc` on the global cancel path,
-  `newTask()`, workspace switch, `AbortSignal`) closes a pending approval
-  as `cancelled` — distinct from `deny`. The awaiting Promise always
-  settles; no dangling cards, no dangling continuations.
-- suspend/resume of the SAME task: `run()` stays the same Promise,
-  exactly one `task_start` / one `task_end`, generation and conversation
-  binding unchanged, provider history untouched by the approval itself.
-- Session grants and pending requests are memory-only and ephemeral.
+The controller supports three fixed request kinds. Their choice sets come from the Harness, never from model-provided button text.
+
+### `permission`
+
+Used for actions such as side-effecting network requests.
+
+- **Allow once**
+- **Allow for this session**
+- **Deny**
+- exact Harness-constructed `policyKey` controls session grants;
+- session grants are in-memory only and disappear on page reload/reset-all-data;
+- deny refuses the current action, not the whole task.
+
+### `capability`
+
+Used by Image Feedback when the current provider/model image-input capability is unknown.
+
+- **Yes / confirm**
+- **No / decline**
+- **I don't know / unsure**
+- no session scope;
+- the approval result is only the human decision; durable capability evidence belongs to `ModelCapabilityRegistry`.
+
+This is a compatibility-knowledge question, not an authority grant.
+
+### `confirmation`
+
+Used for persistent behavior mutations such as SkillInstance create/write/delete.
+
+- **Confirm**
+- **Cancel**
+- no session scope;
+- each mutation asks again;
+- the Harness supplies the Capability/Skill/path identity and reviewable diff;
+- the Skill consumer re-checks the task signal and before-state hash after the decision before committing.
+
+A `confirmation` cannot be upgraded to `scope: 'session'`.
+
+### Shared lifecycle
+
+- Decisions are structured, never bare booleans.
+- Cancel/abort closes the pending request distinctly from a domain denial.
+- Suspend/resume stays inside the same Agent task and Promise.
+- Pending requests are ephemeral control-plane state, not provider/presentation history.
 
 ## Not v1
 
-- persistent allow rules / "always allow"
-- ~~image capability probes (the `capability` kind schema is reserved)~~ — consumed by Image Feedback v1 (docs/IMAGE-INPUT.md): the `capability` kind (confirm / decline / unsure, no session scope) carries ONLY the human decision; all persistence lives in the separate capability registry
-- network policy / NetworkRuntime / CORS routing
-- MCP permissions
-- auto-review agent / risk classifier
-- organization policy, enterprise policy language, policy sync
-- full Codex / Claude Code permission-mode matrices
-- telemetry schema changes
+- persistent allow rules / "always allow";
+- automatic risk-classifier/auto-review approval;
+- organization policy language or policy sync;
+- production MCP permission flows;
+- full Codex / Claude Code permission-mode matrices;
+- a generic audit-log product for approvals.
+
+NetworkRuntime, ImageInputGate, and SkillInstanceWorkspace are **current production consumers** of the framework; they are not future placeholders.
 
 ## Invariants
 
@@ -223,8 +244,8 @@ const approvals = new ApprovalController({ onChange, onEvent });
 
 const decision = await approvals.request(
   {
-    kind: 'permission',                    // 'capability' consumed by Image
-                                           // Feedback v1; 'confirmation' reserved
+    kind: 'permission',                    // or 'capability' / 'confirmation';
+                                           // each kind has a fixed decision schema
     action: { type, summary, detail },     // plain text; summary required
     resource: { type, key, label },        // optional
     policyKey: 'network-origin:https://example.com',  // Harness-canonical

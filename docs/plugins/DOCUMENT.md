@@ -1,7 +1,7 @@
 # Document plugin requirement
 
-Status: proposed / optional  
-Working id: `document`
+Status: exploratory candidate study; not selected for production  
+Working id (research only): `document`
 
 ## User problems
 

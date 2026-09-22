@@ -11,13 +11,20 @@ Forked from the terminal UI / model-interaction skeleton of [Whoami_Cli_game](ht
 
 > **Normalize capabilities. Preserve model semantics.**
 
-> **If a lightweight task can be expressed as computation + files + network, it should not require a cloud computer.**
+> **If a lightweight task fits the browser substrate, it should not require a cloud computer.**
 
-Locus keeps the model-facing machine surface small and Unix-like. The browser runtime provides execution, filesystem and network substrate; the harness composes those capabilities and decides when an extension or heavier provider is required. Domain-specific features should normally grow through Plugins, Skills and MCP rather than by expanding the runtime core.
+Locus keeps the model-facing machine surface small and Unix-like. The browser runtime provides four substrate capabilities — **execution, filesystem, network and perception/model input** — while the harness composes them and decides when an extension or heavier provider is required. Domain-specific features should normally grow through Plugins, Skills and MCP rather than by expanding the runtime core.
 
 Architecture and planning docs:
 
+- **[Documentation / wiki index](docs/README.md)** — start here
 - [Architecture](docs/ARCHITECTURE.md)
+- [Design principles](docs/DESIGN-PRINCIPLES.md)
+- [Concepts and terminology](docs/CONCEPTS.md)
+- [Runtime model](docs/RUNTIME-MODEL.md)
+- [Security model](docs/SECURITY-MODEL.md)
+- [Extension model](docs/EXTENSION-MODEL.md)
+- [Testing philosophy and gates](docs/TESTING.md)
 - [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md)
 - [Model protocol and reasoning replay](docs/MODEL-PROTOCOL.md)
 - [Browser-local persistence](docs/PERSISTENCE.md)
@@ -36,57 +43,52 @@ Remote computers should be escalation providers, not the default, for lightweigh
 - Python execution via Pyodide in a Web Worker (lazy-loaded, stdout/stderr/traceback returned; `pandas` comes from the harness-declared runtime package set, loaded once at worker bootstrap — user imports never trigger package downloads)
 - **Browser-native network capability via `NetworkRuntime` + `curl`** (HTTP/HTTPS: GET/HEAD reads plus `-X POST/-H/-d` writes that ask for user approval; `curl <url>` prints text, `curl -o <file> <url>` downloads). Model-generated Python has no direct network path and cannot trigger package downloads; all HTTP/HTTPS goes through `curl`/`NetworkRuntime` — see [docs/NETWORK-RUNTIME.md](docs/NETWORK-RUNTIME.md) and the Python capability declaration below
 - **Direct browser fetch with transparent edge relay fallback** (GET/HEAD only, on genuine network failure, never after an HTTP response; side-effecting methods pick their backend before sending and are never ambiguously retried)
-- **Binary-safe downloads into the local workspace** (no text decoding anywhere in the network path)
-- Agent tool loop (structured ` ```json ` tool calls, results fed back, max 32 iterations)
+- **Perception / image-input boundary**: uploaded images are stored locally, capability-gated per provider/model identity, and materialized into provider-native image input only at the model boundary; unknown capability asks the user or runs an isolated synthetic probe. Image capability never changes the tool surface — see [docs/IMAGE-INPUT.md](docs/IMAGE-INPUT.md)
+- **Binary-safe downloads into writable VFS paths** (no text decoding anywhere in the network path)
+- Agent tool loop (provider-native tool calls first, strict fenced-JSON fallback second; results fed back, max 32 tool calls per task)
 - Local file output written back into the real workspace directory (create / modify / delete / rename), with external-edit conflict detection and staged (non-atomic) commit reporting
 - Session boundaries that actually isolate: switching workspace or `reset` cancels the running task, clears history, and rebuilds the Python interpreter
 - Structured model responses (visible content / reasoning / stop reason / usage / provider-native replay state) — HTTP 200 semantic errors never trigger a second paid request
 - Browser-local persistence: conversations, presentation events, provider-native replay frames, normalized semantic history and settings live in IndexedDB; `/home/locus` and `/mnt/plugins` use durable OPFS when available
 - Explicit recovery semantics: in-flight runs reopen as `interrupted`, dangling tool calls remain archived but are excluded from the replay checkpoint, and same-provider replay is separate from cross-provider semantic projection
 - In-memory execution telemetry (tool, backend, operation, duration, UTF-8 bytes, success/error) + debug panel
-- **Capability composition layer (v1, architecture only)**: the user enables *Capabilities* — named compositions of local code (Plugins, authority always `none`), on-demand knowledge (Skills) and external authority requirements (MCP, never auto-authorized; unconnected requirements surface as `needs-connection`, never disguised as ready). Each agent task binds an immutable `TaskEnvironment` snapshot (shared plugins/MCP dedupe; UI changes affect only the next task). A Skill is a two-part model: the **SkillDefinition** is immutable publisher metadata plus a default Markdown source in the SkillSourceStore, and enabling a capability materializes its own durable **SkillInstance** at `/home/locus/.skills/<capability-id>/<skill-id>.skill` — definitions may be shared, instances are never shared. Reading guidance is free; every create/write/delete of an instance suspends the task on an explicit user confirmation (with a real diff and TOCTOU re-verification), and removing a capability deletes its customized instances — re-adding restores the defaults. Production catalogs are intentionally empty; tests inject synthetic capabilities. See [docs/CAPABILITY-BOUNDARIES.md](docs/CAPABILITY-BOUNDARIES.md) section 11
+- **Capability composition layer (v1, implemented infrastructure; production catalogs intentionally empty)**: the user enables *Capabilities* — named compositions of local code (Plugins, authority always `none`), on-demand knowledge (Skills) and external authority requirements (MCP, never auto-authorized; unconnected requirements surface as `needs-connection`, never disguised as ready). Each agent task binds an immutable `TaskEnvironment` snapshot (shared plugins/MCP dedupe; UI changes affect only the next task). A Skill has three separated layers: **SkillDefinition** is immutable publisher metadata, **SkillSourceStore** holds the trusted default Markdown source, and enabling a capability materializes its own durable **SkillInstance** at `/home/locus/.skills/<capability-id>/<skill-id>.skill` — definitions may be shared, instances are never shared. Reading guidance is free; every create/write/delete of an instance suspends the task on an explicit user confirmation (with a real diff and TOCTOU re-verification), and removing a capability deletes its customized instances — re-adding restores the defaults. Production catalogs are intentionally empty; tests inject synthetic capabilities. See [docs/CAPABILITY-BOUNDARIES.md](docs/CAPABILITY-BOUNDARIES.md) section 11
 
 ## Architecture
 
-Locus separates the Unix-like interface the model sees from the browser-native substrate that implements it:
+Locus separates the product layer, the harness, and the browser-native machine substrate:
 
 ```
-                    Agent
-                      |
-               +------+------+
-               |             |
-             bash           edit
-               |
-       python / js / curl / Unix utilities
-               |
-        Runtime Substrate
-     execution / filesystem / network
-               |
-             Browser
-```
-
-The current V0.3 implementation is a partial realization of that target:
-
-```
-Agent
+User
   |
-bash
+Capability selection
   |
-Browser Runtime
-  +-- Workspace ------> File System Access API
-  +-- Python ---------> Pyodide Worker
-  +-- curl -----------> NetworkRuntime
-                         +-- browser-direct
-                         +-- edge /fetch relay
+TaskEnvironment (frozen for one task)
+  |
+AgentSession / Harness
+  |---------------------------|
+  |                           |
+model input / perception     model tools
+  |                           |
+ImageInputGate               bash
+                              |
+                         compatibility shell
+                         /      |       \
+                       VFS    Python   NetworkRuntime
+                                |          |
+                          strict-CSP     direct / relay
+                           Pyodide
+
+Substrate: Execution / Filesystem / Network / Perception
 ```
 
-The model should not need to care whether Python is Pyodide, a command is backed by WASM, or HTTP required a relay. `bash` is the Unix-like execution facade; `edit` is the target deterministic mutation interface; execution/filesystem/network are the runtime substrate beneath them.
+The **current model-visible tool registry has exactly two entries**: `bash` and `cloud_bash`. `cloud_bash` is an unconfigured legacy/escalation stub and fails; ordinary local and network work uses `bash`. There is no current `edit` tool and no current JavaScript shell command.
 
-Plugins add code, Skills add knowledge, and MCP adds external authority — **Capabilities compose them for the user**. The user operates on Capabilities; the components are internal composition. Domain capabilities such as Excel editing, RAG, ffmpeg, LibreOffice or compilers should normally be composed above the runtime rather than becoming new core tools. Each agent task runs against a frozen `TaskEnvironment` — the resolved capability snapshot for that one task. A skill's *definition* is a shared immutable template; each enabled capability owns a private, durable *instance* under `~/.skills` that the agent may read freely and may only change — write, recreate, delete — with an explicit per-mutation user confirmation.
+The shell deliberately looks familiar rather than complete. It exposes a bounded Unix-like command set and ordinary paths; the model does not need to learn whether a command is implemented by JavaScript, Pyodide, a browser API, or an edge relay.
 
-A `cloud_bash` tool exists in the current interface but is not configured and always returns `success: false` with `Cloud execution is not configured.` It represents a future escalation provider for workloads that genuinely need a remote computer.
+**Capability is the user-facing extension unit.** A Capability resolves Plugins (local code), SkillInstances (capability-private mutable guidance), and MCP requirements (external authority) into a frozen `TaskEnvironment`. Production extension catalogs are intentionally empty today; the composition runtime is implemented and proven with synthetic tests, while the trusted real-package Plugin Runtime is the next extension-layer milestone.
 
-See [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md) for the detailed layer model.
+See [Architecture](docs/ARCHITECTURE.md), [Concepts](docs/CONCEPTS.md), [Runtime model](docs/RUNTIME-MODEL.md), and [Security model](docs/SECURITY-MODEL.md).
 
 ```
 index.html            Vite entry page + inline Pyodide worker source; loads runtime classic scripts, then the Vue app
@@ -101,7 +103,9 @@ src/
   network.js          NetworkRuntime: direct fetch with transparent /fetch relay fallback
   workspace.js        WorkspaceAdapter + LocalDirectoryWorkspace (File System Access API provider)
   vfs.js              Linux-like VFS: VirtualWorkspace mount table + MemoryWorkspace/UploadWorkspace/SystemBinWorkspace
-  extensions.js       Capability Composition v1: descriptor validators, catalogs, CapabilityManager, SkillDefinition/SkillSourceStore/skill-instance lifecycle, frozen TaskEnvironment, PluginRuntimeProvider seam, read-only StaticFileWorkspace, guarded SkillInstanceWorkspace
+  capabilities.js     model image-capability registry + ImageInputGate (provider/model input capability, not product Capability composition)
+  attachments.js      durable image attachment store and integrity checks
+  extensions.js       Capability Composition v1: descriptors/catalogs, CapabilityManager, SkillDefinition/SkillSourceStore/SkillInstance lifecycle, frozen TaskEnvironment, PluginRuntimeProvider seam, guarded SkillInstanceWorkspace
   telemetry.js        in-memory execution log
   main.js             Vue bootstrap (+ ?e2e=1 / ?demo=… QA hooks)
   App.vue             three-region workspace shell
@@ -126,7 +130,7 @@ The `bash` tool is a **Unix-like compatibility shell, not full POSIX bash**. It 
 - **stdout/stderr**: the executor keeps the two streams separated per command (`{success, stdout, stderr}`) and merges them only at the tool boundary for presentation. A failing `cat missing.txt` produces empty stdout and a `cat: ...` stderr — never one mixed bag.
 - **Redirection** (generic execution-layer feature, applied left to right — order matters): `cmd > file` / `>> file` (stdout truncate / append), `cmd 2> file` / `2>> file` (stderr truncate / append), `cmd 2>&1` (stderr inherits stdout's *current* destination — so `cmd > all.txt 2>&1` merges both into the file, while `cmd 2>&1 > out.txt` keeps stderr captured and sends only stdout to the file), and `> /dev/null` / `2> /dev/null` as a pure **discard sink** (`/dev/null` is only a redirection target — there is deliberately no `/dev`, so `cat /dev/null` still fails like any missing file). Redirection never changes a command's success: `cat missing 2> err.txt || echo fallback` and `cat missing 2>/dev/null || echo fallback` both still run the fallback. Other file descriptors (`1>&2`, `3>`, `&>`, `<`, heredocs other than python's) are rejected with clear errors.
 - **mv**: `mv <src>... <dest>` — file→file, file→directory, bounded recursive directory move, multiple sources into a directory, cross-mount moves included. An existing destination is a loud failure (no implicit overwrite, no `-f`). Implemented as copy → verify → delete: the source is never removed before the destination write has landed, and a read-only source mount (e.g. `/mnt/upload`) fails the move *before* the destination is touched, since the source could not be removed. Paths are ordinary VFS-absolute paths (`/foo` resolves against the virtual cwd's filesystem root).
-- **rm**: `rm [-f] [-r|-R] <path>...` — files, multiple operands, `-f` ignores missing paths, `-r` for recursive directory removal. Protected roots (`/`, `/usr`, `/home`, `/home/locus`, `/mnt`, `/mnt/workspace`, `/mnt/upload`, `/mnt/download`, `/mnt/plugins`) are hard-refused for recursive delete; children obey their mount's authority (`/mnt/upload/*` is read-only). Recursive deletion checks cancellation before every removal and reports exactly what was already deleted — a cancel is never a fake rollback. There is no permission-prompt layer yet by design.
+- **rm**: `rm [-f] [-r|-R] <path>...` — files, multiple operands, `-f` ignores missing paths, `-r` for recursive directory removal. Protected roots (`/`, `/usr`, `/home`, `/home/locus`, `/mnt`, `/mnt/workspace`, `/mnt/upload`, `/mnt/download`, `/mnt/plugins`) are hard-refused for recursive delete; children obey their mount's authority (`/mnt/upload/*` is read-only). Recursive deletion checks cancellation before every removal and reports exactly what was already deleted — a cancel is never a fake rollback. Ordinary writable-file deletion has no generic approval prompt; task overlays may impose stricter policy, such as mandatory confirmation for SkillInstance deletion.
 - **Virtual cwd**: every bash invocation starts at the default cwd — `/mnt/workspace` when a folder is mounted, otherwise `/home/locus`. `cd` changes the cwd only within that one invocation, and `cd` above the filesystem root is rejected. Relative paths in all commands resolve against the virtual cwd, and `python script.py` runs with Python's cwd equal to the shell cwd. Environment: `HOME=/home/locus`, `TMPDIR=/tmp`, `PATH=/usr/local/bin:/usr/bin:/bin`.
 - **ls**: `-a` (show dotfiles; `.`/`..` are never synthesized — the File System Access API has no such entries), `-l` (type/size/modified — no fake uid/gid/permissions/inodes), `-h` (deterministic human sizes: `421 B`, `12.4 KiB`, `3.1 MiB`), combined short flags, multiple paths. Compatibility semantics, not bit-perfect GNU ls.
 - **find** (bounded subset): `find [path...] [-name glob] [-type f|d] [-maxdepth N]`, glob supports `*`/`?` only. Deterministic order, workspace-confined, cancellation-aware, capped at 5000 visited entries / 1000 results with an explicit truncation note. No `-exec`/`-delete`/`-size`/boolean expressions.
@@ -142,20 +146,29 @@ The `bash` tool is a **Unix-like compatibility shell, not full POSIX bash**. It 
 
 ## curl in the browser runtime
 
-`curl` is currently the Unix-facing frontend to Locus network capability. It is a deliberately small compatibility command, not real curl:
+`curl` is the Unix-facing frontend to `NetworkRuntime`, not a wrapper around a host curl binary.
+
+Supported shape:
 
 ```bash
-curl <https-url>               # text-like responses (text/*, JSON, XML, YAML, JS) print to stdout
-curl -o <file> <https-url>     # binary-safe download to any writable VFS path (e.g. /mnt/download) (also: --output)
+curl <url>
+curl -o <file> <url>
+curl -I <url>
+curl -X <method> [-H "Name: value"] [-d <data>] <url>
+curl --data-binary @file <url>
 ```
 
-- HTTPS URLs only; `http://` and URLs with embedded credentials (`user:pass@host`) are rejected.
-- No other flags (`-H`, `-X`, `-d`, `-u`, cookies, …) — unsupported options fail with a clear message.
-- Requests are anonymous by construction (`credentials: 'omit'`), carry a client deadline (60s direct / 45s relay, covering headers **and** body), and a 16MB response cap enforced while streaming.
-- Redirects are followed by the browser, which enforces CORS per hop; the runtime does not claim per-hop visibility it does not have — hops the browser cannot validate fail as network errors and may go through the relay (which re-validates HTTPS per hop).
-- Binary responses are never dumped to the terminal as garbage; the command tells the model to re-run with `-o`.
-- Routing is transparent: direct browser fetch first; only a genuine CORS/network failure (and only when the page is hosted over HTTP(S)) falls back to the same-origin `/fetch` relay. An HTTP error status (404/401/500/…) is an authoritative response and is never re-sent through a different backend — and neither are timeouts, size-cap rejections or user cancellations.
-- From `file://` there is no relay; blocked requests fail with a clear error.
+- Targets may be absolute HTTP or HTTPS URLs. URL-embedded credentials are rejected.
+- GET/HEAD are read-like and need no approval. Only a genuine failure of the initial direct browser transport may fall back once to the relay.
+- POST/PUT/PATCH/DELETE/OPTIONS are side-effecting: they require approval, choose their backend before dispatch, and are never ambiguously retried.
+- Explicit application headers, including `Authorization`, may be sent. Ambient browser credentials are not inherited: `credentials: 'omit'`, Cookie/Sec-/hop-by-hop/browser-controlled headers are filtered, and credential-bearing redirects are origin-bound.
+- Request bodies are bounded (2 MiB default); responses are bounded (16 MiB default); deadlines cover headers and body.
+- `-o` writes binary-safe bytes to a writable VFS path. Without `-o`, text-like content may be printed; binary payloads are not dumped into the terminal.
+- Python user code itself has no network authority. Today the model uses the outer `curl` path for HTTP.
+
+Routing is a Harness concern. The model sees ordinary HTTP semantics, not CORS/direct/relay topology.
+
+See [docs/NETWORK-RUNTIME.md](docs/NETWORK-RUNTIME.md) for the exact method, header, redirect, SSRF, retry, approval, and error contracts.
 
 ## Run
 
@@ -178,21 +191,24 @@ Connection behavior: if you configure an explicit proxy URL it is always used. O
 
 ## The two relays: /proxy vs /fetch
 
+These are transport helpers, not execution sandboxes.
+
 | | `/proxy` (`functions/proxy.js`) | `/fetch` (`functions/fetch.js`) |
 |---|---|---|
-| Purpose | LLM API CORS relay | anonymous public-HTTPS resource relay |
-| Method | POST only | GET only |
-| Credentials | forwards `Authorization` / `x-api-key` to the model API | never forwards any credentials — requests are anonymous |
-| Redirects | never followed (→ 502) | followed up to 5 hops, HTTPS re-validated per hop |
-| Response cap | 8MB (`MAX_PROXY_RESPONSE_BYTES`) | 16MB (`MAX_FETCH_RESPONSE_BYTES`) |
-| Inbound limit | 1MB body (`MAX_PROXY_BODY_BYTES`): Content-Length pre-check + stream counting, 30s inbound deadline (`PROXY_INBOUND_TIMEOUT_MS` → 408) | GET only — no request body |
-| Timeout | 30s (`PROXY_TIMEOUT_MS`), covers headers **and** full body | 30s (`FETCH_TIMEOUT_MS`), covers headers **and** full body |
-| Null-body statuses | 204/205 answered with a null body | 204/205/304 answered with a null body |
-| Payload | JSON text | binary-safe bytes; final URL in `X-Locus-Final-URL` |
-| Markers | every response carries `X-Locus-Relay: 1` (distinguishes a missing function from an authoritative relay answer) | own failures carry `X-Locus-Relay-Error: 1` |
-| Active content | n/a (model API JSON) | `X-Content-Type-Options: nosniff` on everything; `Content-Security-Policy: sandbox` on HTML/XHTML/SVG/JS so a navigated response renders in an opaque origin with scripting disabled |
+| Purpose | LLM API CORS relay | ordinary HTTP(S) resource relay for NetworkRuntime |
+| Outer request form | POST | legacy GET query form, or POST JSON envelope |
+| Upstream methods | model API POST | GET / HEAD / POST / PUT / PATCH / DELETE / OPTIONS |
+| Ambient browser credentials | none beyond explicit model API auth supplied by the caller | none; cookies are stripped and `credentials: 'omit'` semantics are preserved |
+| Explicit Authorization | forwarded to the configured model API | allowed as an explicit application header; stripped on cross-origin read redirects |
+| Redirects | never followed (relay error) | bounded and policy-checked; side-effecting cross-origin redirects are blocked |
+| Request cap | 1 MiB proxy body | 2 MiB upstream request body |
+| Response cap | 8 MiB | 16 MiB |
+| Upstream timeout | 30 s | 30 s |
+| Active-content hardening | n/a (model API JSON) | `nosniff`; sandbox CSP on active content |
 
-Both are intentionally provider/site-agnostic for demo and development use, with no domain allowlists. Neither is intended to be deployed as an unrestricted production multi-tenant relay without additional rate limiting / access policy. The `/fetch` relay marks its own failures with `X-Locus-Relay-Error: 1` so clients can distinguish relay errors from authoritative upstream HTTP responses.
+NetworkRuntime's client deadline is slightly longer than the relay upstream deadline so a structured relay timeout can arrive first. Relay errors are marked separately from authoritative upstream HTTP responses.
+
+Neither relay should be treated as an unrestricted production multi-tenant service without deployment-level access policy/rate limiting.
 
 ## V0.3 reliability, integrity and permission-boundary fixes
 
@@ -332,12 +348,12 @@ manifest's package wheel set, and user execution keeps its untouched 30s budget 
 - Only user-granted mounts are accessible beyond the built-in virtual filesystem: the external folder appears only at `/mnt/workspace`, `/mnt/upload` holds user-picked files read-only, and paths are normalized with `..` escapes rejected
 - No native shell, no `child_process`, no localhost server, no remote code execution
 - Locus does not automatically upload workspace files to any execution server; only content explicitly surfaced through the agent conversation (tool results the model chose to read) is sent to the model API
-- Model-generated Python has **no direct network path**: the worker is created by a strict-CSP creator iframe, so the **browser itself** blocks every network act (fetch, XMLHttpRequest, WebSocket, EventSource, WebTransport, Worker, SharedWorker, RTCPeerConnection, importScripts, caches, dynamic import) from inside it with zero requests — the `Function` constructor stays reachable because compute is not the boundary (the F04a-R1 residual this used to allow is closed; see the Python capability declaration). On top of the browser boundary the worker applies the F04a JS lockdown before any user code: every denial at the global slot AND at every prototype-chain level that owns the name, so a recovered `Object.getPrototypeOf(self).fetch` is the same denial, and string-handler `setTimeout`/`setInterval` (eval in disguise) are refused at every level while real function handlers keep working — network belongs to `curl`/`NetworkRuntime`. This is a runtime authority boundary verified with request counters (`tests/e2e-python-authority.cjs`, `tests/e2e-python-browser-authority.cjs`), not a hostile-code sandbox certification — see the Python capability declaration below
-- Network access via `curl` is anonymous HTTPS GET only: no cookies (`credentials: 'omit'`), no auth headers, no URL userinfo, no custom request headers, no POST
+- Model-generated Python has **no direct network path**: the worker is created by a strict-CSP creator iframe, so the **browser itself** blocks network egress primitives and remote code loading (fetch, XMLHttpRequest, WebSocket, EventSource, WebTransport, remote Worker/SharedWorker creation, RTCPeerConnection, importScripts, caches, dynamic import) from inside it with zero requests — the `Function` constructor stays reachable because compute is not the boundary (the F04a-R1 residual this used to allow is closed; see the Python capability declaration). On top of the browser boundary the worker applies the F04a JS lockdown before any user code: every denial at the global slot AND at every prototype-chain level that owns the name, so a recovered `Object.getPrototypeOf(self).fetch` is the same denial, and string-handler `setTimeout`/`setInterval` (eval in disguise) are refused at every level while real function handlers keep working — network belongs to `curl`/`NetworkRuntime`. This is a runtime authority boundary verified with request counters (`tests/e2e-python-authority.cjs`, `tests/e2e-python-browser-authority.cjs`), not a hostile-code sandbox certification — see the Python capability declaration below
+- Network access via `curl` has **no ambient browser credentials** (`credentials: 'omit'`, URL userinfo rejected, cookies stripped). GET/HEAD are read-like; supported side-effecting methods such as POST/PUT/PATCH/DELETE/OPTIONS require explicit approval and are dispatched exactly once. Explicit application headers such as `Authorization` may be supplied; browser-controlled, cookie, proxy, and hop-by-hop headers are refused.
 - Switching workspaces or `reset` is a full session boundary: the running task is cancelled, history is cleared, and the Python interpreter is rebuilt
 - API keys are not persisted by default; explicit opt-in stores them only in this browser profile and never in history, provider frames, normalized messages, telemetry, logs or exports
 - `/home/locus` and `/mnt/plugins` are durable local state when OPFS is available. `/tmp`, `/mnt/upload`, `/mnt/download` and active task/process state are ephemeral
-- Persistent plugin bytes are installed-code state only; they do not grant remote authority, credentials or MCP access
+- `/mnt/plugins` is a durable local namespace when OPFS is available, but **main currently ships no production plugin catalog or trusted package loader**. Plugin metadata/code never implies remote authority, credentials, or MCP access.
 - `/fetch` responses are de-privileged for rendering: `nosniff` everywhere, `Content-Security-Policy: sandbox` on HTML/SVG/JS — a navigated response lands in an opaque origin with scripting disabled (verified in real Chrome by `tests/verify-active-content.cjs`)
 
 ### Python capability declaration (read this)
@@ -414,9 +430,10 @@ certification**: ordinary model-generated Python has no supported direct network
 browser network primitives are denied (verified in real Chrome with server-side request counters in
 `tests/e2e-python-authority.cjs` and `tests/e2e-python-browser-authority.cjs`), but Locus does not claim
 arbitrary hostile Python cannot escape — Pyodide's `js` bridge still exposes non-network browser APIs.
-Second, the **trusted harness** still fetches the pinned Pyodide core and the declared package closure
-from the CDN during its bootstrap phase (the worker itself performs zero network requests); integrity
-attestation of those bytes is a separate concern and intentionally out of scope for this boundary.
+Second, the **trusted harness** still fetches the pinned Pyodide core and declared package closure
+from the CDN during bootstrap (the worker itself performs zero network requests). That supply path is
+separate from the no-network authority boundary and is handled by the F04c size/hash verification
+contract above; the two claims should not be conflated.
 
 **F04a-R1 (closed history).** The global `Function` constructor cannot be denied — Pyodide's own glue
 calls it, and `runPythonAsync` breaks without it ("globals must be a real dict"); denying
@@ -449,7 +466,7 @@ View it in the context rail's **Telemetry** section, or `window.__telemetry` in 
 - browser automation / Chromium control
 - Office rendering / DOCX / XLSX / PDF / LibreOffice
 - WebContainer / WASI / arbitrary native binaries
-- full POSIX shell (the `bash` tool is a bounded Unix-*compatibility* shell: `pwd`, `cd`, `ls -a/-l/-h`, `cat`, `echo`, `find`, `grep`, `head`, `tail`, `wc`, `mv`, `rm`, `python`, `curl`, `help` + `;`/`&&`/`||`/`|` + `>`/`>>`/`2>`/`2>>`/`2>&1` — no `&`, `$()`, subshells, variables, glob expansion, input redirects or arbitrary file descriptors) and full curl (no `-H`/`-X`/`-d`/`-u`/cookies/POST)
+- full POSIX shell (the `bash` tool is a bounded Unix-*compatibility* shell: `pwd`, `cd`, `ls`, `cat`, `echo`, `find`, `grep`, `head`, `tail`, `wc`, `sort`, `mv`, `rm`, `python`, `curl`, `which`, `help` + `;`/`&&`/`||`/`|` + bounded redirects — no `&`, `$()`, subshells, variables, glob expansion, input redirects or arbitrary file descriptors) and full curl parity (the supported subset includes GET/HEAD, `-o`, `-I`, `-X`, `-H`, `-d`, and `--data-binary @file`; unsupported flags fail clearly, and ambient cookies/auth are never inherited)
 - authenticated website sessions
 - local models
 - cloud workspace adapters and remote authority persistence
