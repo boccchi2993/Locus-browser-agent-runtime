@@ -542,7 +542,9 @@ mutation, a higher-risk class than ordinary workspace writes:
   rule: capability guidance under `~/.skills` may be customized when the
   user asks for future behavior changes, and such mutations require
   explicit user confirmation from Locus.
-- Skill bodies still NEVER enter persistence or the system prompt: the
+- Skill bodies still NEVER enter the TaskEnvironment or the system
+  prompt, and mutable SkillInstance contents persist only as
+  capability-private durable files under `/home/locus/.skills`: the
   model reads a guidance file with `cat` when — and only when — the task
   needs it, and the body then enters history as ordinary tool output
   inside the existing `HISTORY_BUDGET_BYTES` accounting (lazy loading is

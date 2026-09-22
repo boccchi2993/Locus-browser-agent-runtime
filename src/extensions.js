@@ -41,15 +41,19 @@
 //      add/remove).
 //    - System prompt carries the capability INDEX (display names +
 //      skill guide paths), never skill bodies (agent.js renders it;
-//      bodies are read on demand from the read-only skill mount).
+//      guidance is read on demand from capability-private SkillInstance
+//      files under /home/locus/.skills/<capability-id>/<skill-id>.skill).
 //    - Skills are trusted harness content: a SkillDefinition is the
 //      publisher's immutable metadata + default source template; an
 //      ENABLED capability materializes its own private, durable
 //      SkillInstance at /home/locus/.skills/<capability-id>/<skill-id>.skill.
 //      Definitions may be shared; instances are NEVER shared.
-//    - Skill bodies never enter persistence or the system prompt; skill
-//      READS are free, every CREATE/WRITE/DELETE of an instance requires
-//      an explicit user confirmation (behavior mutation) — enforced by
+//    - Skill bodies never enter the TaskEnvironment or the system prompt;
+//      mutable SkillInstance contents DO persist as capability-private
+//      durable files under /home/locus/.skills and become provider-visible
+//      only through explicit on-demand reads. Skill READS are free, every
+//      CREATE/WRITE/DELETE of an instance requires an explicit user
+//      confirmation (behavior mutation) — enforced by
 //      SkillInstanceWorkspace, never by shell command type.
 // ============================================================
 //  Loaded after vfs.js (uses WorkspaceAdapter + normalizeWorkspacePath).
