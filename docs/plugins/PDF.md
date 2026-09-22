@@ -1,7 +1,7 @@
 # PDF plugin requirement
 
-Status: proposed / optional  
-Working id: `pdf`
+Status: exploratory candidate study; not selected for production  
+Working id (research only): `pdf`
 
 ## User problems
 
