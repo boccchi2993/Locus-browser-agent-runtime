@@ -11,13 +11,20 @@ Forked from the terminal UI / model-interaction skeleton of [Whoami_Cli_game](ht
 
 > **Normalize capabilities. Preserve model semantics.**
 
-> **If a lightweight task can be expressed as computation + files + network, it should not require a cloud computer.**
+> **If a lightweight task fits the browser substrate, it should not require a cloud computer.**
 
-Locus keeps the model-facing machine surface small and Unix-like. The browser runtime provides execution, filesystem and network substrate; the harness composes those capabilities and decides when an extension or heavier provider is required. Domain-specific features should normally grow through Plugins, Skills and MCP rather than by expanding the runtime core.
+Locus keeps the model-facing machine surface small and Unix-like. The browser runtime provides four substrate capabilities — **execution, filesystem, network and perception/model input** — while the harness composes them and decides when an extension or heavier provider is required. Domain-specific features should normally grow through Plugins, Skills and MCP rather than by expanding the runtime core.
 
 Architecture and planning docs:
 
+- **[Documentation / wiki index](docs/README.md)** — start here
 - [Architecture](docs/ARCHITECTURE.md)
+- [Design principles](docs/DESIGN-PRINCIPLES.md)
+- [Concepts and terminology](docs/CONCEPTS.md)
+- [Runtime model](docs/RUNTIME-MODEL.md)
+- [Security model](docs/SECURITY-MODEL.md)
+- [Extension model](docs/EXTENSION-MODEL.md)
+- [Testing philosophy and gates](docs/TESTING.md)
 - [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md)
 - [Model protocol and reasoning replay](docs/MODEL-PROTOCOL.md)
 - [Browser-local persistence](docs/PERSISTENCE.md)
@@ -36,6 +43,7 @@ Remote computers should be escalation providers, not the default, for lightweigh
 - Python execution via Pyodide in a Web Worker (lazy-loaded, stdout/stderr/traceback returned; `pandas` comes from the harness-declared runtime package set, loaded once at worker bootstrap — user imports never trigger package downloads)
 - **Browser-native network capability via `NetworkRuntime` + `curl`** (HTTP/HTTPS: GET/HEAD reads plus `-X POST/-H/-d` writes that ask for user approval; `curl <url>` prints text, `curl -o <file> <url>` downloads). Model-generated Python has no direct network path and cannot trigger package downloads; all HTTP/HTTPS goes through `curl`/`NetworkRuntime` — see [docs/NETWORK-RUNTIME.md](docs/NETWORK-RUNTIME.md) and the Python capability declaration below
 - **Direct browser fetch with transparent edge relay fallback** (GET/HEAD only, on genuine network failure, never after an HTTP response; side-effecting methods pick their backend before sending and are never ambiguously retried)
+- **Perception / image-input boundary**: uploaded images are stored locally, capability-gated per provider/model identity, and materialized into provider-native image input only at the model boundary; unknown capability asks the user or runs an isolated synthetic probe. Image capability never changes the tool surface — see [docs/IMAGE-INPUT.md](docs/IMAGE-INPUT.md)
 - **Binary-safe downloads into the local workspace** (no text decoding anywhere in the network path)
 - Agent tool loop (structured ` ```json ` tool calls, results fed back, max 32 iterations)
 - Local file output written back into the real workspace directory (create / modify / delete / rename), with external-edit conflict detection and staged (non-atomic) commit reporting
@@ -44,49 +52,43 @@ Remote computers should be escalation providers, not the default, for lightweigh
 - Browser-local persistence: conversations, presentation events, provider-native replay frames, normalized semantic history and settings live in IndexedDB; `/home/locus` and `/mnt/plugins` use durable OPFS when available
 - Explicit recovery semantics: in-flight runs reopen as `interrupted`, dangling tool calls remain archived but are excluded from the replay checkpoint, and same-provider replay is separate from cross-provider semantic projection
 - In-memory execution telemetry (tool, backend, operation, duration, UTF-8 bytes, success/error) + debug panel
-- **Capability composition layer (v1, architecture only)**: the user enables *Capabilities* — named compositions of local code (Plugins, authority always `none`), on-demand knowledge (Skills) and external authority requirements (MCP, never auto-authorized; unconnected requirements surface as `needs-connection`, never disguised as ready). Each agent task binds an immutable `TaskEnvironment` snapshot (shared plugins/MCP dedupe; UI changes affect only the next task). A Skill is a two-part model: the **SkillDefinition** is immutable publisher metadata plus a default Markdown source in the SkillSourceStore, and enabling a capability materializes its own durable **SkillInstance** at `/home/locus/.skills/<capability-id>/<skill-id>.skill` — definitions may be shared, instances are never shared. Reading guidance is free; every create/write/delete of an instance suspends the task on an explicit user confirmation (with a real diff and TOCTOU re-verification), and removing a capability deletes its customized instances — re-adding restores the defaults. Production catalogs are intentionally empty; tests inject synthetic capabilities. See [docs/CAPABILITY-BOUNDARIES.md](docs/CAPABILITY-BOUNDARIES.md) section 11
+- **Capability composition layer (v1, implemented infrastructure; production catalogs intentionally empty)**: the user enables *Capabilities* — named compositions of local code (Plugins, authority always `none`), on-demand knowledge (Skills) and external authority requirements (MCP, never auto-authorized; unconnected requirements surface as `needs-connection`, never disguised as ready). Each agent task binds an immutable `TaskEnvironment` snapshot (shared plugins/MCP dedupe; UI changes affect only the next task). A Skill is a two-part model: the **SkillDefinition** is immutable publisher metadata plus a default Markdown source in the SkillSourceStore, and enabling a capability materializes its own durable **SkillInstance** at `/home/locus/.skills/<capability-id>/<skill-id>.skill` — definitions may be shared, instances are never shared. Reading guidance is free; every create/write/delete of an instance suspends the task on an explicit user confirmation (with a real diff and TOCTOU re-verification), and removing a capability deletes its customized instances — re-adding restores the defaults. Production catalogs are intentionally empty; tests inject synthetic capabilities. See [docs/CAPABILITY-BOUNDARIES.md](docs/CAPABILITY-BOUNDARIES.md) section 11
 
 ## Architecture
 
-Locus separates the Unix-like interface the model sees from the browser-native substrate that implements it:
+Locus separates the product layer, the harness, and the browser-native machine substrate:
 
 ```
-                    Agent
-                      |
-               +------+------+
-               |             |
-             bash           edit
-               |
-       python / js / curl / Unix utilities
-               |
-        Runtime Substrate
-     execution / filesystem / network
-               |
-             Browser
-```
-
-The current V0.3 implementation is a partial realization of that target:
-
-```
-Agent
+User
   |
-bash
+Capability selection
   |
-Browser Runtime
-  +-- Workspace ------> File System Access API
-  +-- Python ---------> Pyodide Worker
-  +-- curl -----------> NetworkRuntime
-                         +-- browser-direct
-                         +-- edge /fetch relay
+TaskEnvironment (frozen for one task)
+  |
+AgentSession / Harness
+  |---------------------------|
+  |                           |
+model input / perception     model tools
+  |                           |
+ImageInputGate               bash
+                              |
+                         compatibility shell
+                         /      |       \
+                       VFS    Python   NetworkRuntime
+                                |          |
+                          strict-CSP     direct / relay
+                           Pyodide
+
+Substrate: Execution / Filesystem / Network / Perception
 ```
 
-The model should not need to care whether Python is Pyodide, a command is backed by WASM, or HTTP required a relay. `bash` is the Unix-like execution facade; `edit` is the target deterministic mutation interface; execution/filesystem/network are the runtime substrate beneath them.
+The **current model-visible tool registry has exactly two entries**: `bash` and `cloud_bash`. `cloud_bash` is an unconfigured legacy/escalation stub and fails; ordinary local and network work uses `bash`. There is no current `edit` tool and no current JavaScript shell command.
 
-Plugins add code, Skills add knowledge, and MCP adds external authority — **Capabilities compose them for the user**. The user operates on Capabilities; the components are internal composition. Domain capabilities such as Excel editing, RAG, ffmpeg, LibreOffice or compilers should normally be composed above the runtime rather than becoming new core tools. Each agent task runs against a frozen `TaskEnvironment` — the resolved capability snapshot for that one task. A skill's *definition* is a shared immutable template; each enabled capability owns a private, durable *instance* under `~/.skills` that the agent may read freely and may only change — write, recreate, delete — with an explicit per-mutation user confirmation.
+The shell deliberately looks familiar rather than complete. It exposes a bounded Unix-like command set and ordinary paths; the model does not need to learn whether a command is implemented by JavaScript, Pyodide, a browser API, or an edge relay.
 
-A `cloud_bash` tool exists in the current interface but is not configured and always returns `success: false` with `Cloud execution is not configured.` It represents a future escalation provider for workloads that genuinely need a remote computer.
+**Capability is the user-facing extension unit.** A Capability resolves Plugins (local code), SkillInstances (capability-private mutable guidance), and MCP requirements (external authority) into a frozen `TaskEnvironment`. Production extension catalogs are intentionally empty today; the composition runtime is implemented and proven with synthetic tests, while the trusted real-package Plugin Runtime is the next extension-layer milestone.
 
-See [Capability boundaries](docs/CAPABILITY-BOUNDARIES.md) for the detailed layer model.
+See [Architecture](docs/ARCHITECTURE.md), [Concepts](docs/CONCEPTS.md), [Runtime model](docs/RUNTIME-MODEL.md), and [Security model](docs/SECURITY-MODEL.md).
 
 ```
 index.html            Vite entry page + inline Pyodide worker source; loads runtime classic scripts, then the Vue app
@@ -101,7 +103,9 @@ src/
   network.js          NetworkRuntime: direct fetch with transparent /fetch relay fallback
   workspace.js        WorkspaceAdapter + LocalDirectoryWorkspace (File System Access API provider)
   vfs.js              Linux-like VFS: VirtualWorkspace mount table + MemoryWorkspace/UploadWorkspace/SystemBinWorkspace
-  extensions.js       Capability Composition v1: descriptor validators, catalogs, CapabilityManager, SkillDefinition/SkillSourceStore/skill-instance lifecycle, frozen TaskEnvironment, PluginRuntimeProvider seam, read-only StaticFileWorkspace, guarded SkillInstanceWorkspace
+  capabilities.js     model image-capability registry + ImageInputGate (provider/model input capability, not product Capability composition)
+  attachments.js      durable image attachment store and integrity checks
+  extensions.js       Capability Composition v1: descriptors/catalogs, CapabilityManager, SkillDefinition/SkillSourceStore/SkillInstance lifecycle, frozen TaskEnvironment, PluginRuntimeProvider seam, guarded SkillInstanceWorkspace
   telemetry.js        in-memory execution log
   main.js             Vue bootstrap (+ ?e2e=1 / ?demo=… QA hooks)
   App.vue             three-region workspace shell
@@ -333,11 +337,11 @@ manifest's package wheel set, and user execution keeps its untouched 30s budget 
 - No native shell, no `child_process`, no localhost server, no remote code execution
 - Locus does not automatically upload workspace files to any execution server; only content explicitly surfaced through the agent conversation (tool results the model chose to read) is sent to the model API
 - Model-generated Python has **no direct network path**: the worker is created by a strict-CSP creator iframe, so the **browser itself** blocks every network act (fetch, XMLHttpRequest, WebSocket, EventSource, WebTransport, Worker, SharedWorker, RTCPeerConnection, importScripts, caches, dynamic import) from inside it with zero requests — the `Function` constructor stays reachable because compute is not the boundary (the F04a-R1 residual this used to allow is closed; see the Python capability declaration). On top of the browser boundary the worker applies the F04a JS lockdown before any user code: every denial at the global slot AND at every prototype-chain level that owns the name, so a recovered `Object.getPrototypeOf(self).fetch` is the same denial, and string-handler `setTimeout`/`setInterval` (eval in disguise) are refused at every level while real function handlers keep working — network belongs to `curl`/`NetworkRuntime`. This is a runtime authority boundary verified with request counters (`tests/e2e-python-authority.cjs`, `tests/e2e-python-browser-authority.cjs`), not a hostile-code sandbox certification — see the Python capability declaration below
-- Network access via `curl` is anonymous HTTPS GET only: no cookies (`credentials: 'omit'`), no auth headers, no URL userinfo, no custom request headers, no POST
+- Network access via `curl` is anonymous by construction (`credentials: 'omit'`, URL userinfo rejected, ambient cookies stripped). GET/HEAD are read-like; supported side-effecting methods such as POST/PUT/PATCH/DELETE/OPTIONS require explicit approval and are dispatched exactly once. Custom headers are bounded and filtered; browser-controlled, cookie, and hop-by-hop headers are refused.
 - Switching workspaces or `reset` is a full session boundary: the running task is cancelled, history is cleared, and the Python interpreter is rebuilt
 - API keys are not persisted by default; explicit opt-in stores them only in this browser profile and never in history, provider frames, normalized messages, telemetry, logs or exports
 - `/home/locus` and `/mnt/plugins` are durable local state when OPFS is available. `/tmp`, `/mnt/upload`, `/mnt/download` and active task/process state are ephemeral
-- Persistent plugin bytes are installed-code state only; they do not grant remote authority, credentials or MCP access
+- `/mnt/plugins` is a durable local namespace when OPFS is available, but **main currently ships no production plugin catalog or trusted package loader**. Plugin metadata/code never implies remote authority, credentials, or MCP access.
 - `/fetch` responses are de-privileged for rendering: `nosniff` everywhere, `Content-Security-Policy: sandbox` on HTML/SVG/JS — a navigated response lands in an opaque origin with scripting disabled (verified in real Chrome by `tests/verify-active-content.cjs`)
 
 ### Python capability declaration (read this)
@@ -449,7 +453,7 @@ View it in the context rail's **Telemetry** section, or `window.__telemetry` in 
 - browser automation / Chromium control
 - Office rendering / DOCX / XLSX / PDF / LibreOffice
 - WebContainer / WASI / arbitrary native binaries
-- full POSIX shell (the `bash` tool is a bounded Unix-*compatibility* shell: `pwd`, `cd`, `ls -a/-l/-h`, `cat`, `echo`, `find`, `grep`, `head`, `tail`, `wc`, `mv`, `rm`, `python`, `curl`, `help` + `;`/`&&`/`||`/`|` + `>`/`>>`/`2>`/`2>>`/`2>&1` — no `&`, `$()`, subshells, variables, glob expansion, input redirects or arbitrary file descriptors) and full curl (no `-H`/`-X`/`-d`/`-u`/cookies/POST)
+- full POSIX shell (the `bash` tool is a bounded Unix-*compatibility* shell: `pwd`, `cd`, `ls`, `cat`, `echo`, `find`, `grep`, `head`, `tail`, `wc`, `sort`, `mv`, `rm`, `python`, `curl`, `which`, `help` + `;`/`&&`/`||`/`|` + bounded redirects — no `&`, `$()`, subshells, variables, glob expansion, input redirects or arbitrary file descriptors) and full curl parity (the supported subset includes GET/HEAD, `-o`, `-I`, `-X`, `-H`, `-d`, and `--data-binary @file`; unsupported flags fail clearly, and ambient cookies/auth are never inherited)
 - authenticated website sessions
 - local models
 - cloud workspace adapters and remote authority persistence
