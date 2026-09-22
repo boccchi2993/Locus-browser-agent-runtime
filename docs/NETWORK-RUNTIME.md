@@ -82,8 +82,9 @@ Only `http:` and `https:`. Everything else — `file:`, `ftp:`, `data:`,
 `blob:`, `javascript:`, `ws:`, `wss:`, `chrome:`, `about:`, and any unknown
 scheme — is rejected client-side with `network_unsupported_scheme` before any
 backend is contacted (curl must never hand those to browser fetch).
-Credentials embedded in the URL (`https://user:pass@host/`) are rejected;
-requests are anonymous by construction.
+Credentials embedded in the URL (`https://user:pass@host/`) are rejected.
+Requests do not inherit ambient browser credentials; explicit application headers such as
+`Authorization` are governed by the header policy below.
 
 URLs are parsed with `new URL(...)` only — never regex-split. The canonical
 request identity is the WHATWG-canonicalized
