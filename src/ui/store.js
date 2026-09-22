@@ -25,6 +25,7 @@ import { reactive, computed } from 'vue';
    LocalDirectoryWorkspace, ensureWorkspacePermission, PythonRuntime,
    Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS,
    CapabilityManager, CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
+   SkillSourceStore, SkillInstanceStorage, SkillInstanceWorkspace,
    PersistenceServiceInstance, OPFSWorkspace, ConversationHistoryWorkspace,
    getProviderAdapter, projectNormalizedHistory */
 
@@ -36,9 +37,13 @@ const vfs = new VirtualWorkspace({ listCommands: () => Object.keys(SHELL_COMMAND
 export { vfs };
 
 // Capability Composition v1: page-session CapabilityManager over the
-// (empty) PRODUCTION catalogs. No persistence — a reload resets to the
-// default. Tests/e2e inject synthetic catalogs through
-// injectCapabilityCatalogs(); production code never does.
+// (empty) PRODUCTION catalogs, an EMPTY default source store and the
+// durable skill-instance storage backed by the CURRENT /home/locus mount
+// (memory before boot, OPFS after — resolved dynamically, never captured).
+// No capability persistence — a reload resets enabled-state; the
+// materialized instances stay durable and a re-enable reuses them.
+// Tests/e2e inject synthetic catalogs through injectCapabilityCatalogs();
+// production code never does.
 const capabilityManager = typeof CapabilityManager === 'function'
   ? new CapabilityManager({
       catalogs: {
@@ -47,6 +52,15 @@ const capabilityManager = typeof CapabilityManager === 'function'
         skills: SKILL_CATALOG,
         mcps: MCP_CATALOG,
       },
+      sources: typeof SkillSourceStore === 'function' ? new SkillSourceStore() : undefined,
+      instances: typeof SkillInstanceStorage === 'function'
+        ? new SkillInstanceStorage({
+            resolveHome: () => {
+              const r = vfs.resolveMount('/home/locus');
+              return r ? r.provider : null;
+            },
+          })
+        : undefined,
     })
   : null;
 export { capabilityManager };
@@ -62,11 +76,12 @@ export function capabilityList() {
 
 // TEST/E2E-ONLY synthetic catalog injection (production catalogs stay
 // empty). Validates loudly before swapping; enabled-state resets with
-// the new set. Rejected while a task is running.
-export function injectCapabilityCatalogs(catalogs) {
+// the new set. Optional second argument swaps the synthetic SOURCE store:
+// { [skillId]: { version, source } }. Rejected while a task is running.
+export function injectCapabilityCatalogs(catalogs, sources) {
   if (!capabilityManager) throw new Error('capability runtime unavailable');
   if (store.busy || session.task) throw new Error('cannot change capabilities while a task is running');
-  capabilityManager.replaceCatalogs(catalogs);
+  capabilityManager.replaceCatalogs(catalogs, sources);
   syncCapabilityProjection();
   return store.capabilities;
 }
@@ -74,7 +89,11 @@ export function injectCapabilityCatalogs(catalogs) {
 // Capability mutations are between-task actions: while a task runs the
 // UI disables them AND these guards reject programmatic calls. A task
 // already holds its own frozen TaskEnvironment either way — the guard
-// exists to keep manager state and user expectation aligned.
+// exists to keep manager state and user expectation aligned. Both enable
+// and disable now touch the DURABLE home (instance materialization /
+// capability-directory removal), so both run inside the storage-mutation
+// gate: a running task can never race OPFS skill files, and a failed
+// destructive removal surfaces as an error instead of a fake "Removed".
 function assertCapabilitiesIdle() {
   if (store.busy || session.task) {
     throw new Error('a task is running; capability changes apply between tasks');
@@ -84,16 +103,20 @@ function assertCapabilitiesIdle() {
 export async function enableCapability(id) {
   if (!capabilityManager) throw new Error('capability runtime unavailable');
   assertCapabilitiesIdle();
-  const state = await capabilityManager.enable(id);
-  syncCapabilityProjection();
-  return state;
+  return withStorageMutation(async () => {
+    const state = await capabilityManager.enable(id);
+    syncCapabilityProjection();
+    return state;
+  });
 }
 
-export function disableCapability(id) {
+export async function disableCapability(id) {
   if (!capabilityManager) throw new Error('capability runtime unavailable');
   assertCapabilitiesIdle();
-  capabilityManager.disable(id);
-  syncCapabilityProjection();
+  await withStorageMutation(async () => {
+    await capabilityManager.disable(id);
+    syncCapabilityProjection();
+  });
 }
 
 // The ONLY write path for external-connection state (the future MCP
@@ -639,10 +662,13 @@ export function resolveApproval(requestId, decision) {
 //                 now", not "No, this model is text-only" — nothing is
 //                 written to the capability registry; the gate treats the
 //                 image as unsent for this run and does not re-ask.
+//   confirmation→ CANCEL the mutation (behavior changes never ride an
+//                 implicit deny that might be read as a lasting verdict;
+//                 the model is simply told the change did not happen).
 export function denyApproval() {
   const pending = store.pendingApproval;
   if (!pending) return false;
-  if (pending.kind === 'capability') {
+  if (pending.kind === 'capability' || pending.kind === 'confirmation') {
     return approvals.cancel(pending.id, 'escape');
   }
   return approvals.resolve(pending.id, { outcome: 'deny', scope: 'once' });
@@ -1074,13 +1100,35 @@ export async function submit(text) {
     // bubble). run() emits ONE task_start for it.
     // Capability Composition v1: build THIS task's immutable environment,
     // prepare the python plugin set for it, and bind per-task mounts on
-    // the fork (skill guides + plugin/capability introspection, all
-    // read-only). The environment is deeply frozen — later capability
-    // changes can only affect the NEXT task, never this one.
+    // the fork (plugin/capability introspection, read-only; the guarded
+    // skill-instance view below). The environment is deeply frozen —
+    // later capability changes can only affect the NEXT task, never this
+    // one. Presence is re-observed first so a skill deleted or recreated
+    // by an earlier task is honestly reflected in THIS task's index.
+    if (capabilityManager) await capabilityManager.refreshSkillPresence();
     const taskEnvironment = capabilityManager ? capabilityManager.buildTaskEnvironment() : null;
     await preparePythonRuntimeForEnvironment(taskEnvironment);
     const taskVfs = vfs.fork();
     if (capabilityManager && taskEnvironment) {
+      if (taskEnvironment.skills.length && typeof SkillInstanceWorkspace === 'function') {
+        // Task-bound approval-guarded view of /home/locus/.skills: every
+        // skill mutation of this task (shell redirects, rm, curl -o,
+        // python write-backs) suspends on a confirmation here. The signal
+        // getter is generation-pinned — after a session switch this fork's
+        // guard fails closed instead of borrowing the next task's signal.
+        const forkGeneration = session.generation;
+        taskVfs.mount('/home/locus/.skills', new SkillInstanceWorkspace({
+          storage: capabilityManager.skillInstances,
+          context: {
+            approvals: approvals,
+            conversationId: runningConversationId || store.liveConversationId || null,
+            taskGeneration: session.generation,
+            getSignal: () => ((session.generation === forkGeneration && session.task)
+              ? session.task.controller.signal : null),
+            taskEnvironment: taskEnvironment,
+          },
+        }), 'read-write');
+      }
       for (const mount of capabilityManager.taskVfsMounts(taskEnvironment)) {
         taskVfs.mount(mount.path, mount.provider, mount.authority);
       }

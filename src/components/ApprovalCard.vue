@@ -49,12 +49,19 @@ const cardEl = ref(null);
 // Feedback v1, docs/IMAGE-INPUT.md) is a KNOWLEDGE question about the
 // model, not a permission: its outcomes are confirm/decline/unsure, it
 // has no session grants, and Escape cancels the decision instead of
-// answering "No" (docs/APPROVALS.md).
+// answering "No" (docs/APPROVALS.md). confirmation (mutable skill
+// instances) is a BEHAVIOR-MUTATION gate: Confirm/Cancel only, no
+// session grant, and the harness — never the model — supplied the
+// summary, diff and resource identity.
 const KIND_TEXT = {
   permission: { title: 'Approval required', lead: 'Locus wants permission to:' },
   capability: {
     title: 'Image capability',
     lead: 'Locus does not know whether the current model supports image input. Is this an image-capable model?',
+  },
+  confirmation: {
+    title: 'Behavior change',
+    lead: 'Locus wants to change future capability guidance:',
   },
 };
 const KIND_BUTTONS = {
@@ -67,6 +74,10 @@ const KIND_BUTTONS = {
     { label: 'No', style: 'deny', decision: { outcome: 'decline' } },
     { label: 'Yes', style: 'primary', decision: { outcome: 'confirm' } },
     { label: "I don't know", style: 'secondary', decision: { outcome: 'unsure' } },
+  ],
+  confirmation: [
+    { label: 'Cancel', style: 'deny', cancel: true },
+    { label: 'Confirm', style: 'primary', decision: { outcome: 'confirm', scope: 'once' } },
   ],
 };
 const FALLBACK_BUTTONS = [{ label: 'Dismiss', style: 'secondary', cancel: true }];

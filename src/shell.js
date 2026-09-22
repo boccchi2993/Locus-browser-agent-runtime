@@ -853,7 +853,10 @@ const PythonRuntime = {
         await vfs.mkdir(d);
         mkdirs.push(d);
       } catch (e) {
-        writeFailed.push('mkdir ' + d + ': ' + (e && e.message ? e.message : String(e)));
+        // A skill-boundary refusal is a DECISION (harness-owned layout),
+        // reported as a refused conflict — never a silent skip.
+        if (isSkillMutationError(e)) conflicts.push({ path: d, reason: e.message });
+        else writeFailed.push('mkdir ' + d + ': ' + (e && e.message ? e.message : String(e)));
       }
     }
 
@@ -913,7 +916,12 @@ const PythonRuntime = {
         await vfs.write(f.path, bytes);
         written.push(f.path);
       } catch (e) {
-        writeFailed.push(f.path + ': ' + (e && e.message ? e.message : String(e)));
+        // Skill mutations are approval-bound at the task fork's
+        // SkillInstanceWorkspace: declined confirmations, TOCTOU
+        // conflicts and undeclared paths are honest REFUSALS (changeset
+        // reports the skill as not persisted), not generic I/O errors.
+        if (isSkillMutationError(e)) conflicts.push({ path: f.path, reason: e.message });
+        else writeFailed.push(f.path + ': ' + (e && e.message ? e.message : String(e)));
       }
     }
 
@@ -969,7 +977,8 @@ const PythonRuntime = {
           deleted.push(p);
         } catch (e) {
           if (e && e.name === 'NotFoundError') continue; // already gone
-          writeFailed.push('delete ' + p + ': ' + (e && e.message ? e.message : String(e)));
+          if (isSkillMutationError(e)) conflicts.push({ path: p, reason: e.message });
+          else writeFailed.push('delete ' + p + ': ' + (e && e.message ? e.message : String(e)));
         }
       }
     } else if (result.deleted && result.deleted.length && deletesBlocked) {
@@ -1013,7 +1022,8 @@ const PythonRuntime = {
           deleted.push(p);
         } catch (e) {
           if (e && e.name === 'NotFoundError') continue; // already gone
-          writeFailed.push('rmdir ' + p + ': ' + (e && e.message ? e.message : String(e)));
+          if (isSkillMutationError(e)) conflicts.push({ path: p, reason: e.message });
+          else writeFailed.push('rmdir ' + p + ': ' + (e && e.message ? e.message : String(e)));
         }
       }
     } else if (deletedDirs.length && dirDeletesBlocked) {
@@ -1624,6 +1634,36 @@ function writableErrMsg(e) {
   if (e && e.name === 'NotMountedError') return 'not mounted';
   if (e && e.name === 'ReadOnlyError') return 'read-only filesystem';
   return e && e.message ? e.message : String(e);
+}
+
+// ---------- capability skill instance boundary (mutable skill closure) ----
+// Skill instance identity IS the path (capabilityId + skillId) under
+// /home/locus/.skills. Two shell operations can never apply to it:
+//   mv — a move would split the mutation across an approval-bound write
+//        and an approval-bound delete; a half-approved half-move is
+//        exactly the incoherent state the path identity forbids.
+//   rm -r on the skills root or a capability directory — capability-wide
+//        deletion is exclusively the user's Remove action in Settings.
+// Single-file writes/deletes route through the task's guarded
+// SkillInstanceWorkspace mount (echo >, >>, curl -o, rm <file>, python
+// commits all ask there); these checks only close the two structural
+// holes the guard cannot see (mv is read+write+delete at the shell layer,
+// and rm -r would walk into per-file approvals).
+const SKILL_INSTANCE_SHELL_ROOT = '/home/locus/.skills';
+const SKILL_IDENTITY_BOUNDARY_MSG =
+  'Skill instance paths are stable; edit the skill in place, '
+  + 'delete the individual skill with approval, or remove/re-add the capability.';
+
+function underSkillInstances(abs) {
+  return abs === SKILL_INSTANCE_SHELL_ROOT || abs.startsWith(SKILL_INSTANCE_SHELL_ROOT + '/');
+}
+
+// True when a guard error came from the skill mutation boundary (declined
+// confirmation, TOCTOU conflict, undeclared path, size bound). The python
+// commit phase reports these as REFUSED conflicts — honest changeset
+// accounting — instead of generic write failures.
+function isSkillMutationError(e) {
+  return !!e && typeof e.code === 'string' && e.code.indexOf('skill_mutation_') === 0;
 }
 
 // The parent of an absolute target must be an existing directory. Mount
@@ -2572,6 +2612,12 @@ async function shMv(ctx, args) {
     if (ctx.vfs.isProtectedRoot(srcAbs)) {
       return shErr('mv: ' + srcDisplay + ': refusing to move protected path: ' + srcAbs);
     }
+    // Skill instance identity is path-stable: any move touching ~/.skills
+    // (source OR destination) is refused outright — never split into an
+    // approved write plus an approved delete.
+    if (underSkillInstances(srcAbs) || underSkillInstances(destAbs)) {
+      return shErr('mv: ' + srcDisplay + ': ' + SKILL_IDENTITY_BOUNDARY_MSG);
+    }
     let srcStat;
     try {
       srcStat = await ctx.vfs.stat(srcAbs);
@@ -2803,6 +2849,15 @@ async function shRm(ctx, args) {
       continue;
     }
     if (st.kind === 'directory') {
+      // Capability-wide deletion is exclusively the user's Remove action
+      // in Settings: no recursive shell removal of the skills root or a
+      // capability's instance directory, however spelled. A single
+      // declared <skill>.skill file is still deletable (with approval).
+      if (underSkillInstances(abs)) {
+        errors.push('rm: refusing to remove capability skill directory: ' + abs + '. '
+          + SKILL_IDENTITY_BOUNDARY_MSG);
+        continue;
+      }
       if (!recursive) {
         errors.push('rm: ' + op + ': is a directory');
         continue;

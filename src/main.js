@@ -178,12 +178,12 @@ if (e2eMode) {
     store: () => ui.getAttachmentStore(),
   };
   // Capability Composition v1 seam (never exposed outside ?e2e=1):
-  // TEST-ONLY synthetic catalog injection + manager driving. The
-  // production catalog is empty; nothing here exists in a normal run.
+  // TEST-ONLY synthetic catalog + source injection and manager driving.
+  // The production catalog is empty; nothing here exists in a normal run.
   window.__locus.capabilityComposition = {
     manager: () => ui.capabilityManager,
     list: () => ui.capabilityList(),
-    injectTestCatalog: (catalogs) => ui.injectCapabilityCatalogs(catalogs),
+    injectTestCatalog: (catalogs, sources) => ui.injectCapabilityCatalogs(catalogs, sources),
     enable: (id) => ui.enableCapability(id),
     disable: (id) => ui.disableCapability(id),
     connectMcp: (id) => ui.setMcpConnectionState(id, 'connected'),

@@ -62,12 +62,17 @@
             <span class="capability-state" :data-state="c.state">{{ stateLabel(c) }}</span>
             <button v-if="!c.enabled" class="rail-btn" type="button" :disabled="store.busy || store.cancelling"
               :data-testid="'capability-add-' + c.id" @click="addCapability(c)">Add</button>
-            <button v-else class="rail-btn" type="button" :disabled="store.busy || store.cancelling"
-              :data-testid="'capability-remove-' + c.id" @click="removeCapability(c)">Remove</button>
+            <button v-else-if="removingId !== c.id" class="rail-btn danger" type="button" :disabled="store.busy || store.cancelling"
+              :data-testid="'capability-remove-' + c.id" @click="beginRemoveCapability(c)">Remove</button>
+            <button v-else class="rail-btn danger" type="button" :disabled="store.busy || store.cancelling"
+              :data-testid="'capability-remove-confirm-' + c.id" @click="removeCapability(c)">Confirm remove</button>
           </div>
           <div class="hint">{{ c.description }}</div>
           <div v-if="c.enabled" class="hint" :data-testid="'capability-includes-' + c.id">
             Includes: {{ c.includes.plugins }} local software · {{ c.includes.skills }} guidance · {{ c.includes.mcps }} external connections
+          </div>
+          <div v-if="c.enabled" class="hint" data-testid="capability-remove-warning">
+            Removing this capability also deletes its customized guidance. Re-adding it restores the default guidance.
           </div>
           <div v-if="c.enabled && c.error" class="hint">{{ c.error }}</div>
           <template v-if="c.enabled">
@@ -121,7 +126,7 @@ import {
   forgetApiKeys as forgetStoredApiKeys, resetAllData as resetLocalData,
   refreshImageCapability, recheckImageCapability,
 } from '../ui/store.js';
-import { computed, onMounted } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 
 const storageSummary = computed(() => {
   const s = store.storageStatus;
@@ -140,12 +145,22 @@ const imageCapabilitySummary = computed(() => {
 
 const capabilities = computed(() => store.capabilities);
 
+// Two-step destructive confirmation for Remove (fixed UI copy, never a
+// model-controlled ApprovalCard — this is the USER's own button action).
+// Removing a capability deletes its durable skill instances; the warning
+// above the buttons states that semantics permanently.
+const removingId = ref(null);
+
 function stateLabel(c) {
   if (!c.enabled) return c.state === 'disabled' ? 'Not added' : c.state;
   return { ready: 'Ready', 'needs-connection': 'Connection required', error: 'Error', disabled: 'Not added' }[c.state] || c.state;
 }
 
 async function refreshCapabilities() { capabilityList(); }
+
+function beginRemoveCapability(c) {
+  removingId.value = c.id;
+}
 
 async function addCapability(c) {
   try {
@@ -156,12 +171,14 @@ async function addCapability(c) {
   }
 }
 
-function removeCapability(c) {
+async function removeCapability(c) {
   try {
-    disableCapability(c.id);
+    await disableCapability(c.id);
     refreshCapabilities();
   } catch (e) {
     store.storageNotice = e.message || String(e);
+  } finally {
+    removingId.value = null;
   }
 }
 
