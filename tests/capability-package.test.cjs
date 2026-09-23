@@ -536,6 +536,12 @@ async function patchManifest(ws, rel, transform) {
   }
 
   // ===================== P40 synthetic wheel fixture is a REAL wheel =====================
+  // Boundary: these checks prove the FIXTURE artifact prepared for the
+  // next milestone (Trusted Plugin Runtime) is a genuine wheel. They
+  // do NOT mean buildProject validates arbitrary author-supplied wheel
+  // bytes - Package Core checks only the declared format, bounds and
+  // exact identity; wheel installability is verified by the Trusted
+  // Plugin Runtime (offline install + smoke import before READY).
   {
     const buf = FIXTURE_FILES.get(WHEEL_REL);
     const u8 = Buffer.from(buf);

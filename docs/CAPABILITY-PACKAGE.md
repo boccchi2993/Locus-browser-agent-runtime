@@ -177,6 +177,12 @@ non-bundle) throw instead.
 - `LocusCapabilityPackage.inspectBundle(bundle)` - zero side effects,
   returns a SAFE plain summary (ids, versions, imports, sizes, hashes,
   `totalBytes`, `valid: true`) and never raw bytes or skill bodies.
+  `valid: true` means a STRUCTURALLY VALID CapabilityBundle (schema,
+  graph coherence, source/path rules, authority policy, bounds,
+  declared artifact format, exact content identity and size). It does
+  NOT mean any Plugin has been installed or smoke-imported:
+  runtime-specific installability is verified by the Trusted Plugin
+  Runtime before the runtime reports READY, never by Package Core.
 
 ### 2b.7 CapabilityBundle and the lock
 
@@ -216,7 +222,9 @@ A package must fail validation on:
 - missing referenced local components;
 - duplicate logical files;
 - unsupported schema version;
-- incompatible runtime/artifact shape.
+- runtime/artifact declaration mismatch (package policy: `python`
+  runtime with exactly one declared `python-wheel` artifact — a
+  declared-shape check only, not byte-level wheel validation).
 
 ## 4. Source manifests
 
@@ -388,7 +396,11 @@ Validation is layered.
 - Python imports match the existing module-name contract;
 - artifacts exist and stay within package bounds;
 - builder computes size + SHA-256;
-- runtime-specific compatibility is checked before the bundle can be called valid.
+- Package Core validates the declared artifact format, bounds,
+  identity and exact bytes. Runtime-specific installability is
+  verified by the Trusted Plugin Runtime before the runtime reports
+  READY — it is not checked here, and a valid CapabilityBundle is
+  not yet a proven-installable Plugin.
 
 ### E. Authority validation
 
@@ -430,7 +442,7 @@ The model cannot invoke a hidden “trust this package” shell command.
 
 ## 8. What validation and import do — and do not — prove
 
-Package validation proves **shape, graph coherence, bounds, and byte identity**. It is not malware scanning and it does not prove that third-party code is benevolent.
+Package validation proves **shape, graph coherence, bounds, and byte identity**. It is not malware scanning and it does not prove that third-party code is benevolent. It also does not parse or install artifact bytes: a declared `python-wheel` artifact is checked as a declared format with exact identity, not as a structurally installable wheel. That proof belongs to the Trusted Plugin Runtime (offline install + smoke import before READY).
 
 An explicit import is therefore a trust transition:
 
@@ -476,7 +488,7 @@ The Plugin Runtime should not care whether verified bytes came from:
 - a future built-in trusted catalog provider;
 - a future pinned remote artifact provider.
 
-It receives an artifact whose identity, size, digest, runtime, and expected imports have already been validated.
+It receives an artifact whose identity, size, digest, runtime, and expected imports have already been validated. Package Core never parses, installs, or executes artifact bytes — `python-wheel` is a declaration whose semantics only the runtime verifies.
 
 For Python v1:
 

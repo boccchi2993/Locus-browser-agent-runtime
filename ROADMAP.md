@@ -243,11 +243,8 @@ than something that requires source edits to Locus.
 
 Planned contract:
 
-- editable Capability Project layout;
 - editable Capability Project layout; [implemented]
-- strict validator over manifests/component graph/authority;
 - strict validator over manifests/component graph/authority; [implemented]
-- deterministic builder that generates size + SHA-256 lock metadata;
 - deterministic builder that generates size + SHA-256 lock metadata; [implemented]
 - page-session imported-package registry for v1;
 - explicit user import/trust transition;

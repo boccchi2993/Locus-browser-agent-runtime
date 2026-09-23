@@ -83,4 +83,8 @@ RECORD-checked synthetic pure-Python wheel) through a
 `WorkspaceAdapter` provider and proves validation, deterministic build,
 byte isolation, safe inspect, bounds, path traversal rejection and
 zero-write behavior. That is unit evidence for validate/build/inspect
-only - it is NOT evidence that import, registration or enablement works.
+only - it is NOT evidence that import, registration or enablement works,
+and NOT evidence that Package Core validates arbitrary wheel bytes.
+P40 proves the prepared FIXTURE is a real wheel; runtime installability
+of an author artifact is Trusted Plugin Runtime work (offline install +
+smoke import before READY).
