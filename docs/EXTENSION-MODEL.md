@@ -62,10 +62,14 @@ Supporting facts:
   base, plugin artifacts are extension payload delivered in the bootstrap
   MESSAGE.
 - The trusted harness (`PythonRuntime.configureExtensions`) validates the
-  wheel payload (schema, basename-only `.whl` filename, `python-wheel`
-  format, size bounds <= the package artifact bound, lowercase hex SHA-256,
-  bytes view with `byteLength == size`) and takes an OWN COPY — a caller
-  mutating its bytes afterwards can never change future boots.
+  wheel payload (canonical plugin id matching the descriptors'
+  `EXTENSION_ID_PATTERN`, exactly one `.whl` artifact per module, schema,
+  basename-only `.whl` filename, `python-wheel` format, size bounds <= the
+  package artifact bound, lowercase hex SHA-256, bytes view with
+  `byteLength == size`) and takes an OWN COPY of the exact declared byte
+  range — a caller mutating its bytes or the surrounding backing buffer
+  afterwards can never change future boots. The same canonical plugin id
+  gate covers the legacy synthetic source path.
 - The worker NEVER trusts the channel: it re-verifies byte identity before
   writing anything, installs from `/tmp/locus-plugin-artifacts/<sha256>/`,
   deletes the scratch file in every outcome, and smoke-imports every

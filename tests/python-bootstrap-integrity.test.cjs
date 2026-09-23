@@ -603,8 +603,9 @@ async function run() {
     let firstAssetDelayElapsed = false;
     const log = [];
     global.fetch = installFakeFetch({
-      // The first asset crawls; 10 assets x 25ms ~= 250ms acquisition, still
-      // inside its 10s budget. The init budget is only 150ms BUT it is
+      // The first asset crawls; at 25ms per asset the whole-manifest
+      // acquisition stays well inside its 10s budget. The init budget is
+      // only 150ms BUT it is
       // paused during acquisition, so the 100ms boot reply afterwards must
       // still fit — the two budgets cannot eat each other.
       'pyodide.js': () => new Promise((resolve) => setTimeout(() => {

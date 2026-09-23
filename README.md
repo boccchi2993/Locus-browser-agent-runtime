@@ -388,7 +388,7 @@ check derives from that single table. The harness downloads each asset as **raw 
 `res.text()`), bounds the read at the manifest's exact size (streaming readers stop and cancel the
 moment a body exceeds the bound, so an oversized response cannot balloon memory), then verifies the
 SHA-256 with the browser's native WebCrypto — text decoding happens only AFTER the digest matches, and
-only a complete 10/10 verified set is delivered to the worker or written to the page-session cache.
+only a complete verified manifest set is delivered to the worker or written to the page-session cache.
 Byte-size, truncation, hash-mismatch, HTTP-failure, stalled-body and cancelled acquisitions all fail
 closed with distinct, labelled errors (`python_bootstrap_integrity` / `python_bootstrap_unavailable` /
 `python_asset_timeout` / `python_bootstrap_timeout`); a context without WebCrypto `subtle` cannot
