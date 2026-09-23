@@ -71,13 +71,23 @@ const PYTHON_BOOTSTRAP_MANIFEST = Object.freeze([
   { name: 'python_dateutil-2.9.0.post0-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream', size: 444927, sha256: '302d74af893af51ee8b52e2c06a1fc2bc73cfe645eed3f35a17f082cdf101c7d' },
   { name: 'six-1.16.0-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream', size: 38737, sha256: 'f359c3850331f250d1a5e394aae58193774c6358676340aba992718589b9dcf1' },
   { name: 'pytz-2024.1-py2.py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream', size: 1083571, sha256: '561652a008b98ef7b66a6acf816e3f4d1c0e17e8ed9eb8dbb993037413cda597' },
+  // Trusted wheel installer support (TPR v1A): the EXACT micropip closure
+  // declared by the SAME pinned pyodide-lock.json. Loaded by the worker ONLY
+  // when a plugin payload carries wheels, always inside the bootstrap window
+  // and always BEFORE the network lockdown. Plugin wheels themselves are
+  // payload data (bootstrap MESSAGE), never manifest entries — the manifest
+  // stays the Locus runtime trusted base.
+  { name: 'micropip-0.6.0-py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream', size: 125054, sha256: 'd97c0c01748ddbc52a19944c6a6788c6a8969ed13158c06bc63c6eb02779cd98' },
+  { name: 'packaging-23.2-py3-none-any.whl', kind: 'bytes', mime: 'application/octet-stream', size: 194236, sha256: '3c30fe6689a35520f2040f4963eae8dbdf6aaa8e326674a13bca3f11514c674a' },
 ]);
-// Core runtime files vs the declared runtime package closure (pandas).
-// The package half must equal EXACTLY the pandas dependency closure in the
-// pinned pyodide-lock.json - no missing dependency, no undeclared extra -
-// which tests/python-bootstrap-integrity.test.cjs pins against a lockfile
-// snapshot and the browser e2e re-verifies against the real (integrity-
-// passed) lockfile bytes.
+// Core runtime files vs the declared runtime package closure (pandas) vs the
+// declared trusted wheel installer closure (micropip). The package half must
+// equal EXACTLY the pandas dependency closure and the installer half EXACTLY
+// the micropip dependency closure in the pinned pyodide-lock.json - no
+// missing dependency, no undeclared extra, no overlap - which
+// tests/python-bootstrap-integrity.test.cjs pins against a lockfile snapshot
+// and the browser e2e re-verifies against the real (integrity-passed)
+// lockfile bytes.
 const PYTHON_BOOTSTRAP_CORE_ASSETS = Object.freeze([
   'pyodide.js', 'pyodide.asm.js', 'pyodide.asm.wasm', 'pyodide-lock.json', 'python_stdlib.zip',
 ]);
@@ -87,6 +97,10 @@ const PYTHON_RUNTIME_PACKAGE_FILES = Object.freeze([
   'python_dateutil-2.9.0.post0-py2.py3-none-any.whl',
   'six-1.16.0-py2.py3-none-any.whl',
   'pytz-2024.1-py2.py3-none-any.whl',
+]);
+const PYTHON_INSTALLER_SUPPORT_FILES = Object.freeze([
+  'micropip-0.6.0-py3-none-any.whl',
+  'packaging-23.2-py3-none-any.whl',
 ]);
 
 // The creator iframe's strict policy. No http/https/blob/data source in
@@ -324,6 +338,54 @@ async function readBodyBounded(res, entry, stallMs) {
   return out;
 }
 
+// ---------- TPR v1A: trusted wheel payload validation (main thread) ----------
+// One plugin wheel artifact as configured through configureExtensions. These
+// checks are the trusted Harness invariants: shape, bounds and the metadata
+// <-> bytes agreement. The WORKER re-verifies byte identity (size + WebCrypto
+// SHA-256) before installing — this side only guarantees that what is posted
+// is self-consistent, correctly bounded plugin data. Never raw-bytes
+// dependent: a validation failure names the plugin and the fault category.
+const PYTHON_PLUGIN_WHEEL_MAX_BYTES = 64 * 1024 * 1024; // == Capability Package artifact bound
+const PYTHON_PLUGIN_WHEEL_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\.whl$/;
+
+function validateWheelArtifact(pluginId, wheel) {
+  const bad = (category) => {
+    throw new Error('PythonRuntime.configureExtensions: plugin ' + pluginId
+      + ' wheel artifact ' + category);
+  };
+  if (!wheel || typeof wheel !== 'object') bad('entry is not an object');
+  const filename = wheel.filename;
+  if (typeof filename !== 'string' || !PYTHON_PLUGIN_WHEEL_NAME.test(filename)
+      || filename.indexOf('/') !== -1 || filename.indexOf('\\') !== -1) {
+    bad('filename must be a plain .whl basename');
+  }
+  if (wheel.format !== 'python-wheel') bad('format must be exactly "python-wheel"');
+  if (!Number.isInteger(wheel.size) || wheel.size < 0) bad('size must be a finite integer >= 0');
+  if (wheel.size > PYTHON_PLUGIN_WHEEL_MAX_BYTES) {
+    bad('size ' + wheel.size + ' exceeds the ' + PYTHON_PLUGIN_WHEEL_MAX_BYTES + '-byte artifact bound');
+  }
+  if (typeof wheel.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(wheel.sha256)) {
+    bad('sha256 must be exactly 64 lowercase hex characters');
+  }
+  const bytes = wheel.bytes;
+  const isView = !!bytes && typeof bytes === 'object'
+    && typeof bytes.byteLength === 'number'
+    && bytes.buffer instanceof ArrayBuffer;
+  if (!isView) bad('bytes must be a Uint8Array (or an ArrayBuffer view)');
+  if (bytes.byteLength !== wheel.size) {
+    bad('bytes.byteLength ' + bytes.byteLength + ' != declared size ' + wheel.size);
+  }
+  // OWN COPY (CapabilityBundle readBytes rule): the caller mutating its
+  // original buffer after configureExtensions must never change what future
+  // boots install. The structured clone into the worker leaves this page
+  // copy untouched, so every boot (first, reset, crash-rebuild) replays the
+  // same canonical bytes.
+  const copy = bytes instanceof Uint8Array
+    ? new Uint8Array(bytes)
+    : new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return { filename: filename, format: 'python-wheel', size: wheel.size, sha256: wheel.sha256, bytes: copy };
+}
+
 const PythonRuntime = {
   worker: null, // facade over the creator-relayed worker (null = cold)
   status: 'cold', // cold | loading | ready
@@ -413,16 +475,29 @@ const PythonRuntime = {
       const id = ++this._reqId;
       const remaining = Math.max(initClock.remaining(), 0);
       const reply = await new Promise((resolve) => {
-        this._pending.set(id, {
+        const entry = {
           resolve,
           timer: setTimeout(() => {
             this._pending.delete(id);
             resolve({ error: pythonInitTimeoutError(b.bootstrapMs).message });
           }, remaining),
-        });
+        };
+        this._pending.set(id, entry);
+        // The boot-reply wait is INSIDE the boot's cancellation plane: a
+        // task/session cancellation (or a reset, or a worker-fatal, or the
+        // budget deadline) that lands while the worker is still installing
+        // must end the boot IMMEDIATELY — never let a cancelled boot turn
+        // READY hours later when the worker finally replies 'locked'.
+        boot.ac.signal.addEventListener('abort', () => {
+          const pendingEntry = this._pending.get(id);
+          if (pendingEntry !== entry) return; // real reply already landed
+          this._pending.delete(id);
+          clearTimeout(entry.timer);
+          resolve({ error: boot.ac.signal.reason });
+        }, { once: true });
         this._postToWorker({ id: id, cmd: 'bootstrap', assets: assets, extensionModules: this._extensions ? this._extensions.modules : [] });
       });
-      if (reply.error) throw new Error(reply.error);
+      if (reply.error) throw (reply.error instanceof Error ? reply.error : new Error(reply.error));
       if (reply.status !== 'locked') throw new Error('python runtime bootstrap did not lock');
     } catch (e) {
       this.worker = null;
@@ -646,6 +721,18 @@ const PythonRuntime = {
   // only). Shape-validated and frozen; a booted interpreter is never
   // touched here — swapping the live plugin set is the harness's
   // explicit reset() decision, never a side effect of configuration.
+  //
+  // Two module payload shapes exist:
+  //  - LEGACY SYNTHETIC COMPOSITION PATH: { pluginId, files: {rel: text},
+  //    imports } — source text written straight into site-packages by the
+  //    worker. Capability Composition's synthetic proof; NOT Trusted
+  //    Plugin Runtime artifact delivery (V1B retires/isolates it).
+  //  - TRUSTED WHEEL PAYLOAD (TPR v1A): { pluginId, wheels: [{ filename,
+  //    format, size, sha256, bytes }], imports } — exact verified wheel
+  //    bytes installed OFFLINE by the worker before READY. Every invariant
+  //    a worker cannot be trusted to catch is enforced HERE: a metadata/
+  //    bytes disagreement is a trusted-harness bug and must fail before
+  //    the boot send, never inside the interpreter.
   configureExtensions(ext) {
     if (ext === null || ext === undefined) {
       this._extensions = null;
@@ -655,11 +742,35 @@ const PythonRuntime = {
       throw new Error('PythonRuntime.configureExtensions: invalid extension payload');
     }
     const modules = ext.modules.map((m) => {
-      if (!m || typeof m !== 'object' || typeof m.pluginId !== 'string'
-          || !m.files || typeof m.files !== 'object' || !Array.isArray(m.imports)) {
+      if (!m || typeof m !== 'object' || typeof m.pluginId !== 'string' || !m.pluginId
+          || !Array.isArray(m.imports)) {
         throw new Error('PythonRuntime.configureExtensions: invalid extension module entry');
       }
-      return { pluginId: m.pluginId, files: Object.assign({}, m.files), imports: m.imports.slice() };
+      if (m.imports.some((n) => !/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(String(n)))) {
+        throw new Error('PythonRuntime.configureExtensions: invalid smoke import name in module ' + m.pluginId);
+      }
+      const hasFiles = m.files !== undefined;
+      const hasWheels = m.wheels !== undefined;
+      if (hasFiles && hasWheels) {
+        throw new Error('PythonRuntime.configureExtensions: module ' + m.pluginId
+          + ' carries both files and wheels payloads');
+      }
+      if (hasWheels) {
+        const wheels = m.wheels.map((w) => validateWheelArtifact(m.pluginId, w));
+        return Object.freeze({ pluginId: m.pluginId, imports: m.imports.slice(), wheels: Object.freeze(wheels.map(Object.freeze)) });
+      }
+      if (!hasFiles || typeof m.files !== 'object' || Array.isArray(m.files)) {
+        throw new Error('PythonRuntime.configureExtensions: invalid extension module entry');
+      }
+      const files = {};
+      for (const rel of Object.keys(m.files)) {
+        if (typeof m.files[rel] !== 'string') {
+          throw new Error('PythonRuntime.configureExtensions: module ' + m.pluginId
+            + ' payload file ' + rel + ' must be UTF-8 text');
+        }
+        files[rel] = m.files[rel];
+      }
+      return Object.freeze({ pluginId: m.pluginId, files: files, imports: m.imports.slice() });
     });
     this._extensions = Object.freeze({ key: ext.key, modules: Object.freeze(modules) });
   },

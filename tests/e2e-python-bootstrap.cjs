@@ -32,7 +32,7 @@ const {
 } = require('./helpers/chrome.cjs');
 const { loadPythonManifest } = require('./helpers/python-manifest.cjs');
 
-const { base: PYODIDE_CDN, manifest: PY_MANIFEST } = loadPythonManifest();
+const { base: PYODIDE_CDN, manifest: PY_MANIFEST, runtimePackageFiles: PY_RUNTIME_PACKAGE_FILES } = loadPythonManifest();
 const ASSET_CACHE_DIR = path.join(__dirname, '..', 'tmp-f04b-probe', 'pyodide');
 
 async function evaluate(cdp, expression, timeoutMs) {
@@ -238,8 +238,8 @@ async function main() {
         console.log('# hosted E1 cold boot took ' + Math.round(e1.ms / 100) / 10 + 's');
         const e1hits = assetHitCount() - t1;
         const expectedUrls = PY_MANIFEST.map((a) => a.name).sort();
-        check('hosted E1 acquisition fetched EXACTLY the 10 pinned URLs (no path/query variation)',
-          e1hits === PY_MANIFEST.length, 'delta=' + e1hits);
+        check('hosted E1 acquisition fetched EXACTLY the pinned URL set, one fetch each (no path/query variation)',
+          e1hits === PY_MANIFEST.length, 'delta=' + e1hits + ' expected=' + PY_MANIFEST.length);
 
         // E2: pandas compute proves the bytes are genuinely intact.
         const e2 = await bootAndRun(cdp, 'E2',
@@ -262,8 +262,11 @@ async function main() {
           };
           walk('pandas');
           const lockFiles = [...closure].map((n) => lock.packages[n].file_name).sort();
-          const wheelFiles = PY_MANIFEST.filter((a) => a.name.endsWith('.whl')).map((a) => a.name).sort();
-          check('hosted E3 live lockfile pandas closure == manifest wheel set EXACTLY',
+          // The manifest's RUNTIME package wheels (the trusted wheel
+          // installer closure is a separate partition, loaded only for
+          // wheel payloads — not part of the pandas closure).
+          const wheelFiles = PY_RUNTIME_PACKAGE_FILES.slice().sort();
+          check('hosted E3 live lockfile pandas closure == declared runtime package wheel set EXACTLY',
             JSON.stringify(lockFiles) === JSON.stringify(wheelFiles),
             JSON.stringify([lockFiles, wheelFiles]));
         }
@@ -328,7 +331,7 @@ async function main() {
           && !/python execution timed out/.test(e7.r.error || ''),
           JSON.stringify(e7.r).slice(0, 300));
         check('hosted E7 verified assets RETAINED after the init timeout',
-          await evaluate(cdp, '!!window.__pyrt._assets && Object.keys(window.__pyrt._assets).length === 10') === true, '');
+          await evaluate(cdp, '!!window.__pyrt._assets && Object.keys(window.__pyrt._assets).length === ' + PY_MANIFEST.length) === true, '');
         check('hosted E7 init timeout fetched ZERO assets (served from the verified cache)',
           assetHitCount() - t7 === 0, 'delta=' + (assetHitCount() - t7));
         await evaluate(cdp, 'window.__f04cSetWorkerSource(window.__f04cWorkerSrc)');

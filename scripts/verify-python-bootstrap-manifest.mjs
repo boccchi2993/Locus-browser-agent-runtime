@@ -4,10 +4,11 @@
 // from fresh CDN bytes for HUMAN REVIEW (apply by hand).
 //
 //   node scripts/verify-python-bootstrap-manifest.mjs
-//       Fetch the 10 pinned assets from the pinned CDN, check exact size +
+//       Fetch the pinned assets from the pinned CDN, check exact size +
 //       SHA-256 against the manifest, check the pinned pyodide-lock.json,
-//       verify the pandas dependency closure == declared package wheel set,
-//       and re-verify tests/fixtures/pyodide-lock-snapshot.json.
+//       verify that the pandas dependency closure plus the micropip
+//       (trusted wheel installer) closure equal the declared package wheel
+//       set, and re-verify tests/fixtures/pyodide-lock-snapshot.json.
 //
 //   node scripts/verify-python-bootstrap-manifest.mjs --release-dir <dir>
 //       Additionally prove provenance: <dir> holds the files extracted from
@@ -50,7 +51,7 @@ const mBase = src.match(/const PYODIDE_BASE = '([^']+)';/);
 if (!mBase) fail('PYODIDE_BASE not found in src/shell.js');
 const BASE = mBase[1];
 const manifest = vm.runInNewContext('[' + mBlock[1] + ']', Object.freeze({}));
-if (manifest.length !== 10) fail('manifest must hold exactly 10 entries, found ' + manifest.length);
+if (manifest.length === 0) fail('manifest is empty');
 
 // ---- streaming download with exact-size bound + SHA-256 ------------------
 async function fetchVerified(entry) {
@@ -114,7 +115,7 @@ if (releaseDir) {
   console.log('# [3] provenance: pass --release-dir <extracted official release> to byte-compare the official artifacts');
 }
 
-// ---- 4. lockfile: pin + pandas dependency closure -------------------------
+// ---- 4. lockfile: pin + pandas closure + micropip (installer) closure -----
 const lockBytes = cdn.get('pyodide-lock.json');
 const lock = JSON.parse(lockBytes.toString('utf8'));
 console.log(`# [4] lockfile: pyodide ${lock.info.version} abi ${lock.info.abi_version} ${lock.info.arch}/${lock.info.platform} python ${lock.info.python}`);
@@ -126,29 +127,46 @@ if (JSON.stringify([...coreNames].sort()) !== JSON.stringify([...expectedCore].s
   fail('core set must be exactly ' + expectedCore.join(', ') + ' — found ' + coreNames.join(', '));
 }
 
-const closure = new Set();
-const walk = (name) => {
-  if (closure.has(name)) return;
-  const p = lock.packages[name];
-  if (!p) fail(`pandas dependency ${name} missing from the pinned lockfile`);
-  closure.add(name);
-  for (const d of p.depends || []) walk(d);
-};
-walk('pandas');
+// Walk one package's dependency closure through the lockfile.
+function closureOf(root) {
+  const closure = new Set();
+  const walk = (name) => {
+    if (closure.has(name)) return;
+    const p = lock.packages[name];
+    if (!p) fail(`${root} dependency ${name} missing from the pinned lockfile`);
+    closure.add(name);
+    for (const d of p.depends || []) walk(d);
+  };
+  walk(root);
+  return closure;
+}
 
-const lockFiles = [...closure].map((n) => lock.packages[n].file_name).sort();
+// The manifest wheels must partition EXACTLY into the pandas closure (the
+// declared runtime packages) and the micropip closure (the trusted wheel
+// installer support) — no missing dependency, no undeclared extra, no overlap.
+const pandasClosure = closureOf('pandas');
+const installerClosure = closureOf('micropip');
+for (const name of installerClosure) {
+  if (pandasClosure.has(name)) fail(`installer closure package ${name} overlaps the pandas closure`);
+}
+const expectedLockFiles = [
+  ...[...pandasClosure].map((n) => lock.packages[n].file_name),
+  ...[...installerClosure].map((n) => lock.packages[n].file_name),
+].sort();
 const manifestWheels = wheelEntries.map((e) => e.name).sort();
-if (JSON.stringify(lockFiles) !== JSON.stringify(manifestWheels)) {
-  fail(`pandas closure (${lockFiles.join(', ')}) != manifest wheels (${manifestWheels.join(', ')})`);
+if (JSON.stringify(expectedLockFiles) !== JSON.stringify(manifestWheels)) {
+  fail(`closures (pandas + micropip: ${expectedLockFiles.join(', ')}) != manifest wheels (${manifestWheels.join(', ')})`);
 }
-for (const name of closure) {
-  const p = lock.packages[name];
-  const e = manifest.find((x) => x.name === p.file_name);
-  if (!e) fail(`lockfile package ${name} wheel ${p.file_name} not pinned in manifest`);
-  if (p.sha256 && p.sha256 !== e.sha256) fail(`${p.file_name}: lockfile sha256 ${p.sha256} != manifest ${e.sha256}`);
-  console.log(`# [4] ${name}@${p.version} -> ${p.file_name} sha256 OK`);
+for (const [label, closure] of [['pandas', pandasClosure], ['micropip', installerClosure]]) {
+  for (const name of closure) {
+    const p = lock.packages[name];
+    const e = manifest.find((x) => x.name === p.file_name);
+    if (!e) fail(`lockfile package ${name} wheel ${p.file_name} not pinned in manifest`);
+    if (p.sha256 && p.sha256 !== e.sha256) fail(`${p.file_name}: lockfile sha256 ${p.sha256} != manifest ${e.sha256}`);
+    console.log(`# [4] ${label}: ${name}@${p.version} -> ${p.file_name} sha256 OK`);
+  }
 }
-console.log('# [4] pandas dependency closure == manifest wheel set EXACTLY');
+console.log('# [4] pandas + micropip closures == manifest wheel set EXACTLY (disjoint)');
 
 // ---- 5. offline snapshot fixture stays in sync ----------------------------
 const snap = JSON.parse(readFileSync(FIXTURE, 'utf8'));
@@ -156,13 +174,17 @@ const lockEntry = manifest.find((e) => e.name === 'pyodide-lock.json');
 if (snap.lockfile.sha256 !== lockEntry.sha256) {
   fail(`snapshot fixture is for lockfile ${snap.lockfile.sha256}, manifest pins ${lockEntry.sha256} — regenerate tests/fixtures/pyodide-lock-snapshot.json and review`);
 }
-const snapFiles = Object.values(snap.closure).map((p) => p.file_name).sort();
-if (JSON.stringify(snapFiles) !== JSON.stringify(manifestWheels)) {
-  fail('snapshot fixture closure differs from manifest wheels: ' + snapFiles.join(', '));
+const snapClosureFiles = Object.values(snap.closure).map((p) => p.file_name).sort();
+const snapInstallerFiles = Object.values(snap.installerClosure || {}).map((p) => p.file_name).sort();
+if (JSON.stringify([...snapClosureFiles, ...snapInstallerFiles].sort()) !== JSON.stringify(manifestWheels)) {
+  fail('snapshot fixture closures differ from manifest wheels: '
+    + [...snapClosureFiles, ...snapInstallerFiles].join(', '));
 }
-for (const [pkg, p] of Object.entries(snap.closure)) {
-  const e = manifest.find((x) => x.name === p.file_name);
-  if (!e || e.sha256 !== p.sha256) fail(`snapshot fixture wheel ${p.file_name} hash differs from manifest`);
+for (const [group, files] of [['closure', snapClosureFiles], ['installerClosure', snapInstallerFiles]]) {
+  for (const [pkg, p] of Object.entries(snap[group])) {
+    const e = manifest.find((x) => x.name === p.file_name);
+    if (!e || e.sha256 !== p.sha256) fail(`snapshot fixture ${group} wheel ${p.file_name} hash differs from manifest`);
+  }
 }
 console.log('# [5] offline snapshot fixture (tests/fixtures/pyodide-lock-snapshot.json) in sync');
 

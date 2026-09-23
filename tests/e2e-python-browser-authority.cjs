@@ -59,7 +59,7 @@ const STRICT_CSP = "default-src 'none'; connect-src 'none'; "
 // TLD that can never resolve, and the resolver fail-closes on every URL it
 // does not hold EXACTLY (no path/query variation).
 const { loadPythonManifest } = require('./helpers/python-manifest.cjs');
-const { base: PYODIDE_CDN, manifest: PY_MANIFEST } = loadPythonManifest();
+const { base: PYODIDE_CDN, manifest: PY_MANIFEST, installerSupportFiles: PY_INSTALLER_FILES } = loadPythonManifest();
 const VIRTUAL_BASE = 'https://locus-bootstrap.invalid/';
 const ASSET_FILES = PY_MANIFEST.map((a) => ({ name: a.name, kind: a.kind, mime: a.mime }));
 const ASSET_CACHE_DIR = path.join(__dirname, '..', 'tmp-f04b-probe', 'pyodide');
@@ -609,7 +609,13 @@ async function main() {
         if (!pb.error) {
           check(label + ' B02 bootstrap stages reached locked', pb.stages[pb.stages.length - 1] === 'locked',
             JSON.stringify(pb.stages));
-          const expectedServed = new Set(ASSET_FILES.filter((a) => a.name !== 'pyodide.js' && a.name !== 'pyodide.asm.js')
+          // The boot consumes every asset EXCEPT the two page-eval'd JS
+          // files and the trusted wheel-installer closure (TPR v1A), which
+          // the worker loads only when a plugin payload carries wheels —
+          // this suite boots the core runtime with pandas only.
+          const expectedServed = new Set(ASSET_FILES
+            .filter((a) => a.name !== 'pyodide.js' && a.name !== 'pyodide.asm.js'
+              && !PY_INSTALLER_FILES.includes(a.name))
             .map((a) => VIRTUAL_BASE + a.name));
           const servedSet = new Set(pb.served);
           const unexpected = [...servedSet].filter((u) => !expectedServed.has(u));

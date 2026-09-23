@@ -40,9 +40,14 @@
 //
 //  Message in:  { id, cmd: 'bootstrap',
 //                 assets: { <name>: { text | buffer, mime } }
-//                 pluginModules?: [{ pluginId, files: { relPath: text },
-//                                   imports: [module] }]  (harness
-//                 -selected plugin payloads, installed pre-lockdown)
+//                 extensionModules?: [
+//                   { pluginId, files: { relPath: text },
+//                     imports: [module] }                    (LEGACY SYNTHETIC
+//                                     COMPOSITION PATH — source text, not TPR)
+//                 | { pluginId, wheels: [{ filename, format, size,
+//                                          sha256, bytes }],
+//                     imports: [module] } ]  (TPR v1A verified wheel payload,
+//                                   offline-installed before READY)
 //               { id, cmd: 'run', code, cwd,
 //                 mounts: [{ root, readOnly,
 //                            files: [{ path(ABS), b64 }],
@@ -91,11 +96,18 @@ let lockdownAttempted = false;
 let receivedAssets = null;
 let assetsWaiter = null;
 
-// Trusted-harness plugin payloads (Capability Composition v1),
-// delivered WITH the bootstrap message. Installed after the declared
-// runtime package set and BEFORE the network lockdown, so an enabled
-// plugin's import is an ordinary import of pre-installed code — never
-// a lazy install, never a runtime download, never user-driven.
+// Trusted-harness plugin payloads (Capability Composition v1 / TPR v1A),
+// delivered WITH the bootstrap message. Two shapes:
+//   - { pluginId, files: { relPath: text }, imports }  — LEGACY SYNTHETIC
+//     COMPOSITION PATH: source text written into site-packages. Not Trusted
+//     Plugin Runtime artifact delivery (V1B retires/isolates it).
+//   - { pluginId, wheels: [{ filename, format, size, sha256, bytes }],
+//     imports }  — TRUSTED WHEEL PAYLOAD: exact verified wheel bytes,
+//     installed OFFLINE (micropip + emfs: + deps=False) before READY.
+// Installed after the declared runtime package set (and, for wheels, after
+// the fixed installer closure) and BEFORE the network lockdown, so an
+// enabled plugin's import is an ordinary import of pre-installed code —
+// never a lazy install, never a runtime download, never user-driven.
 let receivedExtensions = [];
 
 function awaitAssets() {
@@ -341,31 +353,139 @@ function applyNetworkLockdown(instance) {
   }
 }
 
-// ---- Capability Composition v1: plugin payload install + smoke import ----
-// Runs in the TRUSTED harness window: after the declared package set,
-// before the bootstrap asset map is dropped and the network lockdown
-// applies. Plugin code is selected by the harness from the frozen
-// TaskEnvironment — it is never reachable from a model-generated
-// import (loadPackage/loadPackagesFromImports stay denied forever).
-// Every payload path is re-validated here; any invalid path or failed
-// smoke import THROWS, which fails the whole boot closed: the
-// interpreter never reports READY with a declared plugin missing.
+// ---- TPR v1A: worker-side wheel identity re-verification -----------------
+// The trusted Harness validated payload shape and metadata/bytes agreement
+// before the boot send, and the bytes traveled by structured clone — but the
+// worker NEVER trusts the channel: byte identity (exact size + SHA-256) is
+// re-proved here against the harness-declared metadata before anything is
+// written or installed. WebCrypto subtle is REQUIRED (same rule as the F04c
+// page-side asset gate): a context that cannot verify fails the boot closed.
+// A mismatch throws, which fails the WHOLE boot: no install, no smoke, no
+// READY. Error text names plugin id, artifact filename and fault category —
+// never the raw bytes.
+async function sha256HexOfBytes(bytes) {
+  if (typeof crypto === 'undefined' || !crypto.subtle
+      || typeof crypto.subtle.digest !== 'function') {
+    return null;
+  }
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const view = new Uint8Array(digest);
+  let hex = '';
+  for (let i = 0; i < view.length; i++) hex += (view[i] < 16 ? '0' : '') + view[i].toString(16);
+  return hex;
+}
+
+async function verifyWheelArtifact(mod, wheel) {
+  const bytes = wheel && wheel.bytes;
+  const received = bytes && bytes.byteLength;
+  if (!(bytes instanceof Uint8Array) || received !== wheel.size) {
+    throw new Error('Locus plugin install: artifact size mismatch: plugin ' + mod.pluginId
+      + ', artifact ' + (wheel && wheel.filename) + ' (declared ' + (wheel && wheel.size)
+      + ' bytes, received ' + received + ')');
+  }
+  const hex = await sha256HexOfBytes(bytes);
+  if (hex === null) {
+    throw new Error('Locus plugin install: artifact integrity unavailable (WebCrypto subtle missing): plugin '
+      + mod.pluginId + ', artifact ' + wheel.filename);
+  }
+  if (hex !== wheel.sha256) {
+    throw new Error('Locus plugin install: artifact sha256 mismatch: plugin ' + mod.pluginId
+      + ', artifact ' + wheel.filename);
+  }
+  return bytes;
+}
+
+// ---- TPR v1A: offline wheel install --------------------------------------
+// Harness-derived scratch path only: /tmp/locus-plugin-artifacts/<sha256>/
+// <filename>. The sha256 segment comes from the verified digest, the
+// filename from the main-thread basename validation — no model path input
+// ever reaches this code. The scratch file is interpreter bootstrap scratch:
+// NEVER a /mnt/workspace path, NEVER a Locus VFS durable file. It is removed
+// right after install (best-effort empty-dir cleanup) in every outcome.
+async function installWheelModule(instance, mod) {
+  for (const wheel of mod.wheels) {
+    const bytes = await verifyWheelArtifact(mod, wheel);
+    const dir = '/tmp/locus-plugin-artifacts/' + wheel.sha256;
+    const full = dir + '/' + wheel.filename;
+    instance.FS.mkdirTree(dir);
+    instance.FS.writeFile(full, bytes);
+    try {
+      // OFFLINE install: micropip reads the wheel straight out of the
+      // worker's Emscripten FS (its emfs: scheme is a plain local read) and
+      // deps=False is the Package v1 contract — exactly one wheel, no
+      // dependency closure, no package index, no network anywhere.
+      await instance.runPythonAsync(
+        'import micropip\nawait micropip.install("emfs:' + full + '", deps=False)');
+    } catch (e) {
+      throw new Error('Locus plugin install: offline wheel install failed: plugin ' + mod.pluginId
+        + ', artifact ' + wheel.filename + ': ' + String(e && e.message ? e.message : e));
+    } finally {
+      try { instance.FS.unlink(full); } catch (e) {}
+      try { instance.FS.rmdir(dir); } catch (e) {} // only succeeds when empty
+    }
+  }
+}
+
+// Retire the bootstrap-only installer before READY. The remote fetch path is
+// already dead twice over (F04a fetch denial + creator CSP), but a user-
+// phase micropip.install could still act as a LOCAL package loader (install
+// a wheel sitting in the mirrored workspace into the live interpreter).
+// Package loading is Harness-controlled, so after the trusted installs the
+// installer entry points become denials. `import micropip` itself stays
+// importable — no import-system damage, no hidden semantics.
+async function neuterBootstrapInstaller(instance) {
+  try {
+    await instance.runPythonAsync([
+      'import micropip as _locus_micropip',
+      'def _locus_install_denied(*_args, **_kwargs):',
+      '    raise RuntimeError("Python package installation is controlled by the Locus runtime; plugins are installed by the trusted harness before READY")',
+      '_locus_micropip.install = _locus_install_denied',
+      '_locus_micropip.add_mock_package = _locus_install_denied',
+      '_locus_micropip.remove_mock_package = _locus_install_denied',
+    ].join('\n'));
+  } catch (e) {
+    throw new Error('Locus plugin install: could not retire the bootstrap installer: '
+      + String(e && e.message ? e.message : e));
+  }
+}
+
+// ---- plugin payload install + smoke import ----
+// Runs in the TRUSTED harness window: after the declared package set (and
+// the fixed installer closure for wheel payloads), before the bootstrap
+// asset map is dropped and the network lockdown applies. Plugin code is
+// selected by the harness from the frozen TaskEnvironment — it is never
+// reachable from a model-generated import (loadPackage/
+// loadPackagesFromImports stay denied forever). Every payload path is
+// re-validated here; any invalid path, failed verification or failed smoke
+// import THROWS, which fails the whole boot closed: the interpreter never
+// reports READY with a declared plugin missing.
 async function installExtensionModules(instance) {
   if (!receivedExtensions.length) return;
-  const siteDir = instance.runPython('import sysconfig; sysconfig.get_path("purelib")');
-  if (typeof siteDir !== 'string' || !siteDir.startsWith('/')) {
-    throw new Error('Locus plugin install: could not resolve the site-packages directory');
-  }
+  // The trusted installer closure loads ONLY when a wheel payload needs it,
+  // here in the bootstrap window, from the F04c-verified in-memory set.
+  const needsInstaller = receivedExtensions.some((m) => m && Array.isArray(m.wheels) && m.wheels.length);
+  if (needsInstaller) await instance.loadPackage('micropip');
   for (const mod of receivedExtensions) {
-    const files = (mod && mod.files) || {};
-    for (const rel of Object.keys(files)) {
-      if (!rel || rel.startsWith('/') || rel.indexOf('\\') !== -1 || rel.split('/').indexOf('..') !== -1) {
-        throw new Error('Locus plugin install: invalid payload path: ' + rel);
+    if (mod && Array.isArray(mod.wheels) && mod.wheels.length) {
+      await installWheelModule(instance, mod);
+    } else {
+      // LEGACY SYNTHETIC COMPOSITION PATH: source text into site-packages.
+      // Capability Composition's synthetic proof — NOT Trusted Plugin
+      // Runtime artifact delivery.
+      const siteDir = instance.runPython('import sysconfig; sysconfig.get_path("purelib")');
+      if (typeof siteDir !== 'string' || !siteDir.startsWith('/')) {
+        throw new Error('Locus plugin install: could not resolve the site-packages directory');
       }
-      const full = siteDir + '/' + rel;
-      const dir = full.substring(0, full.lastIndexOf('/'));
-      if (dir && dir !== siteDir) instance.FS.mkdirTree(dir);
-      instance.FS.writeFile(full, String(files[rel]), { encoding: 'utf8' });
+      const files = (mod && mod.files) || {};
+      for (const rel of Object.keys(files)) {
+        if (!rel || rel.startsWith('/') || rel.indexOf('\\') !== -1 || rel.split('/').indexOf('..') !== -1) {
+          throw new Error('Locus plugin install: invalid payload path: ' + rel);
+        }
+        const full = siteDir + '/' + rel;
+        const dir = full.substring(0, full.lastIndexOf('/'));
+        if (dir && dir !== siteDir) instance.FS.mkdirTree(dir);
+        instance.FS.writeFile(full, String(files[rel]), { encoding: 'utf8' });
+      }
     }
     for (const name of (mod && mod.imports) || []) {
       const moduleName = String(name);
@@ -380,6 +500,7 @@ async function installExtensionModules(instance) {
       }
     }
   }
+  if (needsInstaller) await neuterBootstrapInstaller(instance);
 }
 
 // Pyodide is booted lazily on the first run, entirely from the in-memory
@@ -410,11 +531,12 @@ async function ensureLockedPyodide() {
         stdLibURL: VIRTUAL_BASE + 'python_stdlib.zip',
       });
       await instance.loadPackage(PYTHON_RUNTIME_PACKAGES);
-      // Capability Composition v1: all enabled Python plugins are
-      // installed and smoke-imported here — BEFORE the resolver's asset
-      // map is dropped and the lockdown applies. After READY, an enabled
-      // plugin imports like any preinstalled package, with no Harness
-      // RPC and no network.
+      // TPR v1A / Capability Composition: all enabled Python plugins are
+      // verified, installed and smoke-imported here — wheel payloads load
+      // the fixed installer closure (micropip) and install OFFLINE from
+      // in-memory bytes — all BEFORE the resolver's asset map is dropped
+      // and the lockdown applies. After READY, an enabled plugin imports
+      // like any preinstalled package, with no Harness RPC and no network.
       await installExtensionModules(instance);
       // Bootstrap authority ends here: the asset map is dropped BEFORE the
       // lockdown, in the same synchronous block — no user code can run in

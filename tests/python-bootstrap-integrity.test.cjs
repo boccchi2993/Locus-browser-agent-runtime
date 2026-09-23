@@ -17,7 +17,7 @@
 //  M2    budgets: PYTHON_TIMEOUT_MS = 30000 stays USER EXECUTION ONLY;
 //        acquisition/initialization constants exist and are independent
 //  M3    pandas dependency closure == declared package set (lockfile snapshot)
-//  I1    good set: 10/10 verified -> loader resolves, cache written,
+//  I1    good set: 12/12 verified -> loader resolves, cache written,
 //        every fetch URL is exactly PYODIDE_BASE + manifest name
 //  I2    one byte modified -> sha256 mismatch, fail closed, worker never
 //        receives bootstrap, retry from scratch works
@@ -59,7 +59,7 @@ function evalModule(source) {
   global.document = { getElementById: () => null };
   const M = eval(source + '\n;({ PYTHON_TIMEOUT_MS, PYTHON_ASSET_TIMEOUT_MS, PYTHON_ASSET_STALL_MS,'
     + ' PYTHON_BOOTSTRAP_TIMEOUT_MS, PYODIDE_BASE, PYTHON_BOOTSTRAP_MANIFEST, PYTHON_BOOTSTRAP_CORE_ASSETS,'
-    + ' PYTHON_RUNTIME_PACKAGE_FILES, PythonRuntime, pythonBootstrapBudgets, makeBudgetClock, readBodyBounded });');
+    + ' PYTHON_RUNTIME_PACKAGE_FILES, PYTHON_INSTALLER_SUPPORT_FILES, PythonRuntime, pythonBootstrapBudgets, makeBudgetClock, readBodyBounded, validateWheelArtifact });');
   delete global.window;
   delete global.document;
   return M;
@@ -187,7 +187,8 @@ async function run() {
   // ================= M0: manifest structure (REAL source) =================
   const man = REAL.PYTHON_BOOTSTRAP_MANIFEST;
   const names = man.map((a) => a.name);
-  check('M0 manifest holds exactly the pinned 10 assets', man.length === 10
+  check('M0 manifest holds exactly the pinned 12 assets',
+    man.length === 12
     && JSON.stringify(names) === JSON.stringify([
       'pyodide.js', 'pyodide.asm.js', 'pyodide.asm.wasm', 'pyodide-lock.json', 'python_stdlib.zip',
       'pandas-2.2.0-cp312-cp312-pyodide_2024_0_wasm32.whl',
@@ -195,6 +196,8 @@ async function run() {
       'python_dateutil-2.9.0.post0-py2.py3-none-any.whl',
       'six-1.16.0-py2.py3-none-any.whl',
       'pytz-2024.1-py2.py3-none-any.whl',
+      'micropip-0.6.0-py3-none-any.whl',
+      'packaging-23.2-py3-none-any.whl',
     ]), JSON.stringify(names));
   check('M0 manifest is frozen (no runtime mutation)', Object.isFrozen(man), '');
   check('M0 every entry: kind, mime, exact size, lowercase sha256, unique',
@@ -202,18 +205,24 @@ async function run() {
       && typeof a.mime === 'string' && a.mime.length > 0
       && Number.isInteger(a.size) && a.size > 0
       && /^[0-9a-f]{64}$/.test(a.sha256))
-    && new Set(names).size === 10, JSON.stringify(man.map((a) => [a.name, a.kind, a.size])));
+    && new Set(names).size === 12, JSON.stringify(man.map((a) => [a.name, a.kind, a.size])));
   check('M0 pinned CDN base is the exact jsDelivr v0.26.4 full/ URL',
     REAL.PYODIDE_BASE === 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/', REAL.PYODIDE_BASE);
 
-  // ================= M1: core + package partition ==========================
+  // ================= M1: core + package + installer partition ==============
   const coreNames = REAL.PYTHON_BOOTSTRAP_CORE_ASSETS;
   const pkgNames = REAL.PYTHON_RUNTIME_PACKAGE_FILES;
-  check('M1 core set (5) + package set (5) partition the manifest exactly',
-    coreNames.length === 5 && pkgNames.length === 5
-    && new Set([...coreNames, ...pkgNames]).size === 10
-    && names.every((n) => coreNames.includes(n) || pkgNames.includes(n)),
-    JSON.stringify([coreNames, pkgNames]));
+  const installerNames = REAL.PYTHON_INSTALLER_SUPPORT_FILES;
+  check('M1 core (5) + runtime packages (5) + installer support (2) partition the manifest exactly',
+    coreNames.length === 5 && pkgNames.length === 5 && installerNames.length === 2
+    && new Set([...coreNames, ...pkgNames, ...installerNames]).size === 12
+    && names.every((n) => coreNames.includes(n) || pkgNames.includes(n) || installerNames.includes(n))
+    && Object.isFrozen(installerNames),
+    JSON.stringify([coreNames, pkgNames, installerNames]));
+  check('M1b installer support wheels are NOT the pandas closure and NOT plugin payload',
+    installerNames.every((n) => !pkgNames.includes(n))
+    && !names.some((n) => n.startsWith('locus_test_plugin')),
+    JSON.stringify(installerNames));
 
   // ================= M2: budgets ===========================================
   check('M2 PYTHON_TIMEOUT_MS stays 30000 (USER EXECUTION ONLY)',
@@ -250,7 +259,7 @@ async function run() {
       && afterResume < pausedRemaining - 20;
   })(), '');
 
-  // ================= M3: pandas dependency closure (offline snapshot) ======
+  // ================= M3: dependency closures (offline snapshot) ============
   const snap = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'pyodide-lock-snapshot.json'), 'utf8'));
   check('M3 snapshot is of the SAME lockfile the manifest pins',
     snap.lockfile.sha256 === man.find((a) => a.name === 'pyodide-lock.json').sha256,
@@ -260,7 +269,7 @@ async function run() {
     && snap.lockfile.arch === 'wasm32' && snap.lockfile.platform === 'emscripten_3_1_58',
     JSON.stringify(snap.lockfile));
   const closureFiles = Object.values(snap.closure).map((p) => p.file_name).sort();
-  check('M3 pandas dependency closure == declared package wheel set EXACTLY',
+  check('M3 pandas dependency closure == declared runtime package wheel set EXACTLY',
     JSON.stringify(closureFiles) === JSON.stringify([...pkgNames].sort()),
     JSON.stringify(closureFiles));
   let closureHashesOk = true;
@@ -279,6 +288,25 @@ async function run() {
     && snap.closure.numpy.depends.length === 0 && snap.closure.six.depends.length === 0
     && snap.closure.pytz.depends.length === 0,
     JSON.stringify(lockPackages));
+  // TPR v1A: the trusted wheel installer closure (micropip) is pinned with
+  // the same rigor, from the SAME lockfile bytes.
+  const installerPackages = Object.keys(snap.installerClosure || {});
+  check('M3b installer closure walks micropip -> packaging with no extras',
+    installerPackages.length === 2 && installerPackages.includes('micropip') && installerPackages.includes('packaging')
+    && JSON.stringify(snap.installerClosure.micropip.depends) === JSON.stringify(['packaging'])
+    && snap.installerClosure.packaging.depends.length === 0,
+    JSON.stringify(snap.installerClosure));
+  const installerFiles = Object.values(snap.installerClosure || {}).map((p) => p.file_name).sort();
+  check('M3b installer closure == declared installer support wheel set EXACTLY',
+    JSON.stringify(installerFiles) === JSON.stringify([...installerNames].sort()),
+    JSON.stringify([installerFiles, [...installerNames].sort()]));
+  let installerHashesOk = true;
+  for (const [, p] of Object.entries(snap.installerClosure || {})) {
+    const entry = man.find((a) => a.name === p.file_name);
+    if (!entry || entry.sha256 !== p.sha256) installerHashesOk = false;
+  }
+  check('M3b every installer closure wheel hash matches the manifest pin', installerHashesOk,
+    JSON.stringify(Object.entries(snap.installerClosure || {}).map(([k, v]) => [k, v.version, v.sha256.slice(0, 12)])));
 
   // ================= I1: good set ==========================================
   {
@@ -288,9 +316,9 @@ async function run() {
       global.fetch = installFakeFetch(null, log);
       const assets = await rt._loadAssets(null, idleBoot(), TEST.pythonBootstrapBudgets(null));
       const got = Object.keys(assets);
-      check('I1 good set resolves 10/10', got.length === 10 && got.every((n) => names.includes(n)),
+      check('I1 good set resolves 12/12', got.length === 12 && got.every((n) => names.includes(n)),
         JSON.stringify(got));
-      check('I1 cache written only after full verification', rt._assets === assets && Object.keys(rt._assets).length === 10, '');
+      check('I1 cache written only after full verification', rt._assets === assets && Object.keys(rt._assets).length === 12, '');
       check('I1 text assets decoded (only after integrity PASS), bytes as ArrayBuffer',
         typeof assets['pyodide.js'].text === 'string'
         && assets['pyodide.js'].text === new TextDecoder().decode(syntheticBytes['pyodide.js'])
@@ -298,9 +326,9 @@ async function run() {
         && Buffer.from(assets['pyodide.asm.wasm'].buffer).equals(syntheticBytes['pyodide.asm.wasm']),
         JSON.stringify(Object.entries(assets).map(([k, v]) => [k, typeof v.text === 'string' ? 'text' : 'bytes'])));
       check('I1 asset cache reused on the next call with ZERO fetches',
-        log.length === 10
+        log.length === 12
         && (await rt._loadAssets(null, idleBoot(), TEST.pythonBootstrapBudgets(null))) === assets
-        && log.length === 10, 'fetches=' + log.length);
+        && log.length === 12, 'fetches=' + log.length);
     });
   }
 
@@ -539,10 +567,10 @@ async function run() {
       !!bootErr && /Python runtime initialization timed out after 120ms/.test(errText(bootErr))
       && !/python execution timed out/.test(errText(bootErr)), errText(bootErr));
     check('T3 verified assets RETAINED after the init timeout',
-      rt._assets !== null && Object.keys(rt._assets).length === 10, '');
+      rt._assets !== null && Object.keys(rt._assets).length === 12, '');
     check('T3 worker received spawn + verified bootstrap exactly once before the timeout',
       JSON.stringify(postedToWorker.map((m) => m.type || m.cmd)) === JSON.stringify(['spawn', 'bootstrap'])
-      && postedToWorker[1].assets && Object.keys(postedToWorker[1].assets).length === 10,
+      && postedToWorker[1].assets && Object.keys(postedToWorker[1].assets).length === 12,
       JSON.stringify(postedToWorker.map((m) => m.type || m.cmd)));
     check('T3 stack torn down after the init timeout (next run rebuilds)',
       rt.worker === null && rt._creator === null && rt.status === 'cold', '');
