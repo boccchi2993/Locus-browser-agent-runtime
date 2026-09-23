@@ -1,6 +1,6 @@
 # Locus Capability Package Contract
 
-> Status: **package core implemented** — `src/capability-package.js` implements project validate, build, inspect, the immutable logical CapabilityBundle and the generated lock. Explicit import UI, the imported-package registry and the Trusted Plugin Runtime remain contract-only (pending).
+> Status: **package core implemented** — `src/capability-package.js` implements project validate, build, inspect, the immutable logical CapabilityBundle and the generated lock. Explicit import UI and the imported-package registry remain contract-only (pending). The Trusted Plugin Runtime v1A offline wheel bootstrap primitive is implemented (see section 11); CapabilityManager does not yet consume bundle artifacts.
 > Scope: how a Capability project is authored, validated, built, imported, and resolved without editing Locus runtime source.
 
 This document deliberately separates **the authoring/distribution package** from the **runtime Capability object**.
@@ -490,17 +490,28 @@ The Plugin Runtime should not care whether verified bytes came from:
 
 It receives an artifact whose identity, size, digest, runtime, and expected imports have already been validated. Package Core never parses, installs, or executes artifact bytes — `python-wheel` is a declaration whose semantics only the runtime verifies.
 
-For Python v1:
+For Python v1, the runtime half is implemented (TPR v1A, configured
+through a TEST-ONLY trusted-harness seam; CapabilityManager integration
+is v1B):
 
 ```
 verified wheel bytes
   -> strict-CSP worker
-  -> offline installation before READY
+  -> worker re-verifies exact size + SHA-256 (WebCrypto)
+  -> offline installation before READY (micropip + emfs: + deps=False)
   -> smoke import every declared pythonImports entry
+  -> bootstrap installer retired (micropip.install becomes a denial)
   -> normal user import afterwards
 ```
 
-The worker never resolves dependencies or fetches packages from the network.
+The worker never resolves dependencies or fetches packages from the
+network; `deps=False` enforces the Package v1 "exactly one wheel, no
+dependency closure" contract at install time. A declared-shape-valid
+bundle wheel that is not a real wheel fails the boot closed at the
+install step — Package Core identity is not runtime installability, and
+this boundary is now exercised by tests
+(`tests/python-plugin-runtime.test.cjs`,
+`tests/e2e-python-plugin-runtime.cjs`, the I5 case).
 
 ## 12. What is deliberately not in package v1
 

@@ -391,13 +391,21 @@ MCP authority is not connected), `ready` (all required components available),
   are recognized runtimes, but v1 exercises exactly one provider kind (python,
   tests only). A future verified wheel loader plugs in here without touching the
   Capability / Skill / Agent model.
-- Python plugin lifecycle: TaskEnvironment snapshot -> harness configures the
-  payload -> Python worker boots -> all enabled plugin modules installed into
-  site-packages -> smoke import -> READY. After that, `import <module>` works
-  like any preinstalled package. There is NO lazy-install-on-import, no runtime
-  download, no retry loop. A broken payload fails the boot closed.
-- Plugin payloads ride the bootstrap MESSAGE (post-`loadPackage`, pre-lockdown);
-  the F04c `PYTHON_BOOTSTRAP_MANIFEST` trust boundary is untouched.
+- Python plugin lifecycle: TaskEnvironment snapshot -> harness configures
+  the payload -> Python worker boots -> all enabled plugin modules installed
+  into site-packages -> smoke import -> READY. After that, `import <module>`
+  works like any preinstalled package. There is NO lazy-install-on-import, no
+  runtime download, no retry loop. A broken payload fails the boot closed.
+- Two payload transports exist (TPR v1A): the TRUSTED WHEEL PAYLOAD
+  (`wheels: [{filename, format, size, sha256, bytes}]`, worker re-verifies
+  byte identity, installs OFFLINE via micropip `emfs:` + `deps=False` from a
+  `/tmp` scratch path, then retires the installer) and the LEGACY SYNTHETIC
+  COMPOSITION PATH (`files: {sourceText}` — the composition proof, not
+  Trusted Plugin Runtime artifact delivery; v1B removes/isolates it).
+  Both ride the bootstrap MESSAGE (post-`loadPackage`, pre-lockdown); the
+  F04c `PYTHON_BOOTSTRAP_MANIFEST` trust boundary carries only the pinned
+  micropip installer closure — never a plugin wheel. A boot-reply-window
+  cancellation/reset aborts the boot: a cancelled boot can never turn READY.
 
 ### 11.3 Skill semantics (v1): definitions, sources, mutable instances
 

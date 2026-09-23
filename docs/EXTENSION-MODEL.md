@@ -31,27 +31,68 @@ Closed v1 rules:
 
 Current main has a synthetic provider proof only.
 
-## 4. Trusted Plugin Runtime v1 — next milestone
+## 4. Trusted Plugin Runtime v1 — milestones
 
-Prove real code delivery with a synthetic wheel before selecting a product package:
+### v1A — offline wheel bootstrap primitive (implemented)
+
+The lowest runtime primitive is implemented and proven with the Package Core
+synthetic wheel (`locus_test_plugin-1.0.0-py3-none-any.whl`):
 
 ```
-trusted descriptor
- -> fixed artifact identity
- -> trusted harness bounded acquisition
- -> exact size + SHA-256
- -> verified cache
- -> strict-CSP Python worker
- -> offline install before READY
- -> smoke import
- -> ordinary import during user code
+verified wheel bytes (trusted harness payload)
+  -> strict-CSP Pyodide worker
+  -> worker re-verifies exact size + SHA-256 (WebCrypto)
+  -> harness-derived /tmp scratch path
+  -> OFFLINE install: micropip + emfs: + deps=False (measured on the pinned
+     Pyodide 0.26.4; zero network by construction and by request counter)
+  -> declared import smoke test
+  -> bootstrap installer retired (micropip.install becomes a denial)
+  -> network lockdown
+  -> READY
+  -> ordinary user Python: import locus_test_plugin; answer() == 42
 ```
 
-No worker/Plugin network authority, arbitrary model URL, marketplace, PyPI resolver, dependency solver, model-triggered install, or new model tool in v1.
+Supporting facts:
 
-The exact offline wheel installation mechanism is an implementation question to measure.
+- `PYTHON_BOOTSTRAP_MANIFEST` gained ONLY the exact micropip closure
+  declared by the pinned pyodide-lock.json (`micropip-0.6.0`,
+  `packaging-23.2`), size/hash-pinned and verified by
+  `scripts/verify-python-bootstrap-manifest.mjs`. Plugin wheels themselves
+  NEVER enter the manifest: bootstrap assets are the Locus runtime trusted
+  base, plugin artifacts are extension payload delivered in the bootstrap
+  MESSAGE.
+- The trusted harness (`PythonRuntime.configureExtensions`) validates the
+  wheel payload (schema, basename-only `.whl` filename, `python-wheel`
+  format, size bounds <= the package artifact bound, lowercase hex SHA-256,
+  bytes view with `byteLength == size`) and takes an OWN COPY — a caller
+  mutating its bytes afterwards can never change future boots.
+- The worker NEVER trusts the channel: it re-verifies byte identity before
+  writing anything, installs from `/tmp/locus-plugin-artifacts/<sha256>/`,
+  deletes the scratch file in every outcome, and smoke-imports every
+  declared import. Any mismatch or failed smoke import fails the boot
+  closed: no install, no READY.
+- `deps=False` is the Package v1 contract (exactly one wheel, no
+  dependency closure, no package index). After the trusted install,
+  `micropip.install`/`add_mock_package`/`remove_mock_package` become
+  denials; remote installs are additionally dead at the requirement
+  parser and behind the browser CSP (zero requests, request-counter
+  proven). `pyodide.loadPackage` / `loadPackagesFromImports` stay denied.
+  Plugin install time is bounded by the initialization bootstrap budget,
+  never the 30s user execution budget.
 
-Trusted Plugin Runtime is also the code-delivery half of Capability packaging: the package/import layer validates artifact identity and bytes; the runtime receives verified artifacts and prepares them before READY.
+NOT YET (v1B and beyond):
+
+- CapabilityManager artifact refs / `PluginRuntimeProvider` wheel loader;
+- PluginArtifactStore (production artifact storage beyond the test seam);
+- Capability Package import UI, imported-package registration;
+- Reference Capability; self-hosting;
+- the legacy `files: {sourceText}` synthetic composition path still exists
+  (explicitly labeled LEGACY SYNTHETIC COMPOSITION PATH in the worker) and
+  is scheduled for removal/isolation in v1B.
+
+No worker/Plugin network authority, arbitrary model URL, marketplace, PyPI
+resolver, dependency solver, model-triggered install, or new model tool in
+v1.
 
 ## 5. Capability packages and authoring
 

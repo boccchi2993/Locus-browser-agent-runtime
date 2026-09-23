@@ -92,7 +92,14 @@ No product Capability is required yet.
 
 ## 4. Phase B — Trusted Plugin Runtime
 
-Use a tiny synthetic pure-Python wheel to prove the real package boundary.
+Status: the v1A primitive is implemented — a tiny synthetic pure-Python
+wheel is delivered as verified artifact bytes and installed OFFLINE in the
+strict-CSP worker before READY (worker-side size + SHA-256 re-verification,
+micropip `emfs:` + `deps=False`, declared-import smoke test, installer
+retirement). See EXTENSION-MODEL.md section 4 and CAPABILITY-PACKAGE.md
+section 11. What remains contract-only is the wiring from an IMPORTED
+bundle to that runtime seam (CapabilityManager artifact refs, the
+production artifact store, the import UI).
 
 The wheel should have:
 

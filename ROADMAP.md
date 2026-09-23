@@ -212,26 +212,50 @@ The repository now has a wiki-style documentation index and explicit design cont
 
 ### Trusted Plugin Runtime v1
 
-Status: next extension-layer milestone.
+Status: v1A (offline wheel bootstrap primitive) implemented; v1B
+(CapabilityManager artifact refs + production artifact store) is the next
+extension-layer milestone.
 
-Goal: replace the test-only source-string Python plugin proof with a real trusted artifact pipeline while preserving the closed Capability/Skill model.
+v1A — implemented:
 
-Target contract:
+- verified wheel bytes delivered as trusted-harness payload (never a
+  bootstrap-manifest asset), validated and own-copied by
+  `PythonRuntime.configureExtensions` before any boot send;
+- worker re-verifies exact size + SHA-256 (WebCrypto) before install;
+- OFFLINE installation into a fresh runtime before READY: micropip +
+  `emfs:` + `deps=False`, measured on the pinned Pyodide 0.26.4 inside the
+  strict-CSP in-memory bootstrap environment;
+- the exact micropip closure declared by the pinned pyodide-lock.json
+  (`micropip-0.6.0`, `packaging-23.2`) joined the F04c bootstrap manifest
+  with full provenance (release lockfile byte-compare + jsDelivr
+  cross-check + `scripts/verify-python-bootstrap-manifest.mjs`);
+- smoke import before task execution; bootstrap installer retired before
+  READY (`micropip.install` denial; remote/index/local installs and
+  `pyodide.loadPackage*` all dead with zero requests);
+- verified cache/rebuild semantics: crash, reset and cancellation rebuild
+  from the same configured payload with zero network; a cancellation inside
+  the boot-reply window aborts the boot (never a late zombie READY);
+- coverage: `tests/python-plugin-runtime.test.cjs` +
+  `tests/e2e-python-plugin-runtime.cjs` (request-counter oracles).
 
-- fixed trusted Plugin descriptors and artifacts;
-- bounded acquisition by the trusted harness;
-- exact size + SHA-256 verification before bytes enter the Python worker;
-- no Plugin/Python network authority;
-- offline installation into a fresh runtime before READY;
-- smoke import before task execution;
-- verified cache/rebuild semantics;
-- synthetic wheel first; no production package/capability decision until the loader contract is proven;
-- a deterministic synthetic wheel fixture already exists at
-  `tests/fixtures/capability-package/minimal/plugins/locus-test-plugin/artifacts/`
-  (regenerable via `tests/fixtures/capability-package/tools/build-wheel.py`,
-  stdlib only) plus the bundle-side artifact identity (`size` + `sha256`)
-  produced by the package core, ready for this milestone to consume;
-- no marketplace, arbitrary remote manifests, PyPI resolver, or model-triggered install in v1.
+v1B — pending:
+
+- CapabilityManager artifact refs (`PluginRuntimeProvider` wheel loader);
+- PluginArtifactStore production integration;
+- TaskEnvironment stays metadata-only (v1A already keeps wheel bytes out
+  of it);
+- removal/isolation of the LEGACY SYNTHETIC COMPOSITION PATH
+  (`files: {sourceText}`).
+
+Standing v1 contract (unchanged): no Plugin/Python network authority; no
+marketplace, arbitrary remote manifests, PyPI resolver, or model-triggered
+install; synthetic wheel first; no production package/capability decision
+until the loader contract is proven. The deterministic synthetic wheel
+fixture lives at
+`tests/fixtures/capability-package/minimal/plugins/locus-test-plugin/artifacts/`
+(regenerable via `tests/fixtures/capability-package/tools/build-wheel.py`,
+stdlib only) and its bundle-side identity (`size` + `sha256`) comes from
+the package core.
 
 ### Capability package / authoring framework
 

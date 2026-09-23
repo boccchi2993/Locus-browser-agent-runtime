@@ -27,6 +27,8 @@ A strict-CSP creator iframe produces the worker so user-phase network primitives
 
 The trusted page acquires the fixed Pyodide bootstrap set, verifies exact size + SHA-256, then delivers verified bytes to the worker.
 
+Trusted Plugin Runtime v1A extends this contract with verified plugin wheels: the harness validates the payload (shape, bounds, metadata/bytes agreement) and takes an own copy; the worker re-verifies byte identity (size + SHA-256) before installing, installs OFFLINE from a `/tmp` scratch path (micropip `emfs:`, `deps=False` — no dependency closure, no package index), smoke-imports every declared import, deletes the scratch file, retires the bootstrap installer (`micropip.install` becomes a denial), and only then reports READY. Plugin wheels never enter the F04c bootstrap manifest: they travel as payload data, and a broken payload fails the boot closed. After READY, user-phase package loading stays Harness-controlled: `micropip.install` (remote, index, or local `emfs:`) is a denial, `pyodide.loadPackage`/`loadPackagesFromImports` are denied, and the browser CSP makes every remaining network act impossible with zero requests.
+
 This is a concrete no-network authority contract, not proof against every imaginable hostile-code escape.
 
 ## 5. Network authority
@@ -47,7 +49,7 @@ Prompt injection may propose a change. It cannot silently persist one.
 
 Capability enablement does not auto-connect MCP. Plugin v1 authority is exactly `none`.
 
-The future trusted package loader may acquire verified code through the trusted harness, but Plugin code still must not inherit network, DOM, credentials, or MCP authority.
+The future trusted package loader may acquire verified code through the trusted harness, but Plugin code still must not inherit network, DOM, credentials, or MCP authority. (The v1A offline wheel bootstrap primitive implements exactly this: verified wheel bytes in, pre-READY offline install, no new authority for the plugin or for user Python.)
 
 ## 8. Capability package import (planned authoring boundary)
 
