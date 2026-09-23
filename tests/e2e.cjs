@@ -181,6 +181,19 @@ function bootstrapIntegrityE2e() {
   return r.status === 0;
 }
 
+// ---------- 7. trusted plugin runtime e2e (own servers + Chrome) ----------
+// TPR v1A: offline wheel bootstrap primitive, driving the REAL production
+// runtime with the real synthetic wheel: offline micropip install before
+// READY, smoke import, integrity adversarial, crash/reset/cancellation
+// recovery, and request-counter network oracles.
+function pluginRuntimeE2e() {
+  console.log('=== trusted plugin runtime e2e (tests/e2e-python-plugin-runtime.cjs) ===');
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'e2e-python-plugin-runtime.cjs')], {
+    stdio: 'inherit', env: process.env,
+  });
+  return r.status === 0;
+}
+
 async function main() {
   const results = [];
   results.push(['runtime', await runtimeE2e()]);
@@ -193,6 +206,7 @@ async function main() {
   results.push(['network', networkE2e()]);
   results.push(['python-browser-authority', browserAuthorityE2e()]);
   results.push(['python-bootstrap-integrity', bootstrapIntegrityE2e()]);
+  results.push(['trusted-plugin-runtime', pluginRuntimeE2e()]);
   console.log('===');
   let failed = 0;
   for (const [name, ok] of results) {
