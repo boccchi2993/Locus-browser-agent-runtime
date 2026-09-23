@@ -25,6 +25,15 @@
 //  V9  bytes must be an ArrayBuffer view with byteLength == declared size
 //  V10 own-copy isolation: caller mutation never changes future boots
 //  V11 DataView (non-Uint8Array view) accepted and normalized
+//  V12 legacy files payload still accepted (LEGACY SYNTHETIC COMPOSITION
+//      PATH; same canonical pluginId gate)
+//  V13 canonical plugin identity: pluginId must match EXTENSION_ID_PATTERN
+//      (both payload shapes); valid canonical id accepted
+//  V14 wheels non-array rejected with a controlled validation error
+//  V15 zero wheels rejected
+//  V16 multiple wheels rejected (exactly-one-wheel contract)
+//  V17 DataView over a padded backing buffer: own exact-range copy
+//      (byteOffset + byteLength respected, caller mutation inert)
 //  W1  wheel install lifecycle order (pandas -> micropip -> verify -> write
 //      -> emfs install deps=False -> unlink/rmdir -> smoke -> neuter)
 //  W2  tampered bytes (same size, wrong digest) -> sha256 mismatch, no
@@ -61,10 +70,17 @@ const cryptoNode = require('crypto');
 globalThis.crypto = cryptoNode.webcrypto;
 
 const SHELL_SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'shell.js'), 'utf8');
+// index.html loads workspace.js + vfs.js + extensions.js BEFORE shell.js;
+// extensions.js supplies the class bases (WorkspaceAdapter) and the shared
+// EXTENSION_ID_PATTERN / EXTENSION_PY_MODULE_PATTERN bindings shell.js
+// consumes (canonical plugin identity has ONE authoritative regex). The
+// same base trio as the capability suites, in production load order.
+const BASE_SRC = ['src/workspace.js', 'src/vfs.js', 'src/extensions.js']
+  .map((f) => fs.readFileSync(path.join(__dirname, '..', f), 'utf8')).join('\n;\n');
 function evalShell() {
   global.window = { location: { protocol: 'https:' }, addEventListener: () => {} };
   global.document = { getElementById: () => null };
-  const M = eval(SHELL_SRC + '\n;({ PythonRuntime, validateWheelArtifact, PYTHON_PLUGIN_WHEEL_MAX_BYTES });');
+  const M = eval(BASE_SRC + '\n' + SHELL_SRC + '\n;({ PythonRuntime, validateWheelArtifact, PYTHON_PLUGIN_WHEEL_MAX_BYTES });');
   delete global.window;
   delete global.document;
   return M;
@@ -130,6 +146,7 @@ function expectConfigureThrow(name, payload, pattern) {
 expectConfigureThrow('V2a non-object payload rejected', 42, /invalid extension payload/);
 expectConfigureThrow('V2b missing key rejected', { modules: [] }, /invalid extension payload/);
 expectConfigureThrow('V2c modules not an array rejected', { key: 'k', modules: {} }, /invalid extension payload/);
+expectConfigureThrow('V2d empty key rejected', { key: '', modules: [] }, /invalid extension payload/);
 expectConfigureThrow('V3a module without pluginId rejected', { key: 'k', modules: [{ imports: [] }] }, /invalid extension module entry/);
 expectConfigureThrow('V3b module with empty pluginId rejected', { key: 'k', modules: [wheelModule({ pluginId: '' })] }, /invalid extension module entry/);
 expectConfigureThrow('V3c module with non-array imports rejected', { key: 'k', modules: [wheelModule({ imports: 'x' })] }, /invalid extension module entry/);
@@ -168,6 +185,9 @@ expectConfigureThrow('V6 wrong format rejected',
   expectConfigureThrow('V9b byteLength != declared size rejected (1296 vs 1295)',
     { key: 'k', modules: [wheelModule({ wheels: [Object.assign({}, w0, { bytes: w0.bytes.slice(0, w0.size - 1) })] })] },
     /bytes\.byteLength 1295 != declared size 1296/);
+  expectConfigureThrow('V9c SharedArrayBuffer-backed view rejected',
+    { key: 'k', modules: [wheelModule({ wheels: [Object.assign({}, w0, { bytes: new Uint8Array(new SharedArrayBuffer(w0.size)) })] })] },
+    /bytes must be a Uint8Array/);
 }
 {
   // V10: the canonical-copy rule (CapabilityBundle readBytes semantics).
@@ -204,6 +224,69 @@ expectConfigureThrow('V6 wrong format rejected',
   check('V12 legacy files payload still accepted on the LEGACY path',
     rt._extensions.modules[0].files && rt._extensions.modules[0].files['m.py'] === 'x'
       && !rt._extensions.modules[0].wheels, JSON.stringify(rt._extensions.modules[0]));
+}
+
+// ------ V13-V17: contract cleanup (canonical id, one-wheel, exact-range own copy) ------
+expectConfigureThrow('V13a pluginId "../evil" rejected (canonical identity)',
+  { key: 'k', modules: [wheelModule({ pluginId: '../evil' })] }, /pluginId must match/);
+expectConfigureThrow('V13b pluginId "Bad ID" rejected (canonical identity)',
+  { key: 'k', modules: [wheelModule({ pluginId: 'Bad ID' })] }, /pluginId must match/);
+expectConfigureThrow('V13c pluginId "Locus-Test-Plugin" (uppercase) rejected',
+  { key: 'k', modules: [wheelModule({ pluginId: 'Locus-Test-Plugin' })] }, /pluginId must match/);
+{
+  // The LEGACY synthetic path enforces the SAME canonical plugin identity.
+  const rt = freshRuntime();
+  let err = null;
+  try { rt.configureExtensions({ key: 'k', modules: [{ pluginId: '../evil', files: { 'm.py': 'x' }, imports: ['m'] }] }); } catch (e) { err = e; }
+  check('V13d legacy files payload enforces the same canonical pluginId',
+    !!err && /pluginId must match/.test(errText(err)) && rt._extensions === null, errText(err));
+}
+{
+  const rt = freshRuntime();
+  rt.configureExtensions({ key: 'k', modules: [wheelModule()] });
+  check('V13e valid canonical pluginId accepted', rt._extensions.modules[0].pluginId === 'locus-test-plugin', '');
+}
+{
+  // V14: a non-array wheels payload is a protocol violation and must fail
+  // with the controlled validation error, never an incidental TypeError
+  // bubbling out of .map.
+  const rt = freshRuntime();
+  let err = null;
+  try { rt.configureExtensions({ key: 'k', modules: [wheelModule({ wheels: {} })] }); } catch (e) { err = e; }
+  check('V14 wheels non-array rejected with a controlled validation error',
+    !!err && /exactly one \.whl artifact/.test(errText(err))
+      && !/\.map is not a function/i.test(errText(err)) && rt._extensions === null, errText(err));
+}
+expectConfigureThrow('V15 zero wheels rejected',
+  { key: 'k', modules: [wheelModule({ wheels: [] })] }, /exactly one \.whl artifact/);
+{
+  const w0 = wheelModule().wheels[0];
+  const second = Object.assign({}, w0, { filename: 'locus_test_plugin-2.0.0-py3-none-any.whl' });
+  expectConfigureThrow('V16 two wheels rejected (exactly-one contract)',
+    { key: 'k', modules: [wheelModule({ wheels: [w0, second] })] }, /exactly one \.whl artifact/);
+}
+{
+  // V17: a non-Uint8Array view (DataView) over a LARGER backing buffer must
+  // be canonicalized to an own copy of EXACTLY the declared byte range —
+  // byteOffset and byteLength respected, the surrounding padding never
+  // retained, and later caller mutation of the whole buffer inert.
+  const prefix = 7; // deliberately misaligned wheel start inside the buffer
+  const suffix = 13;
+  const backing = new ArrayBuffer(prefix + WHEEL_BYTES.byteLength + suffix);
+  const raw = new Uint8Array(backing);
+  raw.set(WHEEL_BYTES, prefix);
+  const view = new DataView(backing, prefix, WHEEL_BYTES.byteLength);
+  const rt = freshRuntime();
+  rt.configureExtensions({ key: 'k', modules: [wheelModule({ wheels: [{
+    filename: WHEEL_FILENAME, format: 'python-wheel', size: WHEEL_BYTES.byteLength,
+    sha256: WHEEL_SHA256, bytes: view,
+  }] })] });
+  for (let i = 0; i < raw.length; i++) raw[i] = 0x5a; // caller mutates EVERYTHING afterwards
+  const stored = rt._extensions.modules[0].wheels[0].bytes;
+  const storedSha = cryptoNode.createHash('sha256').update(stored).digest('hex');
+  check('V17 DataView over padded backing buffer: stored payload is an own exact-range copy',
+    storedSha === WHEEL_SHA256 && stored.byteLength === WHEEL_BYTES.byteLength
+      && stored.every((b, i) => b === WHEEL_BYTES[i]), storedSha);
 }
 
 // ---------- WORKER: real py-worker-src in a recording sandbox ----------

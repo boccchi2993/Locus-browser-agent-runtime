@@ -377,12 +377,19 @@ function validateWheelArtifact(pluginId, wheel) {
   }
   // OWN COPY (CapabilityBundle readBytes rule): the caller mutating its
   // original buffer after configureExtensions must never change what future
-  // boots install. The structured clone into the worker leaves this page
-  // copy untouched, so every boot (first, reset, crash-rebuild) replays the
-  // same canonical bytes.
-  const copy = bytes instanceof Uint8Array
-    ? new Uint8Array(bytes)
+  // boots install. Every accepted view is canonicalized in two steps: a
+  // Uint8Array view over EXACTLY the declared byte range (byteOffset ..
+  // byteOffset + byteLength), then `new Uint8Array(view)` — a fresh,
+  // independent element copy. The caller's backing ArrayBuffer is never
+  // retained (a bare subarray view would still alias it), so mutating any
+  // region of the original buffer afterwards cannot reach the stored
+  // payload. The structured clone into the worker leaves this page copy
+  // untouched, so every boot (first, reset, crash-rebuild) replays the same
+  // canonical bytes.
+  const view = bytes instanceof Uint8Array
+    ? bytes
     : new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const copy = new Uint8Array(view);
   return { filename: filename, format: 'python-wheel', size: wheel.size, sha256: wheel.sha256, bytes: copy };
 }
 
@@ -624,7 +631,8 @@ const PythonRuntime = {
       }
       // Single-threaded: an abort can only land at an await boundary, so a
       // cancelled/timed-out/mismatched acquisition cannot slip past these
-      // checks into the cache write. Only 10/10 verified bytes get here.
+      // checks into the cache write. Only a complete verified manifest set
+      // gets here.
       throwIfCancelled(signal, 'python execution');
       throwIfBootAborted(boot);
       this._assets = out;
@@ -728,17 +736,18 @@ const PythonRuntime = {
   //    worker. Capability Composition's synthetic proof; NOT Trusted
   //    Plugin Runtime artifact delivery (V1B retires/isolates it).
   //  - TRUSTED WHEEL PAYLOAD (TPR v1A): { pluginId, wheels: [{ filename,
-  //    format, size, sha256, bytes }], imports } — exact verified wheel
-  //    bytes installed OFFLINE by the worker before READY. Every invariant
-  //    a worker cannot be trusted to catch is enforced HERE: a metadata/
-  //    bytes disagreement is a trusted-harness bug and must fail before
-  //    the boot send, never inside the interpreter.
+  //    format, size, sha256, bytes }], imports } — EXACTLY ONE verified
+  //    wheel per module, installed OFFLINE by the worker before READY.
+  //    Every invariant a worker cannot be trusted to catch is enforced
+  //    HERE: a metadata/bytes disagreement is a trusted-harness bug and
+  //    must fail before the boot send, never inside the interpreter.
   configureExtensions(ext) {
     if (ext === null || ext === undefined) {
       this._extensions = null;
       return;
     }
-    if (!ext || typeof ext !== 'object' || typeof ext.key !== 'string' || !Array.isArray(ext.modules)) {
+    if (!ext || typeof ext !== 'object' || typeof ext.key !== 'string' || !ext.key
+        || !Array.isArray(ext.modules)) {
       throw new Error('PythonRuntime.configureExtensions: invalid extension payload');
     }
     const modules = ext.modules.map((m) => {
@@ -746,7 +755,18 @@ const PythonRuntime = {
           || !Array.isArray(m.imports)) {
         throw new Error('PythonRuntime.configureExtensions: invalid extension module entry');
       }
-      if (m.imports.some((n) => !/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(String(n)))) {
+      // CANONICAL PLUGIN IDENTITY: the trusted Harness payload may not invent
+      // a weaker id schema — every module id must match the SAME
+      // EXTENSION_ID_PATTERN the descriptors are validated against
+      // (extensions.js, loaded before this script by index.html; no local
+      // copy of the regex). Both payload shapes — LEGACY SYNTHETIC
+      // COMPOSITION PATH (files) and TRUSTED PLUGIN RUNTIME V1A (wheels) —
+      // pass through this gate.
+      if (!EXTENSION_ID_PATTERN.test(m.pluginId)) {
+        throw new Error('PythonRuntime.configureExtensions: module pluginId must match '
+          + EXTENSION_ID_PATTERN + ': ' + m.pluginId);
+      }
+      if (m.imports.some((n) => !EXTENSION_PY_MODULE_PATTERN.test(String(n)))) {
         throw new Error('PythonRuntime.configureExtensions: invalid smoke import name in module ' + m.pluginId);
       }
       const hasFiles = m.files !== undefined;
@@ -756,6 +776,15 @@ const PythonRuntime = {
           + ' carries both files and wheels payloads');
       }
       if (hasWheels) {
+        // EXACTLY-ONE-WHEEL (Package v1 / TPR v1A contract): one python-wheel
+        // artifact per plugin — no dependency closure, no multi-wheel format.
+        // A wrong shape is a protocol violation and fails here with a
+        // controlled validation error, never as an incidental JS TypeError
+        // bubbling out of the mapping below.
+        if (!Array.isArray(m.wheels) || m.wheels.length !== 1) {
+          throw new Error('PythonRuntime.configureExtensions: module ' + m.pluginId
+            + ' wheels payload must be an array with exactly one .whl artifact');
+        }
         const wheels = m.wheels.map((w) => validateWheelArtifact(m.pluginId, w));
         return Object.freeze({ pluginId: m.pluginId, imports: m.imports.slice(), wheels: Object.freeze(wheels.map(Object.freeze)) });
       }

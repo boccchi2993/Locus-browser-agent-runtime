@@ -84,6 +84,9 @@ async function loadAsset(name) {
 // itself is untouched production code.
 function buildPage(shellUrl, workerSrc, localAssets, wheelB64, wheelSha, wheelSize) {
   return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>TPR v1A</title></head><body>'
+    // index.html load order: extensions.js (canonical EXTENSION_ID_PATTERN
+    // owner) BEFORE shell.js, which consumes the shared binding.
+    + '<script src="extensions.js"><\/script>'
     + '<script src="' + shellUrl + '"><\/script>'
     + '<script>'
     + 'var __nativeFetch = window.fetch.bind(window);'
@@ -178,6 +181,12 @@ async function main() {
       res.end(src);
       return;
     }
+    if (u.pathname === '/extensions.js') {
+      const src = assetBytes.get('__extensions__');
+      res.setHeader('content-type', 'text/javascript; charset=utf-8');
+      res.end(src);
+      return;
+    }
     if (u.pathname.startsWith('/assets/')) {
       const name = u.pathname.slice('/assets/'.length);
       assetHits.push({ name, t: Date.now() });
@@ -225,6 +234,7 @@ async function main() {
     console.log('# loading pinned asset set (' + PY_MANIFEST.length
       + ' files, disk cache at ' + ASSET_CACHE_DIR + ' when present, CDN otherwise)');
     assetBytes.set('__shell__', await fs.readFile(path.join(__dirname, '..', 'src', 'shell.js')));
+    assetBytes.set('__extensions__', await fs.readFile(path.join(__dirname, '..', 'src', 'extensions.js')));
     for (const a of PY_MANIFEST) assetBytes.set(a.name, await loadAsset(a.name));
     const html = await fs.readFile(path.join(__dirname, '..', 'index.html'), 'utf8');
     const wm = html.match(/<script type="text\/worker" id="py-worker-src">([\s\S]*?)<\/script>/);
