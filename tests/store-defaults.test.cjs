@@ -19,6 +19,8 @@ const src = fs.readFileSync(path.join(root, 'src', 'ui', 'store.js'), 'utf8');
 const workspaceSrc = fs.readFileSync(path.join(root, 'src', 'workspace.js'), 'utf8');
 const vfsSrc = fs.readFileSync(path.join(root, 'src', 'vfs.js'), 'utf8');
 const approvalSrc = fs.readFileSync(path.join(root, 'src', 'approval.js'), 'utf8');
+const taskRunnerSrc = fs.readFileSync(path.join(root, 'src', 'harness', 'task-runner.js'), 'utf8');
+const providerSessionSrc = fs.readFileSync(path.join(root, 'src', 'harness', 'provider-session.js'), 'utf8');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -50,7 +52,7 @@ function loadStore(sessionData) {
   };
 
   const code = src
-    .replace(/^import[^\n]*\n/m, '')
+    .replace(/^import[^\n]*\n/gm, '')
     .replace(/^export /gm, '');
   return eval(
     'const reactive = (o) => o;\n' +
@@ -58,6 +60,10 @@ function loadStore(sessionData) {
     workspaceSrc + '\n' +
     vfsSrc + '\n' +
     approvalSrc + '\n' +
+    // M1a: the store imports the harness task-runner/provider-session ESM
+    // modules; strip their export keywords and inline them like the rest.
+    taskRunnerSrc.replace(/^export /gm, '') + '\n' +
+    providerSessionSrc.replace(/^export /gm, '') + '\n' +
     'const SHELL_COMMANDS = {};\n' +
     code + '\n;({ store, vfs, applySettings, persistSettingsIfNeeded, testConnection, addUploadFiles, removeAttachment, refreshArtifacts, downloadArtifact });'
   );
