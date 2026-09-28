@@ -4,6 +4,17 @@ This file is for concrete implementation work.
 
 Architecture-level decisions belong in docs/ARCHITECTURE.md and docs/MODEL-PROTOCOL.md. Milestones belong in ROADMAP.md.
 
+## Next — Runtime / Harness / Product extraction
+
+Contract and gates: [REPOSITORY-SPLIT.md](docs/REPOSITORY-SPLIT.md). All steps below are pending.
+
+- [ ] M0: inventory ownership and freeze public behavior/contract tests at an exact baseline.
+- [ ] M1: extract task assembly from UI, introduce explicit lifecycle bindings and generic operation policies.
+- [ ] M2: replace cross-layer globals with public modules; package workers and prove standalone entries.
+- [ ] M3: extract Runtime and Harness repositories with provenance, independent CI and pinned consumption; remove duplicate product implementations.
+- [ ] M4: land product compatibility adapters, exact dependency lock, latest-main integration and browser acceptance gates.
+
+
 ## Done on feat/linux-like-vfs-v1
 
 - [x] Linux-like VFS v1 (docs/LINUX-LIKE-VFS.md): always-on `VirtualWorkspace` mount table with longest-prefix routing; skeleton `/bin /usr /home /tmp /mnt`; `/home/locus` + `/tmp` + `/mnt/download` (MemoryWorkspace, quota-bounded), `/mnt/upload` (read-only UploadWorkspace holding real File objects), `/usr/bin`+`/bin` reflecting the live SHELL_COMMANDS registry, `/mnt/plugins` reserved; optional `/mnt/workspace` (LocalDirectoryWorkspace) with mount = session boundary

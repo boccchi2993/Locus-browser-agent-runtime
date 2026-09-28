@@ -1,5 +1,7 @@
 # Locus Architecture
 
+> Repository evolution: [Runtime / Harness / Product split](REPOSITORY-SPLIT.md) defines the agreed target ownership, independent repositories and migration gates. The split is not yet implemented; current behavior below remains the baseline.
+
 > Status: current architecture on `main`.  
 > Normative concepts live alongside the implementation; historical audit documents are snapshots, not current truth.
 

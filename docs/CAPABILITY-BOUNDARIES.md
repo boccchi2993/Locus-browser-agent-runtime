@@ -1,5 +1,7 @@
 # Locus Capability Boundaries
 
+> Repository evolution: [Runtime / Harness / Product split](REPOSITORY-SPLIT.md) defines the agreed target ownership, independent repositories and migration gates. The split is not yet implemented; current behavior below remains the baseline.
+
 > This document defines what belongs in the browser runtime, what belongs in the harness, and what should stay outside the core.
 
 ## 1. The target machine
