@@ -10,6 +10,9 @@ The repository keeps documentation beside code so architecture changes, tests, a
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Current layer model and system overview |
 | [REPOSITORY-SPLIT.md](REPOSITORY-SPLIT.md) | Agreed Runtime / Harness / Product target, migration sequence and compatibility gates |
+| [REPOSITORY-SPLIT-INVENTORY.md](REPOSITORY-SPLIT-INVENTORY.md) | M0 audit: per-symbol ownership, coupling catalog, extraction order at the pinned baseline |
+| [REPOSITORY-SPLIT-CONTRACTS.md](REPOSITORY-SPLIT-CONTRACTS.md) | M0 interface drafts: lifecycle, ports, ownership answers, error and versioning semantics |
+| [REPOSITORY-SPLIT-BASELINE.md](REPOSITORY-SPLIT-BASELINE.md) | M0 verification record: environment, commands, results, untested scope, findings |
 | [DESIGN-PRINCIPLES.md](DESIGN-PRINCIPLES.md) | Rules used to decide where functionality belongs |
 | [CONCEPTS.md](CONCEPTS.md) | Canonical vocabulary and terms |
 | [RUNTIME-MODEL.md](RUNTIME-MODEL.md) | One task from user input to local execution/provider replay |
@@ -26,7 +29,7 @@ The repository keeps documentation beside code so architecture changes, tests, a
 | [PERSISTENCE.md](PERSISTENCE.md) | IndexedDB/OPFS and recovery semantics |
 | [IMAGE-INPUT.md](IMAGE-INPUT.md) | Image/perception boundary |
 
-The three-repository split is a target architecture, not an implemented feature. Its migration gates precede further extension-layer expansion; current behavior remains documented in the existing contracts.
+The three-repository split is a target architecture, not an implemented feature. Its migration gates precede further extension-layer expansion; current behavior remains documented in the existing contracts. The M0 audit and contract round is complete (see the REPOSITORY-SPLIT-\* documents above); migration steps M1–M4 remain pending.
 
 Project status lives in [../ROADMAP.md](../ROADMAP.md). Implementation backlog lives in [../TODO.md](../TODO.md).
 

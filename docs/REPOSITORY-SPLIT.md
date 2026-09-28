@@ -134,6 +134,8 @@ Each step is a reviewable change with passing relevant tests. Keep the product u
 - Define ports, result/error semantics, capability descriptions and packaging/CSP requirements.
 - Exit: ownership and contract tests identify every supported cross-layer interaction.
 
+Status: **completed** at baseline `d25f30ea75e54989393230cb6c7695359d4c0815` (branch `docs/repository-split-m0`). Deliverables: [REPOSITORY-SPLIT-INVENTORY.md](REPOSITORY-SPLIT-INVENTORY.md) (per-symbol ownership, ranked coupling catalog, extraction order), [REPOSITORY-SPLIT-CONTRACTS.md](REPOSITORY-SPLIT-CONTRACTS.md) (port drafts incl. AbortController/lifecycle/authority/retry answers), [REPOSITORY-SPLIT-BASELINE.md](REPOSITORY-SPLIT-BASELINE.md) (environment, gate results at that commit, untested scope, findings). M1–M4 remain pending.
+
 ### M1 — Extract task assembly from the UI store
 
 - Move portable task orchestration to Harness and concrete environment preparation to Product adapters.
