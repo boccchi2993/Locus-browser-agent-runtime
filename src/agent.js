@@ -481,6 +481,14 @@ class AgentSession {
   // not delegated to the UI (App.busy): a second run() while a task is
   // live rejects BEFORE touching task state, history, events, model or
   // tools — the failed call leaves no trace in the session.
+  //
+  // opts.controller (M1a task-runner seam): an EXTERNAL task-lifetime
+  // AbortController owned by the Harness task runner, created at submit
+  // time so the preparation window shares the same cancellation signal.
+  // cancel()/reset() abort this.task.controller exactly as before — with
+  // an external controller that propagates to the runner's handle.
+  // Standalone callers (tests, non-product harnesses) omit it and get a
+  // fresh controller, unchanged.
   async run(userText, opts) {
     if (this.task) {
       throw new Error('AgentSession already has a running task');
@@ -496,7 +504,9 @@ class AgentSession {
     const userContent = Array.isArray(o.userContent) && o.userContent.length ? o.userContent : null;
     const imageCount = userContent ? userContent.filter((p) => p && p.type === 'image').length : 0;
     const generation = this.generation;
-    const controller = new AbortController();
+    const controller = (o.controller && typeof o.controller.abort === 'function'
+      && typeof o.controller.signal === 'object')
+      ? o.controller : new AbortController();
     this.task = { controller };
     const emit = this.emit;
     // Session switch (workspace change / reset) and current-session cancel
