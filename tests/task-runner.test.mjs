@@ -37,6 +37,20 @@
 //       cancellation itself, session boundaries win over plain cancel,
 //       and a post-intent necessary persistence failure is never silently
 //       lost
+//   S14 (review round 2) effective-epoch classification at ANY phase: a
+//       preparation-phase epoch change IS a session boundary (thrown or
+//       structured, with or without a plain cancel), an unchanged epoch
+//       keeps plain AbortErrors cancelled, a Product-internal rebind
+//       adopted via handle.adoptEpoch() keeps running and is not misread
+//       as a boundary — while a REAL boundary after the adoption is
+//       still detected; ready adoption remains authoritative
+//   S15 (review round 2) staged termination publication: while the
+//       NECESSARY finalize is parked there is no final task_end, no
+//       `ended`, no admission and no storage action; a finalize
+//       persistence failure REPLACES the outcome (persistence_error,
+//       not a warning); any other finalize failure is contained; the
+//       end notification observes the final outcome and a throw/reject
+//       never wedges the runner; a rejected task finalizes nothing
 //
 // Run: node tests/task-runner.test.mjs
 
@@ -60,7 +74,7 @@ function deferred() {
 // sink records every event AND feeds it back through observeEvent; run
 // bodies emit through the task-bound ctx.emit exactly like the Product
 // passes it into AgentSession.run({ emit }).
-function wire({ prepare, epoch, onTaskEnd }) {
+function wire({ prepare, epoch, onTaskEnd, finalizeTask }) {
   const events = [];
   let currentEpoch = epoch === undefined ? 1 : epoch;
   let runner;
@@ -69,6 +83,7 @@ function wire({ prepare, epoch, onTaskEnd }) {
     prepare,
     sessionEpoch: () => currentEpoch,
     onTaskEnd,
+    finalizeTask,
   });
   return {
     runner, events,
@@ -681,6 +696,273 @@ function wire({ prepare, epoch, onTaskEnd }) {
     outcome.reason === 'completed'
     && w.events.some((e) => e.type === 'warning' && e.code === 'task_aftermath_failed')
     && w.events.filter((e) => e.type === 'task_end').length === 1, JSON.stringify(w.events));
+}
+
+// ---------- S14 (review round 2): effective-epoch classification ----------
+{
+  // One scenario shape, the four matrix corners of "epoch changed during
+  // preparation + AbortError": thrown vs structured, with vs without a
+  // plain cancel. The boundary must win in ALL four (the old code
+  // classified every preparation-phase AbortError as plain cancelled).
+  async function epochAbortCorner({ structured, cancel }) {
+    const gate = deferred();
+    const w = wire({
+      prepare: () => gate.promise.then(() => {
+        const e = Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+        if (structured) return { status: 'failed', error: e };
+        throw e;
+      }),
+    });
+    const handle = w.runner.submit('epoch-abort');
+    w.setEpoch(2);            // external session boundary while preparing
+    if (cancel) handle.cancel('user');
+    gate.resolve();
+    return { w, outcome: await handle.ended };
+  }
+  const cornerA = await epochAbortCorner({ structured: false, cancel: false });
+  check('S14 epoch change + thrown AbortError (no cancel) → session_changed',
+    cornerA.outcome.reason === 'session_changed'
+    && cornerA.w.events.some((e) => e.type === 'warning' && e.code === 'session_changed'),
+    JSON.stringify(cornerA.w.events));
+  const cornerB = await epochAbortCorner({ structured: false, cancel: true });
+  check('S14 epoch change + thrown AbortError + plain cancel → session_changed (boundary wins)',
+    cornerB.outcome.reason === 'session_changed', cornerB.outcome.reason);
+  const cornerC = await epochAbortCorner({ structured: true, cancel: false });
+  check('S14 epoch change + structured AbortError (no cancel) → session_changed',
+    cornerC.outcome.reason === 'session_changed', cornerC.outcome.reason);
+  const cornerD = await epochAbortCorner({ structured: true, cancel: true });
+  check('S14 epoch change + structured AbortError + plain cancel → session_changed (one table, both forms)',
+    cornerD.outcome.reason === 'session_changed', cornerD.outcome.reason);
+}
+{
+  // An unchanged epoch keeps a plain AbortError exactly what it is.
+  const w = wire({
+    prepare: async () => { throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }); },
+  });
+  const handle = w.runner.submit('plain-abort-no-cancel');
+  const outcome = await handle.ended;
+  check('S14 unchanged epoch + AbortError (no cancel) → cancelled',
+    outcome.reason === 'cancelled'
+    && w.events.some((e) => e.type === 'warning' && e.code === 'task_cancelled'), outcome.reason);
+}
+{
+  // A legitimate Product-internal rebind (explicit adoptEpoch at the
+  // rebind point) keeps RUNNING; the REAL boundary that happens after
+  // the adoption is still detected.
+  let runCalls = 0;
+  let adopted = false;
+  let releaseRun;
+  const suspension = new Promise((r) => { releaseRun = r; });
+  const w = wire({
+    prepare: (task) => {
+      // The Product rebinds: session.reset() advanced the generation to 2
+      // and the rebind point adopts it — exactly the prepareTask shape.
+      adopted = task.adoptEpoch(2);
+      w.setEpoch(2);
+      return Promise.resolve({
+        status: 'ready', epoch: 2,
+        run: async () => {
+          runCalls++;
+          await suspension;
+          throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+        },
+      });
+    },
+  });
+  const handle = w.runner.submit('legit-rebind');
+  check('S14 adoptEpoch accepted during preparation', adopted === true
+    && typeof handle.adoptEpoch === 'function');
+  await tick(); await tick();
+  check('S14 legitimate rebind continues into the run phase', runCalls === 1, String(runCalls));
+  w.setEpoch(3);   // a REAL external boundary AFTER the internal rebind
+  releaseRun();
+  const outcome = await handle.ended;
+  check('S14 real boundary after the rebind is still detected (not masked)',
+    outcome.reason === 'session_changed', outcome.reason);
+}
+{
+  // Adoption does not mask a LATER boundary either: prepare adopts the
+  // rebind generation, THEN the session moves on, THEN prepare fails
+  // with an AbortError under a plain cancel — compared against the
+  // ADOPTED epoch, this is a boundary, not a cancellation.
+  const gate = deferred();
+  const w = wire({
+    prepare: (task) => {
+      task.adoptEpoch(2);
+      return gate.promise.then(() => {
+        throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+      });
+    },
+  });
+  const handle = w.runner.submit('adopt-then-boundary');
+  w.setEpoch(3);            // real boundary AFTER the adoption
+  handle.cancel('user');
+  gate.resolve();
+  const outcome = await handle.ended;
+  check('S14 adoption does not mask a later real boundary (cancelled would be wrong)',
+    outcome.reason === 'session_changed', outcome.reason);
+}
+{
+  // Ready adoption stays authoritative: an epoch adopted during
+  // preparation is subsumed by the ready result's epoch.
+  const w = wire({
+    prepare: (task) => {
+      task.adoptEpoch(9);   // stale value — the ready result overrides it
+      return Promise.resolve({ status: 'ready', epoch: 1, run: async () => {} });
+    },
+  });
+  const handle = w.runner.submit('ready-authoritative');
+  const outcome = await handle.ended;
+  check('S14 ready adoption overrides a preparation-phase adoptEpoch',
+    outcome.reason === 'completed', outcome.reason);
+}
+{
+  // adoptEpoch is refused once preparation is over — the task is
+  // settled, and no caller can move an ended task's binding.
+  const w = wire({ prepare: () => Promise.resolve({ status: 'ready', epoch: 1, run: async () => {} }) });
+  const handle = w.runner.submit('late-adopt');
+  await handle.ended;
+  check('S14 adoptEpoch refused after the task ended', handle.adoptEpoch(9) === false);
+}
+
+// ---------- S15 (review round 2): staged termination publication ----------
+{
+  // While the NECESSARY finalize is parked: no final task_end, no
+  // `ended`, no admission, no storage action — the whole
+  // necessary-completion boundary holds.
+  const order = [];
+  let releaseFinalize;
+  const finalizeGate = new Promise((r) => { releaseFinalize = r; });
+  let releaseCleanup;
+  const cleanupGate = new Promise((r) => { releaseCleanup = r; });
+  const w = wire({
+    prepare: () => Promise.resolve({
+      status: 'ready',
+      run: async (ctx) => {
+        ctx.emit({ type: 'task_start', input: 'A' });
+        ctx.emit({ type: 'task_end', reason: 'completed' }); // intent recorded; run returns
+      },
+    }),
+    finalizeTask: async (t, o) => {
+      order.push('finalize:' + o.reason);
+      await finalizeGate;
+      order.push('finalize-done');
+    },
+    onTaskEnd: async (t, o) => {
+      order.push('notify:' + o.reason);
+      check('S15 the end notification runs only AFTER the final task_end was published',
+        w.events.some((e) => e.type === 'task_end' && e.taskId === t.id), JSON.stringify(w.events));
+      await cleanupGate;
+      order.push('notify-done');
+    },
+  });
+  const handle = w.runner.submit('staged');
+  await tick(); await tick(); await tick(); // run body returned; finalize parked
+  check('S15 no final task_end while the necessary finalize is parked',
+    w.events.filter((e) => e.type === 'task_end').length === 0, JSON.stringify(w.events));
+  const endedEarly = await Promise.race([handle.ended.then(() => true), delay(40).then(() => false)]);
+  check('S15 ended NOT resolved while the necessary finalize is parked', endedEarly === false);
+  check('S15 second submit refused while the necessary finalize is parked', w.runner.submit('B') === null);
+  let storageRan = false;
+  const mutation = w.runner.quiesceAndRun(async () => { storageRan = true; return 'ok'; }, { timeoutMs: 90 });
+  const qResult = await mutation.then(() => 'resolved', (e) => 'rejected:' + (e.code || e.message));
+  check('S15 storage action blocked and NOT started while the necessary finalize is parked',
+    qResult.indexOf('rejected') === 0 && storageRan === false, qResult);
+  releaseFinalize();
+  const duringNotify = await Promise.race([handle.ended.then(() => true), delay(60).then(() => false)]);
+  check('S15 ended still pending through the must-await notification phase',
+    duringNotify === false, JSON.stringify(order));
+  releaseCleanup();
+  const outcome = await handle.ended;
+  check('S15 full staged order: intent → finalize → task_end → notify → ended',
+    outcome.reason === 'completed'
+    && order.join(',') === 'finalize:completed,finalize-done,notify:completed,notify-done', JSON.stringify(order));
+  check('S15 exactly one task_end, published after finalize and before the notification',
+    w.events.filter((e) => e.type === 'task_end' && e.taskId === handle.id).length === 1
+    && w.events[w.events.length - 1].type === 'task_end' && w.events[w.events.length - 1].reason === 'completed',
+    JSON.stringify(w.events));
+  const c = w.runner.submit('C');
+  check('S15 admission reopens only at the staged boundary', !!c);
+  await c.ended;
+}
+{
+  // A necessary-finalize persistence failure REPLACES the recorded
+  // intent BEFORE publication: the single terminal is persistence_error,
+  // surfaced as persistence_write_failed — never downgraded to a
+  // task_cleanup_failed warning.
+  const w = wire({
+    prepare: () => Promise.resolve({
+      status: 'ready',
+      run: async (ctx) => {
+        ctx.emit({ type: 'task_start', input: 'work' });
+        ctx.emit({ type: 'task_end', reason: 'completed' }); // intent
+      },
+    }),
+    finalizeTask: async () => {
+      throw Object.assign(new Error('necessary finalize write failed'), { persistenceFailure: true });
+    },
+  });
+  const handle = w.runner.submit('finalize-persist-fail');
+  const outcome = await handle.ended;
+  check('S15 necessary-finalize persistence failure IS the terminal (persistence_error)',
+    outcome.reason === 'persistence_error'
+    && w.events.filter((e) => e.type === 'task_end').length === 1
+    && w.events[w.events.length - 1].reason === 'persistence_error'
+    && w.events.some((e) => e.type === 'error' && e.code === 'persistence_write_failed')
+    && !w.events.some((e) => e.code === 'task_cleanup_failed'), JSON.stringify(w.events));
+}
+{
+  // A non-persistence finalize failure is contained: the recorded intent
+  // stands, the failure surfaces as task_cleanup_failed, ended resolves.
+  const w = wire({
+    prepare: () => Promise.resolve({
+      status: 'ready',
+      run: async (ctx) => {
+        ctx.emit({ type: 'task_start', input: 'work' });
+        ctx.emit({ type: 'task_end', reason: 'completed' });
+      },
+    }),
+    finalizeTask: async () => { throw new Error('finalize boom'); },
+  });
+  const handle = w.runner.submit('finalize-boom');
+  const outcome = await handle.ended;
+  check('S15 non-persistence finalize failure contained: outcome stands, warning surfaced',
+    outcome.reason === 'completed'
+    && w.events.filter((e) => e.type === 'task_end').length === 1
+    && w.events.find((e) => e.type === 'task_end').reason === 'completed'
+    && w.events.some((e) => e.type === 'warning' && e.code === 'task_cleanup_failed'), JSON.stringify(w.events));
+}
+{
+  // The end notification observes the FINAL outcome (post-override), and
+  // a rejection there still resolves `ended` with the published terminal.
+  let notifiedReason = null;
+  const w = wire({
+    prepare: () => Promise.resolve({
+      status: 'ready',
+      run: async (ctx) => { ctx.emit({ type: 'task_end', reason: 'completed' }); },
+    }),
+    finalizeTask: async () => {
+      throw Object.assign(new Error('write failed'), { persistenceFailure: true });
+    },
+    onTaskEnd: async (t, o) => { notifiedReason = o.reason; throw new Error('notify boom'); },
+  });
+  const handle = w.runner.submit('notify-final-outcome');
+  const outcome = await handle.ended;
+  check('S15 the end notification observes the FINAL outcome and cannot wedge the task',
+    outcome.reason === 'persistence_error' && notifiedReason === 'persistence_error', String(notifiedReason));
+}
+{
+  // A rejected task ends silently: no finalize call, no task_end.
+  let finalizeCalls = 0;
+  const w = wire({
+    prepare: () => Promise.resolve({ status: 'silent' }),
+    finalizeTask: () => { finalizeCalls++; },
+  });
+  const handle = w.runner.submit('silent');
+  const outcome = await handle.ended;
+  check('S15 rejected task finalizes nothing and emits nothing',
+    outcome.reason === 'rejected' && finalizeCalls === 0
+    && w.events.filter((e) => e.type === 'task_end').length === 0);
 }
 
 console.log('---');

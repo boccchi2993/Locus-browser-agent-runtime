@@ -27,10 +27,30 @@
 //    sessionEpoch()           current session-generation marker; a
 //                             change after the task pinned its epoch
 //                             is a session boundary for that task.
+//    finalizeTask(handle,     OPTIONAL necessary-finalize step, called
+//                outcome)     EXACTLY once per task BEFORE the final
+//                             task_end is published — the only phase
+//                             whose failure may still CHANGE the
+//                             outcome: a persistence failure here
+//                             becomes the terminal `persistence_error`
+//                             (never downgraded to a warning), while
+//                             any other failure is contained and
+//                             surfaced after publication as a
+//                             `task_cleanup_failed` warning without
+//                             changing the outcome. A thenable return
+//                             is awaited; the single task_end, `ended`,
+//                             admission and the storage gate all wait
+//                             for it. Skip registration unless a write
+//                             is PROVABLY a completion condition of the
+//                             task — telemetry and optional UI saves
+//                             are never necessary writes.
 //    onTaskEnd(task, outcome) called EXACTLY once per task, AFTER the
 //                             final task_end was published and BEFORE
 //                             `ended` resolves — the place to release
-//                             task-scoped bindings. Callback roles:
+//                             task-scoped bindings (the task→conversation
+//                             map must still be ALIVE when the final
+//                             task_end projects; release happens after).
+//                             Callback roles:
 //                             onTaskEnd MAY return a Promise; a
 //                             thenable return is MUST-AWAIT cleanup
 //                             (the runner awaits it before resolving
@@ -101,12 +121,35 @@
 //    An AbortError thrown by a cancelled operation IS the
 //    cancellation (classified by 3/4), never an independent error.
 //
-//  The final task_end is published EXACTLY ONCE, by the runner, when
-//  the real completion boundary is reached: run body returned (or
-//  threw) and, for pre-run paths, immediately at the decision. `ended`
-//  resolves after publication and must-await cleanup; admission
-//  (submit) and the storage quiesce gate key off this same boundary —
-//  observing a terminal EVENT alone never reopens admission.
+//  Effective epoch (one rule for thrown AND structured failures, at
+//  ANY phase): the task's binding is `epoch` once pinned (ready
+//  adoption) and `submitEpoch` before that — never the CURRENT epoch
+//  read at failure time, which would mask a real boundary. During
+//  preparation a Product-internal rebind is LEGITIMATE: the Product
+//  adopts the rebound generation explicitly via handle.adoptEpoch()
+//  at the rebind point, so a later failure compares against the
+//  adopted value and is not misread as a boundary. With no explicit
+//  adoption, a preparation-phase epoch change IS an external
+//  session boundary and wins over a plain cancel.
+//
+//  Termination publication (staged — one task_end, one truth):
+//    1. the run body returned/threw (or a pre-run decision) and the
+//       termination intent is collected;
+//    2. NECESSARY finalize runs (optional finalizeTask dep): a
+//       persistence failure here REPLACES the outcome with
+//       persistence_error before anything is published;
+//    3. the single final task_end is published with the final
+//       outcome (the Product task→conversation map is still alive
+//       for this projection);
+//    4. bindings are released and the end notification runs
+//       (onTaskEnd): awaited, but its failures never change the
+//       published outcome — contained as task_cleanup_failed;
+//    5. admission is released and `ended` resolves. quiesce and the
+//       next task wait for this whole necessary-completion boundary.
+//  `ended` resolves after publication and both awaited phases;
+//  admission (submit) and the storage quiesce gate key off this
+//  same boundary — observing a terminal EVENT alone never reopens
+//  admission.
 // ============================================================
 
 const PREPARE_CANCELLED_MESSAGE = '任务已取消，尚未开始模型请求。';
@@ -123,6 +166,14 @@ function isAbortError(error) {
   return typeof DOMException !== 'undefined' && error instanceof DOMException && error.code === 20;
 }
 
+// One effective-epoch rule for EVERY phase: the pinned binding once the
+// ready adoption happened, the submit-time generation before that. Never
+// the CURRENT epoch — reading that at failure time would compare the
+// session with itself and mask a real boundary.
+function effectiveEpoch(task) {
+  return task.epoch !== null ? task.epoch : task.submitEpoch;
+}
+
 function defaultId(seq) {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return 'task-' + seq + '-' + crypto.randomUUID();
   return 'task-' + seq + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
@@ -135,6 +186,7 @@ export function createTaskRunner(deps) {
 
   const emit = deps.emit;
   const onTaskEnd = typeof deps.onTaskEnd === 'function' ? deps.onTaskEnd : null;
+  const finalizeTask = typeof deps.finalizeTask === 'function' ? deps.finalizeTask : null;
 
   let active = null;
   let submitSeq = 0;
@@ -186,6 +238,20 @@ export function createTaskRunner(deps) {
         state.controller.abort();
         return true;
       },
+      // Explicit adoption of a REBOUND session generation during
+      // preparation (the Product's intentional provider-session rebind).
+      // This is the ONLY way a preparation-phase epoch change stops being
+      // an external boundary: after adoption, failure classification
+      // compares against the adopted value, so a legitimate recovery is
+      // never misread as a session switch. Refused once the task is no
+      // longer preparing or already settled; never overwrites the ready
+      // adoption that follows.
+      adoptEpoch(epoch) {
+        if (state.settled || state.phase !== 'preparing') return false;
+        if (epoch === undefined || epoch === null) return false;
+        state.epoch = epoch;
+        return true;
+      },
     };
     state.handle = handle;   // complete() hands this to onTaskEnd
     return { handle: handle, state: state };
@@ -225,20 +291,49 @@ export function createTaskRunner(deps) {
     task.terminal = { reason: typeof reason === 'string' && reason ? reason : 'completed' };
   }
 
-  // ---- real completion boundary (F1) ----
-  // Publishes the final task_end exactly once, runs must-await cleanup,
-  // and only THEN releases admission and resolves `ended`.
+  // ---- termination publication, staged (S15) ----
+  //   1. (caller) the run body returned/threw or a pre-run decision was
+  //      made — the termination intent is collected;
+  //   2. NECESSARY finalize (finalizeTask dep): awaited BEFORE the outcome
+  //      is fixed; a persistence failure here REPLACES the outcome with
+  //      persistence_error (never downgraded to a warning); any other
+  //      failure is contained and surfaced after publication without
+  //      changing the outcome;
+  //   3. the single final task_end is published with the final outcome —
+  //      the Product task→conversation map is still alive for this
+  //      projection (its release belongs to phase 4);
+  //   4. bindings released + end notification (onTaskEnd): awaited so
+  //      admission and the storage gate cover it, but a throw/rejection
+  //      never changes the published outcome — task_cleanup_failed;
+  //   5. admission released, `ended` resolved. quiesce and the next task
+  //      wait for this whole necessary-completion boundary.
   async function complete(task, outcome) {
     if (task.settled) return;
     task.settled = true;
     task.phase = 'ended';
-    task.outcomeValue = outcome;
     let cleanupFailure = null;
+    if (finalizeTask && outcome.reason !== 'rejected') {   // 'rejected' ends silently (contract)
+      try {
+        const done = finalizeTask(task.handle, outcome);
+        if (done && typeof done.then === 'function') await done;
+      } catch (e) {
+        if (isPersistenceFailure(e)) {
+          outcome.reason = 'persistence_error';
+          emitFor(task, {
+            type: 'error', code: 'persistence_write_failed',
+            message: e && e.message ? e.message : String(e),
+          });
+        } else {
+          cleanupFailure = e;       // contained; surfaced below, outcome stands
+        }
+      }
+    }
+    task.outcomeValue = outcome;
     if (outcome.reason !== 'rejected') {          // 'rejected' emits nothing (contract)
       try {
         emitFor(task, { type: 'task_end', reason: outcome.reason });
       } catch (e) {
-        cleanupFailure = e;                       // a throwing sink must not wedge admission
+        cleanupFailure = cleanupFailure || e;     // a throwing sink must not wedge admission
       }
     }
     if (onTaskEnd) {
@@ -294,12 +389,17 @@ export function createTaskRunner(deps) {
   // One classification for BOTH failure forms (thrown from prepare/run and
   // structured { status: 'failed', error }) — see the priority table in the
   // header. A concurrent cancel never downgrades 1 or 2; an AbortError is
-  // the cancellation itself, never an independent error (F4).
+  // the cancellation itself, never an independent error (F4). The epoch
+  // comparison uses the EFFECTIVE binding (pinned, explicitly adopted rebind,
+  // or submitEpoch) — so a preparation-phase boundary is detected too, while
+  // a Product-internal rebind adopted via handle.adoptEpoch() is not misread
+  // as one, and the CURRENT epoch is never read back into the task to mask
+  // a real switch (S14).
   function classifyFailure(task, error) {
     if (isPersistenceFailure(error)) return 'persistence_error';
     if (isAbortError(error)) {
       if (task.cancelReason === 'session_changed') return 'session_changed';
-      if (task.epoch !== null && deps.sessionEpoch() !== task.epoch) return 'session_changed';
+      if (deps.sessionEpoch() !== effectiveEpoch(task)) return 'session_changed';
       return 'cancelled';
     }
     return 'error';
@@ -383,7 +483,9 @@ export function createTaskRunner(deps) {
       }
       // A ready prepare pins its (possibly rebound) epoch BEFORE the
       // liveness guards: an epoch change is a session boundary that wins
-      // over a concurrent plain cancel (F4).
+      // over a concurrent plain cancel (F4). This ready adoption is
+      // authoritative — it subsumes any preparation-phase adoptEpoch()
+      // call with the Product's final binding for this task.
       if (prep && prep.status === 'ready' && typeof prep.run === 'function') {
         task.epoch = prep.epoch !== undefined ? prep.epoch : task.submitEpoch;
         if (deps.sessionEpoch() !== task.epoch) {

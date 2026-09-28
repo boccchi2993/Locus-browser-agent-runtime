@@ -8,7 +8,7 @@ Environment: same host as the M0 baseline (Windows 10, Git Bash, Node v24.10.0, 
 
 | Piece | File | Notes |
 |---|---|---|
-| Harness task runner | `src/harness/task-runner.js` | ESM, no Vue/DOM/globals. `createTaskRunner({emit, prepare, sessionEpoch, onTaskEnd})` → `submit/activeTask/observeEvent/quiesceAndRun`. TaskHandle: id, read-only signal, idempotent cancel (no-op after end), `ended` promise, outcome getter |
+| Harness task runner | `src/harness/task-runner.js` | ESM, no Vue/DOM/globals. `createTaskRunner({emit, prepare, sessionEpoch, finalizeTask?, onTaskEnd})` → `submit/activeTask/observeEvent/quiesceAndRun`. TaskHandle: id, read-only signal, idempotent cancel (no-op after end), adoptEpoch (preparation-phase rebind adoption), `ended` promise, outcome getter |
 | Harness provider sessions | `src/harness/provider-session.js` | Verbatim extraction of `ensureProviderSession` / `restoreSessionForConversation` / `makePersistenceContext` / `sessionCompatible` with every global replaced by an injected port |
 | AgentSession controller seam | `src/agent.js` | `run(opts)` accepts `opts.controller` (the task-lifetime controller); standalone callers keep self-created controllers; one agent loop, no duplicate implementation |
 | Store rewiring | `src/ui/store.js` | `submit()` = admission call; `prepareTask()` = product preparation returning ready/blocked/silent/failed with a pre-run-start predicate; `cancelTask`/`newTask` keep cancel-vs-session_changed semantics; `withStorageMutation` delegates to the runner gate; busy/binding release moved to id-guarded `onTaskEnd`; `pendingCancel`/`storageMutationTail`/`waitFor` deleted; `providerSessionsAdapter()` is the single lazy globals→ports block |
@@ -17,7 +17,7 @@ Deliberately NOT done (M1b/M2 scope): RuntimeHost/RuntimeSession instantiation, 
 
 ## 2. New behavior evidence (public entry, no Vue/store import)
 
-`tests/task-runner.test.mjs` (30 checks at landing; **74 checks** after the lifecycle review round, see §2b) drives the runner through controlled async barriers:
+`tests/task-runner.test.mjs` (30 checks at landing; **74** after the lifecycle review round, see §2b; **99** after the second round, see §2c) drives the runner through controlled async barriers:
 
 - **S1** normal order — exact event sequence `task_start → tool_call → tool_result → task_end(completed)`, one terminal, one `onTaskEnd`, slot freed.
 - **S2** cancel while preparing — handle+signal exist synchronously at admission; the LATE ready result is refused (zero `run` invocations); backfilled `task_start` only when `preRunStart` asks; single cancelled terminal. Chinese warning text preserved byte-for-byte.
@@ -31,7 +31,7 @@ Deliberately NOT done (M1b/M2 scope): RuntimeHost/RuntimeSession instantiation, 
 
 `tests/provider-session.test.mjs` (14 checks) pins the extraction against fake persistence: compatible-session reuse with cursor realignment and required conversation persist; fresh-row creation with `_replayBlocked` on an invalid normalized prefix; uncheckpointed-suffix rejection (`raw_invalid` degradation, normalized projection loaded read-only, never raw-replayed); incompatible-session normalized fallback; frame/normalized/checkpoint cursor ordering in `makeContext`; a failing required write propagates unswallowed.
 
-Existing store-level suites keep their guarantees through the new path: `conversation-routing` (18/18 at landing, **23/23** after §2b — tail events follow the bound conversation, including the settle-after-projection ordering), `submit-presentation` (15/15 at landing, **22/22** after §2b — pre-run cancel/session-switch/persistence-failure intent preservation, one synthetic start, terminal semantics), `store-defaults` (loader updated to inline the new ESM modules).
+Existing store-level suites keep their guarantees through the new path: `conversation-routing` (18/18 at landing, **23/23** after §2b, **25/25** after §2c — tail events follow the bound conversation, including the settle-after-projection ordering), `submit-presentation` (15/15 at landing, **22/22** after §2b — pre-run cancel/session-switch/persistence-failure intent preservation, one synthetic start, terminal semantics), `store-defaults` (loader updated to inline the new ESM modules).
 
 ## 2b. Lifecycle review round (PR #3 follow-up, 2026-09-29)
 
@@ -46,6 +46,33 @@ A review of head `4840c19` reproduced four lifecycle defects through the runner'
 **F4 — structured failures were classified after the liveness guards.** `drive()` checked `signal.aborted` before `prep.status === 'failed'`, so a structured `{status:'failed', error}` with `persistenceFailure` returned by the real `prepareTask` catch was downgraded to `cancelled` under a concurrent cancel, while the identical THROWN error won — two contradictory classification tables. Fix: one classification table, applied to both forms and BEFORE the liveness guards: `persistence_error` > `error` > `session_changed` > `cancelled`; an `AbortError` IS the cancellation (never upgraded to `error`); an epoch change or an explicit `cancel('session_changed')` wins over a plain cancel. The Product keeps no competing logic — `prepareTask` reports `{status:'failed', error}` and `src/ui/store.js` now imports the runner's `isPersistenceFailure` instead of its own copy. Tests: S13 (structured/throw parity incl. `AbortError` and `session_changed`, epoch+cancel, post-intent persistence override), submit-presentation Case F (the REAL `prepareTask` path: required write failure + concurrent cancel → `persistence_error`, one error item, no provider request).
 
 Product wiring touched by the fixes: `src/harness/task-runner.js` (completion boundary, identity, gate, classification), `src/agent.js` (`opts.emit` task-bound sink seam + `_taskEmit` for `_materializeImageContent`), `src/ui/store.js` (`taskEventTargets` routing with pre-projection drop, `taskEventTargets.delete` in `onTaskEnd`, `ctx.emit` pass-through, shared `isPersistenceFailure` import). Contract §2 records the revised semantics.
+
+## 2c. Second lifecycle round (PR #3 follow-up, 2026-09-29)
+
+Two residual gaps from the same review series, both first reproduced through the runner's public entries against the F1–F4 fix commit (`7ec4917`) before this round's diff. Scope held to the two gaps — no new architecture.
+
+**G1 — a preparation-phase AbortError lost the `session_changed` classification.** `classifyFailure` compared epochs only when `task.epoch !== null`, but the epoch is pinned by the READY result — so a session boundary that happened DURING preparation (epoch change + a thrown OR structured AbortError, with or without a concurrent plain cancel) classified as `cancelled`. Fix: one effective-epoch rule for both failure forms at any phase — the pinned epoch once the ready result adopted it, `submitEpoch` before that, NEVER the current epoch read at failure time (that would compare the session with itself and mask a real boundary). A preparation-phase epoch change is now a session boundary; a legitimate Product-internal rebind is adopted explicitly via the new `handle.adoptEpoch(epoch)` AT the rebind point — `prepareTask` calls it where the intentional provider-session rebind resets the session — and is therefore not misread as a boundary, while a real boundary after the adoption is still detected; the ready epoch stays authoritative (it subsumes any preparation-phase adoption; `adoptEpoch` is refused once preparation is over). Necessary-persistence priority (table rule 1) is untouched. Tests: S14 — four-corner matrix (thrown/structured × cancel/no-cancel, all → `session_changed`), unchanged epoch + AbortError → `cancelled`, rebind adoption continues into run and a real boundary after it is still detected, adoption does not mask a later boundary, ready authority, refused adoption after end.
+
+**G2 — a necessary-finalize failure could not change the already-published terminal.** `complete()` published `task_end` FIRST and only then ran `onTaskEnd`, so a rejected must-await cleanup carrying `persistenceFailure` left the final outcome `completed` with just a `task_cleanup_failed` warning. Fix: staged termination publication — (1) run returns/throws, termination intent collected; (2) NECESSARY finalize (new optional `finalizeTask(handle, outcome)` dep) runs awaited BEFORE the outcome is fixed: a persistence failure there REPLACES the outcome (`persistence_error` + one `persistence_write_failed` error, never downgraded to a warning), any other failure is contained; (3) the single final `task_end` publishes the final outcome while the Product task→conversation map is still ALIVE (its release is stage 4); (4) `onTaskEnd` releases bindings / notifies — still awaited (admission and the storage gate cover it) but contained (`task_cleanup_failed`), never changing the published outcome, and it observes the FINAL outcome; (5) admission released, `ended` resolved. No path publishes a second `task_end`; quiesce and the next task wait for the whole necessary-completion boundary. Product audit: every write on the completion path (`persistConversation` in `handleRuntimeEvent`/`taskFailedProductPart`, `appendPresentationEvent`) is failure-tolerant and optional — none is a completion condition of the task — so the Product registers NO `finalizeTask`; required writes (ensureSession, first user frame, run checkpoints) are awaited inside prepare/run and classify through the failure table. The seam stays available for a proven necessary completion write (M1b reconsideration point). Tests: S15 — parked-finalize barriers (no `task_end`, no `ended`, admission refused, storage action blocked and not started; staged order intent→finalize→task_end→notify→ended), persistence finalize failure → the single terminal `persistence_error`, non-persistence finalize failure contained, notification observes the final outcome and cannot wedge, rejected task finalizes nothing; conversation-routing Case F — the map lives through the terminal projection, is deleted afterwards, and a late tail through the same task's sink is refused.
+
+Contradictory wording fixed in the same round: the contract §3.8 line "task_end … emitted after the final persistence settle" is now literally true (it described the intended order while the code published first); the runner header and `complete()` comments and the store routing comments now all describe the staged order (finalize → publish → release → ended).
+
+Gates for this round (run on the fix commit):
+
+| Command | Result | Notes |
+|---|---|---|
+| Repro scripts against `7ec4917` (public entries, `/tmp/m1a-round2/repro-g{1,2}.mjs`) | both gaps reproduced, exit 2 | G1: epoch 1→2 during a parked prepare + AbortError — all five corners (thrown/structured × cancel/no-cancel, rebind) classified `cancelled` instead of `session_changed`; G2: completed intent + a persistence-failing completion-edge cleanup → final `completed` + only `task_cleanup_failed` (want `persistence_error`). Rerun against this round's runner: all corners + G2 pass, exit 0 |
+| `node tests/task-runner.test.mjs` | PASS | 99 checks (74 prior semantics preserved + 25 new) |
+| `node tests/provider-session.test.mjs` | PASS | 14 checks |
+| `node tests/conversation-routing.test.mjs` | PASS | 25 checks (23 prior + Case F) |
+| `node tests/submit-presentation.test.mjs` | PASS | 22 checks |
+| `npm test` | PASS | 43/43 suites |
+| `npm run build` | PASS | `adoptEpoch` and `finalizeTask` present in `dist/assets/index-*.js` |
+| `node tests/e2e-persistence.cjs` (built app, vite preview + CDP) | PASS | 26/26 checks |
+| `node tests/e2e-ui.cjs` (built app, same preview) | PASS | presentation suite incl. busy-release/view-routing; no console errors |
+| `node tests/e2e-approval.cjs` (built app, same preview) | PASS | approval lifecycle + focus/Escape probes |
+
+Browser gates were run against one explicitly-owned preview server (port 4187) with `?e2e=1`, mirroring the e2e orchestrator's presentation group; each suite owns its Chrome process and profile as usual.
 
 Gates for the review round (run on the fix commit):
 

@@ -239,6 +239,32 @@ check('R0 boot conversation exists', !!A && store.liveConversationId === A.id);
     check('E4 G completes with its own single terminal',
       B.status === 'completed' && B.items.some((i) => i.content === 'G final'), kinds(B).join(',') + '/' + B.status);
   }
+  // ---------- Case F: the task→conversation map lives THROUGH the final
+  // task_end projection and is deleted only afterwards (staged termination);
+  // a late tail through the SAME task's sink is then refused ----------
+  {
+    const conv = convById(store.liveConversationId);
+    session.script = [
+      { type: 'assistant_text', content: 'F final' },
+      { type: 'task_end', reason: 'completed' },
+    ];
+    await submit('task F staged terminal');
+    check('F1 the final task_end still projected through the live routing entry',
+      conv.status === 'completed' && conv.items.some((i) => i.content === 'F final'),
+      conv.status + '/' + kinds(conv).join(','));
+    const staleEmit = session.lastRunEmit; // THIS task's own task-bound sink
+    const itemsAfterEnd = conv.items.length;
+    // The task has fully ended: onTaskEnd deleted its routing entry. Even
+    // with no other task ever started, a late tail through the same sink
+    // is dropped BEFORE projection.
+    staleEmit({ type: 'assistant_text', content: 'F LATE TAIL' });
+    staleEmit({ type: 'task_end', reason: 'error' });
+    await sleep(20);
+    check('F2 a late tail after the map deletion is refused (no re-settle, no projection)',
+      conv.items.length === itemsAfterEnd
+      && !conv.items.some((i) => i.content === 'F LATE TAIL')
+      && conv.status === 'completed', JSON.stringify(conv.items.map((i) => i.kind)));
+  }
 }
 
 console.log('---');

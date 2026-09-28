@@ -345,7 +345,9 @@ let boundTaskId = null;
 // events carry the task id captured AT EXECUTION START; this map resolves
 // them back to the conversation they belong to, even when the event
 // arrives after another task was admitted. Entries are deleted in
-// onTaskEnd — a late tail of a released task is dropped, never projected.
+// onTaskEnd — which runs AFTER the runner published the final task_end,
+// so the terminal projection itself still resolves — and after that a
+// late tail of a released task is dropped, never projected.
 const taskEventTargets = new Map();
 
 let persistenceContext = null;
@@ -474,9 +476,10 @@ function handleRuntimeEvent(event) {
   // The harness task runner observes the pipeline LAST: it records
   // task_start/termination intent only for events carrying the active
   // task's own identity. The single final task_end is published by the
-  // runner at the REAL completion boundary (run body returned + cleanup),
-  // and onTaskEnd — which releases the binding — runs after that
-  // publication. The binding and busy flags are not released anywhere
+  // runner at the REAL completion boundary (run body returned + necessary
+  // finalize), and onTaskEnd — which releases the binding — runs AFTER
+  // that publication, so this projection still finds the task's routing
+  // entry alive. The binding and busy flags are not released anywhere
   // above — onTaskEnd owns them, guarded by task id.
   taskRunner.observeEvent(event);
 }
@@ -498,10 +501,19 @@ const taskRunner = createTaskRunner({
   emit: handleRuntimeEvent,
   prepare: (task) => prepareTask(task),
   sessionEpoch: () => session.generation,
+  // No finalizeTask registered, deliberately: an audit of every write on
+  // the completion path (persistConversation in handleRuntimeEvent /
+  // taskFailedProductPart, appendPresentationEvent) found them all to be
+  // OPTIONAL, failure-tolerant saves — none is a completion condition of
+  // the task. Required writes (ensureSession, first user frame, run
+  // checkpoints) are awaited inside prepare/run and classify through the
+  // failure table; the finalizeTask seam stays available for a PROVEN
+  // necessary completion write (M1b reconsideration point).
   onTaskEnd: (task) => {
-    // Exactly once per task, before its ended promise resolves. Guarded
-    // by task id: a late finish of an older task never releases a newer
-    // task's binding.
+    // Exactly once per task, AFTER the final task_end was published (the
+    // projection above could still resolve this task's routing entry) and
+    // before its ended promise resolves. Guarded by task id: a late
+    // finish of an older task never releases a newer task's binding.
     if (boundTaskId === task.id) {
       runningConversationId = null;
       boundTaskId = null;
@@ -960,6 +972,13 @@ async function prepareTask(task) {
         // Intentional provider-session rebind, not a user workspace switch.
         session.reset();
         pinnedGeneration = session.generation;
+        // Explicit adoption (runner contract): without this the runner
+        // would classify any failure after this point against the
+        // submit-time epoch and misread THIS legitimate rebind as an
+        // external session boundary. After adoption, failure
+        // classification and the ready liveness guard compare against
+        // the adopted generation.
+        task.adoptEpoch(pinnedGeneration);
         session.history = projectNormalizedHistory(providerSession._projectedHistory, providerConfig().dialect);
         delete providerSession._projectedHistory;
       }
