@@ -172,14 +172,16 @@ export function createTaskRunner(deps) {
     emitTerminal(task, 'cancelled');
   }
 
-  // Preparation or run threw: classify honestly, never downgrade to
-  // cancelled even when a cancel is also pending.
-  function failTask(task, error) {
+  // Preparation or run failed: classify honestly, never downgrade to
+  // cancelled even when a cancel is also pending. `preRunStart` (explicit
+  // or the one the task already carries) decides the backfilled start.
+  function failTask(task, error, preRunStart) {
     if (task.settled) return;
     const persistence = isPersistenceFailure(error);
-    if (task.preRunStart) {
+    const startCheck = typeof preRunStart === 'function' ? preRunStart : task.preRunStart;
+    if (startCheck) {
       let want = false;
-      try { want = !!task.preRunStart(); } catch (e) { want = false; }
+      try { want = !!startCheck(); } catch (e) { want = false; }
       if (want) emitStartIfPending(task);
     }
     emit({
@@ -200,6 +202,10 @@ export function createTaskRunner(deps) {
         failTask(task, error);
         return;
       }
+      // Adopt the prepare outcome's pre-run-start predicate BEFORE any
+      // liveness guard can terminate the task — a cancelled prepare still
+      // backfills a task_start when the Product asks for it.
+      if (prep && typeof prep.preRunStart === 'function') task.preRunStart = prep.preRunStart;
       // Runner-side liveness guard (Product prepare self-checks too).
       if (task.signal.aborted && !task.settled) {
         terminatePreRun(task, 'cancelled');
@@ -212,6 +218,13 @@ export function createTaskRunner(deps) {
       if (prep.status === 'blocked') {
         emit({ type: 'error', code: prep.code || 'task_prepare_blocked', message: prep.message || '' });
         emitTerminal(task, prep.reason || 'interrupted');
+        return;
+      }
+      // Structured preparation failure: the Product reports the thrown
+      // error plus (optionally) the pre-run-start predicate so the runner
+      // can backfill a task_start exactly like the pre-run paths.
+      if (prep.status === 'failed') {
+        failTask(task, prep.error, prep.preRunStart);
         return;
       }
       if (prep.status !== 'ready' || typeof prep.run !== 'function') {
