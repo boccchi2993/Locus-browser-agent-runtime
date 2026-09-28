@@ -143,6 +143,8 @@ Status: **completed** at baseline `d25f30ea75e54989393230cb6c7695359d4c0815` (br
 - Move skill-specific policy out of shell commands while retaining operation-aware enforcement.
 - Exit: task setup/run/cancel/reset can be exercised without Vue or a Locus page; existing routing, approval and filesystem behavior is preserved.
 
+Status: **M1a completed** on `refactor/repository-split-m1a` (task lifecycle + provider-session orchestration extracted into Vue-free harness modules, store wired through them, M0 contract claims corrected; verification in [REPOSITORY-SPLIT-M1A-VERIFICATION.md](REPOSITORY-SPLIT-M1A-VERIFICATION.md)). M1b (interpreter lifecycle handle, `~/.skills` mutation-policy port) remains pending; M1 as a whole is not complete until M1b lands.
+
 ### M2 — Establish explicit modules and standalone entry points
 
 - Replace implicit classic-script dependencies with declared public module interfaces.
