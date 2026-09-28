@@ -46,10 +46,10 @@ No external model API, key, or paid endpoint is used by any suite: model calls g
 
 The single-process full e2e run reported `FAIL suite: python-authority` and `FAIL suite: network` while the other 14 entries passed. Both suites pass when re-run with identical inputs:
 
-- `python-authority` failed at CDP *readiness* (`waitForRuntimeCondition`, `tests/helpers/chrome.cjs` — phase `pyauth-app-boot`) — the page was loaded but the boot condition poll timed out after 7 prior suites had each spawned and torn down their own Chrome; this matches the load-related readiness flake documented in earlier closure audits. Standalone re-run (with a `vite preview` server on the documented `E2E_APP_URL` default): **56/56 PASS**. Note for reproduction: this suite requires a served app when run outside `npm run test:e2e`; running it without a server produces the same readiness failure and is not a product defect.
+- `python-authority` failed at CDP *readiness* (`waitForRuntimeCondition`, `tests/helpers/chrome.cjs` — phase `pyauth-app-boot`) — the page was loaded but the boot condition poll timed out after 7 prior suites had each spawned and torn down their own Chrome. Standalone re-run (with a `vite preview` server on the documented `E2E_APP_URL` default): **56/56 PASS**. Note for reproduction: this suite requires a served app when run outside `npm run test:e2e`; running it without a server produces the same readiness failure and is not a product defect.
 - `network` standalone re-run (the suite is self-contained: own dist rebuild, app+relay+target servers): **60 PASS / 0 FAIL, exit 0**.
 
-Conclusion: no evidence of a product regression at this baseline; the failures are the known sequential-load flake class. M1+ migration gates that depend on these suites should keep the existing practice of re-running a failed suite standalone before treating it as a blocker.
+What this does and does not prove (corrected in M1a): the standalone re-runs prove only that each suite passes under standalone conditions — they do not identify why the in-sequence run failed. Sequential-load readiness contention is a *candidate* explanation consistent with flake observations recorded in earlier closure audits, but it was not isolated or confirmed by experiment in this round, so it must not be cited as an established root cause. No retry/timeout loosening was added. What stands regardless: the M0 audit conclusions rest on source inspection, not on these test results, and both suites were observed green on this exact commit under standalone conditions.
 
 ## 4. Findings
 
