@@ -13,6 +13,7 @@ The repository keeps documentation beside code so architecture changes, tests, a
 | [REPOSITORY-SPLIT-INVENTORY.md](REPOSITORY-SPLIT-INVENTORY.md) | M0 audit: per-symbol ownership, coupling catalog, extraction order at the pinned baseline |
 | [REPOSITORY-SPLIT-CONTRACTS.md](REPOSITORY-SPLIT-CONTRACTS.md) | M0 interface drafts: lifecycle, ports, ownership answers, error and versioning semantics |
 | [REPOSITORY-SPLIT-BASELINE.md](REPOSITORY-SPLIT-BASELINE.md) | M0 verification record: environment, commands, results, untested scope, findings |
+| [REPOSITORY-SPLIT-M1A-VERIFICATION.md](REPOSITORY-SPLIT-M1A-VERIFICATION.md) | M1a verification record: extracted modules, lifecycle test evidence, gate results |
 | [DESIGN-PRINCIPLES.md](DESIGN-PRINCIPLES.md) | Rules used to decide where functionality belongs |
 | [CONCEPTS.md](CONCEPTS.md) | Canonical vocabulary and terms |
 | [RUNTIME-MODEL.md](RUNTIME-MODEL.md) | One task from user input to local execution/provider replay |

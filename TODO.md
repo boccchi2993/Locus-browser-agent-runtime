@@ -8,8 +8,9 @@ Architecture-level decisions belong in docs/ARCHITECTURE.md and docs/MODEL-PROTO
 
 Contract and gates: [REPOSITORY-SPLIT.md](docs/REPOSITORY-SPLIT.md). All steps below are pending except M0.
 
-- [x] M0: inventory ownership and freeze public behavior/contract tests at an exact baseline. (Completed at `d25f30e` on `docs/repository-split-m0`: [inventory](docs/REPOSITORY-SPLIT-INVENTORY.md), [contracts](docs/REPOSITORY-SPLIT-CONTRACTS.md), [baseline results](docs/REPOSITORY-SPLIT-BASELINE.md) — 41/41 unit suites, build, real-world-50 fixture checks, and the browser e2e set verified at that commit; two load flakes re-verified standalone.)
-- [ ] M1: extract task assembly from UI, introduce explicit lifecycle bindings and generic operation policies.
+- [x] M0: inventory ownership and freeze public behavior/contract tests at an exact baseline. (Completed at `d25f30e` on `docs/repository-split-m0`: [inventory](docs/REPOSITORY-SPLIT-INVENTORY.md), [contracts](docs/REPOSITORY-SPLIT-CONTRACTS.md), [baseline results](docs/REPOSITORY-SPLIT-BASELINE.md) — 41/41 unit suites, build, real-world-50 fixture checks, and the browser e2e set verified at that commit; `python-authority` and `network` failed in the single sequential run and passed standalone re-runs; first-failure root cause not confirmed — see baseline §3.)
+- [x] M1a: extract the task lifecycle and provider-session orchestration from the UI store into Vue-free harness modules (`src/harness/task-runner.js`, `src/harness/provider-session.js`), wire the store through them, and correct the M0 contract claims that affected implementation. (Completed on `refactor/repository-split-m1a`; see [M1a verification](docs/REPOSITORY-SPLIT-M1A-VERIFICATION.md).)
+- [ ] M1b: interpreter lifecycle behind an explicit runtime handle (replace global `PythonRuntime` access from the moved orchestration), move the `~/.skills` shell rules behind the mutation-policy port.
 - [ ] M2: replace cross-layer globals with public modules; package workers and prove standalone entries.
 - [ ] M3: extract Runtime and Harness repositories with provenance, independent CI and pinned consumption; remove duplicate product implementations.
 - [ ] M4: land product compatibility adapters, exact dependency lock, latest-main integration and browser acceptance gates.

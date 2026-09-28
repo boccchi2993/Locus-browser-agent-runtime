@@ -1,5 +1,5 @@
 // ============================================================
-//  PRESENTATION STORE (Vue)
+//  PRESENTATION STORE (Vue) — Product composition layer
 //
 //  The store is the presentation consumer of the AgentSession event
 //  stream. It owns UI state ONLY: conversations/timelines (a pure
@@ -12,6 +12,19 @@
 //  the injected runtime (AgentSession and friends). The timeline is
 //  never serialized back into provider history.
 //
+//  M1a (repository split): the TASK lifecycle (admission, task
+//  controller, prepare→run→settle ordering, pre-run cancellation,
+//  storage-mutation quiesce) moved to the Harness module
+//  src/harness/task-runner.js; protocol-replay session preparation and
+//  the durable persistence context moved to
+//  src/harness/provider-session.js. This store now provides the
+//  PRODUCT side: conversation identity, UI projection, persistence
+//  storage access, VFS/Python preparation, model configuration and
+//  test/demo hooks — wired through the two harness modules' ports.
+//  Classic-script globals this file still reads are concentrated in
+//  the adapter blocks below (marked M1b/M2 elimination points in
+//  docs/REPOSITORY-SPLIT-INVENTORY.md).
+//
 //  Runtime globals (AgentSession, Model, callModel, executeTool,
 //  LocalDirectoryWorkspace, ensureWorkspacePermission, PythonRuntime,
 //  Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS) come from
@@ -20,6 +33,8 @@
 // ============================================================
 
 import { reactive, computed } from 'vue';
+import { createTaskRunner, isPersistenceFailure } from '../harness/task-runner.js';
+import { createProviderSessions } from '../harness/provider-session.js';
 
 /* global AgentSession, Model, callModel, executeTool, buildSystemPrompt,
    LocalDirectoryWorkspace, ensureWorkspacePermission, PythonRuntime,
@@ -322,12 +337,22 @@ function wiredToolExecutor(tool, input, workspace, opts) {
 // A task's events follow the task, not whichever conversation happens to be
 // live when a tail event (warning/session_changed/task_end) arrives.
 let runningConversationId = null;
+// Task↔conversation binding owner (id of the runner task that currently
+// owns runningConversationId). Released by onTaskEnd, guarded by id so a
+// late finish of an older task can never release a newer task's binding.
+let boundTaskId = null;
+// Task-id → conversation-id for EVENT ROUTING (lifecycle fix): a task's
+// events carry the task id captured AT EXECUTION START; this map resolves
+// them back to the conversation they belong to, even when the event
+// arrives after another task was admitted. Entries are deleted in
+// onTaskEnd — which runs AFTER the runner published the final task_end,
+// so the terminal projection itself still resolves — and after that a
+// late tail of a released task is dropped, never projected.
+const taskEventTargets = new Map();
 
 let persistenceContext = null;
 let persistenceBootPromise = null;
 let persistenceBootComplete = false;
-let pendingCancel = false;
-let storageMutationTail = Promise.resolve();
 const STORAGE_MUTATION_TIMEOUT_MS = 10000;
 
 function reportPersistenceIssue(error, message) {
@@ -339,10 +364,8 @@ function reportPersistenceIssue(error, message) {
   }
 }
 
-function isPersistenceFailure(error) {
-  return !!(error && (error.persistenceFailure || error.code === 'persistence_write_failed'
-    || error.name === 'PersistenceError' || error.name === 'StorageClearError'));
-}
+// isPersistenceFailure moved to src/harness/task-runner.js (M1a lifecycle
+// fix): ONE classification table shared by the Product and the runner.
 
 function persistConversation(conv) {
   if (!conv || typeof PersistenceServiceInstance === 'undefined') return Promise.resolve();
@@ -378,216 +401,62 @@ function providerConfig() {
   };
 }
 
-function sessionCompatible(meta, config) {
-  try {
-    const adapter = getProviderAdapter({ dialect: config.dialect, apiBase: config.apiBase });
-    return !!(adapter && typeof adapter.isRawReplayCompatible === 'function'
-      && adapter.isRawReplayCompatible(meta, config));
-  } catch (e) { return false; }
-}
-
-async function ensureProviderSession(conv) {
+// ---------- harness provider sessions (M1a) ----------
+// The replay/session-preparation logic lives in
+// src/harness/provider-session.js. This adapter is the Product's ONLY
+// place that maps classic-script persistence/adapter globals onto that
+// module's ports (M1b/M2 elimination point: inject the service instance
+// instead of reading the global here). Built LAZILY on first use — the
+// globals may be installed by the host page (or a test) after this
+// module loads, exactly like the old call-time typeof checks.
+let providerSessionsInstance = null;
+function providerSessionsAdapter() {
+  if (providerSessionsInstance) return providerSessionsInstance;
   if (typeof PersistenceServiceInstance === 'undefined' || typeof getProviderAdapter !== 'function') return null;
-  const service = PersistenceServiceInstance;
-  const config = providerConfig();
-  let previous = conv && conv.activeProviderSessionId ? await service.get('providerSessions', conv.activeProviderSessionId) : null;
-  if (!previous) previous = conv ? await service.loadProviderSession(conv.id) : null;
-  if (previous && conv.persistenceState !== 'degraded' && sessionCompatible(previous, config)) {
-    if (previous.nextFrameSequence == null) {
-      const frames = await service.loadProviderFrames(previous.id);
-      previous.nextFrameSequence = frames.reduce((n, f) => Math.max(n, f.sequence || 0), 0);
-    }
-    if (previous.nextNormalizedSequence == null) {
-      const messages = await service.loadNormalizedMessages(conv.id);
-      previous.nextNormalizedSequence = messages.reduce((n, m) => Math.max(n, m.sequence || 0), 0);
-    }
-    if (conv.activeProviderSessionId !== previous.id) {
-      conv.activeProviderSessionId = previous.id;
-      await persistConversation(conv, { required: true });
-    }
-    return previous;
-  }
-  const row = {
-    id: durableId('provider-session'), conversationId: conv.id,
-    provider: config.provider, adapterId: config.adapterId, dialect: config.dialect,
-    model: config.model, endpointIdentity: config.endpointIdentity,
-    protocolVersion: config.protocolVersion,
-    providerIdentity: createProviderIdentity(config),
-    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-    replayCheckpointSequence: 0, nextFrameSequence: 0, nextNormalizedSequence: 0,
-    persistenceState: 'healthy', rawReplayInvalid: false, schemaVersion: 2,
-  };
-  row._projectedHistory = await service.loadNormalizedMessages(conv.id);
-  row.nextNormalizedSequence = row._projectedHistory.reduce((n, message) => Math.max(n, message.sequence || 0), 0);
-  try { validateNormalizedPrefix(conv.id, row._projectedHistory); }
-  catch (e) {
-    row._projectedHistory = [];
-    row._replayBlocked = true;
-    row.replayError = { code: e.code || 'normalized_invalid', message: e.message || String(e) };
-  }
-  const persistedRow = Object.assign({}, row);
-  delete persistedRow._projectedHistory;
-  await service.saveProviderSession(persistedRow);
-  conv.activeProviderSessionId = row.id;
-  await persistConversation(conv, { required: true });
-  return row;
+  providerSessionsInstance = createProviderSessions({
+    persistence: {
+      get: (name, key) => PersistenceServiceInstance.get(name, key),
+      loadProviderSession: (conversationId) => PersistenceServiceInstance.loadProviderSession(conversationId),
+      loadProviderFrames: (sessionId) => PersistenceServiceInstance.loadProviderFrames(sessionId),
+      loadNormalizedMessages: (conversationId) => PersistenceServiceInstance.loadNormalizedMessages(conversationId),
+      saveProviderSession: (row) => PersistenceServiceInstance.saveProviderSession(row),
+      appendProviderFrame: (frame) => PersistenceServiceInstance.appendProviderFrame(frame),
+      saveNormalizedMessage: (row) => PersistenceServiceInstance.saveNormalizedMessage(row),
+    },
+    persistConversation: (conv, opts) => persistConversation(conv, opts),
+    reportIssue: (error, message) => reportPersistenceIssue(error, message),
+    getAdapter: (config) => getProviderAdapter(config),
+    providerConfig: providerConfig,
+    createProviderIdentity: createProviderIdentity,
+    projectHistory: (messages, dialect) => projectNormalizedHistory(messages, dialect),
+    validateReplayPrefix: (meta, frames, adapter) => validateReplayPrefix(meta, frames, adapter),
+    validateNormalizedPrefix: (conversationId, rows) => validateNormalizedPrefix(conversationId, rows),
+    durableId: durableId,
+    now: () => new Date().toISOString(),
+  });
+  return providerSessionsInstance;
 }
 
-async function restoreSessionForConversation(conv) {
-  if (!conv || typeof PersistenceServiceInstance === 'undefined') return null;
-  const config = providerConfig();
-  const adapter = getProviderAdapter({ dialect: config.dialect, apiBase: config.apiBase });
-  const previous = conv.activeProviderSessionId
-    ? await PersistenceServiceInstance.get('providerSessions', conv.activeProviderSessionId)
-    : await PersistenceServiceInstance.loadProviderSession(conv.id);
-  session.reset();
-  session.replayBlocked = false;
-  if (!previous) return null;
-  if (sessionCompatible(previous, config) && conv.persistenceState !== 'degraded') {
-    const allFrames = await PersistenceServiceInstance.loadProviderFrames(previous.id);
-    const frames = allFrames.filter((frame) => frame.sequence <= previous.replayCheckpointSequence);
-    try {
-      validateReplayPrefix(previous, frames, adapter);
-      // A durable suffix exists when a response/tool result was archived but
-      // the checkpoint write failed.  It is intentionally not replay-safe:
-      // reusing only the old checkpoint could execute an already-side-effecting
-      // tool a second time after reload.
-      if (allFrames.some((frame) => frame.sequence > previous.replayCheckpointSequence)) {
-        throw Object.assign(new Error('durable transcript has an uncheckpointed suffix'), {
-          name: 'ReplayValidationError', code: 'uncheckpointed_suffix', replayInvalid: true,
-        });
-      }
-      session.history = frames.map((f) => f.raw).filter(Boolean);
-    } catch (e) {
-      previous.rawReplayInvalid = true;
-      previous.persistenceState = 'invalid';
-      previous.replayError = { code: e.code || 'replay_invalid', message: e.message || String(e) };
-      conv.runState = 'interrupted';
-      conv.status = 'interrupted';
-      conv.persistenceState = 'degraded';
-      conv.replayState = 'raw_invalid';
-      await PersistenceServiceInstance.saveProviderSession(previous);
-      await persistConversation(conv);
-      try {
-        const normalized = await PersistenceServiceInstance.loadNormalizedMessages(conv.id);
-        validateNormalizedPrefix(conv.id, normalized);
-        // The semantic projection is useful for inspection/recovery, but a
-        // corrupt raw checkpoint is never silently turned into a new provider
-        // request. Starting a fresh task creates a new safe boundary.
-        session.replayBlocked = true;
-        session.history = projectNormalizedHistory(normalized, config.dialect);
-      } catch (normalizedError) {
-        session.history = [];
-        session.replayBlocked = true;
-        conv.replayState = 'blocked';
-        conv.replayError = { code: normalizedError.code || 'normalized_invalid', message: normalizedError.message || String(normalizedError) };
-        await persistConversation(conv);
-      }
-    }
-  } else {
-    const normalized = await PersistenceServiceInstance.loadNormalizedMessages(conv.id);
-    try {
-      validateNormalizedPrefix(conv.id, normalized);
-      session.history = projectNormalizedHistory(normalized, config.dialect);
-    } catch (e) {
-      session.history = [];
-      session.replayBlocked = true;
-      conv.runState = 'interrupted';
-      conv.status = 'interrupted';
-      conv.persistenceState = 'degraded';
-      conv.replayState = 'blocked';
-      conv.replayError = { code: e.code || 'normalized_invalid', message: e.message || String(e) };
-      await persistConversation(conv);
-    }
-  }
-  return previous;
-}
-
-function makePersistenceContext(conv, providerSession) {
-  let frameSequence = providerSession.nextFrameSequence || 0;
-  let normalizedSequence = providerSession.nextNormalizedSequence || 0;
-  return {
-    async onUserMessage(text, userContent) {
-      // Rich user content (docs/IMAGE-INPUT.md): the raw provider frame
-      // and the normalized row keep SEMANTIC image parts (attachmentId +
-      // sha256 refs into the durable store) — never base64. Replay
-      // materializes the bytes at request time through the gate.
-      const parts = Array.isArray(userContent) && userContent.length ? userContent : null;
-      const raw = { role: 'user', content: parts || text };
-      await PersistenceServiceInstance.appendProviderFrame({
-        sessionId: providerSession.id, conversationId: conv.id,
-        sequence: ++frameSequence, turnId: providerSession.id,
-        direction: 'outbound', role: 'user', kind: 'user', raw: raw,
-      });
-      await PersistenceServiceInstance.saveNormalizedMessage({
-        conversationId: conv.id, sequence: ++normalizedSequence,
-        role: 'user', kind: 'message', text: text,
-        contentParts: parts || null,
-      });
-      providerSession.nextFrameSequence = frameSequence;
-      providerSession.nextNormalizedSequence = normalizedSequence;
-      // A user frame is a safe replay boundary. If the browser dies before
-      // the provider answers, the next run can still resume from this turn
-      // without replaying a dangling assistant/tool frame.
-      providerSession.replayCheckpointSequence = frameSequence;
-      providerSession.updatedAt = new Date().toISOString();
-      await PersistenceServiceInstance.saveProviderSession(providerSession);
-    },
-    async onProviderFrame(payload) {
-      const raw = payload.raw || null;
-      const frame = await PersistenceServiceInstance.appendProviderFrame({
-        sessionId: providerSession.id, conversationId: conv.id,
-        sequence: ++frameSequence, turnId: providerSession.id,
-        direction: payload.role === 'assistant' ? 'inbound' : 'outbound',
-        role: payload.role || (raw && raw.role) || null, kind: payload.kind || 'message', raw: raw,
-        toolCallId: payload.toolCallId || null,
-      });
-      providerSession.updatedAt = new Date().toISOString();
-      providerSession.nextFrameSequence = frameSequence;
-      providerSession.nextNormalizedSequence = normalizedSequence;
-      if (payload.rawResponse) {
-        await PersistenceServiceInstance.saveNormalizedMessage({
-          conversationId: conv.id, sequence: ++normalizedSequence,
-          role: 'assistant', kind: payload.rawResponse.toolCalls ? 'tool_call' : 'message', text: payload.rawResponse.content || '',
-          reasoning: payload.rawResponse.reasoning || null,
-          toolCalls: payload.rawResponse.toolCalls || null,
-        });
-      }
-      providerSession.nextNormalizedSequence = normalizedSequence;
-      await PersistenceServiceInstance.saveProviderSession(providerSession);
-      return frame;
-    },
-    async onNormalizedMessage(payload) {
-      const row = await PersistenceServiceInstance.saveNormalizedMessage(Object.assign({}, payload, {
-        conversationId: conv.id, sequence: ++normalizedSequence,
-      }));
-      providerSession.nextNormalizedSequence = normalizedSequence;
-      await PersistenceServiceInstance.saveProviderSession(providerSession);
-      return row;
-    },
-    async onCheckpoint(payload) {
-      if (!payload || !payload.frame) return;
-      providerSession.replayCheckpointSequence = payload.frame.sequence || providerSession.replayCheckpointSequence || 0;
-      providerSession.updatedAt = new Date().toISOString();
-      await PersistenceServiceInstance.saveProviderSession(providerSession);
-    },
-    async onPersistenceError(error) {
-      providerSession.persistenceState = 'degraded';
-      providerSession.lastPersistenceError = { code: error.code || 'persistence_write_failed', message: error.message || String(error) };
-      try { await PersistenceServiceInstance.saveProviderSession(providerSession); } catch (ignored) {}
-      conv.persistenceState = 'degraded';
-      conv.runState = 'interrupted';
-      conv.status = 'interrupted';
-      await persistConversation(conv);
-    },
-    async onPersistenceWarning(error) {
-      reportPersistenceIssue(error, 'Optional persistence warning');
-    },
-  };
-}
+// restoreSessionForConversation / makePersistenceContext moved to
+// src/harness/provider-session.js (M1a); use
+// providerSessions.restoreInto(session, conv) and
+// providerSessions.makeContext(conv, providerSession).
 
 function handleRuntimeEvent(event) {
-  const targetId = runningConversationId !== null ? runningConversationId : store.liveConversationId;
+  // Task-identity routing (lifecycle fix): a stamped event belongs to the
+  // conversation its task bound AT EXECUTION START — never to whichever
+  // task/conversation is live when the event arrives. A late tail of an
+  // already-released task is DROPPED here, BEFORE any projection, so it
+  // can neither pollute the next task's conversation/UI nor bump its
+  // telemetry. Unstamped events (session-level diagnostics outside any
+  // task) keep the legacy fallback routing.
+  let targetId;
+  if (event && event.taskId !== undefined) {
+    targetId = taskEventTargets.get(event.taskId) || null;
+    if (targetId == null) return;
+  } else {
+    targetId = runningConversationId !== null ? runningConversationId : store.liveConversationId;
+  }
   const conv = store.conversations.find((c) => c.id === targetId);
   if (conv) {
     LocusProjector.projectEvent(conv, event);
@@ -604,13 +473,15 @@ function handleRuntimeEvent(event) {
     }
   }
   if (event.type === 'tool_result') store.telemetryVersion++;
-  if (event.type === 'task_end') {
-    // Reliable lifecycle end: release the binding only when the task that
-    // owned it reports its end.
-    runningConversationId = null;
-    store.busy = false;
-    store.cancelling = false;
-  }
+  // The harness task runner observes the pipeline LAST: it records
+  // task_start/termination intent only for events carrying the active
+  // task's own identity. The single final task_end is published by the
+  // runner at the REAL completion boundary (run body returned + necessary
+  // finalize), and onTaskEnd — which releases the binding — runs AFTER
+  // that publication, so this projection still finds the task's routing
+  // entry alive. The binding and busy flags are not released anywhere
+  // above — onTaskEnd owns them, guarded by task id.
+  taskRunner.observeEvent(event);
 }
 
 export const session = new AgentSession({
@@ -619,6 +490,38 @@ export const session = new AgentSession({
   buildSystemPrompt: buildSystemPrompt,
   emit: handleRuntimeEvent,
   onSessionReset: () => { if (typeof PythonRuntime !== 'undefined') PythonRuntime.reset(); },
+});
+
+// ---------- harness task runner (M1a) ----------
+// Owns admission, the task-lifetime controller, prepare→run→settle
+// ordering and the storage-mutation quiesce gate. The Product side of
+// the split: prepareTask below supplies conversation binding, image
+// building, provider-session persistence, VFS/Python preparation.
+const taskRunner = createTaskRunner({
+  emit: handleRuntimeEvent,
+  prepare: (task) => prepareTask(task),
+  sessionEpoch: () => session.generation,
+  // No finalizeTask registered, deliberately: an audit of every write on
+  // the completion path (persistConversation in handleRuntimeEvent /
+  // taskFailedProductPart, appendPresentationEvent) found them all to be
+  // OPTIONAL, failure-tolerant saves — none is a completion condition of
+  // the task. Required writes (ensureSession, first user frame, run
+  // checkpoints) are awaited inside prepare/run and classify through the
+  // failure table; the finalizeTask seam stays available for a PROVEN
+  // necessary completion write (M1b reconsideration point).
+  onTaskEnd: (task) => {
+    // Exactly once per task, AFTER the final task_end was published (the
+    // projection above could still resolve this task's routing entry) and
+    // before its ended promise resolves. Guarded by task id: a late
+    // finish of an older task never releases a newer task's binding.
+    if (boundTaskId === task.id) {
+      runningConversationId = null;
+      boundTaskId = null;
+    }
+    taskEventTargets.delete(task.id);
+    store.busy = false;
+    store.cancelling = false;
+  },
 });
 
 // Approval Framework v1 (src/approval.js): the controller is the CANONICAL
@@ -872,8 +775,13 @@ export function newTask() {
   // the old task's tail events (session_changed / task_end) must still
   // project into ITS conversation. The new conversation becomes live/active
   // immediately, yet never receives the old task's events. store.busy stays
-  // true until the old task actually ends — the AgentSession concurrent-run
-  // guard is never bypassed by flipping UI flags early.
+  // true until the old task actually ends — the runner's admission is
+  // never bypassed by flipping UI flags early.
+  //
+  // The session-level cancel/reset (not a runner cancel) is what carries
+  // the session_changed outcome: an in-run task is aborted through the
+  // session's controller, and a still-preparing task is recognized by the
+  // runner's epoch guard after its next liveness check.
   if (store.busy) session.cancel();
   session.reset();
   // Session boundary: a pending approval dies with the old task (running
@@ -954,41 +862,50 @@ async function buildImageUserContent(input) {
   return { parts, blocked: false };
 }
 
-export async function submit(text) {
-  const input = String(text || '').trim();
-  if (!input) return;
-  // While an approval is pending the composer must not start a new task —
-  // approve, deny, or cancel the task are the three available actions.
-  if (store.pendingApproval) return;
-  const waitingForPersistence = !!persistenceBootPromise && !persistenceBootComplete;
-  if (store.busy && !waitingForPersistence) return;
-  if (waitingForPersistence) {
-    // The page can become interactive before IndexedDB/OPFS restoration has
-    // finished. Hold the composer in a busy state while boot settles so a
-    // first task cannot race boot's conversation/session restoration.
+// Product preparation for one ACCEPTED task, invoked by the harness task
+// runner after the task has taken the active slot (admission and the task
+// controller already exist — pre-run cancellation is task.cancel()).
+// Self-checks task liveness after every await that precedes a side
+// effect; the runner additionally guards when this resolves. Returns a
+// PrepareOutcome (see src/harness/task-runner.js).
+async function prepareTask(task) {
+  // Task event identity (lifecycle fix): bind THIS task's id to the
+  // conversation its events belong to, captured at execution start. The
+  // binding is refined when the run conversation is pinned below; the
+  // runner's pre-run terminals emitted before that still route here.
+  taskEventTargets.set(task.id, store.liveConversationId);
+  const input = task.input;
+
+  // (1) The page can become interactive before IndexedDB/OPFS restoration
+  // has finished. Hold the task while boot settles so it cannot race
+  // boot's conversation/session restoration.
+  if (persistenceBootPromise && !persistenceBootComplete) {
     store.busy = true;
     store.cancelling = false;
     try { await persistenceBootPromise; } catch (e) {}
   }
-  // An idle user may open an archived conversation and continue it. The
-  // presentation-only switch remains harmless while another task is live;
-  // only submission rebinds the session to the selected conversation.
+
+  // (2) An idle user may open an archived conversation and continue it.
+  // Submission rebinds the session to the selected conversation.
   if (store.activeConversationId && store.activeConversationId !== store.liveConversationId) {
     const selected = store.conversations.find((c) => c.id === store.activeConversationId);
     if (selected) {
       store.liveConversationId = selected.id;
-      try {
-        await restoreSessionForConversation(selected);
-      } catch (e) {
-        selected.persistenceState = 'degraded';
-        selected.runState = 'interrupted';
-        selected.status = 'interrupted';
-        reportPersistenceIssue(e, 'Conversation replay could not be restored');
-        return;
+      const providerSessions = providerSessionsAdapter();
+      if (providerSessions) {
+        try {
+          await providerSessions.restoreInto(session, selected);
+        } catch (e) {
+          selected.persistenceState = 'degraded';
+          selected.runState = 'interrupted';
+          selected.status = 'interrupted';
+          reportPersistenceIssue(e, 'Conversation replay could not be restored');
+          return { status: 'silent' };
+        }
       }
       if (session.replayBlocked) {
         store.storageNotice = 'This conversation has an invalid durable checkpoint and was not sent to the provider. Start a new task to continue safely.';
-        return;
+        return { status: 'silent' };
       }
     }
   }
@@ -998,113 +915,94 @@ export async function submit(text) {
     store.storageNotice = selectedConversation.replayState === 'raw_invalid'
       ? 'This conversation has an invalid durable checkpoint and was not sent to the provider. Start a new task to continue safely.'
       : 'This conversation has degraded persistence and was not retried. Start a new task to continue safely.';
-    return;
+    return { status: 'silent' };
   }
   // Submitting always targets the live session. If the user is viewing an
   // archived conversation, snap back to the live one first — presentation
   // history is never replayed into provider history.
   store.activeConversationId = store.liveConversationId;
-  // Image attachments (docs/IMAGE-INPUT.md): durable snapshot + semantic
-  // parts BEFORE any task state moves. Budget overflow blocks the submit
-  // with an explicit error; individual rejected images degrade to a
+
+  // (3) Image attachments (docs/IMAGE-INPUT.md): durable snapshot +
+  // semantic parts BEFORE any task state moves. Budget overflow blocks the
+  // task with an explicit error; individual rejected images degrade to a
   // warning and the text still goes out.
   const imageBuild = await buildImageUserContent(input);
-  if (imageBuild.blocked) return;
+  if (imageBuild.blocked) return { status: 'silent' };
   const userContent = imageBuild.parts;
+
   store.plusMenuOpen = false;
   store.busy = true;
   store.cancelling = false;
-  pendingCancel = false;
   // Bind this task's events to the conversation that is live NOW, before
   // run() starts. If newTask()/mountFolder() later moves liveConversationId
   // while this task is still settling, its tail events still land here.
   if (store.liveConversationId == null) startConversation(); // defensive: never route into a random conversation
   runningConversationId = store.liveConversationId;
-  const boundId = runningConversationId;
-  const boundConversation = store.conversations.find((c) => c.id === boundId);
-  let submitGeneration = session.generation;
-  const projectPreRunIntent = () => {
-    if (boundConversation && !boundConversation.items.length && boundConversation.status === 'idle') {
-      handleRuntimeEvent({ type: 'task_start', input: input });
-    }
-  };
-  const finishPreRunSessionSwitch = () => {
-    if (pendingCancel) {
-      // Persistence can still be committing the first user frame when a
-      // cancel arrives. Preserve that intent only on this terminal path;
-      // normal task_start ownership belongs to AgentSession.run().
-      projectPreRunIntent();
-      handleRuntimeEvent({
-        type: 'warning',
-        code: 'task_cancelled',
-        message: '任务已取消，尚未开始模型请求。',
-      });
-      handleRuntimeEvent({ type: 'task_end', reason: 'cancelled' });
-      return true;
-    }
-    if (session.generation === submitGeneration) return false;
-    // A session boundary can arrive before AgentSession.run(). Preserve the
-    // submitted intent once before recording that terminal outcome.
-    projectPreRunIntent();
-    handleRuntimeEvent({
-      type: 'warning',
-      code: 'session_changed',
-      message: '会话已切换，丢弃本次任务的后续结果。',
-    });
-    handleRuntimeEvent({ type: 'task_end', reason: 'session_changed' });
-    return true;
-  };
+  boundTaskId = task.id;
+  taskEventTargets.set(task.id, store.liveConversationId);
+  const boundConversation = store.conversations.find((c) => c.id === runningConversationId);
+  // Pre-run terminal paths backfill a task_start only when the bound
+  // conversation would otherwise never see the submitted intent (same
+  // predicate the old projectPreRunIntent used).
+  const preRunStart = () => boundConversation && !boundConversation.items.length && boundConversation.status === 'idle';
+  // Session-generation pin: rebinding to an archived conversation (above)
+  // already advanced the generation legitimately; from HERE any further
+  // change is a session boundary for this task.
+  let pinnedGeneration = session.generation;
+  // Liveness sentinel handed back to the runner: a ready result whose run
+  // body does nothing. The runner's guards (signal first, then epoch) turn
+  // it into the honest cancelled / session_changed terminal — this task
+  // must not reach AgentSession.run().
+  const stopReady = () => ({ status: 'ready', run: async () => {}, epoch: pinnedGeneration, preRunStart });
+  const preRunStopped = () => task.signal.aborted || session.generation !== pinnedGeneration;
+
+  let contextBound = false;
   try {
-    if (typeof PersistenceServiceInstance !== 'undefined' && typeof getProviderAdapter === 'function') {
-      const providerSession = await ensureProviderSession(boundConversation);
-      if (finishPreRunSessionSwitch()) return;
-      persistenceContext = makePersistenceContext(boundConversation, providerSession);
+    // (4) Durable ordering: user presentation/semantic/provider state is
+    // committed before AgentSession can make the first model request.
+    // Rich content (image attachment refs) rides in the same frame —
+    // base64 never enters persistence (docs/IMAGE-INPUT.md).
+    const providerSessions = providerSessionsAdapter();
+    if (providerSessions) {
+      const providerSession = await providerSessions.ensureSession(boundConversation);
+      if (preRunStopped()) return stopReady();
+      persistenceContext = providerSessions.makeContext(boundConversation, providerSession);
       if (providerSession && Array.isArray(providerSession._projectedHistory)
         && providerSession._projectedHistory.length) {
-        if (typeof session.reset === 'function') session.reset();
-        // This reset is the intentional provider-session rebind above, not a
-        // user workspace switch. Continue guarding against later external
-        // switches from the new generation.
-        submitGeneration = session.generation;
+        // Intentional provider-session rebind, not a user workspace switch.
+        session.reset();
+        pinnedGeneration = session.generation;
+        // Explicit adoption (runner contract): without this the runner
+        // would classify any failure after this point against the
+        // submit-time epoch and misread THIS legitimate rebind as an
+        // external session boundary. After adoption, failure
+        // classification and the ready liveness guard compare against
+        // the adopted generation.
+        task.adoptEpoch(pinnedGeneration);
         session.history = projectNormalizedHistory(providerSession._projectedHistory, providerConfig().dialect);
         delete providerSession._projectedHistory;
       }
       if (providerSession && providerSession._replayBlocked) session.replayBlocked = true;
       if (session.replayBlocked) {
-        handleRuntimeEvent({ type: 'error', code: 'raw_replay_invalid', message: 'Durable conversation history is invalid; no provider request was sent. Start a new task to continue safely.' });
-        handleRuntimeEvent({ type: 'task_end', reason: 'interrupted' });
-        return;
+        return {
+          status: 'blocked', code: 'raw_replay_invalid',
+          message: 'Durable conversation history is invalid; no provider request was sent. Start a new task to continue safely.',
+        };
       }
       boundConversation.runState = 'running';
       boundConversation.updatedAt = new Date().toISOString();
       await persistConversation(boundConversation, { required: true });
-      // Durable ordering: user presentation/semantic/provider state is
-      // committed before AgentSession can make the first model request.
-      // Rich content (image attachment refs) rides in the same frame —
-      // base64 never enters persistence (docs/IMAGE-INPUT.md).
       await persistenceContext.onUserMessage(input, userContent);
-      if (finishPreRunSessionSwitch()) return;
+      if (preRunStopped()) return stopReady();
       if (typeof session.setPersistenceContext === 'function') session.setPersistenceContext(persistenceContext);
+      contextBound = true;
     }
-    // run() resolves only AFTER task_end has been emitted (the binding is
-    // released by handleRuntimeEvent at that point) — so by the time this
-    // await returns, no late event of this task can still be in flight.
-    //
-    // The task binds a FORK of the live VFS: same providers, but a private
-    // mount table. A workspace switch mid-task (mountFolder replaces the
-    // /mnt/workspace provider on the live VFS) can never rebind this task's
-    // filesystem routing — its late async operations keep touching the OLD
-    // provider, and the generation/abort guards drop its results.
-    // One user turn: text + selected image attachments bind into a single
-    // provider turn (never a separate image turn, never a duplicate
-    // bubble). run() emits ONE task_start for it.
-    // Capability Composition v1: build THIS task's immutable environment,
-    // prepare the python plugin set for it, and bind per-task mounts on
-    // the fork (plugin/capability introspection, read-only; the guarded
-    // skill-instance view below). The environment is deeply frozen —
-    // later capability changes can only affect the NEXT task, never this
-    // one. Presence is re-observed first so a skill deleted or recreated
-    // by an earlier task is honestly reflected in THIS task's index.
+    // (5) Capability Composition v1: build THIS task's immutable
+    // environment, prepare the python plugin set for it, and bind
+    // per-task mounts on a FORK of the live VFS. A workspace switch
+    // mid-task can never rebind this task's filesystem routing — its late
+    // async operations keep touching the OLD provider, and the
+    // generation/abort guards drop its results.
     if (capabilityManager) await capabilityManager.refreshSkillPresence();
     const taskEnvironment = capabilityManager ? capabilityManager.buildTaskEnvironment() : null;
     await preparePythonRuntimeForEnvironment(taskEnvironment);
@@ -1133,66 +1031,79 @@ export async function submit(text) {
         taskVfs.mount(mount.path, mount.provider, mount.authority);
       }
     }
-    await session.run(input, { workspace: taskVfs, taskEnvironment, userContent });
+    return {
+      status: 'ready',
+      epoch: session.generation,
+      preRunStart,
+      run: async (ctx) => {
+        // run() resolves only AFTER task_end has been emitted — by the
+        // time this await returns, no late event of this task is in
+        // flight. One user turn: text + selected image attachments bind
+        // into a single provider turn; run() emits ONE task_start.
+        try {
+          await session.run(input, { workspace: taskVfs, taskEnvironment, userContent, controller: ctx.controller, emit: ctx.emit });
+        } catch (e) {
+          // The runner emits the error/terminal pair; this is the Product
+          // side of the old catch block (degraded marking + snapshot).
+          taskFailedProductPart(boundConversation, e);
+          throw e;
+        } finally {
+          if (contextBound && typeof session.setPersistenceContext === 'function') session.setPersistenceContext(null);
+          persistenceContext = null;
+        }
+      },
+    };
   } catch (e) {
-    // run() threw without a normal task lifecycle (e.g. the concurrent-run
-    // guard): no task_end will arrive, so release the binding here instead
-    // of leaving a stale route for some future task's events.
-    if (runningConversationId === boundId) runningConversationId = null;
-    const conv = store.conversations.find((c) => c.id === boundId);
-    if (conv) {
-      if (!conv.items.length && conv.status === 'idle') {
-        LocusProjector.projectEvent(conv, { type: 'task_start', input: input });
-      }
-      LocusProjector.projectEvent(conv, {
-        type: 'error',
-        code: isPersistenceFailure(e) ? 'persistence_write_failed' : 'task_rejected',
-        message: e && e.message ? e.message : String(e),
-      });
-      LocusProjector.projectEvent(conv, {
-        type: 'task_end', reason: isPersistenceFailure(e) ? 'persistence_error' : 'error',
-      });
-      if (isPersistenceFailure(e)) {
-        conv.persistenceState = 'degraded';
-        reportPersistenceIssue(e, 'Task persistence failed');
-      }
-      persistConversation(conv);
-    }
-  } finally {
-    if (typeof session.setPersistenceContext === 'function') session.setPersistenceContext(null);
-    persistenceContext = null;
-    pendingCancel = false;
-    store.busy = false;
-    store.cancelling = false;
+    // Preparation failed (required persistence failure, ensureSession
+    // fault…): report it STRUCTURED (never rethrow) so the runner can
+    // classify, backfill the pre-run start and emit exactly one terminal.
+    taskFailedProductPart(boundConversation, e);
+    return { status: 'failed', error: e, preRunStart };
   }
 }
 
-export function cancelTask() {
-  if (!store.busy) return;
-  if (!session.task) {
-    pendingCancel = true;
-    store.cancelling = true;
-    return;
+// Product-side failure bookkeeping shared by the prepare and run paths
+// (the runner owns the error/task_end events).
+function taskFailedProductPart(conv, e) {
+  if (!conv) return;
+  if (isPersistenceFailure(e)) {
+    conv.persistenceState = 'degraded';
+    reportPersistenceIssue(e, 'Task persistence failed');
   }
-  if (!session.task.controller.signal.aborted) {
-    session.cancel();
+  persistConversation(conv);
+}
+
+export async function submit(text) {
+  const input = String(text || '').trim();
+  if (!input) return;
+  // While an approval is pending the composer must not start a new task —
+  // approve, deny, or cancel the task are the three available actions.
+  if (store.pendingApproval) return;
+  // Admission (one active task, storage-mutation gate, boot wait) is the
+  // harness runner's; a refused submit is silent exactly as before.
+  const handle = taskRunner.submit(input);
+  if (!handle) return;
+  await handle.ended;
+}
+
+export function cancelTask() {
+  // Pre-run AND in-run cancellation share the task-lifetime controller
+  // owned by the harness runner (previously the pre-run window used a
+  // separate pendingCancel flag). The session-level cancel is kept for
+  // the run phase: with the real AgentSession it aborts the very same
+  // task controller (handed over via run({ controller })); sessions that
+  // create their own controller (standalone harnesses, test fakes) are
+  // still cancelled through it.
+  const task = taskRunner.activeTask();
+  if (!task) return;
+  if (!task.signal.aborted) {
+    task.cancel('user');
+    if (session.task) session.cancel();
     store.cancelling = true;
   }
 }
 
 // ---------- workspace ----------
-
-function waitFor(cond, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  return new Promise((resolve) => {
-    const tick = () => {
-      if (cond()) return resolve(true);
-      if (Date.now() >= deadline) return resolve(false);
-      setTimeout(tick, 100);
-    };
-    tick();
-  });
-}
 
 async function pickDirectory() {
   const h = hooks();
@@ -1203,39 +1114,17 @@ async function pickDirectory() {
   return window.showDirectoryPicker({ mode: 'readwrite' });
 }
 
-function storageMutationBlockedError() {
-  const e = new Error('Storage action could not proceed because the running task did not stop.');
-  e.name = 'StorageMutationBlockedError';
-  e.code = 'active_task_did_not_stop';
-  return e;
-}
-
-// One runtime gate for every destructive/mount mutation.  UI disabled states
-// are only a convenience; this gate is the authority that cancels and waits
-// for AgentSession.finally to release the task before backing providers move.
-export async function quiesceRuntimeForStorageMutation() {
-  if (!store.busy && !session.task) return;
-  store.cancelling = true;
-  if (session.task) session.cancel();
-  else pendingCancel = true; // submit may still be before session.run()
-  const stopped = await waitFor(() => !store.busy && !session.task, STORAGE_MUTATION_TIMEOUT_MS);
-  if (!stopped) {
-    const error = storageMutationBlockedError();
-    store.storageNotice = error.message;
-    throw error;
-  }
-}
-
+// One runtime gate for every destructive/mount mutation (M1a: the stop,
+// wait and mutual-exclusion semantics live in the harness runner's
+// quiesceAndRun — admission stays closed for the whole window and the
+// gate is released even when the action throws). UI disabled states are
+// only a convenience; this gate is the authority.
 async function withStorageMutation(action) {
-  let release;
-  const previous = storageMutationTail;
-  storageMutationTail = new Promise((resolve) => { release = resolve; });
-  await previous;
   try {
-    await quiesceRuntimeForStorageMutation();
-    return await action();
-  } finally {
-    release();
+    return await taskRunner.quiesceAndRun(action, { timeoutMs: STORAGE_MUTATION_TIMEOUT_MS });
+  } catch (e) {
+    if (e && e.code === 'active_task_did_not_stop') store.storageNotice = e.message;
+    throw e;
   }
 }
 
@@ -1671,7 +1560,8 @@ async function bootPersistence() {
       const continuation = rows.find((c) => c.items && c.items.length || c.status && c.status !== 'idle') || rows[0];
       store.activeConversationId = continuation.id;
       store.liveConversationId = continuation.id;
-      await restoreSessionForConversation(continuation);
+      const providerSessions = providerSessionsAdapter();
+      if (providerSessions) await providerSessions.restoreInto(session, continuation);
       for (const c of rows) await persistConversation(c);
     }
     await restoreWorkspaceHandle();

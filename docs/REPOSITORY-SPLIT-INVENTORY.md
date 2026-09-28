@@ -204,21 +204,21 @@ Tests: `tests/attachments.test.cjs`, `tests/capabilities.test.cjs`, `tests/image
 
 ### 2.14 `src/ui/store.js` — Product; the M1 extraction donor
 
-Everything stays Product except the pieces M1 moves:
+**M1a update (post-extraction state):** the task lifecycle (admission, task controller, prepare→run→settle, pre-run cancel, quiesce gate) now lives in `src/harness/task-runner.js`, and the provider-session machinery in `src/harness/provider-session.js` — both ESM modules with injected ports, tested without Vue or the store (`tests/task-runner.test.mjs`, `tests/provider-session.test.mjs`). What remains in the store is the Product side: `prepareTask()` (conversation rebind, image build, VFS fork + skill mounts, python payload prep), the lazy `providerSessionsAdapter()` (the ONE place classic-script persistence/adapter globals map onto harness ports — M1b/M2 elimination point), UI projection, settings, storage controls and boot. Couplings that REMAIN after M1a: store still reads `session`/`vfs`/`PythonRuntime`/`SkillInstanceWorkspace`/`PersistenceServiceInstance` globals directly inside `prepareTask` and the adapter block; `agent.js` still reads `AGENT_TOOL_DEFINITIONS`/`shellSystemPromptSection` globals; worker sources still ship in page DOM. Historical disposition table (pre-M1a target, kept for reference):
 
 | Region | Disposition |
 |---|---|
 | Module-scope `vfs`, `capabilityManager`, `session`, `approvals` construction | P (composition), but construction args become adapter-mediated in M1 |
 | `preparePythonRuntimeForEnvironment` | **M1 → H/R boundary**: compares `env.pythonExtensionKey` with `PythonRuntime.extensionKey()`, resets + `configureExtensions(pythonExtensionPayload(env))`. This is task-assembly logic driving a Runtime global; becomes the lifecycle port call (contract §3.1/§3.7) |
 | `wiredModelClient`, `wiredToolExecutor` | P adapters (inject `approvals`, `conversationId`, `taskGeneration`, hooks) |
-| Provider-session machinery (`ensureProviderSession`, `restoreSessionForConversation`, `makePersistenceContext`, `providerConfig`, `sessionCompatible`) | **M1 → H** (task/session orchestration over injected persistence + adapter APIs) |
-| `submit` (rebind, image build, persistence-first ordering, task fork, skill mount, `session.run`) | **M1 → H** orchestration with Product-injected callbacks; conversation identity stays P |
+| Provider-session machinery (`ensureProviderSession`, `restoreSessionForConversation`, `makePersistenceContext`, `providerConfig`, `sessionCompatible`) | **M1a → DONE** (`src/harness/provider-session.js`) |
+| `submit` (rebind, image build, persistence-first ordering, task fork, skill mount, `session.run`) | **M1a → runner + `prepareTask`**; conversation identity stays P |
 | `handleRuntimeEvent` + projector | P projection |
-| `cancelTask` (incl. pre-run `pendingCancel`), `quiesceRuntimeForStorageMutation`, `withStorageMutation` | **M1 → H** cancellation/quiescence semantics; storage actions remain P |
+| `cancelTask` (incl. pre-run `pendingCancel`), `quiesceRuntimeForStorageMutation`, `withStorageMutation` | **M1a → DONE** (runner cancel/quiesce; `pendingCancel` deleted) |
 | Settings (`applySettings`, `persistSettingsIfNeeded`, `testConnection`) | P (config provisioning) |
 | Conversations, workspace mount/restore, uploads/artifacts, storage controls, boot | P |
 
-Tests: `tests/store-defaults.test.cjs`, `tests/conversation-routing.test.mjs`, `tests/submit-presentation.test.mjs`; browser: presentation, responsive, persistence. Gap: submit-path ordering (persistence before first model call) is pinned by `submit-presentation` + e2e-persistence; the pre-run cancel window (`pendingCancel`) is pinned by store-defaults; both must survive M1 as Harness-side tests.
+Tests: `tests/store-defaults.test.cjs`, `tests/conversation-routing.test.mjs`, `tests/submit-presentation.test.mjs`, plus the new harness suites; browser: presentation, responsive, persistence. Gap closed by M1a: submit-path ordering and the pre-run cancel window are now pinned BOTH at the harness layer (S1–S9) and through the store suites.
 
 ### 2.15 Vue components, `src/main.js`, `src/App.vue`, `functions/`, `vite.config.js`
 

@@ -1,6 +1,6 @@
 # Repository split M0 — interface contracts (drafts)
 
-Status: M0 deliverable. These are implementable drafts for M1/M2, written against the audited baseline (`d25f30e`, see [REPOSITORY-SPLIT-INVENTORY.md](REPOSITORY-SPLIT-INVENTORY.md)). They are documentation, not shipped code: TypeScript-like notation describes shapes for the JavaScript implementations; no migration to TypeScript is implied. In-process module calls are sufficient — no RPC, service, or message bus is introduced.
+Status: M0 deliverable, **revised in M1a** (corrections: §3.5 authorization direction — each core defines its own side, Product bridges; §4 model-retry row — current behavior, not a non-delivery guarantee; §3.1/§3.4 current-vs-target lifecycle distinction — single live session + lazy interpreter today; §3.4-Q1 — internal execution-layer cancellation controllers are legitimate when cascading the task signal). **M1a landed** the §2 task lifecycle and the §3.9 persistence-context port as real modules (`src/harness/task-runner.js`, `src/harness/provider-session.js`, product wiring in `src/ui/store.js`; verification in [REPOSITORY-SPLIT-M1A-VERIFICATION.md](REPOSITORY-SPLIT-M1A-VERIFICATION.md)). Everything naming RuntimeHost/RuntimeSession/ExecutionAuthorization/worker packaging remains a draft for M1b/M2. These are implementable drafts for M1/M2, written against the audited baseline (`d25f30e`, see [REPOSITORY-SPLIT-INVENTORY.md](REPOSITORY-SPLIT-INVENTORY.md)). They are documentation, not shipped code: TypeScript-like notation describes shapes for the JavaScript implementations; no migration to TypeScript is implied. In-process module calls are sufficient — no RPC, service, or message bus is introduced.
 
 Design rule (from the task and REPOSITORY-SPLIT §4): no single boundless `RuntimeContext`/`AppContext`. Each concern below is its own small port with its own owner. Ports are plain parameters, exactly like the existing seams they formalize (`AgentSession` deps, `policyContext.approvals`, `imageInput`).
 
@@ -11,7 +11,7 @@ Design rule (from the task and REPOSITORY-SPLIT §4): no single boundless `Runti
 | 3.1 | `RuntimeHost` / `RuntimeSession` lifecycle + execution | Runtime | Runtime; Product constructs |
 | 3.2 | `ToolPort` (definitions + executor) | Harness | Product adapter (today `executeTool`) |
 | 3.3 | `FileSystemContext` | Runtime | Runtime (`VirtualWorkspace` fork) |
-| 3.5 | `AuthorizationPort` | Harness (`ApprovalController` semantics) | Product wires UI; Runtime consumes |
+| 3.5 | `ExecutionAuthorization` (Runtime-defined consumer interface) / `ApprovalController` (Harness-defined approval semantics) | each core defines its own side | Product adapter bridges the two |
 | 3.6 | Worker/bootstrap packaging | Runtime | Runtime |
 | 3.7 | Description + mutation-policy + plugin-payload ports | split per section | |
 | 3.8 | Event sinks (`RuntimeEventSink`, harness task events) | each emitter | Product projects |
@@ -21,7 +21,16 @@ Design rule (from the task and REPOSITORY-SPLIT §4): no single boundless `Runti
 
 ## 2. Task lifecycle (state machine, owner: Harness task runner)
 
-Formalizes what `submit()`/`cancelTask()`/`quiesceRuntimeForStorageMutation()` do today (`src/ui/store.js`):
+**M1a implementation status: LANDED** as `src/harness/task-runner.js` (`createTaskRunner`, `submit`, `activeTask`, `observeEvent`, `quiesceAndRun`; TaskHandle with id/signal/idempotent cancel/adoptEpoch/ended/outcome). Deviations from the draft below, all intentional: the outcome enum adds `interrupted` (blocked raw replay) and `rejected` (silent product-side refusal). **Revised after the M1a lifecycle review (PR #3 follow-up)** — the corrections below supersede the earlier wording ("signal → epoch → failure-class priority", "observeEvent settles on task_end after its own task_start"):
+
+1. **Real completion boundary.** Observing a terminal `task_end` EVENT never settles a task. The run body hands `task_end` to its task-bound `ctx.emit`, which records the termination *intent*; the runner publishes the single final `task_end` itself only once the run body has returned or thrown (pre-run paths complete immediately at their decision). `ended` resolves after publication and after must-await cleanup; admission (`submit`) and the storage quiesce gate key off this same boundary — a terminal event alone never reopens admission.
+2. **Task event identity.** Every lifecycle event carries the task's unforgeable `taskId`, captured at EXECUTION START — the runner stamps its own emissions, and the run body emits through the per-task sink the runner hands it as `ctx.emit` (the Product passes it into `AgentSession.run({ emit })`). Nothing is stamped with "whoever is active when the event arrives". `observeEvent` and the Product's `handleRuntimeEvent` filter/route by that identity BEFORE projection: a late tail (task_start/task_end/warning/tool_result) of an already-released task is dropped and can neither settle nor pollute the active task's state or UI. The marker lives on the event envelope only — provider messages are untouched and `toolCallId` semantics are preserved.
+3. **One classification table for thrown AND structured failures** (`{status:'failed', error}` classifies identically to a throw, and BEFORE the liveness guards): `persistence_error` > `error` (an honest independent failure) > `session_changed` (epoch change, explicit `cancel('session_changed')`) > `cancelled`. A thrown `AbortError` IS the cancellation, never an independent error. A necessary persistence failure surfacing after a termination intent but before publication overrides the recorded reason and is never silently lost.
+4. **Synchronous quiesce admission close.** `quiesceAndRun` closes admission SYNCHRONOUSLY at the call itself (pending-mutation counter, not a flag set after an await) and keeps it closed for as long as ANY queued mutation is pending — no reopening window between queued storage actions. A timeout neither executes the action nor pretends the old task ended.
+5. **Effective-epoch classification at ANY phase** (second lifecycle round). Failure classification compares against the task's EFFECTIVE binding — the pinned epoch once the ready result adopted it, the submit-time generation before that — never the CURRENT epoch read at failure time (that would compare the session with itself and mask a real boundary). A preparation-phase epoch change IS an external session boundary (thrown or structured AbortError, with or without a concurrent plain cancel → `session_changed`). A legitimate Product-internal rebind adopts its generation explicitly via `handle.adoptEpoch(epoch)` AT the rebind point and is therefore not misread as a boundary, while a real boundary after the adoption is still detected. The ready result's epoch remains authoritative (it subsumes any preparation-phase adoption; `adoptEpoch` is refused once preparation is over). Persistence keeps priority 1 over all of this.
+6. **Staged termination publication** (second lifecycle round). The completion boundary is staged, one task_end, one truth: (1) the run body returned/threw (or a pre-run decision) — the termination intent is collected; (2) NECESSARY finalize runs — the optional `finalizeTask(handle, outcome)` dep, awaited BEFORE the outcome is fixed: a persistence failure there REPLACES the outcome with `persistence_error` (never downgraded to a warning), any other failure is contained; (3) the single final `task_end` publishes the final outcome — the Product task→conversation map is still ALIVE for this projection (its release is stage 4); (4) `onTaskEnd` releases bindings / notifies — awaited so admission and the storage gate cover it, but a throw/rejection never changes the published outcome (`task_cleanup_failed`); (5) admission is released and `ended` resolves; quiesce and the next task wait for this whole necessary-completion boundary. No code path publishes a second `task_end`. Register `finalizeTask` only for a PROVEN necessary completion write — telemetry and optional UI saves are never necessary writes (the Product currently registers none; its completion-path writes are failure-tolerant optional saves, and required writes classify through the failure table inside prepare/run).
+
+`finalizeTask` vs `onTaskEnd` roles are explicit: `finalizeTask` (optional) is the only phase whose failure may still CHANGE the outcome (necessary persistence → `persistence_error`); it runs before publication and is covered by `ended`, admission and the gate. `onTaskEnd` is the post-publication release/notification: a thenable return is MUST-AWAIT cleanup (covered by `ended`, admission and the gate); a throw (or rejected cleanup promise) is contained, surfaced as a `task_cleanup_failed` warning, and `ended` still resolves — the published outcome stands. Formalizes what `submit()`/`cancelTask()`/`quiesceRuntimeForStorageMutation()` did in `src/ui/store.js`:
 
 ```
 submitted → preparing → running → settling → ended
@@ -32,7 +41,11 @@ TaskHandle (Harness) = {
   id: string                    // today: implicit runningConversationId + generation pair
   signal: AbortSignal           // ONE controller per task, see §3.4-Q1
   cancel(reason): void          // idempotent; sets terminal intent
-  ended: Promise<TaskOutcome>   // resolves exactly once, after the terminal event
+  adoptEpoch(epoch): boolean    // explicit adoption of a Product-internal rebind's
+                                //   generation DURING preparation (§2 rule 5); refused
+                                //   once preparation is over; the ready epoch wins
+  ended: Promise<TaskOutcome>   // resolves exactly once, at the staged completion
+                                //   boundary: finalize + terminal published + release done
   outcome: TaskOutcome          // { reason: 'completed'|'cancelled'|'session_changed'|
                                 //            'error'|'persistence_error'|'iteration_limit'|
                                 //            'interrupted', committedEffectsReported: boolean }
@@ -42,13 +55,15 @@ TaskHandle (Harness) = {
 Rules (all already enforced somewhere today; the contract makes them one place):
 
 - The handle is created at `submitted` — **before** any preparation or `AgentSession.run`. A cancel in `preparing` aborts `signal` and the runner records the terminal outcome without any provider request (today: `pendingCancel` + `finishPreRunSessionSwitch`, `src/ui/store.js`).
-- A session boundary (conversation switch, workspace remount, reset) sets `outcome.reason = 'session_changed'` on every live handle; their tail events still project into *their own* conversation (today: `runningConversationId` release rules in `handleRuntimeEvent`).
-- Exactly one terminal event per task (`task_end`). Nothing may attach to an ended handle (§3.8).
+- A session boundary (conversation switch, workspace remount, reset) sets `outcome.reason = 'session_changed'` on every live handle; their tail events still project into *their own* conversation — routed by the event's `taskId` → conversation binding captured at execution start (`taskEventTargets` in `src/ui/store.js`), never by whichever conversation is live when the event arrives.
+- Exactly one terminal event per task (`task_end`), published by the runner at the real completion boundary. Nothing may attach to an ended handle (§3.8).
 - Required persistence failure during the first user frame or any checkpoint transitions the task to `ended(persistence_error)`; no provider request follows a failed required write that precedes it (today: durable-ordering block in `submit`).
 
 ## 3. Port reference
 
-### 3.1 Runtime lifecycle and execution (Runtime-owned)
+### 3.1 Runtime lifecycle and execution (Runtime-owned) — **target interface**
+
+Current reality (must not be blurred): today there is **one** live agent session and **one** interpreter per page (`session` and `PythonRuntime` are singletons; `src/ui/store.js`, `src/shell.js`). The `RuntimeHost`/`RuntimeSession` shapes below are the *target* extraction interface; introducing them must not be read as supporting multiple concurrent sessions or retaining multiple interpreters. The interpreter also boots **lazily** — the first Python execution fetches/boots it; preparation only *configures* the payload for a future boot, so a text-only task downloads and starts nothing.
 
 Formalizes `PythonRuntime` (`src/shell.js`), `runShellCommand`, and `preparePythonRuntimeForEnvironment` (`src/ui/store.js`) into instance-scoped lifecycle. No page-global interpreter remains reachable across the boundary.
 
@@ -65,7 +80,8 @@ RuntimeHost = {
   capabilities(): RuntimeCapabilities    // §5 — declared, not version-guessed
   createSession(opts: {
     filesystem: FileSystemContext        // §3.3 — session's base context (durable mounts)
-    authorization: AuthorizationPort     // §3.5 — session-scoped; grants live here
+    authorization: ExecutionAuthorization  // §3.5 — Runtime-defined consumer interface,
+                                            //   bridged by Product to the Harness approvals
     mutationPolicy?: MutationPolicy      // §3.7 — skill-path rules etc.
   }) → RuntimeSession
 }
@@ -73,9 +89,14 @@ RuntimeHost = {
 RuntimeSession = {
   // Between tasks ONLY. Compares desired interpreter payload with the live
   // one (today: PythonRuntime.extensionKey()); rebuilds when different.
-  // In-flight executions settle first (bounded by the execution deadline)
-  // or the prepare fails with 'busy' — it never mutates an interpreter
-  // serving an active task.
+  //
+  // CURRENT behavior this must preserve (M1a audit): prepare only RESETS and
+  // RECONFIGURES when the extension key changed — it does NOT proactively
+  // boot the interpreter. Python boots lazily on the first execution, so a
+  // text-only task performs zero Python asset acquisition. The "in-flight
+  // executions settle first" wording below is the target contract for the
+  // instance API; today the equivalent guarantee comes from preparation
+  // running between tasks plus the storage-mutation quiesce gate.
   prepare(req: { signal: AbortSignal, python?: PluginPayload | null })
     → Promise<{ rebuiltInterpreter: boolean }>
 
@@ -170,8 +191,8 @@ TaskExecutionContext = {
                                          //   frozen at task start
   cwdBase: string                        // invocation-local cwd still resets per execute
   policy: MutationPolicy                 // §3.7
-  authorization: AuthorizationPort       // task-scoped VIEW: a task cannot consume a
-                                         //   later task's grants (§3.4-Q4)
+  authorization: ExecutionAuthorization  // §3.5 — task-scoped VIEW: a task cannot consume
+                                         //   a later task's grants (§3.4-Q4)
 }
 ```
 
@@ -179,32 +200,47 @@ Binding rules (current behavior, restated as contract): providers are captured a
 
 ### 3.4 Ownership and concurrency — explicit answers
 
-- **Q1 — who creates and owns the AbortController?** The Harness task runner creates exactly ONE controller per task at `submitted` time (before preparation). It is passed, never re-created: to `prepare`, to every `execute`, to the model client (today `AgentSession.run` creates it at run-start; M1 moves creation to submit so the pre-run window is covered — this is the `pendingCancel` pattern generalized). Runtime creates only *internal deadline timers*, never task controllers.
+- **Q1 — who creates and owns the AbortController?** The Harness task runner creates exactly ONE task-lifetime controller per task at `submitted` time (before preparation). It is passed, never re-created: to `prepare`, to every `execute`, to the model client (today `AgentSession.run` creates it at run-start; M1a moves creation to submit so the pre-run window is covered — this is the `pendingCancel` pattern generalized). The execution layer MAY keep its own *internal* deadline/cancellation controllers (e.g. the Python worker kill timer and per-run abort wiring in `PythonRuntime._runOnce`) — that is not a second task controller as long as they cascade the task signal and cannot outlive the task's own abort semantics.
 - **Q2 — how do you cancel before `AgentSession.run`?** `TaskHandle.cancel()` aborts the same controller; the runner checks `signal.aborted` at each phase boundary (after image build, after provider-session ensure, after first-frame persistence) and records `ended(cancelled)` with zero provider requests (today: `finishPreRunSessionSwitch`).
-- **Q3 — who owns the Runtime instance, and how does its lifetime map to tasks/sessions?** Product constructs ONE `RuntimeHost` per page. Each agent session (conversation binding) gets ONE `RuntimeSession` over the page's durable `FileSystemContext`. Tasks never own interpreters — they own a frozen `TaskExecutionContext`; the interpreter is session-scoped and rebuilt only between tasks (Q5). This preserves today's page-singleton behavior (`vfs`, `PythonRuntime`) while removing the global access path.
+- **Q3 — who owns the Runtime instance, and how does its lifetime map to tasks/sessions?** Target: Product constructs ONE `RuntimeHost` per page; each agent session gets ONE `RuntimeSession` over the page's durable `FileSystemContext`; tasks own only a frozen `TaskExecutionContext`. Current reality: a single live session and a single lazy interpreter exist per page (`session`, `PythonRuntime` singletons) — the instance API is the extraction goal, not a claim that concurrent sessions or interpreter pools exist today.
 - **Q4 — how is a cancelled old task prevented from writing into a new workspace or consuming new-task authority?** Three independent guards, as today: (a) routing isolation — providers captured in the task's fork cannot be replaced by later mounts; (b) liveness — every commit boundary re-checks the task `signal`, and post-cancel `execute` calls reject with `task_expired` before dispatch; (c) authority isolation — the authorization port handed to a task is a task-scoped view whose grant lookups and pending requests are pinned to that task's identity; a session switch cancels pending approvals (`cancelAll('session_boundary')`) and grants survive only at the session level, never borrowed across tasks (generation-pinned `getSignal` today).
-- **Q5 — when the plugin set changes, who decides to rebuild the interpreter, and how are old executions handled?** The Harness decides (it owns `TaskEnvironment`): at the next `prepare()` it passes the new `PluginPayload`; the Runtime compares extension keys and rebuilds. `prepare` is between-tasks only: in-flight executions settle first (bounded by the execution deadline), then the interpreter is reset and re-bootstrapped with the new payload *before* READY — no lazy install-on-import (today: `preparePythonRuntimeForEnvironment` + `configureExtensions`, and the storage-mutation quiesce gate for the same reason).
+- **Q5 — when the plugin set changes, who decides to rebuild the interpreter, and how are old executions handled?** The Harness decides (it owns `TaskEnvironment`): at the next `prepare()` it passes the new `PluginPayload`; the Runtime compares extension keys and resets/reconfigures when they differ. Current behavior: this happens *between* tasks (the previous task has already ended), reconfiguration precedes any boot, and the plugin set installs during the bootstrap window before READY — no lazy install-on-import; the interpreter itself stays lazily booted (first Python execution). Waiting for in-flight executions is, today, the storage-mutation quiesce gate's job (`withStorageMutation`), not `prepare`'s (see §3.1 note).
 - **Q6 — which errors are retryable, and which have committed side effects?** See §4. Summary: nothing with a possible side effect is ever automatically re-dispatched by the platform layers.
 - **Q7 — who maintains persisted data and provider-native replay?** Replay semantics (raw frames, checkpoints, `validateReplayPrefix`/`validateNormalizedPrefix`, uncheckpointed-suffix rejection) are Harness-owned behind `PersistencePort` (§3.9). Storage mechanics (IDB/OPFS/schema/migrations, conversation records, attachment bytes) are Product-owned. Runtime persists only through providers (OPFS home/plugin dirs). No layer may swallow a required-write failure (§4.4).
 - **Q8 — how does the UI get state without reading private fields?** Three channels only: (1) the harness task event stream (`task_start … task_end`, consumed via `LocusProjector`); (2) `RuntimeEventSink` status events (replacing the `sb-python` DOM write and the 1s `PythonRuntime.status` poll); (3) canonical getters on controllers (`ApprovalController.pending`, `TaskHandle.outcome`). The store's `pendingApproval` mirror pattern stays the model: UI state is a projection, never a second owner.
 
-### 3.5 Authorization (port shape shared by both cores; semantics from `src/approval.js`)
+### 3.5 Authorization — two sides, bridged by Product
+
+Direction (corrected in M1a): **each core defines its own side of the authorization boundary.** The Runtime defines the execution-authorization interface *it needs*; the Harness defines the approval controller and approval semantics; a Product adapter connects them. Neither core imports the other's types or implementation.
 
 ```
-AuthorizationPort = {
+ExecutionAuthorization (Runtime-defined; what Runtime code may call) = {
   request(req: {
-    kind: 'permission' | 'capability' | 'confirmation'
-    action:   { type, summary, detail? }        // plain text, harness-constructed
+    action:   { type, summary, detail? }        // plain text, constructed by the
+                                                //   Runtime consumer (e.g. network write)
     resource: { type, key, label? }
-    policyKey: string                            // harness-canonical, e.g. 'network-write:<origin>'
-    executionId: string                          // §3.8 correlation (replaces
-                                                 //   conversationId/taskGeneration at this boundary)
+    policyKey: string                            // canonical key, e.g. 'network-write:<origin>'
+    executionId: string                          // §3.8 correlation; NO chat identities
   }, { signal: AbortSignal })
-    → Promise<{ outcome: 'allow'|'deny'|'cancelled'|'confirm'|'decline', scope: 'once'|'session' }>
+    → Promise<{ outcome: 'allow'|'deny'|'cancelled', scope: 'once'|'session' }>
+}
+
+ApprovalController (Harness-defined; src/approval.js today) = {
+  // kinds ('permission'|'capability'|'confirmation'), decision schemas, grants,
+  // pending-state ownership, observer containment — semantics owned by Harness.
+  // Chat-layer identities (conversationId, taskGeneration) ride on harness-side
+  // requests only; they never enter the Runtime interface.
+}
+
+ProductAuthorizationAdapter = {
+  // Translates ExecutionAuthorization requests into ApprovalController requests
+  // (supplying harness-side identity context) and delivers decisions back.
+  // Must not widen authority: a granted approval never enables a non-HTTP
+  // scheme, method, or mount the Runtime did not already allow.
 }
 ```
 
-Boundary rules (unchanged from docs/APPROVALS.md, restated for the split): approval can reduce autonomy, never manufacture authority; deny ≠ cancel; the consumer re-checks the task signal immediately before the protected side effect with no await in between (network.js `request()` is the reference implementation); at most one pending interactive request; stale ids are no-ops; grants are exact-key, session-scoped, memory-only. Chat-layer identities (`conversationId`, `taskGeneration`) stay Harness-side; the port carries execution-scoped correlation only.
+Boundary rules (unchanged from docs/APPROVALS.md, restated for the split): approval can reduce autonomy, never manufacture authority; deny ≠ cancel; the consumer re-checks the task signal immediately before the protected side effect with no await in between (network.js `request()` is the reference implementation); at most one pending interactive request; stale ids are no-ops; grants are exact-key, session-scoped, memory-only.
 
 ### 3.6 Packaging, workers, CSP (Runtime-owned)
 
@@ -303,7 +339,7 @@ Failure semantics (current, kept): a failed *required* write ends the task with 
 
 | Class | Example | Auto-retry? | Rationale |
 |---|---|---|---|
-| Model transport TypeError (network/CORS) | `model.js` | Once, to `/proxy` relay, same body | request provably not delivered |
+| Model transport TypeError (network/CORS) | `model.js` | **Current code:** once, to `/proxy` relay, same body. A fetch TypeError does **not** prove the request was never delivered — the request may have reached the provider, so this fallback carries a duplicate-inference risk (see note below) | row describes what the code does today, not a delivery guarantee |
 | Model HTTP authoritative (401/402/403/429) | `AUTHORITATIVE_STATUS` | No | provider answer |
 | Model parse/body-read/timeout/cancel | `ParseError` etc. | No | inference may be billed |
 | Network read-like transport failure | GET/HEAD direct `DirectTransportFailure` | Once to relay | reads duplicate harmlessly |
@@ -314,6 +350,8 @@ Failure semantics (current, kept): a failed *required* write ends the task with 
 | Required persistence write failure | `persistence_write_failed` | No; task ends `persistence_error` | replay integrity beats progress |
 | Interpreter bootstrap integrity failure | `python_bootstrap_unavailable` / sha mismatch | Fresh worker rebuild only; never unverified bytes | fail-closed acquisition |
 | `task_expired` / stale execution | post-cancel dispatch | No | old task must not act |
+
+Note on model-transport fallback: the first row records current behavior, not an endorsed guarantee. A model POST re-sent to `/proxy` after a TypeError can repeat an inference the provider already executed (double billing); unlike the network GET/HEAD fallback, model requests are not idempotent by construction. The split does not change this implementation in M1a; whether to keep, gate, or drop the model-call relay fallback is recorded as follow-up work owned by the Harness repository (M1a verification record, "deferred").
 
 ## 5. Contract version and capability negotiation
 

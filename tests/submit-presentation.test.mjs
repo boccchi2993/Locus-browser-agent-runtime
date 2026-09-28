@@ -29,16 +29,22 @@ class FakeAgentSession {
 
   cancel() { if (this.task) this.task.controller.abort(); }
 
-  async run(input) {
+  async run(input, opts) {
     if (this.task) throw new Error('AgentSession already has a running task');
     this.runCalls++;
+    // Mirror the real AgentSession seam (M1a lifecycle fix): the task-bound
+    // emit sink from the harness runner's ctx wins; the sink is recorded so
+    // tests can drive an already-ended task's entry point (late tails).
+    const o = opts || {};
+    const emit = (o.emit && typeof o.emit === 'function') ? o.emit : this.emit;
+    this.lastRunEmit = emit;
     const controller = new AbortController();
     this.task = { controller };
     try {
-      this.emit({ type: 'task_start', input });
+      emit({ type: 'task_start', input });
       for (const step of this.script) {
         if (typeof step === 'function') await step(controller, this);
-        else this.emit(step);
+        else emit(step);
       }
     } finally {
       if (this.task && this.task.controller === controller) this.task = null;
@@ -119,6 +125,7 @@ const userItems = (conv, content) => conv.items.filter((item) =>
 const taskStarts = (conversationId, input) => presentationEvents.filter((row) =>
   row.conversationId === conversationId && row.event.type === 'task_start'
   && (input === undefined || row.event.input === input));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // A. Normal first submit: AgentSession owns the only task_start.
 {
   const conv = live();
@@ -207,6 +214,76 @@ const taskStarts = (conversationId, input) => presentationEvents.filter((row) =>
   check('E2 pre-run persistence failure keeps terminal semantics', conv.status === 'persistence_error'
     && conv.items.filter((item) => item.kind === 'error' && item.code === 'persistence_write_failed').length === 1);
   check('E3 pre-run persistence failure sends no provider request', session.runCalls === runsBefore);
+  loadProviderSession = async () => null;
+}
+
+// F. Required persistence failure vs a concurrent cancel: ONE classification
+//    table (F4). The Product reports the failure STRUCTURED from the real
+//    prepareTask catch; the runner must not downgrade it to cancelled.
+{
+  newTask();
+  const conv = live();
+  const runsBefore = session.runCalls;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  loadProviderSession = async () => {
+    markStarted();
+    await gate;
+    throw Object.assign(new Error('simulated required write failure'), { persistenceFailure: true });
+  };
+  const p = submit('persist fail vs cancel');
+  await started;
+  cancelTask(); // user cancels while the required write is still in flight
+  release();
+  await p;
+  check('F1 required write failure is NOT downgraded by the concurrent cancel',
+    conv.status === 'persistence_error', conv.status);
+  check('F2 exactly one persistence_write_failed error is surfaced',
+    conv.items.filter((item) => item.kind === 'error' && item.code === 'persistence_write_failed').length === 1,
+    JSON.stringify(conv.items.map((i) => i.kind + ':' + (i.code || ''))));
+  check('F3 no provider request was sent', session.runCalls === runsBefore);
+  loadProviderSession = async () => null;
+}
+
+// G. A late tail of an ENDED task cannot pollute the next task while it is
+//    still preparing (F2, Product routing level — the filter runs BEFORE
+//    any projection).
+{
+  newTask();
+  const convA = live();
+  session.script = [
+    { type: 'assistant_text', content: 'tail source final' },
+    { type: 'task_end', reason: 'completed' },
+  ];
+  await submit('tail source A');
+  const staleEmit = session.lastRunEmit; // the ended task's task-bound sink
+  newTask();
+  const convB = live();
+  check('G0 stale sink captured and conversations differ',
+    typeof staleEmit === 'function' && convA.id !== convB.id);
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  loadProviderSession = async () => { markStarted(); await gate; return null; };
+  const p = submit('B while stale tails fly');
+  await started; // B is PREPARING (parked at the persistence gate)
+  staleEmit({ type: 'task_start', input: 'late restart' });
+  staleEmit({ type: 'tool_result', tool: 'bash', success: true, output: 'STALE' });
+  staleEmit({ type: 'warning', code: 'late_warning', message: 'stale' });
+  staleEmit({ type: 'task_end', reason: 'completed' });
+  await sleep(10);
+  check('G1 B conversation untouched by the stale tail while preparing',
+    convB.items.length === 0, JSON.stringify(convB.items));
+  check('G2 busy still held for the preparing task', store.busy === true);
+  release();
+  await p;
+  check('G3 B completes with only its own projected events',
+    userItems(convB, 'B while stale tails fly').length === 1
+    && !JSON.stringify(convB.items).includes('STALE')
+    && convB.status === 'completed', JSON.stringify(convB.items));
   loadProviderSession = async () => null;
 }
 

@@ -34,16 +34,23 @@ class FakeAgentSession {
     if (this.onSessionReset) this.onSessionReset();
   }
   cancel() { if (this.task) this.task.controller.abort(); }
-  async run(input) {
+  async run(input, opts) {
     if (this.task) throw new Error('AgentSession already has a running task');
     if (this.throwOnRun) throw new Error(this.throwOnRun);
+    // Mirror the real AgentSession seam (M1a lifecycle fix): a task-bound
+    // emit sink handed in by the harness runner's ctx wins; standalone
+    // emission keeps this.emit. The sink is recorded so tests can inject
+    // a LATE tail through an already-ended task's entry point.
+    const o = opts || {};
+    const emit = (o.emit && typeof o.emit === 'function') ? o.emit : this.emit;
+    this.lastRunEmit = emit;
     const controller = new AbortController();
     this.task = { controller };
     try {
-      this.emit({ type: 'task_start', input });
+      emit({ type: 'task_start', input });
       for (const step of this.script) {
         if (typeof step === 'function') await step(controller, this);
-        else this.emit(step);
+        else emit(step);
       }
     } finally {
       if (this.task && this.task.controller === controller) this.task = null;
@@ -190,6 +197,74 @@ check('R0 boot conversation exists', !!A && store.liveConversationId === A.id);
   await submit('task E after failure');
   check('D3 binding reusable after pre-task failure',
     B.items.some((i) => i.content === 'after D') && B.status === 'completed');
+
+  // ---------- Case E: a late tail of an ENDED task cannot pollute anything (F2) ----------
+  {
+    session.script = [
+      { type: 'assistant_text', content: 'stale-tail source final' },
+      { type: 'task_end', reason: 'completed' },
+    ];
+    await submit('stale-tail source');
+    const staleEmit = session.lastRunEmit; // the ended task's task-bound sink
+    check('E0 captured a task-bound emit sink from the ended task', typeof staleEmit === 'function');
+
+    const g = gate();
+    session.script = [
+      { type: 'reasoning', content: 'G working', presentation: 'raw' },
+      () => g.wait(),
+      { type: 'assistant_text', content: 'G final' },
+      { type: 'task_end', reason: 'completed' },
+    ];
+    const bItemsBeforeG = B.items.length;
+    const pG = submit('task G with stale tails');
+    await sleep(20);
+    check('E1 G is running in B', store.busy === true && B.status === 'running');
+
+    // The ended task's entry point emits a full late tail — including a
+    // task_start that would double-start G and a terminal that would end it.
+    staleEmit({ type: 'tool_result', tool: 'bash', success: true, output: 'STALE-TAIL-OUTPUT' });
+    staleEmit({ type: 'warning', code: 'late_warning', message: 'stale tail' });
+    staleEmit({ type: 'task_start', input: 'late restart' });
+    staleEmit({ type: 'task_end', reason: 'error' });
+    await sleep(20);
+
+    check('E2 stale tail events dropped BEFORE projection (B untouched)',
+      B.items.length === bItemsBeforeG + 2 // G's user item + its first reasoning (before the gate)
+      && !B.items.some((i) => (i.result && i.result.output) === 'STALE-TAIL-OUTPUT')
+      && !B.items.some((i) => i.kind === 'warning'), kinds(B).join(',') + '/' + B.status);
+    check('E3 stale terminal does not settle G', store.busy === true && B.status === 'running', B.status);
+    g.release();
+    await pG;
+    await sleep(20);
+    check('E4 G completes with its own single terminal',
+      B.status === 'completed' && B.items.some((i) => i.content === 'G final'), kinds(B).join(',') + '/' + B.status);
+  }
+  // ---------- Case F: the task→conversation map lives THROUGH the final
+  // task_end projection and is deleted only afterwards (staged termination);
+  // a late tail through the SAME task's sink is then refused ----------
+  {
+    const conv = convById(store.liveConversationId);
+    session.script = [
+      { type: 'assistant_text', content: 'F final' },
+      { type: 'task_end', reason: 'completed' },
+    ];
+    await submit('task F staged terminal');
+    check('F1 the final task_end still projected through the live routing entry',
+      conv.status === 'completed' && conv.items.some((i) => i.content === 'F final'),
+      conv.status + '/' + kinds(conv).join(','));
+    const staleEmit = session.lastRunEmit; // THIS task's own task-bound sink
+    const itemsAfterEnd = conv.items.length;
+    // The task has fully ended: onTaskEnd deleted its routing entry. Even
+    // with no other task ever started, a late tail through the same sink
+    // is dropped BEFORE projection.
+    staleEmit({ type: 'assistant_text', content: 'F LATE TAIL' });
+    staleEmit({ type: 'task_end', reason: 'error' });
+    await sleep(20);
+    check('F2 a late tail after the map deletion is refused (no re-settle, no projection)',
+      conv.items.length === itemsAfterEnd
+      && !conv.items.some((i) => i.content === 'F LATE TAIL')
+      && conv.status === 'completed', JSON.stringify(conv.items.map((i) => i.kind)));
+  }
 }
 
 console.log('---');
