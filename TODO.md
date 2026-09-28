@@ -6,9 +6,9 @@ Architecture-level decisions belong in docs/ARCHITECTURE.md and docs/MODEL-PROTO
 
 ## Next — Runtime / Harness / Product extraction
 
-Contract and gates: [REPOSITORY-SPLIT.md](docs/REPOSITORY-SPLIT.md). All steps below are pending.
+Contract and gates: [REPOSITORY-SPLIT.md](docs/REPOSITORY-SPLIT.md). All steps below are pending except M0.
 
-- [ ] M0: inventory ownership and freeze public behavior/contract tests at an exact baseline.
+- [x] M0: inventory ownership and freeze public behavior/contract tests at an exact baseline. (Completed at `d25f30e` on `docs/repository-split-m0`: [inventory](docs/REPOSITORY-SPLIT-INVENTORY.md), [contracts](docs/REPOSITORY-SPLIT-CONTRACTS.md), [baseline results](docs/REPOSITORY-SPLIT-BASELINE.md) — 41/41 unit suites, build, real-world-50 fixture checks, and the browser e2e set verified at that commit; two load flakes re-verified standalone.)
 - [ ] M1: extract task assembly from UI, introduce explicit lifecycle bindings and generic operation policies.
 - [ ] M2: replace cross-layer globals with public modules; package workers and prove standalone entries.
 - [ ] M3: extract Runtime and Harness repositories with provenance, independent CI and pinned consumption; remove duplicate product implementations.
