@@ -19,6 +19,7 @@ Architecture and planning docs:
 
 - **[Documentation / wiki index](docs/README.md)** — start here
 - [Architecture](docs/ARCHITECTURE.md)
+- [Three-repository split](docs/REPOSITORY-SPLIT.md) — target boundaries, migration gates, and mainline integration
 - [Design principles](docs/DESIGN-PRINCIPLES.md)
 - [Concepts and terminology](docs/CONCEPTS.md)
 - [Runtime model](docs/RUNTIME-MODEL.md)

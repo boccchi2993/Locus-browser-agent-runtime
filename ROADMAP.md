@@ -4,6 +4,14 @@ This roadmap describes architectural milestones, not every implementation task.
 
 The project should prefer depth and semantic correctness over rapidly expanding the number of tools.
 
+## Next architectural priority — three-repository split
+
+Status: target agreed; implementation pending. See [REPOSITORY-SPLIT.md](docs/REPOSITORY-SPLIT.md).
+
+Extract independently usable Runtime and Harness repositories; retain this repository as the Product integration owner. Complete contract inventory, task assembly extraction, explicit modules, external repository extraction and product compatibility gates before further extension-layer expansion. Preserve existing behavior and authority guarantees throughout.
+
+Product continuously integrates both latest mainlines while shipping exact tested commit pairs. This milestone does not mark Trusted Plugin Runtime or other extension work complete.
+
 ## V0.2 — Browser-native network execution
 
 Status: implemented.

@@ -9,6 +9,7 @@ The repository keeps documentation beside code so architecture changes, tests, a
 | Document | Purpose |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Current layer model and system overview |
+| [REPOSITORY-SPLIT.md](REPOSITORY-SPLIT.md) | Agreed Runtime / Harness / Product target, migration sequence and compatibility gates |
 | [DESIGN-PRINCIPLES.md](DESIGN-PRINCIPLES.md) | Rules used to decide where functionality belongs |
 | [CONCEPTS.md](CONCEPTS.md) | Canonical vocabulary and terms |
 | [RUNTIME-MODEL.md](RUNTIME-MODEL.md) | One task from user input to local execution/provider replay |
@@ -24,6 +25,8 @@ The repository keeps documentation beside code so architecture changes, tests, a
 | [MODEL-PROTOCOL.md](MODEL-PROTOCOL.md) | Provider-native history and replay |
 | [PERSISTENCE.md](PERSISTENCE.md) | IndexedDB/OPFS and recovery semantics |
 | [IMAGE-INPUT.md](IMAGE-INPUT.md) | Image/perception boundary |
+
+The three-repository split is a target architecture, not an implemented feature. Its migration gates precede further extension-layer expansion; current behavior remains documented in the existing contracts.
 
 Project status lives in [../ROADMAP.md](../ROADMAP.md). Implementation backlog lives in [../TODO.md](../TODO.md).
 
