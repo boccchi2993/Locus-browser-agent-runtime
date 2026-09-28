@@ -21,7 +21,14 @@ Design rule (from the task and REPOSITORY-SPLIT §4): no single boundless `Runti
 
 ## 2. Task lifecycle (state machine, owner: Harness task runner)
 
-**M1a implementation status: LANDED** as `src/harness/task-runner.js` (`createTaskRunner`, `submit`, `activeTask`, `observeEvent`, `quiesceAndRun`; TaskHandle with id/signal/idempotent cancel/ended/outcome). Deviations from the draft below, all intentional: the outcome enum adds `interrupted` (blocked raw replay) and `rejected` (silent product-side refusal); outcome priority is signal → epoch → structured failure class (a thrown/failed prepare's `persistence_error`/`error` beats a concurrent cancel); `observeEvent` settles the active task on `task_end` only after its own `task_start` was observed (single-session invariant). Formalizes what `submit()`/`cancelTask()`/`quiesceRuntimeForStorageMutation()` did in `src/ui/store.js`:
+**M1a implementation status: LANDED** as `src/harness/task-runner.js` (`createTaskRunner`, `submit`, `activeTask`, `observeEvent`, `quiesceAndRun`; TaskHandle with id/signal/idempotent cancel/ended/outcome). Deviations from the draft below, all intentional: the outcome enum adds `interrupted` (blocked raw replay) and `rejected` (silent product-side refusal). **Revised after the M1a lifecycle review (PR #3 follow-up)** — the four corrections below supersede the earlier wording ("signal → epoch → failure-class priority", "observeEvent settles on task_end after its own task_start"):
+
+1. **Real completion boundary.** Observing a terminal `task_end` EVENT never settles a task. The run body hands `task_end` to its task-bound `ctx.emit`, which records the termination *intent*; the runner publishes the single final `task_end` itself only once the run body has returned or thrown (pre-run paths complete immediately at their decision). `ended` resolves after publication and after must-await cleanup; admission (`submit`) and the storage quiesce gate key off this same boundary — a terminal event alone never reopens admission.
+2. **Task event identity.** Every lifecycle event carries the task's unforgeable `taskId`, captured at EXECUTION START — the runner stamps its own emissions, and the run body emits through the per-task sink the runner hands it as `ctx.emit` (the Product passes it into `AgentSession.run({ emit })`). Nothing is stamped with "whoever is active when the event arrives". `observeEvent` and the Product's `handleRuntimeEvent` filter/route by that identity BEFORE projection: a late tail (task_start/task_end/warning/tool_result) of an already-released task is dropped and can neither settle nor pollute the active task's state or UI. The marker lives on the event envelope only — provider messages are untouched and `toolCallId` semantics are preserved.
+3. **One classification table for thrown AND structured failures** (`{status:'failed', error}` classifies identically to a throw, and BEFORE the liveness guards): `persistence_error` > `error` (an honest independent failure) > `session_changed` (epoch change, explicit `cancel('session_changed')`) > `cancelled`. A thrown `AbortError` IS the cancellation, never an independent error. A necessary persistence failure surfacing after a termination intent but before publication overrides the recorded reason and is never silently lost.
+4. **Synchronous quiesce admission close.** `quiesceAndRun` closes admission SYNCHRONOUSLY at the call itself (pending-mutation counter, not a flag set after an await) and keeps it closed for as long as ANY queued mutation is pending — no reopening window between queued storage actions. A timeout neither executes the action nor pretends the old task ended.
+
+`onTaskEnd` roles are explicit: a thenable return is MUST-AWAIT cleanup (covered by `ended`, admission and the gate); a throw (or rejected cleanup promise) is contained, surfaced as a `task_cleanup_failed` warning, and `ended` still resolves. Formalizes what `submit()`/`cancelTask()`/`quiesceRuntimeForStorageMutation()` did in `src/ui/store.js`:
 
 ```
 submitted → preparing → running → settling → ended
@@ -32,7 +39,8 @@ TaskHandle (Harness) = {
   id: string                    // today: implicit runningConversationId + generation pair
   signal: AbortSignal           // ONE controller per task, see §3.4-Q1
   cancel(reason): void          // idempotent; sets terminal intent
-  ended: Promise<TaskOutcome>   // resolves exactly once, after the terminal event
+  ended: Promise<TaskOutcome>   // resolves exactly once, at the real completion
+                                // boundary: terminal published + cleanup done
   outcome: TaskOutcome          // { reason: 'completed'|'cancelled'|'session_changed'|
                                 //            'error'|'persistence_error'|'iteration_limit'|
                                 //            'interrupted', committedEffectsReported: boolean }
@@ -42,8 +50,8 @@ TaskHandle (Harness) = {
 Rules (all already enforced somewhere today; the contract makes them one place):
 
 - The handle is created at `submitted` — **before** any preparation or `AgentSession.run`. A cancel in `preparing` aborts `signal` and the runner records the terminal outcome without any provider request (today: `pendingCancel` + `finishPreRunSessionSwitch`, `src/ui/store.js`).
-- A session boundary (conversation switch, workspace remount, reset) sets `outcome.reason = 'session_changed'` on every live handle; their tail events still project into *their own* conversation (today: `runningConversationId` release rules in `handleRuntimeEvent`).
-- Exactly one terminal event per task (`task_end`). Nothing may attach to an ended handle (§3.8).
+- A session boundary (conversation switch, workspace remount, reset) sets `outcome.reason = 'session_changed'` on every live handle; their tail events still project into *their own* conversation — routed by the event's `taskId` → conversation binding captured at execution start (`taskEventTargets` in `src/ui/store.js`), never by whichever conversation is live when the event arrives.
+- Exactly one terminal event per task (`task_end`), published by the runner at the real completion boundary. Nothing may attach to an ended handle (§3.8).
 - Required persistence failure during the first user frame or any checkpoint transitions the task to `ended(persistence_error)`; no provider request follows a failed required write that precedes it (today: durable-ordering block in `submit`).
 
 ## 3. Port reference

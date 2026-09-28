@@ -463,7 +463,7 @@ class AgentSession {
       out[i] = Object.assign({}, m, { content: parts });
     }
     if (missingAttachment) {
-      this.emit({
+      (this._taskEmit || this.emit)({
         type: 'warning', code: 'image_attachment_missing',
         message: 'One image attachment could no longer be read from durable storage; the model was told it is unavailable.',
       });
@@ -489,6 +489,14 @@ class AgentSession {
   // an external controller that propagates to the runner's handle.
   // Standalone callers (tests, non-product harnesses) omit it and get a
   // fresh controller, unchanged.
+  //
+  // opts.emit (M1a lifecycle fix): a TASK-BOUND emit sink (the harness
+  // task runner's ctx.emit). Every event of THIS run — task_start,
+  // tool_call/tool_result, warnings and the terminal — then carries the
+  // task identity captured at execution start, so a late tail of this
+  // task can never be attributed to a later one. Omitted → this.emit,
+  // unchanged. The override is stored for helpers that emit through
+  // this.emit (_materializeImageContent) and cleared in the run finally.
   async run(userText, opts) {
     if (this.task) {
       throw new Error('AgentSession already has a running task');
@@ -508,7 +516,9 @@ class AgentSession {
       && typeof o.controller.signal === 'object')
       ? o.controller : new AbortController();
     this.task = { controller };
-    const emit = this.emit;
+    const taskEmitOverride = (o.emit && typeof o.emit === 'function') ? o.emit : null;
+    const emit = taskEmitOverride || this.emit;
+    this._taskEmit = taskEmitOverride;
     // Session switch (workspace change / reset) and current-session cancel
     // are DIFFERENT events: the former makes every late result foreign to
     // the new session (discard silently), the latter stops the loop but
@@ -931,6 +941,7 @@ class AgentSession {
       throw e;
     } finally {
       if (this.task && this.task.controller === controller) this.task = null;
+      this._taskEmit = null;
     }
   }
 }

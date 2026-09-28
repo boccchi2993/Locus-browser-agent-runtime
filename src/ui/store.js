@@ -33,7 +33,7 @@
 // ============================================================
 
 import { reactive, computed } from 'vue';
-import { createTaskRunner } from '../harness/task-runner.js';
+import { createTaskRunner, isPersistenceFailure } from '../harness/task-runner.js';
 import { createProviderSessions } from '../harness/provider-session.js';
 
 /* global AgentSession, Model, callModel, executeTool, buildSystemPrompt,
@@ -341,6 +341,12 @@ let runningConversationId = null;
 // owns runningConversationId). Released by onTaskEnd, guarded by id so a
 // late finish of an older task can never release a newer task's binding.
 let boundTaskId = null;
+// Task-id → conversation-id for EVENT ROUTING (lifecycle fix): a task's
+// events carry the task id captured AT EXECUTION START; this map resolves
+// them back to the conversation they belong to, even when the event
+// arrives after another task was admitted. Entries are deleted in
+// onTaskEnd — a late tail of a released task is dropped, never projected.
+const taskEventTargets = new Map();
 
 let persistenceContext = null;
 let persistenceBootPromise = null;
@@ -356,10 +362,8 @@ function reportPersistenceIssue(error, message) {
   }
 }
 
-function isPersistenceFailure(error) {
-  return !!(error && (error.persistenceFailure || error.code === 'persistence_write_failed'
-    || error.name === 'PersistenceError' || error.name === 'StorageClearError'));
-}
+// isPersistenceFailure moved to src/harness/task-runner.js (M1a lifecycle
+// fix): ONE classification table shared by the Product and the runner.
 
 function persistConversation(conv) {
   if (!conv || typeof PersistenceServiceInstance === 'undefined') return Promise.resolve();
@@ -437,7 +441,20 @@ function providerSessionsAdapter() {
 // providerSessions.makeContext(conv, providerSession).
 
 function handleRuntimeEvent(event) {
-  const targetId = runningConversationId !== null ? runningConversationId : store.liveConversationId;
+  // Task-identity routing (lifecycle fix): a stamped event belongs to the
+  // conversation its task bound AT EXECUTION START — never to whichever
+  // task/conversation is live when the event arrives. A late tail of an
+  // already-released task is DROPPED here, BEFORE any projection, so it
+  // can neither pollute the next task's conversation/UI nor bump its
+  // telemetry. Unstamped events (session-level diagnostics outside any
+  // task) keep the legacy fallback routing.
+  let targetId;
+  if (event && event.taskId !== undefined) {
+    targetId = taskEventTargets.get(event.taskId) || null;
+    if (targetId == null) return;
+  } else {
+    targetId = runningConversationId !== null ? runningConversationId : store.liveConversationId;
+  }
   const conv = store.conversations.find((c) => c.id === targetId);
   if (conv) {
     LocusProjector.projectEvent(conv, event);
@@ -454,11 +471,13 @@ function handleRuntimeEvent(event) {
     }
   }
   if (event.type === 'tool_result') store.telemetryVersion++;
-  // The harness task runner observes the pipeline LAST: its exactly-once
-  // task_start/task_end bookkeeping settles the task (and onTaskEnd
-  // releases the binding) only after THIS event has projected into the
-  // conversation it belongs to. The binding and busy flags are not
-  // released anywhere above — onTaskEnd owns them, guarded by task id.
+  // The harness task runner observes the pipeline LAST: it records
+  // task_start/termination intent only for events carrying the active
+  // task's own identity. The single final task_end is published by the
+  // runner at the REAL completion boundary (run body returned + cleanup),
+  // and onTaskEnd — which releases the binding — runs after that
+  // publication. The binding and busy flags are not released anywhere
+  // above — onTaskEnd owns them, guarded by task id.
   taskRunner.observeEvent(event);
 }
 
@@ -487,6 +506,7 @@ const taskRunner = createTaskRunner({
       runningConversationId = null;
       boundTaskId = null;
     }
+    taskEventTargets.delete(task.id);
     store.busy = false;
     store.cancelling = false;
   },
@@ -837,6 +857,11 @@ async function buildImageUserContent(input) {
 // effect; the runner additionally guards when this resolves. Returns a
 // PrepareOutcome (see src/harness/task-runner.js).
 async function prepareTask(task) {
+  // Task event identity (lifecycle fix): bind THIS task's id to the
+  // conversation its events belong to, captured at execution start. The
+  // binding is refined when the run conversation is pinned below; the
+  // runner's pre-run terminals emitted before that still route here.
+  taskEventTargets.set(task.id, store.liveConversationId);
   const input = task.input;
 
   // (1) The page can become interactive before IndexedDB/OPFS restoration
@@ -902,6 +927,7 @@ async function prepareTask(task) {
   if (store.liveConversationId == null) startConversation(); // defensive: never route into a random conversation
   runningConversationId = store.liveConversationId;
   boundTaskId = task.id;
+  taskEventTargets.set(task.id, store.liveConversationId);
   const boundConversation = store.conversations.find((c) => c.id === runningConversationId);
   // Pre-run terminal paths backfill a task_start only when the bound
   // conversation would otherwise never see the submitted intent (same
@@ -996,7 +1022,7 @@ async function prepareTask(task) {
         // flight. One user turn: text + selected image attachments bind
         // into a single provider turn; run() emits ONE task_start.
         try {
-          await session.run(input, { workspace: taskVfs, taskEnvironment, userContent, controller: ctx.controller });
+          await session.run(input, { workspace: taskVfs, taskEnvironment, userContent, controller: ctx.controller, emit: ctx.emit });
         } catch (e) {
           // The runner emits the error/terminal pair; this is the Product
           // side of the old catch block (degraded marking + snapshot).
