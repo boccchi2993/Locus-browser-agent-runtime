@@ -110,7 +110,36 @@ Preserved unchanged (pinned by the existing suites): the adoptEpoch legitimate-r
 
 Full `npm run test:e2e` after the §6 fixes (single sequential run, exit 0, **16/16 suite entries**): runtime, active-content, presentation, responsive, **persistence**, wire, **approval**, image, grep, **python-authority**, **capabilities**, **skill-instances**, network, **python-browser-authority (102/102)**, **python-bootstrap-integrity (27/27)**, **trusted-plugin-runtime (33/33)** — i.e. every affected gate named by the review round: browser Python (authority / browser-authority / bootstrap-integrity), plugins (trusted-plugin-runtime), approvals, skills (skill-instances + capabilities), persistence. Notably python-authority drives `window.__locus.pythonRuntime().reset()` on the PRODUCTION instance with a full re-bootstrap, and trusted-plugin-runtime R2 re-verifies `reset()` + re-boot with a configured payload — both now exercising the new commit-phase invalidation and full-lifetime counting paths on the real asset chain. No assertion loosened, no retry added; first and only run of this round is the recorded gate.
 
-## 8. M2 next step (precise scope)
+## 8. M1b final targeted fix (2026-09-29): last dispatched effect, settlement validity
+
+The last item of the M1b follow-up (append commit on top of `9222341`; no history rewrite, no merge, M2 untouched).
+
+### 8.1 The gap
+
+§6.2's commit-phase invalidation checked validity before every side effect but relied on a LATER loop iteration to surface a boundary that landed while an effect was IN FLIGHT. When the run's LAST (only) provider call — a write, mkdir, file removal or directory removal — had been dispatched but not settled, and a reset()/dispose() landed in that window, the effect settled, no further pre-effect check existed, and the final report read `result.error || boundaryStop` = `error: null`: a boundary-stopped run presented as a success (`runPythonCode` would report `success: true`). The dispatched effect itself was real and stayed committed — only the classification lied.
+
+### 8.2 Fix
+
+`src/shell.js` `_runOnce`, at result formation (immediately before the return): re-run `invalidated()` and, when neither a real worker error nor an earlier stop already owns the report, carry the boundary reason into `boundaryStop`. Settlement of a provider call is not validation. No new lifecycle machinery, no change to the per-side-effect guards, no rollback: what committed stays in `written`/`mkdirs`/`deleted`, nothing is fabricated into `notPersisted`, and `result.error` keeps precedence over the boundary text. CONTRACTS §3.1 run()/reset() wording now states the report-formation re-validation explicitly.
+
+### 8.3 Evidence (failing on `9222341` first)
+
+`tests/python-lifecycle.test.cjs` **LC9a–LC9s** (first run against the old code: 6 failures, every one `"error":null` with the committed operation correctly kept — write+reset LC9d, write+dispose LC9i, mkdir+reset LC9l, file delete+reset LC9n, rmdir+reset LC9p, provider-failure+boundary LC9s): a barrier fixture parks the run's ONLY changeset entry INSIDE the provider call (`vfs.write`/`mkdir`/`remove` entered, promise unsettled), driven through the real `runtime.run` public entry + controlled worker; reset/dispose lands; the barrier releases. After the fix, in every scenario: `error` carries the boundary reason; the really-committed operation stays in `written`/`mkdirs`/`deleted` and out of `notPersisted`; `busyExecutions` is 1 across the barrier and the synchronous boundary and 0 exactly at settlement; a boundary-free run of the same shape still succeeds (LC9q); a real worker error is not overwritten by the boundary (LC9r); a provider failure text survives in `writeFailed` while the boundary is the `error` (LC9s). Final: **92/92**.
+
+### 8.4 Gates for this round
+
+| Command | Result | Notes |
+|---|---|---|
+| `node tests/python-lifecycle.test.cjs` | PASS | **92/92** (86 from §6 + LC9) |
+| `node tests/store-python-lifecycle.test.mjs` | PASS | 21/21 |
+| `node tests/task-runner.test.mjs` | PASS | 99/99 |
+| `node tests/mutation-policy.test.cjs` | PASS | 35/35 |
+| `npm test` | PASS | **46/46 suites, 2085 checks, 0 failures** |
+| `npm run build` | PASS | |
+
+Browser gates deliberately NOT re-run: the change is host-side result classification only (`shell.js` final-report formation + tests) — worker protocol, bootstrap, VFS and mutation-policy semantics untouched, so per this round's charter no mechanical full browser round. §7's 16/16 browser record over the same production seams remains the standing gate.
+
+## 9. M2 next step (precise scope)
 
 1. RuntimeHost/RuntimeSession wrapper (contract §3.1 target shape): worker assets as string modules, `ExecutionRequest`/`ExecutionResult` port, status events replacing `#sb-python` + the 1s poll, `LOCUS_HOME_SKELETON` as a mount argument, `EXTENSION_*` patterns as payload-port contract data.
 2. Harness port injection (§3.2/§3.7): `buildSystemPrompt` via injected description port; `executeTool` split into registry + product adapter; `Telemetry` as an injected sink; independence suites (each core's test entry loads only its own files + fakes).

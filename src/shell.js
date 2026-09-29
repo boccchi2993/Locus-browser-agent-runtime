@@ -1416,6 +1416,17 @@ function createPythonRuntime() {
       notPersisted.push('directory deletions skipped (' + deletedDirs.join(', ') + '): ' + why);
     }
 
+    // A boundary may land while the FINAL provider side effect is in flight
+    // (dispatched, not yet settled): settlement of that call is not
+    // validation, and with no later commit iteration there is no further
+    // pre-effect check to catch it — the report below would read error:null
+    // and present a boundary-stopped run as a success. Re-validate the
+    // generation HERE, at result formation. What already committed stays
+    // reported in written/mkdirs/deleted (no rollback, no fabricated
+    // notPersisted), and a real worker error keeps its precedence.
+    const finalInvalid = invalidated();
+    if (finalInvalid && !result.error && !boundaryStop) boundaryStop = finalInvalid;
+
     return {
       stdout: result.stdout || '',
       stderr: result.stderr || '',

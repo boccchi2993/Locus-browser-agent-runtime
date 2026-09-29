@@ -104,7 +104,12 @@ PythonRuntimeInstance = {
   // commits nothing further, and reports honestly (boundary reason in
   // `error`, stopped operations in `notPersisted`) — never an empty
   // success masking the invalidation, never a partial result presented
-  // as complete.
+  // as complete. Validity is re-checked ONE LAST TIME when the report
+  // is formed: a boundary that lands while the FINAL dispatched effect
+  // is still unsettled still lands in that report's `error` (settlement
+  // of a provider call is not validation), what the effect really
+  // committed stays in `written`/`mkdirs`/`deleted`, and a real worker
+  // error keeps precedence over the boundary reason.
   run(code, vfs, opts) → Promise<ExecutionReport>
 
   // Session/rebuild boundary. SYNCHRONOUS effect: aborts the in-flight
@@ -125,7 +130,9 @@ PythonRuntimeInstance = {
   //       to the provider (posted worker execution, in-flight commit).
   //       These CANNOT be rolled back; after their settlement nothing
   //       further runs and the report says exactly what committed and
-  //       what never ran.
+  //       what never ran — including the boundary itself in `error`,
+  //       re-validated at report formation so the LAST settling effect
+  //       can never yield an error:null success.
   // The instance stays REUSABLE afterwards. A boundary landing while a
   // run is suspended between seat acquisition and the worker post is
   // caught by the reset generation: the run rejects with the boundary

@@ -650,6 +650,208 @@ async function run() {
       JSON.stringify({ error: outE.error, busy: rtE.snapshot().busyExecutions }));
   }
 
+  // ===== LC9. boundary lands while the LAST commit side effect is IN FLIGHT =====
+  // The complement of LC8: there the boundary paused runs at async PRE-checks
+  // (stat/readBytes gates) so no side effect ever dispatched. Here the final
+  // provider call has ENTERED but not settled when reset()/dispose() lands.
+  // Settlement of that call is NOT validation — the run's generation is gone
+  // and the final report must say so (error = the boundary reason), while
+  // what the in-flight operation really committed stays reported in written/
+  // mkdirs/deleted: no fake rollback, no fabricated notPersisted entry. Every
+  // operation kind is pinned as the LAST (only) changeset entry, so the
+  // result never depends on a later loop iteration re-checking the boundary.
+  {
+    // Fake VFS whose SIDE-EFFECT methods (write/mkdir/remove) park at entry
+    // until the test releases the gate — the provider operation is already
+    // dispatched, exactly like a slow OPFS/FS handle in production. Mirror-in
+    // collection only reads the provider; the commit phases call the VFS.
+    function dispatchBarrierVfs(files, opts) {
+      const enc = new TextEncoder();
+      const store = new Map(Object.keys(files).map((p) => [p, enc.encode(files[p])]));
+      const dirs = new Set(opts && opts.dirs ? opts.dirs : []);
+      const sideEffects = [];
+      let entered = false, gateRelease = null;
+      const gate = () => new Promise((r) => { gateRelease = r; });
+      const gated = (method, path, perform) => async (...args) => {
+        const hit = opts && opts.gate === method && path === opts.path;
+        if (hit) { entered = true; await gate(); }
+        if (hit && opts.failWith) throw opts.failWith;
+        return perform(...args);
+      };
+      const notFound = () => { const e = new Error('not found'); e.name = 'NotFoundError'; throw e; };
+      const provider = {
+        list: async () => [...store.keys()].map((p) => ({ name: p.slice('/mnt/workspace/'.length), kind: 'file' })),
+        stat: async (rel) => { const b = store.get('/mnt/workspace/' + rel); return b ? { kind: 'file', size: b.length } : notFound(); },
+        readBytes: async (rel) => { const b = store.get('/mnt/workspace/' + rel); return b ? b : notFound(); },
+      };
+      const vfs = {
+        dataMounts: () => [{ root: '/mnt/workspace', provider: provider, authority: 'read-write' }],
+        resolveMount: (p) => String(p).indexOf('/mnt/workspace') === 0
+          ? { path: '/mnt/workspace', authority: 'read-write' } : null,
+        isProtectedRoot: () => false,
+        stat: async (p) => {
+          const b = store.get(p);
+          if (b) return { kind: 'file', size: b.length };
+          if (dirs.has(p)) return { kind: 'directory', size: 0 };
+          notFound();
+        },
+        exists: async (p) => store.has(p) || dirs.has(p),
+        mkdir: gated('mkdir', opts && opts.path, (p) => { dirs.add(p); sideEffects.push('mkdir ' + p); }),
+        write: gated('write', opts && opts.path, (p, bytes) => { store.set(p, bytes); sideEffects.push('write ' + p); }),
+        remove: gated('remove', opts && opts.path, (p) => {
+          store.delete(p); dirs.delete(p); sideEffects.push('remove ' + p);
+        }),
+      };
+      return {
+        vfs: vfs, sideEffects: sideEffects,
+        entered: () => entered,
+        release: () => { if (gateRelease) gateRelease(); },
+      };
+    }
+
+    // Drive one run to its parked last side effect: real runtime.run entry,
+    // controlled worker answering with `reply`, then wait for the gate.
+    async function parkAtLastEffect(reply, files, opts) {
+      const rt = M.createPythonRuntime();
+      const ctl = attachControlledWorker(rt);
+      rt.status = 'ready';
+      const fb = dispatchBarrierVfs(files, opts);
+      const runP = rt.run('CODE', fb.vfs, { cwd: '/tmp' });
+      await tick();
+      ctl.resolve(ctl.log[0].id, reply);
+      for (let i = 0; i < 20 && !fb.entered(); i++) await tick();
+      return { rt: rt, fb: fb, runP: runP };
+    }
+
+    // ---- LC9-a: reset lands while the ONLY changeset write is in flight
+    const a = await parkAtLastEffect(
+      { files: [{ path: '/mnt/workspace/out.txt', b64: 'aGVsbG8=' }], deleted: [] },
+      { '/mnt/workspace/in.txt': 'seed' },
+      { gate: 'write', path: '/mnt/workspace/out.txt' });
+    check('LC9 the dispatched write is parked inside the provider call',
+      a.fb.entered() && a.fb.sideEffects.length === 0, JSON.stringify(a.fb.sideEffects));
+    check('LC9b the run stays counted while its side effect is unsettled',
+      a.rt.snapshot().busyExecutions === 1, JSON.stringify(a.rt.snapshot()));
+    a.rt.reset('lc9 reset mid-write');
+    check('LC9c the synchronous reset does not masquerade as settlement',
+      a.rt.snapshot().busyExecutions === 1, JSON.stringify(a.rt.snapshot()));
+    a.fb.release();
+    const outA = await a.runP;
+    check('LC9d the settled run reports the boundary as its error (never error:null)',
+      outA.error === 'lc9 reset mid-write',
+      JSON.stringify({ error: outA.error, written: outA.written, notPersisted: outA.notPersisted }));
+    check('LC9e the write that really completed stays in written — no fake rollback',
+      outA.written.length === 1 && outA.written[0] === '/mnt/workspace/out.txt'
+        && a.fb.sideEffects.indexOf('write /mnt/workspace/out.txt') !== -1,
+      JSON.stringify({ written: outA.written, sideEffects: a.fb.sideEffects }));
+    check('LC9f the committed file is not fabricated into notPersisted',
+      outA.notPersisted.length === 0, JSON.stringify(outA.notPersisted));
+    check('LC9g tracking released exactly at settlement',
+      a.rt.snapshot().busyExecutions === 0, JSON.stringify(a.rt.snapshot()));
+
+    // ---- LC9-b: dispose lands while the only write is in flight
+    const b = await parkAtLastEffect(
+      { files: [{ path: '/mnt/workspace/out.txt', b64: 'aGVsbG8=' }], deleted: [] },
+      { '/mnt/workspace/in.txt': 'seed' },
+      { gate: 'write', path: '/mnt/workspace/out.txt' });
+    b.rt.dispose('lc9 dispose mid-write');
+    check('LC9h dispose keeps the unsettled run counted',
+      b.rt.snapshot().busyExecutions === 1, JSON.stringify(b.rt.snapshot()));
+    b.fb.release();
+    const outB = await b.runP;
+    check('LC9i the disposed run reports the disposal as its error and keeps the commit',
+      outB.error === 'python runtime disposed: lc9 dispose mid-write'
+        && outB.written.length === 1 && outB.notPersisted.length === 0,
+      JSON.stringify({ error: outB.error, written: outB.written, notPersisted: outB.notPersisted }));
+    check('LC9j tracking released, terminal state intact',
+      b.rt.snapshot().busyExecutions === 0
+        && b.rt.snapshot().disposed === 'python runtime disposed: lc9 dispose mid-write',
+      JSON.stringify(b.rt.snapshot()));
+
+    // ---- LC9-c: reset lands while the only MKDIR is in flight
+    const c = await parkAtLastEffect(
+      { files: [], deleted: [], createdDirs: ['/mnt/workspace/newdir'] },
+      {},
+      { gate: 'mkdir', path: '/mnt/workspace/newdir' });
+    check('LC9k the mkdir run is parked inside the provider call',
+      c.fb.entered() && c.rt.snapshot().busyExecutions === 1, JSON.stringify(c.fb.sideEffects));
+    c.rt.reset('lc9 reset mid-mkdir');
+    c.fb.release();
+    const outC = await c.runP;
+    check('LC9l the settled mkdir run reports the boundary (not error:null), commit kept',
+      outC.error === 'lc9 reset mid-mkdir' && outC.mkdirs.length === 1
+        && outC.mkdirs[0] === '/mnt/workspace/newdir' && outC.notPersisted.length === 0,
+      JSON.stringify({ error: outC.error, mkdirs: outC.mkdirs, notPersisted: outC.notPersisted }));
+
+    // ---- LC9-d: reset lands while the only FILE DELETION is in flight
+    const d = await parkAtLastEffect(
+      { files: [], deleted: ['/mnt/workspace/gone.txt'] },
+      { '/mnt/workspace/gone.txt': 'data' },
+      { gate: 'remove', path: '/mnt/workspace/gone.txt' });
+    check('LC9m the deletion run is parked inside the provider call',
+      d.fb.entered() && d.rt.snapshot().busyExecutions === 1, JSON.stringify(d.fb.sideEffects));
+    d.rt.reset('lc9 reset mid-delete');
+    d.fb.release();
+    const outD = await d.runP;
+    check('LC9n the settled deletion run reports the boundary, deletion kept in deleted',
+      outD.error === 'lc9 reset mid-delete' && outD.deleted.length === 1
+        && outD.deleted[0] === '/mnt/workspace/gone.txt' && outD.notPersisted.length === 0,
+      JSON.stringify({ error: outD.error, deleted: outD.deleted, notPersisted: outD.notPersisted }));
+
+    // ---- LC9-e: reset lands while the only DIRECTORY DELETION is in flight
+    const e = await parkAtLastEffect(
+      { files: [], deleted: [], deletedDirs: ['/mnt/workspace/sub'] },
+      { '/mnt/workspace/keep.txt': 'data' },
+      { gate: 'remove', path: '/mnt/workspace/sub', dirs: ['/mnt/workspace/sub'] });
+    check('LC9o the rmdir run is parked inside the provider call',
+      e.fb.entered() && e.rt.snapshot().busyExecutions === 1, JSON.stringify(e.fb.sideEffects));
+    e.rt.reset('lc9 reset mid-rmdir');
+    e.fb.release();
+    const outE = await e.runP;
+    check('LC9p the settled rmdir run reports the boundary, removal kept in deleted',
+      outE.error === 'lc9 reset mid-rmdir' && outE.deleted.length === 1
+        && outE.deleted[0] === '/mnt/workspace/sub' && outE.notPersisted.length === 0,
+      JSON.stringify({ error: outE.error, deleted: outE.deleted, notPersisted: outE.notPersisted }));
+
+    // ---- LC9-f: no boundary — the same single-write run completes clean
+    const f = await parkAtLastEffect(
+      { files: [{ path: '/mnt/workspace/out.txt', b64: 'aGVsbG8=' }], deleted: [] },
+      { '/mnt/workspace/in.txt': 'seed' },
+      { gate: 'write', path: '/nowhere' }); // gate never hit
+    f.fb.release();
+    const outF = await f.runP;
+    check('LC9q a boundary-free run of the same shape still succeeds',
+      outF.error === null && outF.written.length === 1
+        && f.rt.snapshot().busyExecutions === 0,
+      JSON.stringify({ error: outF.error, written: outF.written }));
+
+    // ---- LC9-g: a REAL worker error keeps precedence over the boundary
+    const g = await parkAtLastEffect(
+      { error: 'worker exploded', files: [{ path: '/mnt/workspace/out.txt', b64: 'aGVsbG8=' }], deleted: [] },
+      { '/mnt/workspace/in.txt': 'seed' },
+      { gate: 'write', path: '/mnt/workspace/out.txt' });
+    g.rt.reset('lc9 reset after worker error');
+    g.fb.release();
+    const outG = await g.runP;
+    check('LC9r the worker\u2019s own error is not overwritten by the boundary reason',
+      outG.error === 'worker exploded', JSON.stringify({ error: outG.error }));
+
+    // ---- LC9-h: a provider failure message survives the boundary report
+    const quotaErr = new Error('provider refused: quota exceeded');
+    const h = await parkAtLastEffect(
+      { files: [{ path: '/mnt/workspace/out.txt', b64: 'aGVsbG8=' }], deleted: [] },
+      { '/mnt/workspace/in.txt': 'seed' },
+      { gate: 'write', path: '/mnt/workspace/out.txt', failWith: quotaErr });
+    h.rt.reset('lc9 reset mid-failing-write');
+    h.fb.release();
+    const outH = await h.runP;
+    check('LC9s the provider failure text survives in writeFailed while the boundary is the error',
+      outH.error === 'lc9 reset mid-failing-write'
+        && outH.writeFailed.length === 1
+        && outH.writeFailed[0].indexOf('provider refused: quota exceeded') !== -1,
+      JSON.stringify({ error: outH.error, writeFailed: outH.writeFailed }));
+  }
+
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
 }
