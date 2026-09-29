@@ -1,5 +1,6 @@
 // Trusted Plugin Runtime v1A BROWSER e2e. Real headless Chrome, the REAL
-// production runtime (src/shell.js PythonRuntime + the REAL py-worker-src
+// production runtime (the store's canonical instance from src/shell.js
+// createPythonRuntime + the REAL py-worker-src
 // from index.html), a real strict-CSP creator iframe, a real Pyodide 0.26.4
 // boot and the REAL synthetic wheel from the Capability Package fixture --
 // against local controllable servers:
@@ -103,7 +104,7 @@ function buildPage(shellUrl, workerSrc, localAssets, wheelB64, wheelSha, wheelSi
     + '__el.textContent = ' + JSON.stringify(workerSrc) + ';'
     + 'document.head.appendChild(__el);'
     + 'window.__tpr = { ready: true, configError: null };'
-    + 'window.__pyrt = PythonRuntime;'
+    + 'window.__pyrt = window.__locus.pythonRuntime();'
     + 'function wheelBytes(tamper) {'
     + '  var bin = atob(' + JSON.stringify(wheelB64) + ');'
     + '  var bytes = new Uint8Array(bin.length);'

@@ -1,5 +1,6 @@
 // Python bootstrap integrity + lifecycle BROWSER e2e (F04c). Real headless
-// Chrome, the REAL production runtime (src/shell.js PythonRuntime + the REAL
+// Chrome, the REAL production runtime (the store's canonical instance from
+// src/shell.js createPythonRuntime + the REAL
 // py-worker-src from index.html), a real strict-CSP creator iframe and a
 // real Pyodide 0.26.4 boot -- against a LOCAL controllable asset server:
 //
@@ -88,7 +89,7 @@ function buildPage(shellUrl, workerSrc, localAssets) {
     + '__el.textContent = ' + JSON.stringify(workerSrc) + ';'
     + 'document.head.appendChild(__el);'
     + 'window.__f04c = { ready: true };'
-    + 'window.__pyrt = PythonRuntime;'
+    + 'window.__pyrt = window.__locus.pythonRuntime();'
     + 'window.__f04cWorkerSrc = document.getElementById("py-worker-src").textContent;'
     + 'window.__f04cSetWorkerSource = function (t) { document.getElementById("py-worker-src").textContent = t; };'
     + 'window.__f04cRun = function (code, opts) {'

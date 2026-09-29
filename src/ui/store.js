@@ -26,10 +26,13 @@
 //  docs/REPOSITORY-SPLIT-INVENTORY.md).
 //
 //  Runtime globals (AgentSession, Model, callModel, executeTool,
-//  LocalDirectoryWorkspace, ensureWorkspacePermission, PythonRuntime,
+//  LocalDirectoryWorkspace, ensureWorkspacePermission, createPythonRuntime,
 //  Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS) come from
 //  the classic scripts loaded by index.html before this module — same as
-//  the old ui.js wiring.
+//  the old ui.js wiring. M1b (repository split): the python interpreter is
+//  an INSTANCE created and owned here (no page-global PythonRuntime); task
+//  preparation, session reset and shell execution all use that one
+//  instance.
 // ============================================================
 
 import { reactive, computed } from 'vue';
@@ -37,7 +40,7 @@ import { createTaskRunner, isPersistenceFailure } from '../harness/task-runner.j
 import { createProviderSessions } from '../harness/provider-session.js';
 
 /* global AgentSession, Model, callModel, executeTool, buildSystemPrompt,
-   LocalDirectoryWorkspace, ensureWorkspacePermission, PythonRuntime,
+   LocalDirectoryWorkspace, ensureWorkspacePermission, createPythonRuntime,
    Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS,
    CapabilityManager, CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
    SkillSourceStore, SkillInstanceStorage, SkillInstanceWorkspace,
@@ -146,22 +149,62 @@ export function setMcpConnectionState(id, state) {
   return next;
 }
 
-// Boot the Python interpreter with the plugin payload set THIS task's
-// TaskEnvironment needs: a changed extension key means the booted
-// interpreter holds a different plugin set, so it is reset and the
-// next boot installs the new payload before READY (never a lazy
-// install-on-import). With no python plugins this is a no-op.
-async function preparePythonRuntimeForEnvironment(env) {
-  if (typeof PythonRuntime === 'undefined') return;
-  const wanted = env ? env.pythonExtensionKey : null;
-  const current = typeof PythonRuntime.extensionKey === 'function' ? PythonRuntime.extensionKey() : null;
-  if (current === wanted) return;
-  PythonRuntime.reset();
-  if (typeof PythonRuntime.configureExtensions === 'function' && capabilityManager) {
-    // A null key means the core-only runtime: clear the payload explicitly
-    // (configureExtensions validates strict shapes and rejects key: null).
-    PythonRuntime.configureExtensions(wanted === null ? null : capabilityManager.pythonExtensionPayload(env));
+// ---------- python interpreter lifecycle (M1b, repository split) ----------
+// The Product OWNS the ONE canonical interpreter instance for the page
+// (contract REPOSITORY-SPLIT-CONTRACTS 3.1 / 3.4-Q3). It is created here —
+// lazily on first use, so deployments and Node tests without the shell
+// runtime simply get none — and the SAME instance is (a) configured by task
+// preparation (prepare), (b) reset at session boundaries, and (c) injected
+// into every shell execution (opts.pythonRuntime), so preparation and
+// execution can never split onto two interpreters. There is deliberately
+// NO page-global fallback: a shell python command without an injected
+// instance fails loudly (runPythonCode), it never resurrects a global.
+// Tests may substitute the instance via window.__LOCUS_HOOKS__.pythonRuntime
+// before first use; production resolves the createPythonRuntime factory
+// from shell.js.
+let pythonRuntimeResolved; // undefined = unresolved; null = resolved: none available
+function ensurePythonRuntime() {
+  if (pythonRuntimeResolved !== undefined) return pythonRuntimeResolved;
+  const h = hooks();
+  if (h && h.pythonRuntime) {
+    pythonRuntimeResolved = h.pythonRuntime;
+  } else if (typeof createPythonRuntime === 'function') {
+    pythonRuntimeResolved = createPythonRuntime();
+  } else {
+    pythonRuntimeResolved = null;
   }
+  return pythonRuntimeResolved;
+}
+
+// Canonical accessor for callers outside this module (the UI status poll
+// and the ?e2e=1 seam). Returns null when this deployment has no python
+// runtime.
+export function pythonRuntime() {
+  const rt = ensurePythonRuntime();
+  return rt || null;
+}
+
+// Configure the interpreter with the plugin payload set THIS task's
+// TaskEnvironment needs (instance.prepare): a changed extension key means
+// the configured interpreter holds a different plugin set, so prepare
+// validates the NEW payload first, then rebuilds the payload set — the
+// next boot installs it before READY (never a lazy install-on-import).
+// Same-key preparation is a no-op and nothing here boots the interpreter
+// or downloads assets: a text-only task performs zero Python work.
+// With no python plugins (null key) this returns the runtime to core-only.
+// A validation failure is all-or-nothing inside prepare: the previously
+// configured payload survives intact.
+async function preparePythonRuntimeForEnvironment(env) {
+  const rt = ensurePythonRuntime();
+  if (!rt) return;
+  const wanted = env ? env.pythonExtensionKey : null;
+  // A null key means the core-only runtime: the payload is cleared
+  // explicitly (buildExtensions validates strict shapes and rejects
+  // key: null payloads).
+  const payload = wanted === null || !capabilityManager
+    ? null
+    : capabilityManager.pythonExtensionPayload(env);
+  await rt.prepare({ python: payload });
 }
 
 const UPLOAD_ROOT = '/mnt/upload';
@@ -322,6 +365,10 @@ function wiredToolExecutor(tool, input, workspace, opts) {
     approvals: approvals,
     conversationId: runningConversationId || store.liveConversationId || null,
     taskGeneration: session.generation,
+    // M1b: the canonical interpreter instance — shell python executes on
+    // exactly the instance task preparation configured (see the lifecycle
+    // block above).
+    pythonRuntime: pythonRuntime(),
   });
   const h = hooks();
   if (h && typeof h.toolExecutor === 'function') return h.toolExecutor(tool, input, workspace, o);
@@ -489,7 +536,10 @@ export const session = new AgentSession({
   toolExecutor: wiredToolExecutor,
   buildSystemPrompt: buildSystemPrompt,
   emit: handleRuntimeEvent,
-  onSessionReset: () => { if (typeof PythonRuntime !== 'undefined') PythonRuntime.reset(); },
+  // M1b: the session boundary resets the SAME canonical instance the
+  // task preparation configured (interpreter globals/modules/tmp die
+  // here; verified assets and the lifecycle object survive).
+  onSessionReset: () => { const rt = ensurePythonRuntime(); if (rt) rt.reset(); },
 });
 
 // ---------- harness task runner (M1a) ----------

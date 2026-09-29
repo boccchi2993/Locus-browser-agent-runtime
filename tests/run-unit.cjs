@@ -41,6 +41,7 @@ const SUITES = [
   'python-bootstrap-integrity.test.cjs',
   'python-plugin-runtime.test.cjs',
   'python-lifecycle.test.cjs',
+  'store-python-lifecycle.test.mjs',
   'vfs-audit.test.cjs',
   'attachments.test.cjs',
   'capabilities.test.cjs',
