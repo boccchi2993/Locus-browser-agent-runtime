@@ -43,7 +43,7 @@ Inspected baseline: `d25f30ea75e54989393230cb6c7695359d4c0815` (merge of PR #1).
 | `session` | `src/ui/store.js` (`new AgentSession({...})`) | One agent session per page; conversation switch = `session.reset()` + history swap |
 | `approvals` | `src/ui/store.js` (`new ApprovalController({...})`) | One approval controller per page |
 | `capabilityManager` | `src/ui/store.js` (`new CapabilityManager({...})`) | Page-session capability state |
-| `PythonRuntime` | `src/shell.js` (plain object singleton) | ONE interpreter per page; rebuilt on extension-key change |
+| `PythonRuntime` — **removed in M1b** | `createPythonRuntime()` (`src/shell.js`): the interpreter is an INSTANCE; the Product (store) owns the ONE canonical page instance (contract §3.1 M1b form) |
 | `PersistenceServiceInstance` | `src/persistence.js` | IDB/OPFS service instance |
 | `Model` | `src/model.js` | Mutable provider config (key/base/model/proxy/dialect/transport) |
 | `Telemetry` | `src/telemetry.js` | In-memory records (500 cap) |
@@ -90,7 +90,7 @@ Callers: store.js (the page VFS + per-task forks), shell.js (`asVfs`, `resolveSh
 | Cancellation errors (`makeCancelledError`, `isCancelledError`, `throwIfCancelled`) | R | |
 | Bootstrap manifest, budgets, asset fetch/verify (`PYTHON_BOOTSTRAP_MANIFEST`, `readBodyBounded`, `sha256Hex`, budget clocks, `openBootstrapAbort`) | R | F04c integrity boundary; keep manifest the single source of bootstrap URLs |
 | Wheel artifact validation (`validateWheelArtifact`, `PYTHON_PLUGIN_WHEEL_*`) | R | Main-thread half of TPR v1A |
-| `PythonRuntime` (plain-object singleton, `src/shell.js:396`) | R | Creator iframe + worker lifecycle, queue serialization, `_runOnce` mirror/commit phases, `reset()`, `extensionKey()`, `configureExtensions()` |
+| `PythonRuntime` → `createPythonRuntime()` (**M1b**: instance factory) | R | Creator iframe + worker lifecycle, queue serialization, `_runOnce` mirror/commit phases, `prepare`/`reset`/`dispose`/`snapshot` lifecycle, `extensionKey()`, `buildExtensions`/`configureExtensions()`. All mutable state per instance; the page-global singleton is gone (consumers: store wiring + `opts.pythonRuntime`) |
 | `PythonRuntime._setStatus` | R **(defect)** | Writes `document.getElementById('sb-python')` — Runtime→DOM presentation write; must become a status event (see BASELINE §4, D1) |
 | `PythonRuntime.configureExtensions` id validation | R | Uses globals `EXTENSION_ID_PATTERN`/`EXTENSION_PY_MODULE_PATTERN` from extensions.js — a Runtime file validating against Harness-owned identity rules via script order. Must receive the pattern/validator as part of the payload port |
 | Worker source acquisition (`_ensureWorker` reads `#py-worker-src`; `GrepRegexRuntime.createWorker` reads `#grep-worker-src`) | R **(packaging)** | Runtime reads its own worker sources out of Product page DOM. Must ship as Runtime assets (contract §3.6) |
@@ -99,7 +99,7 @@ Callers: store.js (the page VFS + per-task forks), shell.js (`asVfs`, `resolveSh
 | `SHELL_COMMANDS`, `SHELL_ALIASES`, `SHELL_OPERATORS`, `SHELL_REDIRECTS`, `shellHelpText`, `shellSystemPromptSection` | R | `shellSystemPromptSection` is the *capability description port* the Harness prompt consumes (today via a global read in agent.js) |
 | VFS bridge (`asVfs`, `resolveShellPath`, `statShellPath`, `checkParentDir`, `writableErrMsg`) | R | |
 | Handlers `shPwd` … `shSort`, `shWhich` | R | |
-| `underSkillInstances`, `SKILL_INSTANCE_SHELL_ROOT`, `SKILL_IDENTITY_BOUNDARY_MSG`, `isSkillMutationError` | **P policy inside R** | Hardcoded `/home/locus/.skills` layout knowledge in `shMv` (refuses any move touching `~/.skills`, preflight) and `shRm` (refuses recursive removal of the skills root / capability dirs). Must become an operation-aware mutation policy injected by Product/Harness (contract §3.7) while keeping the refusals bit-exact |
+| `underSkillInstances` / `SKILL_*` / `isSkillMutationError` — **moved out in M1b** | **P policy** (`src/mutation-policy.js`, Product) | The `/home/locus/.skills` layout knowledge and refusal texts now live in `LocusMutationPolicy`, injected into every bash execution via `opts.mutationPolicy`; shell.js consumes the operation-aware port (checkMove/checkRemove/isPolicyRefusal) with byte-stable refusal texts. A missing product policy fails the bash call loudly |
 | Grep worker session (`GrepRegexRuntime`, `createGrepRegexSession`, `shGrep`) | R | Fail-closed containment; `_workerFactory` is a TEST-ONLY seam |
 | `shMv`, `shRm`, `mvFile`, `mvDirectory`, `rmRecursive`, `throwMutationCancelled` | R | Keep committed-entry reporting on cancel (not rollback) |
 | Executor (`runShellCommand`, `runPipeline`, `runSimpleCommand`) | R | Backend/operation attribution (`browser`/`browser-direct`/`edge-relay`/compound) is Runtime routing state |
@@ -204,6 +204,8 @@ Tests: `tests/attachments.test.cjs`, `tests/capabilities.test.cjs`, `tests/image
 
 ### 2.14 `src/ui/store.js` — Product; the M1 extraction donor
 
+**M1b update:** the store now OWNS the canonical python interpreter instance (lazily resolved: `window.__LOCUS_HOOKS__.pythonRuntime` seam → `createPythonRuntime` factory → null), drives it from `preparePythonRuntimeForEnvironment` (instance.prepare) and `onSessionReset` (instance.reset), and injects the SAME instance (`opts.pythonRuntime`) plus the Locus mutation policy (`opts.mutationPolicy`, loud failure when unavailable) into every bash call. `main.js` mirrors instance status; `?e2e=1` exposes `window.__locus.pythonRuntime()`.
+
 **M1a update (post-extraction state):** the task lifecycle (admission, task controller, prepare→run→settle, pre-run cancel, quiesce gate) now lives in `src/harness/task-runner.js`, and the provider-session machinery in `src/harness/provider-session.js` — both ESM modules with injected ports, tested without Vue or the store (`tests/task-runner.test.mjs`, `tests/provider-session.test.mjs`). What remains in the store is the Product side: `prepareTask()` (conversation rebind, image build, VFS fork + skill mounts, python payload prep), the lazy `providerSessionsAdapter()` (the ONE place classic-script persistence/adapter globals map onto harness ports — M1b/M2 elimination point), UI projection, settings, storage controls and boot. Couplings that REMAIN after M1a: store still reads `session`/`vfs`/`PythonRuntime`/`SkillInstanceWorkspace`/`PersistenceServiceInstance` globals directly inside `prepareTask` and the adapter block; `agent.js` still reads `AGENT_TOOL_DEFINITIONS`/`shellSystemPromptSection` globals; worker sources still ship in page DOM. Historical disposition table (pre-M1a target, kept for reference):
 
 | Region | Disposition |
@@ -240,9 +242,8 @@ Each entry: **evidence** (symbol + file at `d25f30e`) → **why it blocks the sp
 4. **Product persistence injects the home layout into the VFS by script order.**
    `VFS_HOME_SKELETON` reads `LOCUS_HOME_SKELETON` from `persistence.js` (`src/vfs.js:360-362`). Blocks: silent P→R dependency invisible to any import graph. Target: explicit mount/bootstrap argument.
 
-5. **Shell commands embed capability/skill layout policy.**
-   `shMv`/`shRm` refuse operations via `underSkillInstances('/home/locus/.skills')` + `SKILL_IDENTITY_BOUNDARY_MSG` (`src/shell.js:1792-1798, 2758-2760, 2996-2999`). Blocks: Runtime knows a Product/Harness concern. Target: operation-aware mutation-policy port (source/dest/recursive) injected at environment bind (contract §3.7); refusals must stay byte-identical.
-
+5. **Shell commands embed capability/skill layout policy.** — **RESOLVED in M1b**
+   `shMv`/`shRm` refused operations via `underSkillInstances('/home/locus/.skills')` + `SKILL_IDENTITY_BOUNDARY_MSG`. Landed: `src/mutation-policy.js` (Product) owns the rules and the byte-stable refusal texts; shell.js consumes `opts.mutationPolicy` (checkMove / checkRemove / isPolicyRefusal) — a missing product policy fails the bash call loudly (contract §3.7 M1b landed rules).
 6. **Chat identities flow into Runtime network authorization.**
    `wiredToolExecutor` passes `conversationId` + `session.generation` into `executeTool` → `runCurl` → `NetworkRuntime.request(spec.policyContext)` (`src/ui/store.js:301-314`, `src/network.js` policyContext). Informational-only today (F-A34) but the field names are a chat concept inside Runtime. Target: execution-scoped authorization context (contract §3.5).
 
@@ -255,9 +256,8 @@ Each entry: **evidence** (symbol + file at `d25f30e`) → **why it blocks the sp
 9. **Product reads a Harness budget constant via global.**
    `store.buildImageUserContent` reads `HISTORY_BUDGET_BYTES` (`src/ui/store.js`, typeof guard). Target: exported getter on the session/task API.
 
-10. **Page-global single interpreter, reset from two places.**
-    `PythonRuntime` is a plain-object singleton (`src/shell.js:396`); reset by `AgentSession.onSessionReset` (store wiring, `src/ui/store.js:621`) and reconfigured per task by `preparePythonRuntimeForEnvironment` (`src/ui/store.js:139-150`). Blocks: REPOSITORY-SPLIT §4 "no hidden dependency on a single product-global interpreter". Target: Runtime instance ownership + lifecycle port (contract §3.4 answers who owns it).
-
+10. **Page-global single interpreter, reset from two places.** — **RESOLVED in M1b**
+    `PythonRuntime` was a plain-object singleton reset from `onSessionReset` and reconfigured per task by `preparePythonRuntimeForEnvironment`. Landed: `createPythonRuntime()` instance factory with an explicit prepare/run/reset/dispose/snapshot lifecycle; the Product owns the ONE canonical instance, drives prepare/reset on it and injects the SAME instance into shell execution (`opts.pythonRuntime`) — no page-global interpreter remains and preparation can never split from execution. The RuntimeHost/RuntimeSession wrapper (construction/sessions, worker-asset packaging) stays M2.
 11. **`ConversationHistoryWorkspace` reaches into a private service method.**
     `read('provider-frames.jsonl')` path uses `service._byIndex` (`src/workspace.js`). Target: public query methods on the Product persistence port.
 
@@ -271,7 +271,7 @@ Non-issues worth recording: `vfs.js` never references `SHELL_COMMANDS` directly 
 The order below sequences M1–M2 so that each step keeps the product usable and gates each change. It refines REPOSITORY-SPLIT §7 with the file-level facts above.
 
 1. **M1a — task assembly out of the store.** Move `submit/cancelTask/quiesce/persistence-context/provider-session` logic behind constructor-injected ports (files: `src/ui/store.js` → new harness-side module, still in-repo). No behavior change; `submit-presentation`, `conversation-routing`, `e2e-persistence` must stay green. Precondition: none.
-2. **M1b — interpreter lifecycle behind an explicit handle.** Replace global `PythonRuntime` access in the moved orchestration with a Runtime lifecycle object (`create/prepare/reset/dispose`, contract §3.1); `preparePythonRuntimeForEnvironment` becomes its `prepareForTask`. Skill-path policy (`shMv`/`shRm`) moves behind the mutation-policy port. Gates: skill-instances + python-plugin suites unchanged.
+2. **M1b — interpreter lifecycle behind an explicit handle.** — **DONE** on `refactor/repository-split-m1b`: `createPythonRuntime()` instances with prepare/run/reset/dispose/snapshot (contract §3.1 M1b form), the product-owned canonical instance wired through prepare/onSessionReset/executor opts; skill-path policy moved behind the mutation-policy port (`src/mutation-policy.js`). Gates: skill-instances + python-plugin suites unchanged (see [REPOSITORY-SPLIT-M1B-VERIFICATION.md](REPOSITORY-SPLIT-M1B-VERIFICATION.md)).
 3. **M2a — Runtime packaging.** Worker sources become Runtime-owned string modules; `_setStatus` becomes an event; `LOCUS_HOME_SKELETON` becomes an argument; `ConversationHistoryWorkspace` moves to Product files. Update `tests/e2e.html` extraction accordingly. Gates: full e2e (runtime + grep + python suites) green with `dist/`-served assets.
 4. **M2b — Harness port injection.** `buildSystemPrompt` consumes `describeCommands`/capability descriptions via injection; `executeTool` splits into Harness registry + Product adapter; `Telemetry` becomes an injected sink; persistence semantics (`validateReplayPrefix`/`validateNormalizedPrefix`) move behind the Harness port with Product storage adapter. Gates: new independence checks (each core's test entry loads only its own files + fakes), all unit suites green.
 5. **M3 — repository extraction** in dependency order: Runtime first (workspace/vfs/shell/network + worker assets + manifest), then Harness (agent/model/adapters/approval/extensions-composition/persistence-ports/attachments-parts), then Product adapters + lock. Precondition: M2a/M2b independence gates passing at the exact source SHA recorded for extraction.
