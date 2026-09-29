@@ -1,0 +1,66 @@
+# Repository split M2a — verification record
+
+Status: M2a deliverable (Runtime independentization). Branch `refactor/repository-split-m2a`, stacked on `refactor/repository-split-m1b` @ `83fdfbb` (PR #4 head, verified unchanged at branch creation; PRs #2 `docs/repository-split-m0` @ `57b3c5d`, #3 M1a @ `0b56922`, #4 M1b @ `83fdfbb` all OPEN — re-verified against the remote before starting; none merged). Companion documents: [REPOSITORY-SPLIT-M2A-DESIGN.md](REPOSITORY-SPLIT-M2A-DESIGN.md) (symbol-level design, written before implementation), [REPOSITORY-SPLIT-CONTRACTS.md](REPOSITORY-SPLIT-CONTRACTS.md) (§3.1/§3.5/§3.6/§3.8 M2a landed notes), [REPOSITORY-SPLIT-INVENTORY.md](REPOSITORY-SPLIT-INVENTORY.md) (couplings #1/#3/#4/#6/#7 resolved, #8 half, #11 moved, #10 wrapper landed), [REPOSITORY-SPLIT.md](REPOSITORY-SPLIT.md) (M2 status).
+
+Environment: Windows 10, Git Bash, Node v24.10.0, local Chrome via CDP; worktree `Locus-repository-split-m2a` (fresh, node_modules junction to the M1b install — unchanged lockfile). Branch base `83fdfbb`; this record covers commits `3e34ec9..HEAD`.
+
+## 1. What landed (commit by commit)
+
+| Commit | Piece |
+|---|---|
+| `3e34ec9` | M2a symbol-level design record (pre-implementation; contract deviations + reasons) |
+| `5dd1e82` | **Worker assets**: `src/runtime/worker-assets.js` (`PY_WORKER_SOURCE`, `GREP_WORKER_SOURCE`, migrated verbatim from `index.html`, CRLF normalized to LF); `createPythonRuntime({ pyWorkerSource })` (required, fail-closed), `createGrepRegexSession(pattern, flags, workerSource)` + shell `opts.grepWorkerSource`; both DOM elements deleted from `index.html`; the product passes sources in; all source-scraping suites import the asset module (`tests/helpers/runtime.cjs`); bootstrap-integrity tamper path rebuilds the instance with the swapped source, carrying the verified byte cache |
+| `5dcdf5d` | **Public entry**: `src/runtime/index.js` (`createRuntime → RuntimeHost → RuntimeSession`); status events (`onStatus`, immediate snapshot on subscribe, contained observer exceptions; `#sb-python` write + the 1s poll deleted); session-layer **prepare barrier**; `LOCUS_HOME_SKELETON` → `VirtualWorkspace({ homeSkeleton })` (neutral `['.config','.cache']` default; product passes its skeleton; `resetHome` rebuilds from the remembered skeleton); Runtime-owned payload-identity contract data (`RUNTIME_PLUGIN_ID_PATTERN`/`RUNTIME_PY_MODULE_PATTERN` in shell.js via the declared core registry; extensions.js keeps the Harness copy); `ConversationHistoryWorkspace` → `src/conversation-history-workspace.js` (Product); network.js consumes the execution-authorization PORT (`authorization`, no `policyContext`, no chat-identity fields); Product rewiring (store resolves ONE host+session through the entry; `executeTool` requires `opts.runtimeSession`; `productNetworkAuthorization` adds identity on the Product side) |
+| `4c36e96` | **Independence gates**: `tests/runtime-standalone.test.mjs` (A/C/D/F), `tests/runtime-host.html` + `tests/e2e-runtime-host.cjs` (B, a real vite build input → `dist/tests/runtime-host.html`), `tests/runtime-boundary.test.cjs` (G). Gate D's first run found a REAL defect: the session prepare registered its abort listener only after the serialization-tail await, losing a cancel that landed while waiting for an earlier prepare — fixed (cancellation plane registered synchronously at call time) |
+| `4a79c01` | **First e2e round fixes** (see §4) |
+| `7a73faa` | **Second e2e round fix** (see §4) |
+
+## 2. Gates
+
+| Command | Result | Notes |
+|---|---|---|
+| `npm test` | **PASS 48/48 suites** (46 + `runtime-standalone` + `runtime-boundary`) | every M1 suite kept, none weakened; python-lifecycle 92, mutation-policy 35, store-python-lifecycle rewritten for the session seam (SP0–SP10c, incl. the authorization-port and no-leak checks) |
+| `npm run build` | PASS | `dist/` carries the worker-asset chunks, `dist/tests/runtime-host.html`, the Product `conversation-history-workspace.js` copy; boundary gate G5 scans the dist copies |
+| `npm run test:e2e` (round 1) | 14/17 — **first failures preserved** (`tmp-e2e-run1.log`, not committed) | FAIL: runtime, runtime-host, python-bootstrap-integrity |
+| `npm run test:e2e` (round 2) | 16/17 | FAIL: runtime (W3b) only |
+| `npm run test:e2e` (round 3, final) | **PASS 17/17, exit 0** | runtime, active-content, runtime-host, presentation, responsive, persistence, wire, approval, image, grep, python-authority, capabilities, skill-instances, network, python-browser-authority, python-bootstrap-integrity, trusted-plugin-runtime — every python/plugin/skill/approval gate green on the production chain |
+
+## 3. Independence gates (brief §10 mapping)
+
+- **A** (`runtime-standalone` A1–A3d): the entry + worker-asset modules import with NO core, no DOM, no page; the core-only classic set (telemetry/workspace/vfs/network/shell) builds a host whose echo/ls/redirect work never touches Python (the document stub THROWS on any touch) — plugin payloads configure with extensions.js/persistence.js/agent.js absent from scope.
+- **B** (`e2e-runtime-host`, packaged `dist/tests/runtime-host.html`, real Chrome): cold load = ZERO CDN fetches; shell + VFS through `session.execute`; grep runs a REAL worker built from the packaged asset and the catastrophic `^(a+)+$` pattern (all-a+X input) is terminated at the hard timeout with the main-thread heartbeat intact; REAL Python boots (pinned manifest), executes and writes back through the VFS; status edges arrive as events; zero page errors. No `#py-worker-src`/`#grep-worker-src`/`#sb-python` exists on the page.
+- **C** (standalone C1–C5 + host-page C/C2): two hosts/sessions — distinct instances, instance-scoped events, filesystem-scoped executions, dispose(A) leaves B operational, disposed A refuses with its reason.
+- **D** (standalone D1–D7): prepare WAITS while an execution is in flight (no timers/polling — settlement-promise barrier); a cancel during the wait refuses cancellation-shaped; a reset during the wait refuses the pending AND the already-waiting prepare (no late configuration); the superseded run settles honestly (boundary reason, never a clean success); a fresh prepare after the boundary applies; a quiet session prepares immediately.
+- **E**: all M1 lifecycle suites retained and green (python-lifecycle 92 incl. LC8/LC9 barrier families; task-runner 99; the M1b assertions are untouched — `store-python-lifecycle` was rewritten for the new seam but every invariant it pinned is still pinned, several now through the public session).
+- **F** (standalone F–Fe): immediate snapshot on subscribe, ordered edge events, unsubscribe stops delivery, a throwing observer is contained at every delivery and never breaks the stream or cleanup.
+- **G** (`runtime-boundary` G1–G6): structural scan (comment-stripped, CRLF-normalized) of the runtime sources AND dist copies — no Harness/Product imports, no product globals (`LOCUS_HOME_SKELETON`/`EXTENSION_*`/controller names), no product DOM ids, no chat-identity field names; the Runtime/Harness payload-pattern copies are pinned EQUAL plus the byte-stable refusal message through the real configure gate; the `__LOCUS_RUNTIME_CORE__` registry is the single declared global seam. Paired with gate A's real execution (structure + behavior).
+
+## 4. First-run failures: root-caused and fixed (no assertion loosening)
+
+**Unit round (gate D)**: the session prepare's abort listener was registered only after `await prev` (the serialization tail), so a cancel landing while an EARLIER prepare still held the tail was lost and the configuration applied late. Fix: the cancellation plane (abort listener + race promise) is created synchronously at call time. Pinned by D3/D4.
+
+**e2e round 1** (14/17): all three failures were test-assembly defects, root-caused with page-side message-flow probes:
+- `runtime` (tests/e2e.html): the local executeTool wrapper still injected `pythonRuntime`/`grepWorkerSource` instead of routing through the public entry (bash now REQUIRES `opts.runtimeSession` — the honest fail-closed error is what surfaced). Wrapper rebuilt over one host+session; the inert `#sb-python` div removed.
+- `runtime-host`: assertion bugs in the NEW suite — `cat` output carries a trailing newline; the catastrophic-backtracking grep input must be the all-a-then-X shape (plain `abc` fails fast and proves nothing); after a completed run the interpreter is warm READY (the worker stays up), not cold.
+- `python-bootstrap-integrity` (E7/E7b): the page driver's `SetWorkerSource` OVERWROTE `window.__f04cWorkerSrc` — the variable E7b later restores from — so the "recovery" rebuild re-applied the STALLED source and hung. The old DOM-based driver mutated only the tag; the asset-module port changed the semantics. Fix: the variable is immutable; SetWorkerSource only rebuilds the instance (carrying the verified cache). Diagnostics were temporary page-side probes, removed before commit.
+
+**e2e round 2** (16/17): `runtime` W3b — the harness VFS no longer implicitly inherits the product home skeleton (neutral default now), so `~/.skills` didn't exist for the cwd test. Fix: the suite passes the PRODUCT skeleton explicitly (exactly the product's `LOCUS_HOME_SKELETON` argument). Suite green alone; round 3 re-ran the FULL set.
+
+**e2e round 3**: 17/17, exit 0 — the recorded gate.
+
+## 5. Real-browser verification (interactive, beyond the deterministic suites)
+
+Preview server (`vite preview`, built dist), ZCode in-app browser, real clicks/evals. Evidence retained in the session artifacts (screenshots) and summarized here:
+
+- **Standalone host page** (`/tests/runtime-host.html`): cold load — 0 CDN fetches, no product DOM, initial status snapshot delivered (`cold`); `echo > file && cat && grep -c` through the public entry (11ms); REAL Python: 12 pinned CDN assets fetched once, `cold → loading → ready` status events, `py-m2a-ok 3` printed, `/mnt/workspace/from-py.txt` written and read back through the shell; zero page errors. Screenshot with a rendered status panel (interpreter ready, event trace, cold-load zero-fetch, "no #py-worker-src / #grep-worker-src").
+- **Full product page** (`/?e2e=1`): cold load — app mounted, runtime session resolved, UI shows `Python: cold`, 0 CDN fetches, 0 console errors; product-chain Python through `session.toolExecutor` (the REAL wired executor) printed `prod-py-ok 3` and committed `/mnt/download/prod.txt`; the status UI followed the events (`loading → ready`), and after `runtime().reset()` showed `cold` (Vue projection verified after its tick); a second Python after the reset re-booted and succeeded; skill-mutation refusal keeps the byte-stable text (`mv: /home/locus/.skills/...: Skill instance paths are stable; ...`); a network POST through the product chain raised the approval card (canonical `network-write:<origin>` policyKey; the Product adapter added `conversationId`/`taskGeneration` on ITS side — the Runtime request carries none) and **Deny** produced the honest `curl: network request denied by user` with the card cleared and zero errors. Screenshots: approval card + Context rail showing `Python: ready`.
+- Not exercised interactively (covered by the deterministic gates instead): plugin enable → interpreter rebuild (trusted-plugin-runtime e2e drives REAL wheel payloads through `prepare` on the production chain; capabilities e2e drives enable/disable/mounts), persistence reload (persistence e2e 26/26).
+
+No real model keys or paid APIs were used. Pyodide assets were downloaded from the pinned CDN exactly as the production bootstrap does (disk cache reused where present).
+
+## 6. Delivered boundary (summary for review)
+
+- **Public interface**: `createRuntime({ workerAssets }) → host { contractVersion, capabilities(), createSession(), dispose() }`; `session { prepare(req), execute({ kind, input, context }), status(), onStatus(fn)→unsubscribe, reset(reason), dispose(reason), pythonRuntime() (test/e2e accessor) }`.
+- **Eliminated dependencies** (Runtime no longer has): `#py-worker-src`/`#grep-worker-src` page elements; `#sb-python` DOM write + 1s poll; `LOCUS_HOME_SKELETON` global read; `EXTENSION_ID_PATTERN`/`EXTENSION_PY_MODULE_PATTERN` global reads; `policyContext { approvals, conversationId, taskGeneration }` chat-identity shape; `ConversationHistoryWorkspace` in workspace.js; product-global execution path in executeTool.
+- **Retained intentionally**: `__LOCUS_RUNTIME_CORE__` registry (declared Runtime-internal seam, deleted at M3); classic-script packaging of the core (eval-based suite model converts at M3); `Telemetry` usage inside tools.js/executor (M2b sink injection); `agent.js` `shellSystemPromptSection` typeof-read (M2b description port).
+- **Not done (M2b/M2c/M3)**: Harness port injection, ToolPort registry/adapter split, Telemetry sink, persistence-port semantics, repository extraction. **M2a complete; M2b/M2c not started.**
