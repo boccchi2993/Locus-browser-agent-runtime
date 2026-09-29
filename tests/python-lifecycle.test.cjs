@@ -157,6 +157,9 @@ async function run() {
     try { await rt.prepare({ signal: ac.signal, python: payload('env-late') }); }
     catch (e) { cancelled = e; }
     check('LC2c a cancelled prepare is refused', !!cancelled, errText(cancelled));
+    check('LC2c2 the refusal is cancellation-shaped (AbortError, existing classification)',
+      !!cancelled && cancelled.name === 'AbortError' && cancelled.cancelled === true,
+      cancelled && cancelled.name);
     check('LC2d a cancelled apply never lands',
       rt.snapshot().extensionKey === 'env-good', JSON.stringify(rt.snapshot()));
 
@@ -436,6 +439,215 @@ async function run() {
       !!qErr && /python runtime reset/.test(errText(qErr)), errText(qErr));
     check('LC7d drained snapshot', rt.snapshot().busyExecutions === 0
       && rt.snapshot().interpreter === 'cold', JSON.stringify(rt.snapshot()));
+  }
+
+  // ===== LC8. reset/dispose invalidate the COMMIT phase (stale writeback) =====
+  // The gap this pins: once the worker has answered, a run parked at an
+  // async pre-commit VFS check used to keep committing mkdir/write/remove
+  // and could even return error:null — the boundary was only enforced
+  // BEFORE the worker post. The runtime itself must honor reset/dispose
+  // through the whole write-back (no caller-side abort is involved in any
+  // LC8 check), busyExecutions must cover the ENTIRE run lifetime, and a
+  // synchronous boundary must not masquerade as the run's settlement.
+  {
+    // Minimal provider+VFS with a barrier at ONE commit-phase vfs call.
+    // Mirror-in collection reads the PROVIDER (list/stat/readBytes on the
+    // provider object); the commit phases consult the VFS itself
+    // (stat before mkdir, readBytes for external-write/delete
+    // verification), so a barrier on the VFS never pauses collection.
+    function barrierVfs(files, authority, barrier) {
+      const enc = new TextEncoder();
+      const store = new Map(Object.keys(files).map((p) => [p, enc.encode(files[p])]));
+      const sideEffects = [];
+      let gatePromise = null, gateRelease = null;
+      const gate = () => {
+        if (!gatePromise) gatePromise = new Promise((r) => { gateRelease = r; });
+        return gatePromise;
+      };
+      const notFound = () => { const e = new Error('not found: barrier fixture'); e.name = 'NotFoundError'; throw e; };
+      const provider = {
+        list: async () => [...store.keys()].map((p) => ({ name: p.slice('/mnt/workspace/'.length), kind: 'file' })),
+        stat: async (rel) => { const b = store.get('/mnt/workspace/' + rel); return b ? { kind: 'file', size: b.length } : notFound(); },
+        readBytes: async (rel) => { const b = store.get('/mnt/workspace/' + rel); return b ? b : notFound(); },
+      };
+      const vfs = {
+        dataMounts: () => [{ root: '/mnt/workspace', provider: provider, authority: authority }],
+        resolveMount: (p) => String(p).indexOf('/mnt/workspace') === 0
+          ? { path: '/mnt/workspace', authority: authority } : null,
+        stat: async (p) => {
+          if (barrier && barrier.method === 'stat' && p === barrier.path) await gate();
+          const b = store.get(p); return b ? { kind: 'file', size: b.length } : notFound();
+        },
+        readBytes: async (p) => {
+          if (barrier && barrier.method === 'readBytes' && p === barrier.path) await gate();
+          const b = store.get(p); return b ? b : notFound();
+        },
+        exists: async (p) => store.has(p),
+        mkdir: async (p) => { sideEffects.push('mkdir ' + p); },
+        write: async (p, bytes) => { sideEffects.push('write ' + p); store.set(p, bytes); },
+        remove: async (p) => { sideEffects.push('remove ' + p); store.delete(p); },
+      };
+      return { vfs: vfs, sideEffects: sideEffects, release: () => { if (gateRelease) gateRelease(); } };
+    }
+
+    // ---- LC8-a: reset lands while the run is parked at the mkdir pre-check
+    const rtA = M.createPythonRuntime();
+    const ctlA = attachControlledWorker(rtA);
+    rtA.status = 'ready';
+    const fbA = barrierVfs({ '/mnt/workspace/in.txt': 'data' }, 'read-write',
+      { method: 'stat', path: '/mnt/workspace/newdir' });
+    const runA = rtA.run('CODE', fbA.vfs, { cwd: '/tmp' });
+    await tick();
+    check('LC8 active execution is counted while the worker holds it',
+      rtA.snapshot().busyExecutions === 1, JSON.stringify(rtA.snapshot()));
+    ctlA.resolve(ctlA.log[0].id, {
+      files: [], deleted: [], createdDirs: ['/mnt/workspace/newdir'],
+    });
+    await tick(); // parked at the async mkdir pre-check (vfs.stat)
+    check('LC8b worker answered, run still committing → busy stays 1 (not 0)',
+      rtA.snapshot().busyExecutions === 1, JSON.stringify(rtA.snapshot()));
+    rtA.reset('lc8 boundary');
+    check('LC8c synchronous invalidation does not masquerade as settlement',
+      rtA.snapshot().busyExecutions === 1, JSON.stringify(rtA.snapshot()));
+    fbA.release();
+    const outA = await runA;
+    check('LC8d the stale run performs NO mkdir after the boundary',
+      fbA.sideEffects.length === 0, JSON.stringify(fbA.sideEffects));
+    check('LC8e honest report: boundary reason + not-persisted accounting (never error:null)',
+      outA.error === 'lc8 boundary' && outA.mkdirs.length === 0
+        && outA.notPersisted.some((s) => s.indexOf('/mnt/workspace/newdir') !== -1 && s.indexOf('lc8 boundary') !== -1),
+      JSON.stringify({ error: outA.error, notPersisted: outA.notPersisted }));
+    check('LC8f the run releases its tracking exactly once at settlement',
+      rtA.snapshot().busyExecutions === 0, JSON.stringify(rtA.snapshot()));
+    // Reusable after reset: a fresh run on the next generation completes.
+    const ctlA2 = attachControlledWorker(rtA);
+    const againA = rtA.run('AGAIN', fbA.vfs, { cwd: '/tmp' });
+    await tick();
+    ctlA2.resolve(ctlA2.log[0].id, { stdout: 'ok-again' });
+    check('LC8g the instance is reusable after the boundary',
+      (await againA).stdout === 'ok-again');
+
+    // ---- LC8-b: dispose lands while parked at the write pre-check
+    // (external mount → optimistic-concurrency readBytes gate).
+    const rtB = M.createPythonRuntime();
+    const ctlB = attachControlledWorker(rtB);
+    rtB.status = 'ready';
+    const fbB = barrierVfs({ '/mnt/workspace/in.txt': 'data' }, 'external-read-write',
+      { method: 'readBytes', path: '/mnt/workspace/in.txt' });
+    const runB = rtB.run('CODE', fbB.vfs, { cwd: '/tmp' });
+    await tick();
+    ctlB.resolve(ctlB.log[0].id, {
+      files: [{ path: '/mnt/workspace/in.txt', b64: 'aGVsbG8=' }], deleted: [],
+    });
+    await tick(); // parked at detectExternalChange's readBytes
+    rtB.dispose('lc8 dispose');
+    check('LC8h dispose keeps the committing run counted until it settles',
+      rtB.snapshot().busyExecutions === 1, JSON.stringify(rtB.snapshot()));
+    fbB.release();
+    const outB = await runB;
+    check('LC8i the stale run performs NO write after dispose',
+      fbB.sideEffects.length === 0, JSON.stringify(fbB.sideEffects));
+    check('LC8j honest disposed report (reason + not-persisted, nothing written)',
+      outB.error === 'python runtime disposed: lc8 dispose' && outB.written.length === 0
+        && outB.notPersisted.some((s) => s.indexOf('/mnt/workspace/in.txt') !== -1),
+      JSON.stringify({ error: outB.error, notPersisted: outB.notPersisted }));
+    check('LC8k tracking released, disposed terminal state intact',
+      rtB.snapshot().busyExecutions === 0
+        && rtB.snapshot().disposed === 'python runtime disposed: lc8 dispose',
+      JSON.stringify(rtB.snapshot()));
+
+    // ---- LC8-c: reset lands at the delete-verification read; BOTH the
+    // pending file deletion and the directory deletion must stay unstarted.
+    const rtC = M.createPythonRuntime();
+    const ctlC = attachControlledWorker(rtC);
+    rtC.status = 'ready';
+    const fbC = barrierVfs({ '/mnt/workspace/file.txt': 'data', '/mnt/workspace/sub/x.txt': 'x' }, 'external-read-write',
+      { method: 'readBytes', path: '/mnt/workspace/file.txt' });
+    const runC = rtC.run('CODE', fbC.vfs, { cwd: '/tmp' });
+    await tick();
+    ctlC.resolve(ctlC.log[0].id, {
+      files: [], deleted: ['/mnt/workspace/file.txt'], deletedDirs: ['/mnt/workspace/sub'],
+    });
+    await tick(); // parked at the delete-phase verification readBytes
+    rtC.reset('lc8 boundary-c');
+    fbC.release();
+    const outC = await runC;
+    check('LC8l neither the file NOR the directory removal starts after the boundary',
+      fbC.sideEffects.length === 0
+        && outC.notPersisted.some((s) => s.indexOf('delete /mnt/workspace/file.txt') !== -1)
+        && outC.notPersisted.some((s) => s.indexOf('rmdir /mnt/workspace/sub') !== -1),
+      JSON.stringify({ sideEffects: fbC.sideEffects, notPersisted: outC.notPersisted }));
+    check('LC8m honest report with the boundary reason',
+      outC.error === 'lc8 boundary-c' && outC.deleted.length === 0, JSON.stringify(outC.error));
+
+    // ---- LC8-d: queued vs active are counted once each; every settle path
+    // (boundary, failure, cancellation) releases exactly once.
+    const rtD = M.createPythonRuntime();
+    const ctlD = attachControlledWorker(rtD);
+    rtD.status = 'ready';
+    const fbD = barrierVfs({ '/mnt/workspace/in.txt': 'data' }, 'read-write',
+      { method: 'stat', path: '/mnt/workspace/newdir' });
+    const runD1 = rtD.run('D1', fbD.vfs, { cwd: '/tmp' });
+    await tick();
+    ctlD.resolve(ctlD.log[0].id, { files: [], deleted: [], createdDirs: ['/mnt/workspace/newdir'] });
+    const runD2 = rtD.run('D2', null, { cwd: '/tmp' }); // queued behind the committing run
+    const runD2caught = runD2.then(() => null, (e) => e); // handler BEFORE any boundary can reject it
+    await tick();
+    check('LC8n queued + committing runs count as TWO (no double counting, no drop)',
+      rtD.snapshot().busyExecutions === 2, JSON.stringify(rtD.snapshot()));
+    rtD.reset('lc8 boundary-d');
+    check('LC8o boundary does not falsify either count',
+      rtD.snapshot().busyExecutions === 2, JSON.stringify(rtD.snapshot()));
+    fbD.release();
+    const outD1 = await runD1;
+    const errD2 = await runD2caught;
+    check('LC8p both stale runs settle honestly (report + rejection) and release once',
+      outD1.error === 'lc8 boundary-d' && !!errD2 && /lc8 boundary-d/.test(errText(errD2))
+        && rtD.snapshot().busyExecutions === 0,
+      JSON.stringify({ out: outD1.error, queued: errText(errD2), busy: rtD.snapshot().busyExecutions }));
+
+    // A failing run (worker error) releases its tracking too.
+    const rtD2 = M.createPythonRuntime();
+    const ctlD2 = attachControlledWorker(rtD2);
+    rtD2.status = 'ready';
+    const failRun = rtD2.run('FAIL', null, { cwd: '/tmp' });
+    await tick();
+    ctlD2.resolve(ctlD2.log[0].id, { stdout: '', error: 'python exploded' });
+    const outFail = await failRun;
+    check('LC8q a failing run settles with the error and releases once',
+      outFail.error === 'python exploded' && rtD2.snapshot().busyExecutions === 0,
+      JSON.stringify({ error: outFail.error, busy: rtD2.snapshot().busyExecutions }));
+
+    // A task-signal cancellation releases its tracking too.
+    const rtD3 = M.createPythonRuntime();
+    const ctlD3 = attachControlledWorker(rtD3);
+    rtD3.status = 'ready';
+    const acD3 = new AbortController();
+    const cancelRun = rtD3.run('CANCEL', null, { cwd: '/tmp', signal: acD3.signal });
+    const cancelCaught = cancelRun.then(() => null, (e) => e);
+    await tick();
+    acD3.abort();
+    const errD3 = await cancelCaught;
+    check('LC8r a cancelled run settles and releases once',
+      !!errD3 && rtD3.snapshot().busyExecutions === 0,
+      errText(errD3) + ' | ' + JSON.stringify(rtD3.snapshot()));
+
+    // ---- LC8-e: an in-flight run whose worker NEVER answers is failed by
+    // the boundary (provider operation already dispatched — no rollback,
+    // but also no continuation, and never reported as success).
+    const rtE = M.createPythonRuntime();
+    attachControlledWorker(rtE);
+    rtE.status = 'ready';
+    const runE = rtE.run('NEVER-ANSWERS', null, { cwd: '/tmp' });
+    await tick();
+    check('LC8s the in-flight run is counted at the worker boundary',
+      rtE.snapshot().busyExecutions === 1, JSON.stringify(rtE.snapshot()));
+    rtE.reset('lc8 boundary-e');
+    const outE = await runE;
+    check('LC8t the boundary fails the dispatched-but-unanswered run honestly',
+      outE.error === 'lc8 boundary-e' && outE.written.length === 0
+        && rtE.snapshot().busyExecutions === 0,
+      JSON.stringify({ error: outE.error, busy: rtE.snapshot().busyExecutions }));
   }
 
   console.log('\n' + passed + ' passed, ' + failed + ' failed');

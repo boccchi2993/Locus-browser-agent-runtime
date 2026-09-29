@@ -453,8 +453,18 @@ function createPythonRuntime() {
   // tail of the run chain; every run() call appends one exclusive turn.
   _queue: Promise.resolve(),
   // Queued-but-unstarted runs, drainable by reset() (a session boundary
-  // must not let a pre-reset run execute on a post-reset worker).
+  // must not let a pre-reset run execute on a post-reset worker). A
+  // reset/dispose only MARKS these entries killed: each entry stays
+  // counted until its run's promise actually settles — a synchronous
+  // boundary must never masquerade as the run's settlement.
   _queuedRuns: new Set(),
+  // ACTIVE runs: every execution between seat acquisition and final
+  // settlement — boot, mirror collection, worker execution AND the whole
+  // commit/write-back phase. busyExecutions = queued + active, so the
+  // count returns to zero only when runs truly settle. Entries are
+  // released exactly once, in the run's own finally — never by
+  // reset()/dispose() themselves.
+  _activeRuns: new Set(),
   // Capability Composition v1: the python extension payload for the
   // NEXT boot ({ key, modules: [{ pluginId, files, imports }] }),
   // configured by the trusted harness from the frozen TaskEnvironment
@@ -776,7 +786,10 @@ function createPythonRuntime() {
     if (this._disposed) throw new Error(this._disposed);
     const signal = req && req.signal;
     if (signal && signal.aborted) {
-      throw new Error('python preparation cancelled' + (signal.reason ? ': ' + signal.reason : ''));
+      // Cancellation-shaped (AbortError): the caller's existing
+      // cancellation classification must read this refusal as a
+      // cancellation, never as an independent prepare error.
+      throw makeCancelledError('python preparation');
     }
     const wanted = req && req.python ? req.python.key : null;
     if (this.extensionKey() === wanted) return { rebuiltInterpreter: false };
@@ -803,11 +816,14 @@ function createPythonRuntime() {
     if (this.worker || this._pending.size) {
       this._killWorker(why);
     }
+    // Queued runs are MARKED killed but stay counted until their promises
+    // actually settle at their next boundary: a synchronous dispose must
+    // not masquerade as those runs' settlement (busyExecutions stays the
+    // honest "not yet settled" signal for callers like the storage gate).
     for (const entry of this._queuedRuns) {
       entry.killed = true;
       entry.reason = why;
     }
-    this._queuedRuns.clear();
     this._disposed = why;
   },
 
@@ -817,7 +833,7 @@ function createPythonRuntime() {
   snapshot() {
     return {
       interpreter: this.status,
-      busyExecutions: this._pending.size + this._queuedRuns.size,
+      busyExecutions: this._queuedRuns.size + this._activeRuns.size,
       extensionKey: this.extensionKey(),
       disposed: this._disposed,
     };
@@ -840,11 +856,14 @@ function createPythonRuntime() {
     // boundary. Timeouts, cancellations and worker crashes kill the worker
     // but deliberately do NOT drain — the next queued run proceeds on a
     // fresh worker (its own timer starts when it gets the seat).
+    // The drain MARKS entries killed; each stays counted until its own
+    // promise settles (the throw in run()) — reset() never releases a
+    // caller's run tracking itself, so busyExecutions cannot claim the
+    // run settled before it actually did.
     for (const entry of this._queuedRuns) {
       entry.killed = true;
       entry.reason = why;
     }
-    this._queuedRuns.clear();
   },
 
   // Current extension key of the configured python runtime (null =
@@ -967,10 +986,14 @@ function createPythonRuntime() {
     const entry = { killed: false, reason: null };
     this._queuedRuns.add(entry);
     const gen = this._resetGeneration;
-    const turn = this._queue.then(() => {
-      // Seat acquired. delete() returning false means reset() drained this
-      // entry while it was queued — the session boundary already won.
-      if (!this._queuedRuns.delete(entry)) {
+    const turn = this._queue.then(async () => {
+      // Seat acquired (or the entry was drained while queued — delete is
+      // idempotent either way). A killed entry belongs to a superseded
+      // generation: the boundary already won and this run must not start.
+      // The entry still releases its own tracking HERE — the boundary only
+      // marked it; the run settles itself.
+      this._queuedRuns.delete(entry);
+      if (entry.killed) {
         throw new Error(entry.reason || this._resetReason || 'python runtime reset (session boundary)');
       }
       // The boundary may also land AFTER the seat was taken but before the
@@ -979,7 +1002,17 @@ function createPythonRuntime() {
       if (gen !== this._resetGeneration) {
         throw new Error(this._resetReason || 'python runtime reset (session boundary)');
       }
-      return this._runOnce(code, vfs, opts, gen);
+      // ACTIVE for the run's WHOLE remaining lifetime — boot, collection,
+      // worker execution and the commit/write-back phase alike — and
+      // released exactly once when the run settles. reset()/dispose() do
+      // NOT touch this set: a synchronous boundary invalidates the run
+      // but never masquerades as its settlement.
+      this._activeRuns.add(entry);
+      try {
+        return await this._runOnce(code, vfs, opts, gen);
+      } finally {
+        this._activeRuns.delete(entry);
+      }
     });
     // A failed or killed run must not poison the callers queued behind it;
     // the chain always advances, so timeouts/cancellations/releases cannot
@@ -995,8 +1028,13 @@ function createPythonRuntime() {
   // opts.signal (optional AbortSignal) cancels the run: cancellation is
   // checked before starting, during mount collection, after the worker
   // reply, after EVERY async pre-check and before EVERY commit side effect.
-  // Commits already finished are not rolled back — the result reports
-  // exactly what committed and what never ran.
+  // A reset()/dispose() boundary is enforced with the same SHAPE (before
+  // the worker post, after the reply, and before every mkdir/write/remove/
+  // rmdir): once the run's generation is superseded, no further VFS side
+  // effect starts. Operations ALREADY handed to the provider (a worker run
+  // in flight, a commit call in flight) cannot be rolled back — the run
+  // waits for their settlement, reports exactly what committed and what
+  // never ran, and never presents a boundary-stopped run as a success.
   // Returns {
   //   stdout, stderr, error,            — compute outcome
   //   written, deleted,                 — ABS paths actually committed (deleted covers files AND directories)
@@ -1015,6 +1053,31 @@ function createPythonRuntime() {
     // rather than generic write failures. No policy = no refusals.
     const policy = opts && opts.mutationPolicy;
     const isRefusal = (e) => !!(policy && typeof policy.isPolicyRefusal === 'function' && policy.isPolicyRefusal(e));
+    // Boundary invalidation for THIS run: a reset()/dispose() that landed
+    // at any await since the run started. Checked before the worker post
+    // (never reach the next generation's interpreter), again once the
+    // worker answers, and before EVERY commit side effect — a run whose
+    // generation already ended must not write stale state back.
+    const invalidated = () => {
+      if (this._disposed) return this._disposed;
+      if (expectedGeneration !== undefined && expectedGeneration !== this._resetGeneration) {
+        return this._resetReason || 'python runtime reset (session boundary)';
+      }
+      return null;
+    };
+    // Commit-phase stop decision: the task signal (cancellation — existing
+    // semantics and texts) or a runtime boundary (reason as the text).
+    // Returns the notPersisted entry, or null when the commit may proceed.
+    let boundaryStop = null; // first boundary reason that stopped a commit
+    const runStopped = (label, cancelledAs) => {
+      if (signal && signal.aborted) return label + ' (' + cancelledAs + ')';
+      const why = invalidated();
+      if (why) {
+        if (!boundaryStop) boundaryStop = why;
+        return label + ' (' + why + ')';
+      }
+      return null;
+    };
     await this._ensureWorker(signal, opts && opts.bootstrapBudgets);
     throwIfCancelled(signal, 'python execution');
 
@@ -1065,9 +1128,8 @@ function createPythonRuntime() {
     // landed while this run was suspended in the boot/mirror awaits
     // invalidates it here — it must never reach the (possibly replaced)
     // interpreter of the next generation.
-    if (expectedGeneration !== undefined && expectedGeneration !== this._resetGeneration) {
-      throw new Error(this._resetReason || 'python runtime reset (session boundary)');
-    }
+    const prePostInvalid = invalidated();
+    if (prePostInvalid) throw new Error(prePostInvalid);
     const id = ++this._reqId;
     const onAbort = () => this._killWorker('python execution cancelled');
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
@@ -1088,6 +1150,14 @@ function createPythonRuntime() {
       if (signal) signal.removeEventListener('abort', onAbort);
     }
     throwIfCancelled(signal, 'python execution');
+    // The worker answered, but a boundary may have landed while this run
+    // was suspended at the reply await: if the boundary itself did not
+    // already fail the reply (_failAllPending puts its reason in
+    // result.error), record it so NOTHING from this changeset commits and
+    // the final report carries the boundary as its error — a run of a
+    // superseded generation is never presented as a clean success.
+    const postReplyInvalid = invalidated();
+    if (postReplyInvalid && !result.error) boundaryStop = postReplyInvalid;
 
     const skippedSet = new Set(skipped.map((s) => s.path));
     const uncollected = result.uncollectedFiles || [];
@@ -1110,8 +1180,9 @@ function createPythonRuntime() {
     // already occupied by a FILE is a loud refusal — file↔directory type
     // changes are never half-applied.
     for (const d of createdDirs) {
-      if (signal && signal.aborted) {
-        notPersisted.push('mkdir ' + d + ' (cancelled before commit)');
+      const stopD = runStopped('mkdir ' + d, 'cancelled before commit');
+      if (stopD) {
+        notPersisted.push(stopD);
         continue;
       }
       const mount = vfs && typeof vfs.resolveMount === 'function' ? vfs.resolveMount(d) : null;
@@ -1140,9 +1211,11 @@ function createPythonRuntime() {
         conflicts.push({ path: d, reason: 'a file exists at this path; file→directory type changes are not committed' });
         continue;
       }
-      // The stat above awaited: re-check cancellation BEFORE the side effect.
-      if (signal && signal.aborted) {
-        notPersisted.push('mkdir ' + d + ' (cancelled before commit)');
+      // The stat above awaited: re-check cancellation AND boundary
+      // validity BEFORE the side effect.
+      const stopD2 = runStopped('mkdir ' + d, 'cancelled before commit');
+      if (stopD2) {
+        notPersisted.push(stopD2);
         continue;
       }
       try {
@@ -1163,8 +1236,9 @@ function createPythonRuntime() {
     // never touched), external mounts keep the optimistic-concurrency
     // check, internal mounts write straight through.
     for (const f of outFiles) {
-      if (signal && signal.aborted) {
-        notPersisted.push(f.path + ' (cancelled before write)');
+      const stopF = runStopped(f.path, 'cancelled before write');
+      if (stopF) {
+        notPersisted.push(stopF);
         continue;
       }
       const mount = vfs && typeof vfs.resolveMount === 'function' ? vfs.resolveMount(f.path) : null;
@@ -1202,10 +1276,11 @@ function createPythonRuntime() {
           continue;
         }
       }
-      // The pre-check awaited: cancellation may have landed meanwhile.
-      // Re-check BEFORE the side effect, not just at the loop top.
-      if (signal && signal.aborted) {
-        notPersisted.push(f.path + ' (cancelled before write)');
+      // The pre-check awaited: cancellation or a boundary may have landed
+      // meanwhile. Re-check BEFORE the side effect, not just at the loop top.
+      const stopF2 = runStopped(f.path, 'cancelled before write');
+      if (stopF2) {
+        notPersisted.push(stopF2);
         continue;
       }
       try {
@@ -1230,8 +1305,9 @@ function createPythonRuntime() {
     const deletesBlocked = writeFailed.length > 0 || conflicts.length > 0 || uncollected.length > 0;
     if (result.deleted && result.deleted.length && !deletesBlocked) {
       for (const p of result.deleted) {
-        if (signal && signal.aborted) {
-          notPersisted.push('delete ' + p + ' (cancelled before commit)');
+        const stopDel = runStopped('delete ' + p, 'cancelled before commit');
+        if (stopDel) {
+          notPersisted.push(stopDel);
           continue;
         }
         const mount = vfs && typeof vfs.resolveMount === 'function' ? vfs.resolveMount(p) : null;
@@ -1263,9 +1339,11 @@ function createPythonRuntime() {
             continue;
           }
         }
-        // Verification awaited: re-check cancellation BEFORE removing.
-        if (signal && signal.aborted) {
-          notPersisted.push('delete ' + p + ' (cancelled before commit)');
+        // Verification awaited: re-check cancellation AND boundary
+        // validity BEFORE removing.
+        const stopDel2 = runStopped('delete ' + p, 'cancelled before commit');
+        if (stopDel2) {
+          notPersisted.push(stopDel2);
           continue;
         }
         try {
@@ -1291,8 +1369,9 @@ function createPythonRuntime() {
     const dirDeletesBlocked = deletesBlocked || writeFailed.length > 0 || conflicts.length > 0;
     if (deletedDirs.length && !dirDeletesBlocked) {
       for (const p of deletedDirs) {
-        if (signal && signal.aborted) {
-          notPersisted.push('rmdir ' + p + ' (cancelled before commit)');
+        const stopRd = runStopped('rmdir ' + p, 'cancelled before commit');
+        if (stopRd) {
+          notPersisted.push(stopRd);
           continue;
         }
         if (vfs && typeof vfs.isProtectedRoot === 'function' && vfs.isProtectedRoot(p)) {
@@ -1313,6 +1392,14 @@ function createPythonRuntime() {
         }
         // A directory that still holds unsynced files is not empty — the
         // provider refuses the removal and the failure is reported below.
+        // No async pre-check precedes this side effect on internal mounts,
+        // so this validity check IS the boundary gate: a run of a
+        // superseded generation must never remove directories.
+        const stopRd2 = runStopped('rmdir ' + p, 'cancelled before commit');
+        if (stopRd2) {
+          notPersisted.push(stopRd2);
+          continue;
+        }
         try {
           await vfs.remove(p);
           deleted.push(p);
@@ -1332,7 +1419,9 @@ function createPythonRuntime() {
     return {
       stdout: result.stdout || '',
       stderr: result.stderr || '',
-      error: result.error || null,
+      // A boundary that stopped the commits is the run's honest error even
+      // when the compute itself succeeded — never a clean success report.
+      error: result.error || boundaryStop || null,
       written,
       mkdirs,
       deleted,
