@@ -86,6 +86,13 @@
     const wsRaw = new MemWS({ 'sales.csv': 'name,revenue,cost\nA,100,40\nB,200,80\nC,300,120\n' });
     const ws = mkVfs(wsRaw);
 
+    // M1b: the shell executes python on an INJECTED interpreter instance
+    // (what the product wiring does). This local wrapper shadows the global
+    // executeTool and adds the instance to every bash call; the reset/worker
+    // assertions below drive the SAME instance.
+    const pyRuntime = createPythonRuntime();
+    const executeTool = (name, input, wsArg, opts) => window.executeTool(name, input, wsArg, Object.assign({ pythonRuntime: pyRuntime }, opts || {}));
+
     // ---------- existing smoke: ls / cat / unsupported / cloud ----------
     check('smoke ls', (await executeTool('bash', 'ls', ws)).output === 'sales.csv');
     check('smoke cat', (await executeTool('bash', 'cat sales.csv', ws)).output.includes('A,100,40'));

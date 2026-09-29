@@ -104,7 +104,7 @@ function buildPage(shellUrl, workerSrc, localAssets, wheelB64, wheelSha, wheelSi
     + '__el.textContent = ' + JSON.stringify(workerSrc) + ';'
     + 'document.head.appendChild(__el);'
     + 'window.__tpr = { ready: true, configError: null };'
-    + 'window.__pyrt = window.__locus.pythonRuntime();'
+    + 'window.__pyrt = createPythonRuntime();' // standalone harness page: own instance from the shell.js factory
     + 'function wheelBytes(tamper) {'
     + '  var bin = atob(' + JSON.stringify(wheelB64) + ');'
     + '  var bytes = new Uint8Array(bin.length);'

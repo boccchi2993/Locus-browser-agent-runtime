@@ -470,8 +470,10 @@ async function main() {
 
     // dist freshness assertion (classic scripts are copied, not bundled)
     const distShell = await fs.readFile(path.join(ROOT, 'dist', 'src', 'shell.js'), 'utf8');
-    check('R3 built dist carries the current runtime (fresh shell.js in dist/src)',
-      distShell.includes('Skill instance paths are stable'));
+    const distPolicy = await fs.readFile(path.join(ROOT, 'dist', 'src', 'mutation-policy.js'), 'utf8');
+    check('R3 built dist carries the current runtime (policy in dist/src, shell.js clean of product rules)',
+      distPolicy.includes('Skill instance paths are stable')
+        && !distShell.includes('Skill instance paths are stable'));
     await evaluate(cdp, 'window.__locus.store.settingsOpen = false; "closed"');
   } catch (e) {
     console.error(e && e.stack || e);

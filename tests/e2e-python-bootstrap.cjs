@@ -89,7 +89,7 @@ function buildPage(shellUrl, workerSrc, localAssets) {
     + '__el.textContent = ' + JSON.stringify(workerSrc) + ';'
     + 'document.head.appendChild(__el);'
     + 'window.__f04c = { ready: true };'
-    + 'window.__pyrt = window.__locus.pythonRuntime();'
+    + 'window.__pyrt = createPythonRuntime();' // standalone harness page: own instance from the shell.js factory
     + 'window.__f04cWorkerSrc = document.getElementById("py-worker-src").textContent;'
     + 'window.__f04cSetWorkerSource = function (t) { document.getElementById("py-worker-src").textContent = t; };'
     + 'window.__f04cRun = function (code, opts) {'
