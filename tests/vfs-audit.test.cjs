@@ -25,7 +25,7 @@ const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js',
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
 const M = eval(src + '\n;({ WorkspaceAdapter, MemoryWorkspace, normalizeWorkspacePath, VirtualWorkspace,'
-  + ' PythonRuntime, SHELL_COMMANDS, NetworkRuntime, runShellCommand, executeTool });');
+  + ' createPythonRuntime, SHELL_COMMANDS, NetworkRuntime, runShellCommand, executeTool });');
 
 function bareVfs(withWorkspace) {
   const vfs = new M.VirtualWorkspace({ listCommands: () => Object.keys(M.SHELL_COMMANDS) });
@@ -38,15 +38,21 @@ function bareVfs(withWorkspace) {
 const bytesEq = (u8, arr) => !!u8 && u8.byteLength === arr.length && arr.every((b, i) => u8[i] === b);
 const hexPrefix = (u8, n) => Array.from((u8 || []).slice(0, n)).join(',');
 
+// M1b: python runs on an INJECTED interpreter instance (what the product
+// wiring does). One suite instance; every bash call gets it via opts.
+const pyrt = M.createPythonRuntime();
+const rawExecuteTool = M.executeTool;
+M.executeTool = (name, input, ws, opts) => rawExecuteTool(name, input, ws, Object.assign({ pythonRuntime: pyrt }, opts || {}));
+
 // ---------- python worker stub (main-thread commit tests) ----------
 function mockWorkerResult(result) {
-  M.PythonRuntime._ensureWorker = () => {};
-  M.PythonRuntime.worker = {
+  pyrt._ensureWorker = () => {};
+  pyrt.worker = {
     postMessage(msg) {
-      const p = M.PythonRuntime._pending.get(msg.id);
+      const p = pyrt._pending.get(msg.id);
       queueMicrotask(() => {
         clearTimeout(p.timer);
-        M.PythonRuntime._pending.delete(msg.id);
+        pyrt._pending.delete(msg.id);
         p.resolve(result);
       });
     },
@@ -55,14 +61,14 @@ function mockWorkerResult(result) {
 // Same stub, but also captures every message sent to the worker.
 function captureWorker(result) {
   const msgs = [];
-  M.PythonRuntime._ensureWorker = () => {};
-  M.PythonRuntime.worker = {
+  pyrt._ensureWorker = () => {};
+  pyrt.worker = {
     postMessage(msg) {
       msgs.push(msg);
-      const p = M.PythonRuntime._pending.get(msg.id);
+      const p = pyrt._pending.get(msg.id);
       queueMicrotask(() => {
         clearTimeout(p.timer);
-        M.PythonRuntime._pending.delete(msg.id);
+        pyrt._pending.delete(msg.id);
         p.resolve(result);
       });
     },

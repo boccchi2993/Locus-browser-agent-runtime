@@ -393,7 +393,46 @@ function validateWheelArtifact(pluginId, wheel) {
   return { filename: filename, format: 'python-wheel', size: wheel.size, sha256: wheel.sha256, bytes: copy };
 }
 
-const PythonRuntime = {
+// M1b (repository split): the interpreter is an INSTANCE, not a page-global
+// singleton. createPythonRuntime() builds one interpreter with ALL of its
+// mutable state owned per instance: the worker facade, boot promise and
+// timers, pending-request map, request sequence, execution queue, plugin
+// payload set and the disposed flag. Two instances share nothing mutable —
+// resetting or disposing one can never touch another (pinned by
+// tests/python-lifecycle.test.cjs).
+//
+// Explicitly shared across instances (all immutable or stateless): the
+// frozen PYTHON_BOOTSTRAP_MANIFEST, the budget constants/clocks, the
+// py-creator document and every helper in this file. The VERIFIED ASSET
+// CACHE (_assets) is intentionally PER INSTANCE: it holds verified bytes
+// for this interpreter’s boots only; sharing it across instances would
+// re-couple lifecycles that M1b exists to separate.
+//
+// Lifecycle (contract docs/REPOSITORY-SPLIT-CONTRACTS.md §3.1, M1b form):
+//   prepare(req)  — between tasks: compare the wanted plugin payload with
+//                    the configured one; validate-then-swap (all-or-nothing,
+//                    never boots, never fetches). Returns
+//                    { rebuiltInterpreter }.
+//   run(code, vfs, opts) — the execution port (serialized queue, mirrors,
+//                    commit phases unchanged).
+//   reset(reason) — session/rebuild boundary: invalidates the in-flight
+//                    boot, pending requests and queued runs SYNCHRONOUSLY.
+//                    reset() returns immediately — an abort’s effect on a
+//                    caller’s in-flight run() promise lands at that run’s
+//                    next await boundary, not inside reset() itself. The
+//                    instance stays reusable afterwards.
+//   dispose(reason) — terminal: everything reset does, plus permanent
+//                    refusal of prepare/run/configureExtensions. Idempotent.
+//                    Late worker messages cannot revive the instance (the
+//                    creator iframe is gone; the disposed flag blocks new
+//                    work).
+//   snapshot()    — canonical state read for callers outside the runtime.
+//
+// The product keeps ONE active instance per page and keeps lazy boot: a
+// text-only task constructs the instance object but never creates a
+// worker, downloads assets or starts Pyodide.
+function createPythonRuntime() {
+  const rt = {
   worker: null, // facade over the creator-relayed worker (null = cold)
   status: 'cold', // cold | loading | ready
   _reqId: 0,
@@ -414,8 +453,18 @@ const PythonRuntime = {
   // tail of the run chain; every run() call appends one exclusive turn.
   _queue: Promise.resolve(),
   // Queued-but-unstarted runs, drainable by reset() (a session boundary
-  // must not let a pre-reset run execute on a post-reset worker).
+  // must not let a pre-reset run execute on a post-reset worker). A
+  // reset/dispose only MARKS these entries killed: each entry stays
+  // counted until its run's promise actually settles — a synchronous
+  // boundary must never masquerade as the run's settlement.
   _queuedRuns: new Set(),
+  // ACTIVE runs: every execution between seat acquisition and final
+  // settlement — boot, mirror collection, worker execution AND the whole
+  // commit/write-back phase. busyExecutions = queued + active, so the
+  // count returns to zero only when runs truly settle. Entries are
+  // released exactly once, in the run's own finally — never by
+  // reset()/dispose() themselves.
+  _activeRuns: new Set(),
   // Capability Composition v1: the python extension payload for the
   // NEXT boot ({ key, modules: [{ pluginId, files, imports }] }),
   // configured by the trusted harness from the frozen TaskEnvironment
@@ -427,6 +476,18 @@ const PythonRuntime = {
   // installed after the declared package set, and fail the boot
   // closed when broken.
   _extensions: null,
+  // Terminal state (dispose()): the disposal reason, or null while the
+  // instance accepts work. Permanent — there is no un-dispose.
+  _disposed: null,
+  // Reset generation: bumped by EVERY reset()/dispose(). A queued run
+  // captures the generation at call time and re-checks it after the seat
+  // is taken and again before the worker post, so a boundary that lands
+  // while a run is suspended between seat and post still invalidates it
+  // (the drained-set alone cannot see runs that already left the queue).
+  _resetGeneration: 0,
+  // The reason carried by the latest reset/dispose, used as the
+  // invalidation error for runs caught by the generation check.
+  _resetReason: null,
 
   // Everything below runs in the TRUSTED harness phase: creator iframe
   // spawn, verified asset acquisition, bootstrap delivery, lock
@@ -438,6 +499,7 @@ const PythonRuntime = {
   // which phase failed. A failure tears the whole stack down so the next
   // run rebuilds from scratch (verified assets stay cached).
   async _ensureWorker(signal, budgets) {
+    if (this._disposed) throw new Error(this._disposed);
     if (this.worker) return;
     throwIfCancelled(signal, 'python execution');
     this._setStatus('loading');
@@ -696,25 +758,112 @@ const PythonRuntime = {
     this._setStatus('cold');
   },
 
+  // ---- M1b lifecycle: prepare ----
+  // Between-task configuration point. Compares the wanted python plugin
+  // payload with the configured one and reconfigures ONLY on a key change.
+  // This is pure configuration work: it never creates the creator iframe,
+  // never spawns a worker, never downloads an asset — the interpreter
+  // stays lazily booted and a text-only task performs zero Python asset
+  // acquisition. A no-change prepare (same key) touches nothing: no reset,
+  // no reconfiguration, no interpreter churn.
+  //
+  // All-or-nothing: the new payload is validated (the exact
+  // configureExtensions shape gates) BEFORE the old interpreter is torn
+  // down, so a validation failure leaves the previously configured payload
+  // fully intact — never a half-applied reset with no payload.
+  //
+  // Synchronous by construction: there is no await between the comparison,
+  // validation, teardown and commit, so a stale or cancelled caller can
+  // never interleave — a late apply cannot overwrite a newer task’s
+  // configuration. An already-aborted req.signal is refused before any
+  // state changes. Returns { rebuiltInterpreter: boolean }.
+  //
+  // Caller contract: prepare runs BETWEEN tasks. A key change tears down
+  // the configured interpreter (reset), which would kill an in-flight
+  // execution — waiting for in-flight work is the harness task runner’s
+  // admission + storage-mutation quiesce gate’s job, not prepare’s.
+  prepare(req) {
+    if (this._disposed) throw new Error(this._disposed);
+    const signal = req && req.signal;
+    if (signal && signal.aborted) {
+      // Cancellation-shaped (AbortError): the caller's existing
+      // cancellation classification must read this refusal as a
+      // cancellation, never as an independent prepare error.
+      throw makeCancelledError('python preparation');
+    }
+    const wanted = req && req.python ? req.python.key : null;
+    if (this.extensionKey() === wanted) return { rebuiltInterpreter: false };
+    // Validate + stage the new payload BEFORE tearing anything down.
+    const staged = wanted === null ? null : this.buildExtensions(req.python);
+    this.reset('python runtime reset (interpreter rebuilt for a changed plugin set)');
+    this._extensions = staged;
+    return { rebuiltInterpreter: true };
+  },
+
+  // ---- M1b lifecycle: dispose ----
+  // Terminal teardown for page teardown / runtime replacement. Everything
+  // reset() does (invalidate boot, pending requests, queued runs) plus a
+  // permanent refusal of prepare/run/configureExtensions. IDEMPOTENT: a
+  // second dispose keeps the FIRST reason and does not throw. Late worker
+  // messages cannot revive the instance: the creator iframe is destroyed
+  // (so _onWindowMessage drops everything) and the disposed flag blocks
+  // new work.
+  dispose(reason) {
+    const why = this._disposed || ('python runtime disposed' + (reason ? ': ' + reason : ''));
+    this._resetReason = why;
+    this._resetGeneration++;
+    this._failBoot(makeCancelledError(why));
+    if (this.worker || this._pending.size) {
+      this._killWorker(why);
+    }
+    // Queued runs are MARKED killed but stay counted until their promises
+    // actually settle at their next boundary: a synchronous dispose must
+    // not masquerade as those runs' settlement (busyExecutions stays the
+    // honest "not yet settled" signal for callers like the storage gate).
+    for (const entry of this._queuedRuns) {
+      entry.killed = true;
+      entry.reason = why;
+    }
+    this._disposed = why;
+  },
+
+  // ---- M1b lifecycle: state reads ----
+  // Canonical snapshot for callers outside the runtime (UI status,
+  // harness adapters, tests). No internal Maps/Sets are exposed.
+  snapshot() {
+    return {
+      interpreter: this.status,
+      busyExecutions: this._queuedRuns.size + this._activeRuns.size,
+      extensionKey: this.extensionKey(),
+      disposed: this._disposed,
+    };
+  },
+
   // Session boundary: drop the entire interpreter (globals, imported
   // modules, /tmp files, pending state). Called on workspace switch and
   // on explicit session reset so no Python state leaks across sessions.
-  reset() {
+  reset(reason) {
+    const why = reason || 'python runtime reset (session boundary)';
+    this._resetReason = why;
+    this._resetGeneration++;
     // An in-flight bootstrap belongs to the dying session: abort its
     // acquisition (verified assets stay cached - they are stateless bytes).
-    this._failBoot(makeCancelledError('python runtime reset (session boundary)'));
+    this._failBoot(makeCancelledError(why));
     if (this.worker || this._pending.size) {
-      this._killWorker('python runtime reset (session boundary)');
+      this._killWorker(why);
     }
     // Drain queued-but-unstarted runs too: the boundary is the queue's
     // boundary. Timeouts, cancellations and worker crashes kill the worker
     // but deliberately do NOT drain — the next queued run proceeds on a
     // fresh worker (its own timer starts when it gets the seat).
+    // The drain MARKS entries killed; each stays counted until its own
+    // promise settles (the throw in run()) — reset() never releases a
+    // caller's run tracking itself, so busyExecutions cannot claim the
+    // run settled before it actually did.
     for (const entry of this._queuedRuns) {
       entry.killed = true;
-      entry.reason = 'python runtime reset (session boundary)';
+      entry.reason = why;
     }
-    this._queuedRuns.clear();
   },
 
   // Current extension key of the configured python runtime (null =
@@ -741,11 +890,8 @@ const PythonRuntime = {
   //    Every invariant a worker cannot be trusted to catch is enforced
   //    HERE: a metadata/bytes disagreement is a trusted-harness bug and
   //    must fail before the boot send, never inside the interpreter.
-  configureExtensions(ext) {
-    if (ext === null || ext === undefined) {
-      this._extensions = null;
-      return;
-    }
+  buildExtensions(ext) {
+    if (ext === null || ext === undefined) return null;
     if (!ext || typeof ext !== 'object' || typeof ext.key !== 'string' || !ext.key
         || !Array.isArray(ext.modules)) {
       throw new Error('PythonRuntime.configureExtensions: invalid extension payload');
@@ -801,7 +947,16 @@ const PythonRuntime = {
       }
       return Object.freeze({ pluginId: m.pluginId, files: files, imports: m.imports.slice() });
     });
-    this._extensions = Object.freeze({ key: ext.key, modules: Object.freeze(modules) });
+    return Object.freeze({ key: ext.key, modules: Object.freeze(modules) });
+  },
+
+  // Configure the extension payload for FUTURE boots (trusted harness
+  // only). Thin assign over buildExtensions — kept as the compatibility
+  // entry for direct payload setters; the task path uses prepare(), which
+  // stages the payload before any teardown. Refuses a disposed instance.
+  configureExtensions(ext) {
+    if (this._disposed) throw new Error(this._disposed);
+    this._extensions = this.buildExtensions(ext);
   },
 
   _failAllPending(errorMessage) {
@@ -827,15 +982,37 @@ const PythonRuntime = {
   // See _runOnce for the per-run contract. opts.bootstrapBudgets is a
   // TEST-ONLY seam shrinking the bootstrap budgets (never used in prod).
   async run(code, vfs, opts) {
+    if (this._disposed) throw new Error(this._disposed);
     const entry = { killed: false, reason: null };
     this._queuedRuns.add(entry);
-    const turn = this._queue.then(() => {
-      // Seat acquired. delete() returning false means reset() drained this
-      // entry while it was queued — the session boundary already won.
-      if (!this._queuedRuns.delete(entry)) {
-        throw new Error(entry.reason || 'python runtime reset (session boundary)');
+    const gen = this._resetGeneration;
+    const turn = this._queue.then(async () => {
+      // Seat acquired (or the entry was drained while queued — delete is
+      // idempotent either way). A killed entry belongs to a superseded
+      // generation: the boundary already won and this run must not start.
+      // The entry still releases its own tracking HERE — the boundary only
+      // marked it; the run settles itself.
+      this._queuedRuns.delete(entry);
+      if (entry.killed) {
+        throw new Error(entry.reason || this._resetReason || 'python runtime reset (session boundary)');
       }
-      return this._runOnce(code, vfs, opts);
+      // The boundary may also land AFTER the seat was taken but before the
+      // run posted (this turn was suspended at an await): the generation
+      // check invalidates it here, before _runOnce starts.
+      if (gen !== this._resetGeneration) {
+        throw new Error(this._resetReason || 'python runtime reset (session boundary)');
+      }
+      // ACTIVE for the run's WHOLE remaining lifetime — boot, collection,
+      // worker execution and the commit/write-back phase alike — and
+      // released exactly once when the run settles. reset()/dispose() do
+      // NOT touch this set: a synchronous boundary invalidates the run
+      // but never masquerades as its settlement.
+      this._activeRuns.add(entry);
+      try {
+        return await this._runOnce(code, vfs, opts, gen);
+      } finally {
+        this._activeRuns.delete(entry);
+      }
     });
     // A failed or killed run must not poison the callers queued behind it;
     // the chain always advances, so timeouts/cancellations/releases cannot
@@ -851,8 +1028,13 @@ const PythonRuntime = {
   // opts.signal (optional AbortSignal) cancels the run: cancellation is
   // checked before starting, during mount collection, after the worker
   // reply, after EVERY async pre-check and before EVERY commit side effect.
-  // Commits already finished are not rolled back — the result reports
-  // exactly what committed and what never ran.
+  // A reset()/dispose() boundary is enforced with the same SHAPE (before
+  // the worker post, after the reply, and before every mkdir/write/remove/
+  // rmdir): once the run's generation is superseded, no further VFS side
+  // effect starts. Operations ALREADY handed to the provider (a worker run
+  // in flight, a commit call in flight) cannot be rolled back — the run
+  // waits for their settlement, reports exactly what committed and what
+  // never ran, and never presents a boundary-stopped run as a success.
   // Returns {
   //   stdout, stderr, error,            — compute outcome
   //   written, deleted,                 — ABS paths actually committed (deleted covers files AND directories)
@@ -864,8 +1046,38 @@ const PythonRuntime = {
   //   uncollected: [paths],             — python outputs over the worker caps (changeset incomplete)
   //   stdoutTruncated, stderrTruncated, — output notice flags (NOT commit failures)
   // }
-  async _runOnce(code, vfs, opts) {
+  async _runOnce(code, vfs, opts, expectedGeneration) {
     const signal = opts && opts.signal;
+    // The injected mutation policy decides which provider errors are
+    // REFUSALS (reported as conflicts — honest changeset accounting)
+    // rather than generic write failures. No policy = no refusals.
+    const policy = opts && opts.mutationPolicy;
+    const isRefusal = (e) => !!(policy && typeof policy.isPolicyRefusal === 'function' && policy.isPolicyRefusal(e));
+    // Boundary invalidation for THIS run: a reset()/dispose() that landed
+    // at any await since the run started. Checked before the worker post
+    // (never reach the next generation's interpreter), again once the
+    // worker answers, and before EVERY commit side effect — a run whose
+    // generation already ended must not write stale state back.
+    const invalidated = () => {
+      if (this._disposed) return this._disposed;
+      if (expectedGeneration !== undefined && expectedGeneration !== this._resetGeneration) {
+        return this._resetReason || 'python runtime reset (session boundary)';
+      }
+      return null;
+    };
+    // Commit-phase stop decision: the task signal (cancellation — existing
+    // semantics and texts) or a runtime boundary (reason as the text).
+    // Returns the notPersisted entry, or null when the commit may proceed.
+    let boundaryStop = null; // first boundary reason that stopped a commit
+    const runStopped = (label, cancelledAs) => {
+      if (signal && signal.aborted) return label + ' (' + cancelledAs + ')';
+      const why = invalidated();
+      if (why) {
+        if (!boundaryStop) boundaryStop = why;
+        return label + ' (' + why + ')';
+      }
+      return null;
+    };
     await this._ensureWorker(signal, opts && opts.bootstrapBudgets);
     throwIfCancelled(signal, 'python execution');
 
@@ -912,6 +1124,12 @@ const PythonRuntime = {
     // yet) — never start the worker run on a cancelled task.
     throwIfCancelled(signal, 'python execution');
 
+    // Last boundary before the worker post: a reset()/dispose() that
+    // landed while this run was suspended in the boot/mirror awaits
+    // invalidates it here — it must never reach the (possibly replaced)
+    // interpreter of the next generation.
+    const prePostInvalid = invalidated();
+    if (prePostInvalid) throw new Error(prePostInvalid);
     const id = ++this._reqId;
     const onAbort = () => this._killWorker('python execution cancelled');
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
@@ -932,6 +1150,14 @@ const PythonRuntime = {
       if (signal) signal.removeEventListener('abort', onAbort);
     }
     throwIfCancelled(signal, 'python execution');
+    // The worker answered, but a boundary may have landed while this run
+    // was suspended at the reply await: if the boundary itself did not
+    // already fail the reply (_failAllPending puts its reason in
+    // result.error), record it so NOTHING from this changeset commits and
+    // the final report carries the boundary as its error — a run of a
+    // superseded generation is never presented as a clean success.
+    const postReplyInvalid = invalidated();
+    if (postReplyInvalid && !result.error) boundaryStop = postReplyInvalid;
 
     const skippedSet = new Set(skipped.map((s) => s.path));
     const uncollected = result.uncollectedFiles || [];
@@ -954,8 +1180,9 @@ const PythonRuntime = {
     // already occupied by a FILE is a loud refusal — file↔directory type
     // changes are never half-applied.
     for (const d of createdDirs) {
-      if (signal && signal.aborted) {
-        notPersisted.push('mkdir ' + d + ' (cancelled before commit)');
+      const stopD = runStopped('mkdir ' + d, 'cancelled before commit');
+      if (stopD) {
+        notPersisted.push(stopD);
         continue;
       }
       const mount = vfs && typeof vfs.resolveMount === 'function' ? vfs.resolveMount(d) : null;
@@ -984,9 +1211,11 @@ const PythonRuntime = {
         conflicts.push({ path: d, reason: 'a file exists at this path; file→directory type changes are not committed' });
         continue;
       }
-      // The stat above awaited: re-check cancellation BEFORE the side effect.
-      if (signal && signal.aborted) {
-        notPersisted.push('mkdir ' + d + ' (cancelled before commit)');
+      // The stat above awaited: re-check cancellation AND boundary
+      // validity BEFORE the side effect.
+      const stopD2 = runStopped('mkdir ' + d, 'cancelled before commit');
+      if (stopD2) {
+        notPersisted.push(stopD2);
         continue;
       }
       try {
@@ -995,7 +1224,7 @@ const PythonRuntime = {
       } catch (e) {
         // A skill-boundary refusal is a DECISION (harness-owned layout),
         // reported as a refused conflict — never a silent skip.
-        if (isSkillMutationError(e)) conflicts.push({ path: d, reason: e.message });
+        if (isRefusal(e)) conflicts.push({ path: d, reason: e.message });
         else writeFailed.push('mkdir ' + d + ': ' + (e && e.message ? e.message : String(e)));
       }
     }
@@ -1007,8 +1236,9 @@ const PythonRuntime = {
     // never touched), external mounts keep the optimistic-concurrency
     // check, internal mounts write straight through.
     for (const f of outFiles) {
-      if (signal && signal.aborted) {
-        notPersisted.push(f.path + ' (cancelled before write)');
+      const stopF = runStopped(f.path, 'cancelled before write');
+      if (stopF) {
+        notPersisted.push(stopF);
         continue;
       }
       const mount = vfs && typeof vfs.resolveMount === 'function' ? vfs.resolveMount(f.path) : null;
@@ -1046,10 +1276,11 @@ const PythonRuntime = {
           continue;
         }
       }
-      // The pre-check awaited: cancellation may have landed meanwhile.
-      // Re-check BEFORE the side effect, not just at the loop top.
-      if (signal && signal.aborted) {
-        notPersisted.push(f.path + ' (cancelled before write)');
+      // The pre-check awaited: cancellation or a boundary may have landed
+      // meanwhile. Re-check BEFORE the side effect, not just at the loop top.
+      const stopF2 = runStopped(f.path, 'cancelled before write');
+      if (stopF2) {
+        notPersisted.push(stopF2);
         continue;
       }
       try {
@@ -1060,7 +1291,7 @@ const PythonRuntime = {
         // SkillInstanceWorkspace: declined confirmations, TOCTOU
         // conflicts and undeclared paths are honest REFUSALS (changeset
         // reports the skill as not persisted), not generic I/O errors.
-        if (isSkillMutationError(e)) conflicts.push({ path: f.path, reason: e.message });
+        if (isRefusal(e)) conflicts.push({ path: f.path, reason: e.message });
         else writeFailed.push(f.path + ': ' + (e && e.message ? e.message : String(e)));
       }
     }
@@ -1074,8 +1305,9 @@ const PythonRuntime = {
     const deletesBlocked = writeFailed.length > 0 || conflicts.length > 0 || uncollected.length > 0;
     if (result.deleted && result.deleted.length && !deletesBlocked) {
       for (const p of result.deleted) {
-        if (signal && signal.aborted) {
-          notPersisted.push('delete ' + p + ' (cancelled before commit)');
+        const stopDel = runStopped('delete ' + p, 'cancelled before commit');
+        if (stopDel) {
+          notPersisted.push(stopDel);
           continue;
         }
         const mount = vfs && typeof vfs.resolveMount === 'function' ? vfs.resolveMount(p) : null;
@@ -1107,9 +1339,11 @@ const PythonRuntime = {
             continue;
           }
         }
-        // Verification awaited: re-check cancellation BEFORE removing.
-        if (signal && signal.aborted) {
-          notPersisted.push('delete ' + p + ' (cancelled before commit)');
+        // Verification awaited: re-check cancellation AND boundary
+        // validity BEFORE removing.
+        const stopDel2 = runStopped('delete ' + p, 'cancelled before commit');
+        if (stopDel2) {
+          notPersisted.push(stopDel2);
           continue;
         }
         try {
@@ -1117,7 +1351,7 @@ const PythonRuntime = {
           deleted.push(p);
         } catch (e) {
           if (e && e.name === 'NotFoundError') continue; // already gone
-          if (isSkillMutationError(e)) conflicts.push({ path: p, reason: e.message });
+          if (isRefusal(e)) conflicts.push({ path: p, reason: e.message });
           else writeFailed.push('delete ' + p + ': ' + (e && e.message ? e.message : String(e)));
         }
       }
@@ -1135,8 +1369,9 @@ const PythonRuntime = {
     const dirDeletesBlocked = deletesBlocked || writeFailed.length > 0 || conflicts.length > 0;
     if (deletedDirs.length && !dirDeletesBlocked) {
       for (const p of deletedDirs) {
-        if (signal && signal.aborted) {
-          notPersisted.push('rmdir ' + p + ' (cancelled before commit)');
+        const stopRd = runStopped('rmdir ' + p, 'cancelled before commit');
+        if (stopRd) {
+          notPersisted.push(stopRd);
           continue;
         }
         if (vfs && typeof vfs.isProtectedRoot === 'function' && vfs.isProtectedRoot(p)) {
@@ -1157,12 +1392,20 @@ const PythonRuntime = {
         }
         // A directory that still holds unsynced files is not empty — the
         // provider refuses the removal and the failure is reported below.
+        // No async pre-check precedes this side effect on internal mounts,
+        // so this validity check IS the boundary gate: a run of a
+        // superseded generation must never remove directories.
+        const stopRd2 = runStopped('rmdir ' + p, 'cancelled before commit');
+        if (stopRd2) {
+          notPersisted.push(stopRd2);
+          continue;
+        }
         try {
           await vfs.remove(p);
           deleted.push(p);
         } catch (e) {
           if (e && e.name === 'NotFoundError') continue; // already gone
-          if (isSkillMutationError(e)) conflicts.push({ path: p, reason: e.message });
+          if (isRefusal(e)) conflicts.push({ path: p, reason: e.message });
           else writeFailed.push('rmdir ' + p + ': ' + (e && e.message ? e.message : String(e)));
         }
       }
@@ -1173,10 +1416,23 @@ const PythonRuntime = {
       notPersisted.push('directory deletions skipped (' + deletedDirs.join(', ') + '): ' + why);
     }
 
+    // A boundary may land while the FINAL provider side effect is in flight
+    // (dispatched, not yet settled): settlement of that call is not
+    // validation, and with no later commit iteration there is no further
+    // pre-effect check to catch it — the report below would read error:null
+    // and present a boundary-stopped run as a success. Re-validate the
+    // generation HERE, at result formation. What already committed stays
+    // reported in written/mkdirs/deleted (no rollback, no fabricated
+    // notPersisted), and a real worker error keeps its precedence.
+    const finalInvalid = invalidated();
+    if (finalInvalid && !result.error && !boundaryStop) boundaryStop = finalInvalid;
+
     return {
       stdout: result.stdout || '',
       stderr: result.stderr || '',
-      error: result.error || null,
+      // A boundary that stopped the commits is the run's honest error even
+      // when the compute itself succeeded — never a clean success report.
+      error: result.error || boundaryStop || null,
       written,
       mkdirs,
       deleted,
@@ -1191,7 +1447,9 @@ const PythonRuntime = {
       outputBytes: outFiles.reduce((n, f) => n + b64ByteLength(f.b64), 0),
     };
   },
-};
+  };
+  return rt;
+}
 
 // Optimistic concurrency check before committing a create/modify.
 // Returns null when the write is safe, or {path, reason} when the real
@@ -1776,34 +2034,21 @@ function writableErrMsg(e) {
   return e && e.message ? e.message : String(e);
 }
 
-// ---------- capability skill instance boundary (mutable skill closure) ----
-// Skill instance identity IS the path (capabilityId + skillId) under
-// /home/locus/.skills. Two shell operations can never apply to it:
-//   mv — a move would split the mutation across an approval-bound write
-//        and an approval-bound delete; a half-approved half-move is
-//        exactly the incoherent state the path identity forbids.
-//   rm -r on the skills root or a capability directory — capability-wide
-//        deletion is exclusively the user's Remove action in Settings.
-// Single-file writes/deletes route through the task's guarded
-// SkillInstanceWorkspace mount (echo >, >>, curl -o, rm <file>, python
-// commits all ask there); these checks only close the two structural
-// holes the guard cannot see (mv is read+write+delete at the shell layer,
-// and rm -r would walk into per-file approvals).
-const SKILL_INSTANCE_SHELL_ROOT = '/home/locus/.skills';
-const SKILL_IDENTITY_BOUNDARY_MSG =
-  'Skill instance paths are stable; edit the skill in place, '
-  + 'delete the individual skill with approval, or remove/re-add the capability.';
-
-function underSkillInstances(abs) {
-  return abs === SKILL_INSTANCE_SHELL_ROOT || abs.startsWith(SKILL_INSTANCE_SHELL_ROOT + '/');
-}
-
-// True when a guard error came from the skill mutation boundary (declined
-// confirmation, TOCTOU conflict, undeclared path, size bound). The python
-// commit phase reports these as REFUSED conflicts — honest changeset
-// accounting — instead of generic write failures.
-function isSkillMutationError(e) {
-  return !!e && typeof e.code === 'string' && e.code.indexOf('skill_mutation_') === 0;
+// ---------- mutation policy (M1b, repository split) ----------
+// Product/Harness filesystem-mutation rules (the Locus skill-identity
+// protection among them) live OUTSIDE the generic runtime: the shell
+// consumes the operation-aware MutationPolicy port from
+// opts.mutationPolicy (contract docs/REPOSITORY-SPLIT-CONTRACTS.md 3.7 —
+// checkMove / checkRemove / isPolicyRefusal). The policy is injected per
+// execution by the product wiring; the GENERIC runtime ships none and is
+// deliberately neutral (plain mv/rm wherever the VFS allows). Refusals
+// compose as `<command>: <policy reason>` — the reason text is the
+// policy's, byte-stable, and this layer adds only the command prefix.
+// The VFS's own read-only / protected-root / path-safety enforcement and
+// the task fork's SkillInstanceWorkspace per-file approval guard are
+// RUNTIME concerns and stay in force regardless of the policy.
+function policyRefusal(verdict) {
+  return (verdict && verdict.reason) || 'refused by the mutation policy';
 }
 
 // The parent of an absolute target must be an existing directory. Mount
@@ -2709,6 +2954,7 @@ function throwMutationCancelled(signal, what, done) {
 
 async function shMv(ctx, args) {
   const signal = ctx.opts && ctx.opts.signal;
+  const policy = ctx.opts && ctx.opts.mutationPolicy;
   const operands = [];
   for (const t of args) {
     if (!t.quoted && t.text.charAt(0) === '-' && t.text.length > 1) {
@@ -2752,11 +2998,27 @@ async function shMv(ctx, args) {
     if (ctx.vfs.isProtectedRoot(srcAbs)) {
       return shErr('mv: ' + srcDisplay + ': refusing to move protected path: ' + srcAbs);
     }
-    // Skill instance identity is path-stable: any move touching ~/.skills
-    // (source OR destination) is refused outright — never split into an
-    // approved write plus an approved delete.
-    if (underSkillInstances(srcAbs) || underSkillInstances(destAbs)) {
-      return shErr('mv: ' + srcDisplay + ': ' + SKILL_IDENTITY_BOUNDARY_MSG);
+    // The FINAL destination (mv-into-directory appends the basename) —
+    // computed here so the injected policy judges the real target.
+    let finalAbs = destAbs;
+    if (destStat && destStat.kind === 'directory') {
+      finalAbs = joinAbs(destAbs, baseName(srcAbs));
+    }
+    // Product/Harness mutation rules ride the injected policy (M1b): any
+    // move touching a protected tree (source OR final destination) is
+    // refused by IT, with its byte-stable reason — never split into an
+    // approved write plus an approved delete. No policy injected = the
+    // generic runtime's neutral behavior.
+    if (policy) {
+      const verdict = policy.checkMove({
+        source: srcAbs,
+        destination: finalAbs,
+        destinationKind: destStat ? destStat.kind : null,
+        recursive: true,
+      });
+      if (!verdict || verdict.allowed !== true) {
+        return shErr('mv: ' + srcDisplay + ': ' + policyRefusal(verdict));
+      }
     }
     let srcStat;
     try {
@@ -2769,12 +3031,8 @@ async function shMv(ctx, args) {
       return shErr('mv: ' + srcDisplay + ': source is on a read-only filesystem; move cannot remove source');
     }
 
-    // An existing destination directory means "move INTO it"; any other
-    // existing destination is a loud failure (no implicit overwrite, no -f).
-    let finalAbs = destAbs;
-    if (destStat && destStat.kind === 'directory') {
-      finalAbs = joinAbs(destAbs, baseName(srcAbs));
-    }
+    // finalAbs was computed above (before the policy check); the rules
+    // below are unchanged.
     if (finalAbs === srcAbs) return shErr('mv: ' + srcDisplay + ' and ' + destDisplay + ' are the same file');
     if (destStat && destStat.kind !== 'directory') {
       return shErr('mv: ' + destDisplay + ': destination exists');
@@ -2942,6 +3200,7 @@ async function mvDirectory(ctx, srcAbs, finalAbs, signal) {
 
 async function shRm(ctx, args) {
   const signal = ctx.opts && ctx.opts.signal;
+  const policy = ctx.opts && ctx.opts.mutationPolicy;
   let force = false, recursive = false;
   const operands = [];
   for (const t of args) {
@@ -2988,16 +3247,20 @@ async function shRm(ctx, args) {
       errors.push('rm: ' + op + ': ' + writableErrMsg(e));
       continue;
     }
-    if (st.kind === 'directory') {
-      // Capability-wide deletion is exclusively the user's Remove action
-      // in Settings: no recursive shell removal of the skills root or a
-      // capability's instance directory, however spelled. A single
-      // declared <skill>.skill file is still deletable (with approval).
-      if (underSkillInstances(abs)) {
-        errors.push('rm: refusing to remove capability skill directory: ' + abs + '. '
-          + SKILL_IDENTITY_BOUNDARY_MSG);
+    // Product/Harness mutation rules ride the injected policy (M1b), for
+    // files and directories alike: the Locus policy refuses directory
+    // removal under the skills root (capability-wide deletion is
+    // exclusively the user's Remove action in Settings) and leaves single
+    // declared skill FILES on their per-file approval path. The VFS's
+    // protected-root refusal above stays a RUNTIME check.
+    if (policy) {
+      const verdict = policy.checkRemove({ target: abs, kind: st.kind, recursive: recursive });
+      if (!verdict || verdict.allowed !== true) {
+        errors.push('rm: ' + policyRefusal(verdict));
         continue;
       }
+    }
+    if (st.kind === 'directory') {
       if (!recursive) {
         errors.push('rm: ' + op + ': is a directory');
         continue;
@@ -3352,7 +3615,7 @@ async function runPython(args, ctx, opts) {
   return await runPythonCode(code, ctx.vfs, pythonOpts(ctx));
 }
 
-// Options handed to PythonRuntime: the caller's opts plus the ABSOLUTE VFS
+// Options handed to the injected python runtime instance: the caller’s opts plus the ABSOLUTE VFS
 // cwd of this invocation (Python's os.chdir target).
 function pythonOpts(ctx) {
   return Object.assign({}, ctx.opts, { cwd: ctx.cwd });
@@ -3362,10 +3625,19 @@ async function runPythonCode(code, vfs, opts) {
   if (!code || !code.trim()) {
     return { success: false, stdout: '', stderr: 'python: empty code', io: { in: 0, out: 0 } };
   }
+  // M1b lifecycle: the interpreter instance arrives INJECTED in opts
+  // (Product wiring). There is deliberately no global fallback — a python
+  // execution without an injected instance is an assembly bug and fails
+  // as an honest tool failure instead of silently resurrecting a
+  // page-global runtime.
+  const rt = opts && opts.pythonRuntime;
+  if (!rt) {
+    return { success: false, stdout: '', stderr: 'python: no runtime instance injected', io: { in: utf8ByteLength(code), out: 0 } };
+  }
 
   let res;
   try {
-    res = await PythonRuntime.run(code, vfs, opts);
+    res = await rt.run(code, vfs, opts);
   } catch (e) {
     if (isCancelledError(e)) {
       return { success: false, stdout: '', stderr: 'python: execution cancelled', cancelled: true, io: { in: utf8ByteLength(code), out: 0 } };

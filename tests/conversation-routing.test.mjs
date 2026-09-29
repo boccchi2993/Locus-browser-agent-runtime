@@ -68,7 +68,8 @@ globalThis.buildSystemPrompt = () => 'test';
 globalThis.verifyConnection = async () => {};
 globalThis.LocalDirectoryWorkspace = class {};
 globalThis.ensureWorkspacePermission = async () => true;
-// PythonRuntime intentionally left undefined — store guards with typeof.
+// createPythonRuntime intentionally left undefined — the store resolves no
+// python runtime here (text-only; M1b lifecycle).
 // store.js boots ONE persistent VFS at module scope: provide the REAL
 // vfs.js (plus workspace.js it extends from) exactly like index.html does.
 globalThis.SHELL_COMMANDS = {};

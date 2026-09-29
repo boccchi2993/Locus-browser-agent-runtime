@@ -139,6 +139,10 @@ if (e2eMode || demoMode) {
 // action) bound to the running task's AbortSignal when one exists.
 // Never exposed outside ?e2e=1 and never rendered as a UI button.
 if (e2eMode) {
+  // M1b seam: the canonical interpreter instance (never exposed outside
+  // ?e2e=1). Browser python e2e drives prepare/reset/worker-state through
+  // it — the SAME object task preparation and shell execution use.
+  window.__locus.pythonRuntime = () => ui.pythonRuntime();
   window.__locus.approvals = {
     // Harness-shaped request passthrough for fake tool executors (the exact
     // shape a real consumer will use).
@@ -192,10 +196,11 @@ if (e2eMode) {
   };
 }
 
-// Python worker status is owned by the runtime (plain object); mirror it
-// into the store for display.
+// Python interpreter status is owned by the store's canonical instance
+// (M1b lifecycle); mirror it into the store for display.
 setInterval(() => {
-  if (typeof PythonRuntime !== 'undefined') ui.store.pythonStatus = PythonRuntime.status;
+  const rt = ui.pythonRuntime();
+  if (rt) ui.store.pythonStatus = rt.status;
 }, 1000);
 
 // ---------- demo automation ----------

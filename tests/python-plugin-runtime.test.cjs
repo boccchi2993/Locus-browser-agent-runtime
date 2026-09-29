@@ -80,27 +80,17 @@ const BASE_SRC = ['src/workspace.js', 'src/vfs.js', 'src/extensions.js']
 function evalShell() {
   global.window = { location: { protocol: 'https:' }, addEventListener: () => {} };
   global.document = { getElementById: () => null };
-  const M = eval(BASE_SRC + '\n' + SHELL_SRC + '\n;({ PythonRuntime, validateWheelArtifact, PYTHON_PLUGIN_WHEEL_MAX_BYTES });');
+  const M = eval(BASE_SRC + '\n' + SHELL_SRC + '\n;({ createPythonRuntime, validateWheelArtifact, PYTHON_PLUGIN_WHEEL_MAX_BYTES });');
   delete global.window;
   delete global.document;
   return M;
 }
 const SHELL = evalShell();
 
+// M1b: instances come from the factory — every mutable field is
+// initialized per instance (no Object.create over a shared singleton).
 function freshRuntime() {
-  const rt = Object.create(SHELL.PythonRuntime);
-  rt._assets = null;
-  rt._boot = null;
-  rt._creator = null;
-  rt._creatorReady = null;
-  rt._pending = new Map();
-  rt._reqId = 0;
-  rt._queuedRuns = new Set();
-  rt._queue = Promise.resolve();
-  rt.worker = null;
-  rt.status = 'cold';
-  rt._extensions = null;
-  return rt;
+  return SHELL.createPythonRuntime();
 }
 
 function wheelModule(overrides) {

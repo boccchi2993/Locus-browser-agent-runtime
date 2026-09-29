@@ -12,7 +12,7 @@ global.document = { getElementById: () => null };
 const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js', 'tools.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
-const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, normalizeVfsPath, VirtualWorkspace, PythonRuntime,'
+const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, normalizeVfsPath, VirtualWorkspace, createPythonRuntime,'
   + ' runShellCommand, executeTool,'
   + ' Telemetry, SHELL_COMMANDS, shellHelpText, shellSystemPromptSection, shellTokenize, parseShellLine, runPipeline });');
 

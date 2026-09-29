@@ -81,7 +81,7 @@ async function main() {
   const hitsTo = (pathname, since) => hits.filter((h) => h.path === pathname && h.t >= since).length;
   const probeTotal = () => hits.filter((h) => ['/probe-hit', '/probe-script.js', '/probe_wheel_fake-1.0-py3-none-any.whl'].indexOf(h.path) !== -1).length;
 
-  // Runs Python through the REAL production path (bash tool → PythonRuntime
+  // Runs Python through the REAL production path (bash tool → the store's
   // → Blob worker). kind='heredoc' wraps multi-line code in the heredoc form.
   const pyCmd = (code) => {
     const body = Array.isArray(code) ? code.join('\n') : code;
@@ -111,7 +111,8 @@ async function main() {
       const L = window.__locus;
       window.__paE2e = {
         exec: (cmd, opts) => window.executeTool('bash', cmd, L.vfs,
-          Object.assign({ approvals: L.approvals && L.approvals.controller }, opts || {})),
+          Object.assign({ approvals: L.approvals && L.approvals.controller,
+            pythonRuntime: L.pythonRuntime() }, opts || {})),
       };
       return 'installed';
     })()`);
@@ -450,7 +451,7 @@ async function main() {
       JSON.stringify(String(creator && creator.srcdoc).slice(0, 160)));
 
     // ---- E11 (CASE H): reset re-applies the lockdown ----
-    await evaluate(cdp, 'PythonRuntime.reset(); "reset"');
+    await evaluate(cdp, 'window.__locus.pythonRuntime().reset(); "reset"');
     const e11a = await runPy('print(40 + 2)');
     check('E11 python works again after reset (full re-bootstrap)',
       e11a.success && e11a.output.trim().endsWith('42'), JSON.stringify(e11a).slice(0, 200));
@@ -464,12 +465,13 @@ async function main() {
 
     // ---- E12 (CASE H): fatal worker recovery re-applies the lockdown ----
     await evaluate(cdp, `(() => {
-      if (!PythonRuntime.worker) return 'no-worker';
-      PythonRuntime.worker.onerror({ message: 'e2e: simulated fatal worker error' });
+      var pyrt = window.__locus.pythonRuntime();
+      if (!pyrt.worker) return 'no-worker';
+      pyrt.worker.onerror({ message: 'e2e: simulated fatal worker error' });
       return 'crashed';
     })()`);
     check('E12 worker fatal error drops the runtime to cold',
-      (await evaluate(cdp, 'PythonRuntime.worker === null && PythonRuntime.status === "cold"')) === true);
+      (await evaluate(cdp, '(function () { var pyrt = window.__locus.pythonRuntime(); return pyrt.worker === null && pyrt.status === "cold"; })()')) === true);
     const e12a = await runPy('print(4 * 21)');
     check('E12b python recovers after a fatal worker error',
       e12a.success && e12a.output.trim().endsWith('84'), JSON.stringify(e12a).slice(0, 200));

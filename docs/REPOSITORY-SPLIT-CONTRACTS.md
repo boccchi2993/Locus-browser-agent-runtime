@@ -1,6 +1,6 @@
 # Repository split M0 — interface contracts (drafts)
 
-Status: M0 deliverable, **revised in M1a** (corrections: §3.5 authorization direction — each core defines its own side, Product bridges; §4 model-retry row — current behavior, not a non-delivery guarantee; §3.1/§3.4 current-vs-target lifecycle distinction — single live session + lazy interpreter today; §3.4-Q1 — internal execution-layer cancellation controllers are legitimate when cascading the task signal). **M1a landed** the §2 task lifecycle and the §3.9 persistence-context port as real modules (`src/harness/task-runner.js`, `src/harness/provider-session.js`, product wiring in `src/ui/store.js`; verification in [REPOSITORY-SPLIT-M1A-VERIFICATION.md](REPOSITORY-SPLIT-M1A-VERIFICATION.md)). Everything naming RuntimeHost/RuntimeSession/ExecutionAuthorization/worker packaging remains a draft for M1b/M2. These are implementable drafts for M1/M2, written against the audited baseline (`d25f30e`, see [REPOSITORY-SPLIT-INVENTORY.md](REPOSITORY-SPLIT-INVENTORY.md)). They are documentation, not shipped code: TypeScript-like notation describes shapes for the JavaScript implementations; no migration to TypeScript is implied. In-process module calls are sufficient — no RPC, service, or message bus is introduced.
+Status: M0 deliverable, **revised in M1a** (corrections: §3.5 authorization direction — each core defines its own side, Product bridges; §4 model-retry row — current behavior, not a non-delivery guarantee; §3.1/§3.4 current-vs-target lifecycle distinction — single live session + lazy interpreter today; §3.4-Q1 — internal execution-layer cancellation controllers are legitimate when cascading the task signal). **M1a landed** the §2 task lifecycle and the §3.9 persistence-context port as real modules (`src/harness/task-runner.js`, `src/harness/provider-session.js`, product wiring in `src/ui/store.js`; verification in [REPOSITORY-SPLIT-M1A-VERIFICATION.md](REPOSITORY-SPLIT-M1A-VERIFICATION.md)). **M1b landed** the §3.1 interpreter lifecycle (as `createPythonRuntime()` instances with prepare/run/reset/dispose/snapshot — no page-global `PythonRuntime` remains) and the §3.7 `MutationPolicy` port (as `src/mutation-policy.js` product policy consumed via `opts.mutationPolicy`; verification in [REPOSITORY-SPLIT-M1B-VERIFICATION.md](REPOSITORY-SPLIT-M1B-VERIFICATION.md)). Everything naming RuntimeHost/RuntimeSession/ExecutionAuthorization/worker packaging remains a draft for M2. These are implementable drafts for M1/M2, written against the audited baseline (`d25f30e`, see [REPOSITORY-SPLIT-INVENTORY.md](REPOSITORY-SPLIT-INVENTORY.md)). They are documentation, not shipped code: TypeScript-like notation describes shapes for the JavaScript implementations; no migration to TypeScript is implied. In-process module calls are sufficient — no RPC, service, or message bus is introduced.
 
 Design rule (from the task and REPOSITORY-SPLIT §4): no single boundless `RuntimeContext`/`AppContext`. Each concern below is its own small port with its own owner. Ports are plain parameters, exactly like the existing seams they formalize (`AgentSession` deps, `policyContext.approvals`, `imageInput`).
 
@@ -61,11 +61,107 @@ Rules (all already enforced somewhere today; the contract makes them one place):
 
 ## 3. Port reference
 
-### 3.1 Runtime lifecycle and execution (Runtime-owned) — **target interface**
+### 3.1 Runtime lifecycle and execution (Runtime-owned) — **M1b form landed; RuntimeHost/RuntimeSession remain the target interface**
 
 Current reality (must not be blurred): today there is **one** live agent session and **one** interpreter per page (`session` and `PythonRuntime` are singletons; `src/ui/store.js`, `src/shell.js`). The `RuntimeHost`/`RuntimeSession` shapes below are the *target* extraction interface; introducing them must not be read as supporting multiple concurrent sessions or retaining multiple interpreters. The interpreter also boots **lazily** — the first Python execution fetches/boots it; preparation only *configures* the payload for a future boot, so a text-only task downloads and starts nothing.
 
-Formalizes `PythonRuntime` (`src/shell.js`), `runShellCommand`, and `preparePythonRuntimeForEnvironment` (`src/ui/store.js`) into instance-scoped lifecycle. No page-global interpreter remains reachable across the boundary.
+M1b status: **LANDED** in the M1b form — `createPythonRuntime()` (`src/shell.js`) builds interpreter instances with all mutable state owned per instance (worker facade, boot promise/timers, pending-request map, request sequence, execution queue, plugin payload, disposed flag, reset generation). Explicitly shared: only the frozen bootstrap manifest and stateless helpers; the VERIFIED ASSET CACHE is per instance by decision. There is NO page-global `PythonRuntime` anymore; the Product (store) creates the ONE canonical instance per page, drives it with prepare/reset, and injects the SAME instance into every shell execution (`opts.pythonRuntime`) — preparation and execution cannot split onto two interpreters. The interface below (RuntimeHost/RuntimeSession/createSession over worker asset bundles) remains the M2 target shape.
+
+M1b landed semantics (implementing the draft above where the code chose names):
+
+```
+createPythonRuntime() → PythonRuntimeInstance   // per-instance state; lazy boot preserved
+
+PythonRuntimeInstance = {
+  // Between tasks. Compares the wanted plugin payload key with the live
+  // one; same key = no-op ({rebuiltInterpreter:false}); key change =
+  // validate-then-swap. Validation (the exact configureExtensions shape
+  // gates) happens BEFORE the teardown: a failure leaves the old payload
+  // fully intact — never a half-applied reset. A prepare whose signal is
+  // already aborted is refused and applies nothing; the refusal is
+  // CANCELLATION-SHAPED (AbortError), so the caller's existing
+  // cancellation classification reads it as a cancellation, never as an
+  // independent prepare error. prepare is
+  // SYNCHRONOUS by construction (no awaits between compare and commit),
+  // so no stale/cancelled caller can interleave; callers cannot assume
+  // async completion because there is none. The Product additionally
+  // self-checks task liveness after every async preparation step
+  // (refreshSkillPresence, prepare) and never hands a cancelled or
+  // boundary-struck task's configuration to the runtime at all.
+  prepare(req: { signal?: AbortSignal, python?: PluginPayload | null })
+    → { rebuiltInterpreter: boolean }
+
+  // The execution port (shell python lands here via opts.pythonRuntime;
+  // serialized queue, mirror/commit phases unchanged). Missing injection
+  // fails the tool call loudly — there is no global fallback. A run is
+  // VALID for its whole lifetime — queued, seat acquisition, boot, file
+  // collection, worker execution AND the complete write-back (commit)
+  // phase: a reset()/dispose() that lands at ANY await boundary
+  // invalidates the run, which then starts NO further VFS side effect
+  // (mkdir, write, file removal, directory removal). Operations ALREADY
+  // dispatched to the provider (a worker run in flight, a commit call in
+  // flight) cannot be rolled back; the run waits out their settlement,
+  // commits nothing further, and reports honestly (boundary reason in
+  // `error`, stopped operations in `notPersisted`) — never an empty
+  // success masking the invalidation, never a partial result presented
+  // as complete. Validity is re-checked ONE LAST TIME when the report
+  // is formed: a boundary that lands while the FINAL dispatched effect
+  // is still unsettled still lands in that report's `error` (settlement
+  // of a provider call is not validation), what the effect really
+  // committed stays in `written`/`mkdirs`/`deleted`, and a real worker
+  // error keeps precedence over the boundary reason.
+  run(code, vfs, opts) → Promise<ExecutionReport>
+
+  // Session/rebuild boundary. SYNCHRONOUS effect: aborts the in-flight
+  // boot, fails every pending request, drains queued-but-unstarted runs,
+  // tears the worker stack down to cold. Three DISTINCT moments must not
+  // be conflated:
+  //   (1) SYNCHRONOUS INVALIDATION — what reset() itself does, before it
+  //       returns: kill the worker stack, mark queued runs killed, bump
+  //       the generation every run re-checks;
+  //   (2) RUN SETTLEMENT — when each affected run's promise actually
+  //       settles, at that run's next await boundary (with the boundary
+  //       reason as its error, or as a cancellation if the task signal
+  //       aborted). Synchronous invalidation is NOT settlement: the
+  //       killed/committing runs stay counted in busyExecutions until
+  //       they truly settle, so admission/quiesce gates never reopen
+  //       early on a lie;
+  //   (3) ALREADY-DISPATCHED PROVIDER EFFECTS — operations already handed
+  //       to the provider (posted worker execution, in-flight commit).
+  //       These CANNOT be rolled back; after their settlement nothing
+  //       further runs and the report says exactly what committed and
+  //       what never ran — including the boundary itself in `error`,
+  //       re-validated at report formation so the LAST settling effect
+  //       can never yield an error:null success.
+  // The instance stays REUSABLE afterwards. A boundary landing while a
+  // run is suspended between seat acquisition and the worker post is
+  // caught by the reset generation: the run rejects with the boundary
+  // reason and never reaches the next generation's interpreter.
+  reset(reason?: string): void
+
+  // Terminal. Everything reset does, plus permanent refusal of
+  // prepare/run/configureExtensions (throws with the disposal reason).
+  // IDEMPOTENT — a second dispose keeps the first reason. Late worker
+  // messages cannot revive the instance (creator destroyed; the disposed
+  // flag blocks new work). Returns nothing; disposal is synchronous
+  // (invalidation sense — affected runs still settle at their own next
+  // await boundary, exactly like reset).
+  dispose(reason?: string): void
+
+  // Canonical state read: { interpreter: 'cold'|'loading'|'ready',
+  // busyExecutions, extensionKey, disposed }. busyExecutions counts
+  // QUEUED (not yet started) + ACTIVE runs, where ACTIVE spans the whole
+  // post-seat lifetime — boot, file collection, worker execution and the
+  // commit/write-back phase — released exactly once at each run's own
+  // settlement (never by reset/dispose). Queued and active runs are
+  // counted once each; a boundary never falsifies the count.
+  snapshot(): RuntimeSnapshot
+}
+```
+
+Deviations from the draft, all intentional at M1b: names follow the code (`run` is the execute port; `reset`/`dispose` take a reason string); the session-level wrapper types (`RuntimeHost.createSession`, `execute(req: ExecutionRequest)`, `cancelActiveExecutions`) are NOT introduced yet — the product injects the instance directly, and M2 wraps it; `prepare` does not wait for in-flight executions (the storage-mutation quiesce gate owns that, per the note below); the status DOM write (`#sb-python`) remains until M2 replaces it with the status event.
+
+Formalizes `preparePythonRuntimeForEnvironment` + `AgentSession.onSessionReset` (store) and the shell's python execution entry into instance-scoped lifecycle. No page-global interpreter remains reachable across the boundary.
 
 ```
 createRuntime(opts: {
@@ -258,15 +354,28 @@ DescriptionPort (Runtime-implemented, Harness-consumed) = {
                                          //   harness prompt wants them
 }
 
-MutationPolicy (Product/Harness-implemented, Runtime-consumed) = {
-  // Operation-aware, replacing hardcoded ~/.skills knowledge in shMv/shRm:
-  checkMove(args:   { source: AbsPath, destination: AbsPath, recursive: boolean })
-    → { allowed: true } | { allowed: false, reason: string }   // reason is user-facing
-  checkRemove(args: { target: AbsPath, recursive: boolean })
-    → { allowed: true } | { allowed: false, reason: string }
-  isPolicyRefusal(error): boolean        // today isSkillMutationError — commit phase
-                                         //   reports these as conflicts, not write failures
-}
+MutationPolicy (Product-implemented, Runtime-consumed) — **M1b LANDED** as
+`src/mutation-policy.js` (`LocusMutationPolicy.create()`), injected by the Product
+into EVERY bash execution (`opts.mutationPolicy`); a product missing its policy
+implementation REFUSES execution loudly instead of running unprotected, and the
+generic runtime with no policy is deliberately neutral:
+
+```
+MutationPolicy = {
+  // Operation-aware (the ~/.skills knowledge moved OUT of shell.js):
+  checkMove(args:   { source: AbsPath, destination: AbsPath,    // destination = the FINAL
+                    destinationKind?: 'file'|'directory'|null,  //   target (mv-into-directory
+                    recursive: boolean })                       //   appends the basename)
+    → { allowed: true } | { allowed: false, reason: string }   // reason is user-facing, WITHOUT
+                                                               //   the command prefix — the shell
+                                                               //   composes 'mv: <src>: <reason>'
+  checkRemove(args: { target: AbsPath, kind: 'file'|'directory', recursive: boolean })
+    → { allowed: true } | { allowed: false, reason: string }   // shell composes 'rm: <reason>'
+  isPolicyRefusal(error): boolean        // the python commit phase reports these as REFUSED
+}                                        //   conflicts (honest changeset accounting), not
+                                         //   generic write failures; no policy injected = no
+                                         //   refusal class
+```
 
 PluginPayload (Harness-prepared, Runtime-validated) = {
   key: string                            // canonical pythonExtensionKeyOf()
@@ -281,7 +390,7 @@ PluginPayload (Harness-prepared, Runtime-validated) = {
 }
 ```
 
-Rules: identity rules are documented *in this contract* (both sides test against the documented shape); refusals keep today's exact message text (`SKILL_IDENTITY_BOUNDARY_MSG`) so shell tests stay byte-stable; the policy is bound at session creation, and the task context freezes the view.
+M1b landed rules: the Locus policy refuses ANY move touching the skills tree (source OR final destination, judged on normalized absolute paths after shell resolution — relative/`..`-spelling cannot bypass) and refuses removal of DIRECTORIES under the root (recursive or not), while single declared skill FILES stay on their per-file approval path. Refusals keep the exact message text the shell used to embed (`SKILL_IDENTITY_BOUNDARY_MSG` etc.) — pinned byte-stable by `tests/mutation-policy.test.cjs`. Check order is preserved (policy refusal before the geometry/stat rules, after protected-root). The policy is NOT a file-access safety boundary: VFS read-only/protected-root/path-safety enforcement and the SkillInstanceWorkspace confirmation/diff/TOCTOU guard stay runtime/provider-level, and the policy can never turn those refusals into allowances. Ownership note for M3: `LocusMutationPolicy` is PRODUCT code — it moves to the Product repository, not Harness.
 
 ### 3.8 Events and observability
 
@@ -330,10 +439,10 @@ Failure semantics (current, kept): a failed *required* write ends the task with 
 | `productToolPort.execute` | `executeTool` + `wiredToolExecutor` (injects authz context) |
 | `productAuthorization` | `approvals` controller wiring (`ApprovalController` + UI projection) |
 | `productDescriptions(env)` | `shellSystemPromptSection` global read in `buildSystemPrompt` |
-| `productMutationPolicy` | hardcoded `~/.skills` rules in `shMv`/`shRm` |
+| `productMutationPolicy` — **M1b LANDED** | `LocusMutationPolicy` (`src/mutation-policy.js`) injected into every bash execution; missing implementation fails loudly |
 | `productPersistence` | `makePersistenceContext` + `PersistenceServiceInstance` glue |
 | `productFilesystem` | VFS construction/mount lifecycle (`mountDurableStorage`, `mountExternalHandle`, task fork + skill/introspection mounts) |
-| `productRuntimeLifecycle` | `preparePythonRuntimeForEnvironment` + `onSessionReset` Python reset |
+| `productRuntimeLifecycle` — **M1b LANDED** | the store's canonical `createPythonRuntime()` instance + `preparePythonRuntimeForEnvironment` (→ instance.prepare) + `onSessionReset` (→ instance.reset) + `opts.pythonRuntime` injection |
 
 ## 4. Error and retry taxonomy (normative)
 
