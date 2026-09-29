@@ -355,21 +355,21 @@ async function main() {
       + ' for (var i = 0; i < mounts.length; i++) fork.mount(mounts[i].path, mounts[i].provider, mounts[i].authority);'
       + ' window.__capFork = fork; return mounts.length; })()');
     const e13 = await evaluate(cdp, '(async function () {'
-      + ' var w = await window.executeTool("bash", "echo patched > /mnt/plugins/synthetic-python-plugin/plugin.json", window.__capFork, {});'
-      + ' var r = await window.executeTool("bash", "cat /mnt/plugins/synthetic-python-plugin/plugin.json", window.__capFork, {});'
+      + ' var w = await window.executeTool("bash", "echo patched > /mnt/plugins/synthetic-python-plugin/plugin.json", window.__capFork, { runtimeSession: window.__locus.runtime() });'
+      + ' var r = await window.executeTool("bash", "cat /mnt/plugins/synthetic-python-plugin/plugin.json", window.__capFork, { runtimeSession: window.__locus.runtime() });'
       + ' return { writeBlocked: !w.success && /read-only/i.test(w.output), read: r.success && r.output.indexOf("\\"authority\\": \\"none\\"") !== -1 }; })()', 60000);
     check('E13 /mnt/plugins introspection readable + write refused', e13.writeBlocked && e13.read, JSON.stringify(e13));
     const e14 = await evaluate(cdp, '(async function () {'
       + ' var mounts = window.__locus.capabilityComposition.manager().taskVfsMounts(window.__locus.capabilityComposition.taskEnvironment());'
       + ' var paths = mounts.map(function (m) { return m.path; });'
-      + ' var r = await window.executeTool("bash", "cat /home/locus/.skills/synthetic-capability/synthetic-skill.skill", window.__capFork, {});'
+      + ' var r = await window.executeTool("bash", "cat /home/locus/.skills/synthetic-capability/synthetic-skill.skill", window.__capFork, { runtimeSession: window.__locus.runtime() });'
       + ' return { oldMountGone: paths.indexOf("/usr/local/share/locus/skills") === -1,'
       + '  read: r.success && r.output.indexOf("SHOULD_ONLY_APPEAR_AFTER_SKILL_READ_7F91") !== -1 }; })()', 60000);
     check('E14 old skill body mount is gone; instance readable under ~/.skills (read is free)',
       e14.oldMountGone && e14.read, JSON.stringify(e14));
     const e15 = await evaluate(cdp, '(async function () {'
-      + ' var r = await window.executeTool("bash", "cat /usr/local/share/locus/capabilities/synthetic-capability/capability.json", window.__capFork, {});'
-      + ' var w = await window.executeTool("bash", "echo x > /usr/local/share/locus/capabilities/synthetic-capability/capability.json", window.__capFork, {});'
+      + ' var r = await window.executeTool("bash", "cat /usr/local/share/locus/capabilities/synthetic-capability/capability.json", window.__capFork, { runtimeSession: window.__locus.runtime() });'
+      + ' var w = await window.executeTool("bash", "echo x > /usr/local/share/locus/capabilities/synthetic-capability/capability.json", window.__capFork, { runtimeSession: window.__locus.runtime() });'
       + ' return { read: r.success && r.output.indexOf("\\"state\\": \\"ready\\"") !== -1, writeBlocked: !w.success && /read-only/i.test(w.output) }; })()', 60000);
     check('E15 capability introspection readable + read-only', e15.read && e15.writeBlocked, JSON.stringify(e15));
 

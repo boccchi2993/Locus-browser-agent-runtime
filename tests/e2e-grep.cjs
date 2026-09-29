@@ -28,7 +28,7 @@ const PAGE_HELPERS = `
   if (window.__gwE2e) return 'ready';
   const L = window.__locus;
   const exec = (cmd, opts) => window.executeTool('bash', cmd, L.vfs,
-    Object.assign({ approvals: L.approvals && L.approvals.controller }, opts || {}));
+    Object.assign({ runtimeSession: L.runtime() }, opts || {}));
   window.__gwE2e = {
     beats: null,
     exec,

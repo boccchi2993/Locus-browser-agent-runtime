@@ -338,6 +338,17 @@ async function readBodyBounded(res, entry, stallMs) {
   return out;
 }
 
+// ---------- Runtime payload contract data (M2a, repository split) ----------
+// The payload-identity rules are the RUNTIME's own declared contract data
+// (REPOSITORY-SPLIT-CONTRACTS §3.7): this module validates plugin payloads
+// against THESE patterns and imports nothing from extensions.js. The
+// Harness keeps its own copy in src/extensions.js; a boundary test pins
+// the two sources EQUAL (the declared synchronization mechanism — the
+// values are contract, not incidental). Error texts embed the pattern
+// source, so byte-stability of the messages is preserved by construction.
+const RUNTIME_PLUGIN_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
+const RUNTIME_PY_MODULE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/;
+
 // ---------- TPR v1A: trusted wheel payload validation (main thread) ----------
 // One plugin wheel artifact as configured through configureExtensions. These
 // checks are the trusted Harness invariants: shape, bounds and the metadata
@@ -909,17 +920,16 @@ function createPythonRuntime(opts) {
         throw new Error('PythonRuntime.configureExtensions: invalid extension module entry');
       }
       // CANONICAL PLUGIN IDENTITY: the trusted Harness payload may not invent
-      // a weaker id schema — every module id must match the SAME
-      // EXTENSION_ID_PATTERN the descriptors are validated against
-      // (extensions.js, loaded before this script by index.html; no local
-      // copy of the regex). Both payload shapes — LEGACY SYNTHETIC
-      // COMPOSITION PATH (files) and TRUSTED PLUGIN RUNTIME V1A (wheels) —
-      // pass through this gate.
-      if (!EXTENSION_ID_PATTERN.test(m.pluginId)) {
+      // a weaker id schema — every module id must match the SAME pattern the
+      // descriptors are validated against (extensions.js keeps its own copy;
+      // equality is pinned by tests/runtime-boundary.test.cjs). Both payload
+      // shapes — LEGACY SYNTHETIC COMPOSITION PATH (files) and TRUSTED
+      // PLUGIN RUNTIME V1A (wheels) — pass through this gate.
+      if (!RUNTIME_PLUGIN_ID_PATTERN.test(m.pluginId)) {
         throw new Error('PythonRuntime.configureExtensions: module pluginId must match '
-          + EXTENSION_ID_PATTERN + ': ' + m.pluginId);
+          + RUNTIME_PLUGIN_ID_PATTERN + ': ' + m.pluginId);
       }
-      if (m.imports.some((n) => !EXTENSION_PY_MODULE_PATTERN.test(String(n)))) {
+      if (m.imports.some((n) => !RUNTIME_PY_MODULE_PATTERN.test(String(n)))) {
         throw new Error('PythonRuntime.configureExtensions: invalid smoke import name in module ' + m.pluginId);
       }
       const hasFiles = m.files !== undefined;
@@ -974,13 +984,36 @@ function createPythonRuntime(opts) {
     this._pending.clear();
   },
 
-  _setStatus(status) {
-    this.status = status;
-    const el = document.getElementById('sb-python');
-    if (el) {
-      el.textContent = 'Python: ' + status;
-      el.className = status;
+  // M2a (repository split): status changes are EVENTS, never DOM writes.
+  // _setStatus updates the instance state and fans out to the listener
+  // set (onStatus). Observer exceptions are CONTAINED per listener: a
+  // throwing observer can never break the execution, other observers or
+  // the cleanup path. Events are instance-scoped — a stale instance's
+  // events reach only its own (unsubscribed) listeners.
+  _statusListeners: null,
+
+  onStatus(fn) {
+    if (typeof fn !== 'function') return () => {};
+    if (!this._statusListeners) this._statusListeners = new Set();
+    this._statusListeners.add(fn);
+    // Immediate snapshot on subscribe: consumers read the current state
+    // without a poll and without a missed-edge window.
+    try { fn(this.snapshot()); } catch (e) { /* contained: initial read */ }
+    return () => { this._statusListeners.delete(fn); };
+  },
+
+  _emitStatus() {
+    if (!this._statusListeners || !this._statusListeners.size) return;
+    const snap = this.snapshot();
+    for (const fn of Array.from(this._statusListeners)) {
+      try { fn(snap); } catch (e) { /* contained: observer failure */ }
     }
+  },
+
+  _setStatus(status) {
+    if (this.status === status) { return; }
+    this.status = status;
+    this._emitStatus();
   },
 
   // Run Python code with every VFS data mount mirrored in — serialized:
@@ -990,7 +1023,7 @@ function createPythonRuntime(opts) {
   // TEST-ONLY seam shrinking the bootstrap budgets (never used in prod).
   async run(code, vfs, opts) {
     if (this._disposed) throw new Error(this._disposed);
-    const entry = { killed: false, reason: null };
+    const entry = { killed: false, reason: null, done: null };
     this._queuedRuns.add(entry);
     const gen = this._resetGeneration;
     const turn = this._queue.then(async () => {
@@ -1025,7 +1058,24 @@ function createPythonRuntime(opts) {
     // the chain always advances, so timeouts/cancellations/releases cannot
     // wedge the queue.
     this._queue = turn.then(() => {}, () => {});
+    // M2a: the entry's settlement promise. Assigned synchronously (no await
+    // separates it from the queued-set add), so a prepare barrier taken at
+    // any later moment sees EVERY in-flight run exactly once.
+    entry.done = turn;
     return turn;
+  },
+
+  // M2a (repository split): resolves when every execution tracked at call
+  // time (queued + active) has SETTLED — the barrier RuntimeSession.prepare
+  // waits on before applying a configuration change. Promise.allSettled:
+  // a failing run is still a settled run. Null when nothing is in flight
+  // (the common between-tasks case — no promise allocated).
+  _inflightSettlement() {
+    const proms = [];
+    for (const e of this._queuedRuns) if (e.done) proms.push(e.done);
+    for (const e of this._activeRuns) if (e.done) proms.push(e.done);
+    if (!proms.length) return null;
+    return Promise.allSettled(proms).then(() => {});
   },
 
   // Run Python code with every VFS data mount mirrored in.
@@ -3922,14 +3972,10 @@ async function runCurl(args, ctx, opts) {
       headers: headers,
       body: body,
       signal: opts && opts.signal,
-      // Approval Framework consumer context (docs/NETWORK-RUNTIME.md):
-      // the approval provider is injected by the tool wiring — the shell
-      // neither constructs approvals nor knows their internals.
-      policyContext: {
-        approvals: opts && opts.approvals,
-        conversationId: opts && opts.conversationId,
-        taskGeneration: opts && opts.taskGeneration,
-      },
+      // Execution authorization port (contract §3.5): the injected
+      // consumer decides; the shell neither constructs approvals nor
+      // carries any chat identity.
+      authorization: opts && opts.authorization,
     });
   } catch (e) {
     if (isCancelledError(e)) return netResult('curl: cancelled', false);
@@ -3986,4 +4032,39 @@ async function runCurl(args, ctx, opts) {
   return netResult(
     'curl: binary response (' + mime + ', ' + res.bytes.byteLength + ' bytes); use curl -o <file> <url>',
     true, res);
+}
+
+// ============================================================
+//  M2a (repository split): the DECLARED Runtime-internal registry.
+//
+//  The runtime core stays a classic script until M3 (repository
+//  extraction); this frozen table is the one named seam the public ESM
+//  entry (src/runtime/index.js) and standalone hosts resolve it through.
+//  It is a table of the SAME functions — never a second state holder.
+//  Consumers outside the Runtime (Harness/Product) must go through the
+//  public entry, never through this registry; the boundary test enforces
+//  that Runtime files reference nothing but their own registry among
+//  globals. Deleted at M3 when shell.js becomes the runtime package.
+// ============================================================
+if (typeof globalThis !== 'undefined') {
+  const __runtimeCoreTable = {
+    contractVersion: 1,
+    // payload contract data (this module is the Runtime's canonical copy)
+    contract: Object.freeze({
+      pluginIdPattern: RUNTIME_PLUGIN_ID_PATTERN,
+      pyModulePattern: RUNTIME_PY_MODULE_PATTERN,
+    }),
+    // interpreter + execution (always defined in this module)
+    createPythonRuntime,
+    runShellCommand,
+    runPythonCode,
+  };
+  // Filesystem primitives load as separate classic scripts; a host that
+  // loaded only part of the core registers what exists — the entry's
+  // resolution check refuses an INCOMPLETE core at createRuntime() time.
+  if (typeof VirtualWorkspace === 'function') __runtimeCoreTable.VirtualWorkspace = VirtualWorkspace;
+  if (typeof MemoryWorkspace === 'function') __runtimeCoreTable.MemoryWorkspace = MemoryWorkspace;
+  if (typeof shellSystemPromptSection === 'function') __runtimeCoreTable.shellSystemPromptSection = shellSystemPromptSection;
+  if (typeof SHELL_COMMANDS !== 'undefined') __runtimeCoreTable.SHELL_COMMANDS = SHELL_COMMANDS;
+  globalThis.__LOCUS_RUNTIME_CORE__ = Object.freeze(__runtimeCoreTable);
 }

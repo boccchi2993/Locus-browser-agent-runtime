@@ -156,6 +156,16 @@ const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js',
   .join('\n;\n');
 const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, VirtualWorkspace, SHELL_COMMANDS, createPythonRuntime, executeTool });');
 
+// M2a: bash routes through the PUBLIC runtime entry (the eval'd
+// shell.js published the declared core registry). Worker sources are
+// never booted by this suite.
+const { createRuntime } = require('../src/runtime/index.js');
+const __session = createRuntime({
+  workerAssets: { pyWorkerSource: '/* not booted in this suite */', grepWorkerSource: '/* not booted in this suite */' },
+}).createSession();
+const exec = (tool, input, workspace, opts) => M.executeTool(tool, input, workspace,
+  Object.assign({ runtimeSession: __session }, opts || {}));
+
 function bareVfs(adapter) {
   const vfs = new M.VirtualWorkspace({ listCommands: () => Object.keys(M.SHELL_COMMANDS) });
   if (adapter) vfs.mount('/mnt/workspace', adapter, 'external-read-write');
@@ -191,7 +201,7 @@ class MemWS extends M.WorkspaceAdapter {
 // M1b: python runs on an INJECTED interpreter instance (what the product
 // wiring does). One suite instance; every bash call gets it via opts.
 const { freshRuntime } = require('./helpers/runtime.cjs');
-const pyrt = freshRuntime(M);
+const pyrt = __session.pythonRuntime(); // the session drives THIS instance
 const rawExecuteTool = M.executeTool;
 M.executeTool = (name, input, ws, opts) => rawExecuteTool(name, input, ws, Object.assign({ pythonRuntime: pyrt }, opts || {}));
 
@@ -239,7 +249,7 @@ async function run() {
     uncollectedFiles: ['/mnt/workspace/renamed'],
     stdoutTruncated: false, stderrTruncated: false,
   });
-  const r1 = await M.executeTool('bash', "python -c 'x'", ws1);
+  const r1 = await exec('bash', "python -c 'x'", ws1);
   check('O1d incomplete changeset → source preserved',
     !!ws1.files['old.txt'] && new TextDecoder().decode(ws1.files['old.txt']) === 'original');
   check('O1e incomplete changeset → tool reports failure', r1.success === false, JSON.stringify(r1.output));
@@ -253,7 +263,7 @@ async function run() {
     deleted: ['/mnt/workspace/old.txt'],
     uncollectedFiles: ['/mnt/workspace/part2.bin', '/mnt/workspace/part3.bin'],
   });
-  const r2 = await M.executeTool('bash', "python -c 'x'", ws2);
+  const r2 = await exec('bash', "python -c 'x'", ws2);
   check('O2 volume-cap uncollected → source preserved + failure',
     r2.success === false && !!ws2.files['old.txt'] && new TextDecoder().decode(ws2.files['old.txt']) === 'original'
     && !!ws2.files['part1.bin'] && new TextDecoder().decode(ws2.files['part1.bin']) === 'part',
@@ -285,7 +295,7 @@ async function run() {
     uncollectedFiles: [],
     stdoutTruncated: true,
   });
-  const r4 = await M.executeTool('bash', "python -c 'x'", ws4);
+  const r4 = await exec('bash', "python -c 'x'", ws4);
   check('O4 stdout truncation alone stays success, rename commits',
     r4.success === true && !('old.txt' in ws4.files) && !!ws4.files['new.txt']
     && r4.output.includes('stdout truncated'), JSON.stringify(r4.output).slice(0, 200));
@@ -293,7 +303,7 @@ async function run() {
   // ---------- O5. plain delete and normal rename unaffected ----------
   const ws5 = new MemWS({ 'gone.txt': 'x' });
   mockWorkerResult({ stdout: '', stderr: '', error: null, files: [], deleted: ['/mnt/workspace/gone.txt'], uncollectedFiles: [] });
-  const r5 = await M.executeTool('bash', "python -c 'x'", ws5);
+  const r5 = await exec('bash', "python -c 'x'", ws5);
   check('O5 plain delete still works', r5.success === true && !('gone.txt' in ws5.files));
 
   const ws6 = new MemWS({ 'old.txt': 'original' });
@@ -303,7 +313,7 @@ async function run() {
     deleted: ['/mnt/workspace/old.txt'],
     uncollectedFiles: [],
   });
-  const r6 = await M.executeTool('bash', "python -c 'x'", ws6);
+  const r6 = await exec('bash', "python -c 'x'", ws6);
   check('O6 normal rename still works', r6.success === true && !('old.txt' in ws6.files)
     && new TextDecoder().decode(ws6.files['renamed']) === 'original');
 
@@ -373,7 +383,7 @@ async function run() {
     files: [{ path: '/mnt/upload/input.txt', b64: btoa('hacked') }],
     deleted: [], uncollectedFiles: [],
   });
-  const r9 = await M.executeTool('bash', "python -c 'x'", vfs9);
+  const r9 = await exec('bash', "python -c 'x'", vfs9);
   check('O9c read-only change rejected at commit with clear conflict',
     r9.success === false
     && r9.output.includes('conflict: /mnt/upload/input.txt')
@@ -387,7 +397,7 @@ async function run() {
     stdout: '', stderr: '', error: null,
     files: [], deleted: ['/mnt/upload/input.txt'], uncollectedFiles: [],
   });
-  const r9b = await M.executeTool('bash', "python -c 'x'", vfs9);
+  const r9b = await exec('bash', "python -c 'x'", vfs9);
   check('O9e read-only delete rejected at commit', r9b.success === false
     && r9b.output.includes('read-only filesystem')
     && (await vfs9.exists('/mnt/upload/input.txt')), JSON.stringify(r9b.output));

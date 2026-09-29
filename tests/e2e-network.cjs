@@ -239,7 +239,14 @@ const PAGE_SCRIPT = String.raw`
   const check = (name, cond, detail) =>
     out.push((cond ? 'PASS ' : 'NET-FAIL ') + name + (detail !== undefined ? ' | ' + String(detail).slice(0, 300) : ''));
   const exec = (cmd, opts) => window.executeTool('bash', cmd, window.__locus.vfs,
-    Object.assign({ approvals: window.__locus.approvals.controller }, opts || {}));
+    Object.assign({
+      runtimeSession: window.__locus.runtime(),
+      // M2a authorization port: this page adapter adds the chat identity
+      // on the product side (null here — the suite drives no live task);
+      // the runtime request itself carries none.
+      authorization: { request: (req, o) => window.__locus.approvals.request(
+        Object.assign({}, req, { conversationId: null, taskGeneration: null }), o) },
+    }, opts || {}));
   const counts = async () => {
     const r = await fetch(TARGET + '/target/counts');
     return await r.json();

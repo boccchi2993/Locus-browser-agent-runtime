@@ -143,6 +143,9 @@ if (e2eMode) {
   // ?e2e=1). Browser python e2e drives prepare/reset/worker-state through
   // it — the SAME object task preparation and shell execution use.
   window.__locus.pythonRuntime = () => ui.pythonRuntime();
+  // M2a seam: the runtime session (prepare/reset/status/execute) — the
+  // public entry object the product chain drives.
+  window.__locus.runtime = () => ui.runtimeSession();
   // M2a seam: the runtime worker assets this build carries (worker-source
   // instrumentation in e2e; never part of the product chain).
   window.__locus.runtimeAssets = () => ui.runtimeWorkerAssets();
@@ -199,12 +202,16 @@ if (e2eMode) {
   };
 }
 
-// Python interpreter status is owned by the store's canonical instance
-// (M1b lifecycle); mirror it into the store for display.
-setInterval(() => {
-  const rt = ui.pythonRuntime();
-  if (rt) ui.store.pythonStatus = rt.status;
-}, 1000);
+// Python interpreter status is owned by the runtime session (M2a): the
+// status EVENT stream replaces the old 1-second poll — the store
+// projection updates on every transition, with the current snapshot
+// delivered synchronously at subscribe time.
+{
+  const rt = ui.runtimeSession();
+  if (rt && typeof rt.onStatus === 'function') {
+    rt.onStatus((snap) => { ui.store.pythonStatus = snap.interpreter; });
+  }
+}
 
 // ---------- demo automation ----------
 if (demoMode === 'task') {

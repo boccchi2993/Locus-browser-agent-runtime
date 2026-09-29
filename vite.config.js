@@ -19,6 +19,7 @@ const RUNTIME_SCRIPTS = [
   'src/model.js',
   'src/workspace.js',
   'src/vfs.js',
+  'src/conversation-history-workspace.js',
   'src/extensions.js',
   'src/capability-package.js',
   'src/attachments.js',

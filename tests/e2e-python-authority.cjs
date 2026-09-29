@@ -111,8 +111,7 @@ async function main() {
       const L = window.__locus;
       window.__paE2e = {
         exec: (cmd, opts) => window.executeTool('bash', cmd, L.vfs,
-          Object.assign({ approvals: L.approvals && L.approvals.controller,
-            pythonRuntime: L.pythonRuntime() }, opts || {})),
+          Object.assign({ runtimeSession: L.runtime() }, opts || {})),
       };
       return 'installed';
     })()`);

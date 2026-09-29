@@ -27,8 +27,23 @@ const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js',
 const M = eval(src + '\n;({ WorkspaceAdapter, MemoryWorkspace, normalizeWorkspacePath, VirtualWorkspace,'
   + ' createPythonRuntime, SHELL_COMMANDS, NetworkRuntime, runShellCommand, executeTool });');
 
+// M2a: bash routes through the PUBLIC runtime entry (the eval'd
+// shell.js published the declared core registry). Worker sources are
+// never booted by this suite.
+const { createRuntime } = require('../src/runtime/index.js');
+const __session = createRuntime({
+  workerAssets: { pyWorkerSource: '/* not booted in this suite */', grepWorkerSource: '/* not booted in this suite */' },
+}).createSession();
+const exec = (tool, input, workspace, opts) => M.executeTool(tool, input, workspace,
+  Object.assign({ runtimeSession: __session }, opts || {}));
+
 function bareVfs(withWorkspace) {
-  const vfs = new M.VirtualWorkspace({ listCommands: () => Object.keys(M.SHELL_COMMANDS) });
+  // M2a: the PRODUCT home skeleton is passed explicitly (this suite
+  // asserts product-shaped mirror contents, PD1e).
+  const vfs = new M.VirtualWorkspace({
+    listCommands: () => Object.keys(M.SHELL_COMMANDS),
+    homeSkeleton: ['.skills', '.config/locus/mcp', '.cache/locus'],
+  });
   if (withWorkspace) {
     vfs.mount('/mnt/workspace', new M.MemoryWorkspace({ name: 'ws' }), 'external-read-write');
   }
@@ -41,7 +56,7 @@ const hexPrefix = (u8, n) => Array.from((u8 || []).slice(0, n)).join(',');
 // M1b: python runs on an INJECTED interpreter instance (what the product
 // wiring does). One suite instance; every bash call gets it via opts.
 const { freshRuntime } = require('./helpers/runtime.cjs');
-const pyrt = freshRuntime(M);
+const pyrt = __session.pythonRuntime(); // the session drives THIS instance
 const rawExecuteTool = M.executeTool;
 M.executeTool = (name, input, ws, opts) => rawExecuteTool(name, input, ws, Object.assign({ pythonRuntime: pyrt }, opts || {}));
 
@@ -199,7 +214,7 @@ async function run() {
     // BA1: non-UTF-8 bytes survive `>>` exactly
     const vfs = bareVfs(false);
     await vfs.write('/tmp/bin.dat', new Uint8Array([0x00, 0xFF, 0xFE, 0x80, 0x41]));
-    const r = await M.executeTool('bash', 'echo X >> /tmp/bin.dat', vfs);
+    const r = await exec('bash', 'echo X >> /tmp/bin.dat', vfs);
     const after = await vfs.readBytes('/tmp/bin.dat');
     check('BA1 binary >> byte-exact prefix + utf8 payload', r.success
       && bytesEq(after, [0x00, 0xFF, 0xFE, 0x80, 0x41, 0x58, 0x0A]),
@@ -207,7 +222,7 @@ async function run() {
 
     // BA2: PNG-like signature untouched
     await vfs.write('/tmp/img.png', new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
-    const r2 = await M.executeTool('bash', 'echo tail >> /tmp/img.png', vfs);
+    const r2 = await exec('bash', 'echo tail >> /tmp/img.png', vfs);
     const png = await vfs.readBytes('/tmp/img.png');
     check('BA2 PNG header byte-exact after >>', r2.success
       && bytesEq(png.slice(0, 8), [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
@@ -215,7 +230,7 @@ async function run() {
 
     // BA3: stderr append (2>>) uses the same byte-safe primitive
     await vfs.write('/tmp/err.dat', new Uint8Array([0x00, 0xFF, 0xFE, 0x80]));
-    const r3 = await M.executeTool('bash', 'cat /missing 2>> /tmp/err.dat', vfs);
+    const r3 = await exec('bash', 'cat /missing 2>> /tmp/err.dat', vfs);
     const err = await vfs.readBytes('/tmp/err.dat');
     check('BA3 binary 2>> preserves original bytes', !r3.success
       && bytesEq(err.slice(0, 4), [0x00, 0xFF, 0xFE, 0x80]) && err.byteLength > 4,
@@ -223,15 +238,15 @@ async function run() {
 
     // BA4: text append behaviour unchanged
     const vfs4 = bareVfs(false);
-    await M.executeTool('bash', 'echo hello > /tmp/t.txt', vfs4);
-    await M.executeTool('bash', 'echo again >> /tmp/t.txt', vfs4);
+    await exec('bash', 'echo hello > /tmp/t.txt', vfs4);
+    await exec('bash', 'echo again >> /tmp/t.txt', vfs4);
     check('BA4 text append unchanged', new TextDecoder().decode(await vfs4.readBytes('/tmp/t.txt')) === 'hello\nagain\n');
 
     // BA5: quota failure — original file untouched
     const vfs5 = bareVfs(false);
     vfs5.mount('/tmp', new M.MemoryWorkspace({ name: 'tmp', maxBytes: 100 }), 'read-write');
     await vfs5.write('/tmp/q.txt', new Uint8Array(90));
-    const r5 = await M.executeTool('bash', 'echo 0123456789abcdef >> /tmp/q.txt', vfs5);
+    const r5 = await exec('bash', 'echo 0123456789abcdef >> /tmp/q.txt', vfs5);
     check('BA5 append quota failure is loud + source intact', !r5.success
       && r5.output.includes('exceeds maxBytes')
       && (await vfs5.readBytes('/tmp/q.txt')).byteLength === 90, JSON.stringify(r5.output));
@@ -243,7 +258,7 @@ async function run() {
     await wsBig.write('big.bin', big);
     const vfs6 = bareVfs(false);
     vfs6.mount('/mnt/workspace', wsBig, 'external-read-write');
-    const r6 = await M.executeTool('bash', 'echo x >> /mnt/workspace/big.bin', vfs6);
+    const r6 = await exec('bash', 'echo x >> /mnt/workspace/big.bin', vfs6);
     check('BA6 oversized append target refused loudly, source intact', !r6.success
       && r6.output.includes('append limit')
       && (await vfs6.readBytes('/mnt/workspace/big.bin')).byteLength === big.byteLength,
@@ -254,7 +269,7 @@ async function run() {
     await vfs7.write('/tmp/c.txt', new TextEncoder().encode('old\n'));
     const ac = new AbortController();
     ac.abort();
-    const r7 = await M.executeTool('bash', 'echo new >> /tmp/c.txt', vfs7, { signal: ac.signal });
+    const r7 = await exec('bash', 'echo new >> /tmp/c.txt', vfs7, { signal: ac.signal });
     check('BA7 cancelled append never writes', !r7.success
       && new TextDecoder().decode(await vfs7.readBytes('/tmp/c.txt')) === 'old\n', JSON.stringify(r7.output));
   }
@@ -269,7 +284,7 @@ async function run() {
     await vfs.mkdir('/mnt/download/empty');
     await vfs.mkdir('/mnt/workspace/emptydir');
     const msgs = captureWorker(okResult());
-    const r = await M.executeTool('bash', 'cd /tmp/empty && python -c "x"', vfs);
+    const r = await exec('bash', 'cd /tmp/empty && python -c "x"', vfs);
     const msg = msgs[0];
     const dirsOf = (root) => {
       const m = msg.mounts.find((mm) => mm.root === root);
@@ -295,7 +310,7 @@ async function run() {
     // PD3: a bogus cwd is NOT fabricated — only VFS-confirmed dirs are added
     const vfs3 = bareVfs(false);
     const msgs3 = captureWorker(okResult());
-    await M.executeTool('bash', 'python -c "x"', vfs3, {}); // cwd = /home/locus (default)
+    await exec('bash', 'python -c "x"', vfs3, {}); // cwd = /home/locus (default)
     const home3 = msgs3[0].mounts.find((m) => m.root === '/home/locus');
     check('PD3 default cwd needs no fabrication (mount root)', msgs3[0].cwd === '/home/locus'
       && !home3.directories.includes('/home/locus'), JSON.stringify(home3.directories));
@@ -367,19 +382,19 @@ async function run() {
     mockWorkerResult(okResult({
       createdDirs: ['/tmp/a', '/home/locus/a', '/mnt/download/a', '/mnt/workspace/a'],
     }));
-    const r = await M.executeTool('bash', 'python -c "x"', vfs);
+    const r = await exec('bash', 'python -c "x"', vfs);
     const isDir = async (p) => (await vfs.stat(p)).kind === 'directory';
     check('DC1 python mkdir persists on /tmp, /home/locus, /mnt/download, /mnt/workspace', r.success
       && r.output.includes('[mkdir: /tmp/a, /home/locus/a, /mnt/download/a, /mnt/workspace/a]')
       && await isDir('/tmp/a') && await isDir('/home/locus/a')
       && await isDir('/mnt/download/a') && await isDir('/mnt/workspace/a'), JSON.stringify(r.output));
-    const ls = await M.executeTool('bash', 'ls /tmp', vfs);
+    const ls = await exec('bash', 'ls /tmp', vfs);
     check('DC1b shell sees the python-created dir', ls.success && ls.output.split('\n').includes('a/'), ls.output);
 
     // DC2: read-only mount — provider untouched, loud conflict
     const vfs2 = bareVfs(false);
     mockWorkerResult(okResult({ createdDirs: ['/mnt/upload/a'] }));
-    const r2 = await M.executeTool('bash', 'python -c "x"', vfs2);
+    const r2 = await exec('bash', 'python -c "x"', vfs2);
     check('DC2 python mkdir on /mnt/upload refused, provider unchanged', !r2.success
       && r2.output.includes('read-only filesystem')
       && (await vfs2.list('/mnt/upload')).length === 0, JSON.stringify(r2.output));
@@ -388,14 +403,14 @@ async function run() {
     const vfs3 = bareVfs(false);
     await vfs3.mkdir('/tmp/goner');
     mockWorkerResult(okResult({ deletedDirs: ['/tmp/goner'] }));
-    const r3 = await M.executeTool('bash', 'python -c "x"', vfs3);
+    const r3 = await exec('bash', 'python -c "x"', vfs3);
     check('DC3 python rmdir persists', r3.success && !(await vfs3.exists('/tmp/goner'))
       && r3.output.includes('[deleted: /tmp/goner]'), JSON.stringify(r3.output));
 
     // DC4: nested create a/b/c all exist afterwards
     const vfs4 = bareVfs(false);
     mockWorkerResult(okResult({ createdDirs: ['/tmp/n', '/tmp/n/m', '/tmp/n/m/o'] }));
-    const r4 = await M.executeTool('bash', 'python -c "x"', vfs4);
+    const r4 = await exec('bash', 'python -c "x"', vfs4);
     check('DC4 nested empty dirs all committed', r4.success
       && await isDir2(vfs4, '/tmp/n') && await isDir2(vfs4, '/tmp/n/m') && await isDir2(vfs4, '/tmp/n/m/o'),
       JSON.stringify(r4.output));
@@ -404,7 +419,7 @@ async function run() {
     const vfs5 = bareVfs(false);
     await vfs5.write('/tmp/f.txt', 'data');
     mockWorkerResult(okResult({ createdDirs: ['/tmp/f.txt'], deleted: ['/tmp/f.txt'] }));
-    const r5 = await M.executeTool('bash', 'python -c "x"', vfs5);
+    const r5 = await exec('bash', 'python -c "x"', vfs5);
     check('DC5 file→dir type change refused loudly, file intact', !r5.success
       && r5.output.includes('type changes are not committed')
       && new TextDecoder().decode(await vfs5.readBytes('/tmp/f.txt')) === 'data'
@@ -414,7 +429,7 @@ async function run() {
     const vfs6 = bareVfs(false);
     await vfs6.mkdir('/tmp/d');
     mockWorkerResult(okResult({ files: [{ path: '/tmp/d', b64: btoa('x') }], deletedDirs: ['/tmp/d'] }));
-    const r6 = await M.executeTool('bash', 'python -c "x"', vfs6);
+    const r6 = await exec('bash', 'python -c "x"', vfs6);
     check('DC6 dir→file type change fails loudly, dir intact', !r6.success
       && r6.output.includes('write-back failed')
       && (await vfs6.stat('/tmp/d')).kind === 'directory', JSON.stringify(r6.output));
@@ -423,14 +438,14 @@ async function run() {
     const vfs7 = bareVfs(false);
     await vfs7.mkdir('/tmp/keep');
     mockWorkerResult(okResult({ createdDirs: ['/mnt/upload/a'], deletedDirs: ['/tmp/keep'] }));
-    const r7 = await M.executeTool('bash', 'python -c "x"', vfs7);
+    const r7 = await exec('bash', 'python -c "x"', vfs7);
     check('DC7 conflict blocks directory deletions, sources preserved', !r7.success
       && await isDir2(vfs7, '/tmp/keep')
       && r7.output.includes('directory deletions skipped'), JSON.stringify(r7.output));
 
     // DC8: a committed dir is synced back in on the NEXT python run
     const msgs8 = captureWorker(okResult());
-    await M.executeTool('bash', 'python -c "x"', vfs); // vfs from DC1, has /tmp/a
+    await exec('bash', 'python -c "x"', vfs); // vfs from DC1, has /tmp/a
     const tmp8 = msgs8[0].mounts.find((m) => m.root === '/tmp');
     check('DC8 committed dirs round-trip into the next sync-in', tmp8.directories.includes('/tmp/a'),
       JSON.stringify(tmp8.directories));
@@ -438,7 +453,7 @@ async function run() {
     // DC9: read-only rmdir refused
     const vfs9 = bareVfs(false);
     mockWorkerResult(okResult({ deletedDirs: ['/mnt/upload/sub'] }));
-    const r9 = await M.executeTool('bash', 'python -c "x"', vfs9);
+    const r9 = await exec('bash', 'python -c "x"', vfs9);
     check('DC9 python rmdir on /mnt/upload refused', !r9.success
       && r9.output.includes('read-only filesystem'), JSON.stringify(r9.output));
   }
@@ -494,16 +509,16 @@ async function run() {
     global.fetch = async () => { calls++; return new Response('data', { status: 200, headers: { 'content-type': 'application/octet-stream' } }); };
     try {
       const vfs = bareVfs(false);
-      const r1 = await M.executeTool('bash', 'curl -o /mnt/download https://example.test/x', vfs);
+      const r1 = await exec('bash', 'curl -o /mnt/download https://example.test/x', vfs);
       check('CD1 curl -o /mnt/download (a directory) fails BEFORE fetch', !r1.success
         && r1.output.includes('is a directory') && calls === 0, r1.output + ' | calls=' + calls);
 
-      const r2 = await M.executeTool('bash', 'curl -o /tmp https://example.test/x', vfs);
+      const r2 = await exec('bash', 'curl -o /tmp https://example.test/x', vfs);
       check('CD2 curl -o /tmp (a directory) fails BEFORE fetch', !r2.success
         && r2.output.includes('is a directory') && calls === 0, r2.output + ' | calls=' + calls);
 
       // the good path is unaffected: a file target still downloads
-      const r3 = await M.executeTool('bash', 'curl -o /mnt/download/f.bin https://example.test/x', vfs);
+      const r3 = await exec('bash', 'curl -o /mnt/download/f.bin https://example.test/x', vfs);
       check('CD3 curl -o file target still downloads', r3.success && calls === 1
         && new TextDecoder().decode(await vfs.readBytes('/mnt/download/f.bin')) === 'data',
         r3.output + ' | calls=' + calls);

@@ -62,10 +62,28 @@ async function executeTool(name, input, workspace, opts) {
 
   try {
     if (toolName === 'bash') {
-      const res = await runShellCommand(input, workspace, opts);
+      // M2a (repository split): the product execution chain goes through
+      // the public RuntimeSession entry — the session injects the
+      // interpreter instance and the grep worker asset itself, so a call
+      // can never execute on a foreign interpreter or fetch worker source
+      // from a page. Running bash WITHOUT a session is an assembly bug
+      // and fails loudly (runtime suites test runShellCommand directly).
+      const runtimeSession = opts && opts.runtimeSession;
+      if (!runtimeSession) throw new Error('bash: no runtime session injected');
+      const res = await runtimeSession.execute({
+        kind: 'shell',
+        input: input,
+        context: {
+          filesystem: workspace,
+          signal: opts && opts.signal,
+          mutationPolicy: opts && opts.mutationPolicy,
+          authorization: opts && opts.authorization,
+          cwd: opts && opts.cwd,
+        },
+      });
       output = res.output;
-      success = !res.isError;
-      if (res.isError) error = firstLine(res.output);
+      success = res.ok;
+      if (!res.ok) error = firstLine(res.output);
       ioIn = res.io.in;
       ioOut = res.io.out;
       // A shell command may run on a more specific backend than the tool

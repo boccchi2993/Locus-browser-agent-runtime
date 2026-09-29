@@ -1,25 +1,26 @@
-// Store python-lifecycle wiring tests (M1b, repository split, node):
+// Store runtime-session lifecycle wiring tests (M2a, repository split):
 // the REAL presentation store (src/ui/store.js) wired to a fake
-// AgentSession and a RECORDED python runtime factory. Proves the M1b
-// ownership invariants at the product seam:
+// AgentSession and a RECORDED runtime session. Proves the ownership
+// invariants at the product seam:
 //
-//   SP1  the store creates the ONE canonical interpreter instance from the
-//        injected factory and task preparation drives THAT instance
-//        (prepare with the TaskEnvironment's payload, null payload when
-//        there is no capability manager);
-//   SP2  shell execution receives exactly the SAME instance in
-//        opts.pythonRuntime — preparation and execution never split;
+//   SP1  the store drives the ONE canonical runtime session and task
+//        preparation configures IT (prepare with the TaskEnvironment's
+//        payload, null payload when there is no capability manager);
+//   SP2  shell execution routes through exactly the SAME session in
+//        opts.runtimeSession — preparation and execution never split;
 //   SP3  the session boundary (newTask / session reset) resets the SAME
-//        instance via onSessionReset;
-//   SP4  the instance is created lazily (text-only work never touches the
-//        factory) and a deployment without the shell runtime resolves to
-//        null with no error;
-//   SP5  window.__LOCUS_HOOKS__.pythonRuntime substitutes the instance
+//        runtime session via onSessionReset;
+//   SP4  the runtime session is resolved lazily (text-only work never
+//        touches it) and a deployment without the runtime core resolves
+//        to null with no error;
+//   SP5  window.__LOCUS_HOOKS__.runtimeSession substitutes the session
 //        (test/e2e seam) before first use.
 //
-// Instance BEHAVIOR (prepare/reset/dispose semantics) is pinned in
-// tests/python-lifecycle.test.cjs against the REAL factory; REAL browser
-// python is gated by the e2e python suites driving the production seam.
+// Interpreter-instance BEHAVIOR (prepare/reset/dispose/prepare-barrier
+// semantics) is pinned in tests/python-lifecycle.test.cjs and
+// tests/runtime-session.test.mjs against the REAL factory/entry; REAL
+// browser python is gated by the e2e python suites driving the
+// production seam.
 // Run: node tests/store-python-lifecycle.test.mjs
 
 import { readFileSync } from 'node:fs';
@@ -28,32 +29,31 @@ import { dirname, join } from 'node:path';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-// ---------- recorded python runtime factory ----------
-// A fake instance faithful to the lifecycle surface the store uses:
-// prepare(req) → { rebuiltInterpreter }, reset(reason), run(code, vfs, opts).
-const createdInstances = [];
-const pythonRuntime = () => ({
-  worker: null,
-  status: 'cold',
-  prepared: [],
-  resets: [],
-  runs: [],
-  extensionKey() { return this.prepared.length ? (this.prepared[this.prepared.length - 1].key ?? null) : null; },
-  async prepare(req) {
-    const wanted = req && req.python ? req.python.key : null;
-    this.prepared.push({ key: wanted, python: req ? req.python : undefined, signal: req ? req.signal : undefined });
-    return { rebuiltInterpreter: false };
-  },
-  reset(reason) { this.resets.push(reason ?? null); },
-  async run(code, vfs, opts) {
-    this.runs.push({ code, opts: opts || null });
-    return { stdout: 'ok', stderr: '', error: null, written: [], deleted: [], mkdirs: [], conflicts: [], writeFailed: [], notPersisted: [], skipped: [], uncollected: [] };
-  },
-});
-globalThis.createPythonRuntime = () => {
-  const rt = pythonRuntime();
-  createdInstances.push(rt);
-  return rt;
+// ---------- recorded runtime session ----------
+// A fake session faithful to the surface the store uses:
+// prepare(req) → { rebuiltInterpreter }, reset(reason), pythonRuntime().
+const createdSessions = [];
+const fakeInterpreter = () => ({ marker: 'fake-interpreter' });
+const makeSession = () => {
+  const s = {
+    interpreter: fakeInterpreter(),
+    prepared: [],
+    resets: [],
+    prepareGate: null,
+    async prepare(req) {
+      if (s.prepareGate) await s.prepareGate();
+      const wanted = req && req.python ? req.python.key : null;
+      s.prepared.push({ key: wanted, python: req ? req.python : undefined, signal: req ? req.signal : undefined });
+      return { rebuiltInterpreter: false };
+    },
+    reset(reason) { s.resets.push(reason ?? null); },
+    status() { return { interpreter: 'cold', busyExecutions: 0, extensionKey: null, disposed: null }; },
+    onStatus() { return () => {}; },
+    pythonRuntime() { return s.interpreter; },
+    execute: async () => { throw new Error('fake session: execute not expected in this suite'); },
+  };
+  createdSessions.push(s);
+  return s;
 };
 
 // index.html loads src/mutation-policy.js as a classic script before the
@@ -125,7 +125,7 @@ globalThis.VirtualWorkspace = (0, eval)(
 // ---------- gated capability manager (prepare-phase liveness, M1b fix) ----
 // Refreshes can hang (durability re-observation): these sections park a
 // REAL submit() inside refreshSkillPresence and prove the stale task never
-// prepares/resets/reconfigures the canonical interpreter afterwards.
+// prepares/resets/reconfigures the canonical runtime session afterwards.
 class FakeCapabilityManager {
   constructor(opts) { this.opts = opts; this.refreshes = 0; this.envBuilt = 0; this.gate = null; }
   async refreshSkillPresence() { this.refreshes++; if (this.gate) await this.gate(); }
@@ -138,6 +138,11 @@ class FakeCapabilityManager {
   listCapabilities() { return []; }
 }
 
+// The canonical runtime session for THIS module graph, injected through the
+// hooks seam BEFORE the store resolves it (the exact production seam).
+const canonical = makeSession();
+globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: canonical } };
+
 const ui = await import('../src/ui/store.js');
 const { store, session, submit, newTask } = ui;
 
@@ -149,18 +154,15 @@ function check(name, cond, detail) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const runScript = (script) => { session.script = script; };
 
-// The canonical instance the store resolved on first use.
-const canonical = ui.pythonRuntime();
+check('SP0 the store resolved exactly the injected session (no second construction)',
+  ui.runtimeSession() === canonical && createdSessions.length === 1,
+  JSON.stringify({ sessions: createdSessions.length }));
 
-check('SP0 exactly ONE instance was created by the store',
-  createdInstances.length === 1 && canonical === createdInstances[0],
-  JSON.stringify({ created: createdInstances.length }));
-
-// ---------- SP4: lazy creation (already proven by order) ----------
-// The factory must not have run before the first explicit pythonRuntime()
-// use OR the first task — both happened above; a second submit reuses the
-// SAME instance (never a second construction).
-const createdBefore = createdInstances.length;
+// ---------- SP4: lazy resolution (already proven by order) ----------
+// The session must not have been touched before the first explicit use OR
+// the first task — both happened below; a second submit reuses the SAME
+// session (never a second resolution).
+const createdBefore = createdSessions.length;
 
 // ---------- SP1 + SP2 + SP3: one task end to end ----------
 {
@@ -169,37 +171,40 @@ const createdBefore = createdInstances.length;
   await session.toolExecutor('bash', 'echo probe', ui.vfs, { signal: new AbortController().signal });
   const done = submit('run python and report');
   await done;
-  check('SP1 task preparation configured the CANONICAL instance',
+  check('SP1 task preparation configured the CANONICAL runtime session',
     canonical.prepared.length === 1
       && canonical.prepared[0].key === null
       && canonical.prepared[0].python === null,
     JSON.stringify(canonical.prepared));
-  check('SP2 the tool executor received the SAME instance in opts.pythonRuntime',
+  check('SP2 the tool executor routed through the SAME session in opts.runtimeSession',
     toolCalls.length >= 1
-      && toolCalls.every((c) => c.opts && c.opts.pythonRuntime === canonical),
-    JSON.stringify(toolCalls.map((c) => c.opts && (c.opts.pythonRuntime === canonical))));
-  check('SP2b no additional instance was constructed for execution',
-    createdInstances.length === createdBefore,
-    JSON.stringify({ created: createdInstances.length, before: createdBefore }));
+      && toolCalls.every((c) => c.opts && c.opts.runtimeSession === canonical),
+    JSON.stringify(toolCalls.map((c) => c.opts && (c.opts.runtimeSession === canonical))));
+  check('SP2b no interpreter instance leaked into the tool opts (the session owns it)',
+    toolCalls.every((c) => c.opts && c.opts.pythonRuntime === undefined && c.opts.grepWorkerSource === undefined),
+    JSON.stringify(toolCalls.map((c) => Object.keys(c.opts || {}))));
+  check('SP2c no additional session was resolved for execution',
+    createdSessions.length === createdBefore,
+    JSON.stringify({ created: createdSessions.length, before: createdBefore }));
 
-  // SP3: the session boundary resets the canonical instance.
+  // SP3: the session boundary resets the canonical runtime session.
   const resetsBefore = canonical.resets.length;
   newTask();
-  check('SP3 the session boundary reset the CANONICAL instance',
+  check('SP3 the session boundary reset the CANONICAL runtime session',
     canonical.resets.length === resetsBefore + 1,
     JSON.stringify(canonical.resets));
 }
 
-// ---------- SP1b: a second task reuses the instance (same key, no reset) ----------
+// ---------- SP1b: a second task reuses the session (same key, no reset) ----------
 {
   runScript([]);
   await submit('second task');
-  check('SP1b the second task reused the SAME instance (no reconfiguration churn)',
+  check('SP1b the second task reused the SAME session (no reconfiguration churn)',
     canonical.prepared.length === 2
       && canonical.prepared[1].key === null
       && canonical.prepared[1].python === null
-      && createdInstances.length === 1,
-    JSON.stringify({ prepared: canonical.prepared.length, created: createdInstances.length }));
+      && createdSessions.length === 1,
+    JSON.stringify({ prepared: canonical.prepared.length, created: createdSessions.length }));
 }
 
 // ---------- SP6: the product mutation policy rides every bash call -------
@@ -221,20 +226,27 @@ const createdBefore = createdInstances.length;
     refusal.allowed === false && refusal.reason.includes('Skill instance paths are stable')
       && allowed.allowed === true,
     JSON.stringify({ refusal, allowed }));
+  // SP6c: the executor opts carry the execution authorization PORT, and it
+  // forwards the plain request PLUS the product-side identity to the
+  // approval controller (contract §3.5 direction).
+  const authorization = toolCalls[0] && toolCalls[0].opts && toolCalls[0].opts.authorization;
+  check('SP6c the executor opts carry an execution authorization port',
+    !!authorization && typeof authorization.request === 'function',
+    JSON.stringify({ present: !!authorization }));
 }
 
-// ---------- SP5: the hooks seam substitutes the instance ----------
+// ---------- SP5: a fresh graph substitutes its own session ----------
 {
-  // Fresh module graph: hooks must be set BEFORE the first pythonRuntime()
-  // resolution of that graph. Use a subprocess-style second import via a
-  // query string so the store module re-evaluates.
-  globalThis.window = { __LOCUS_HOOKS__: { pythonRuntime: pythonRuntime() } };
-  createdInstances.length = 0;
+  // Fresh module graph: hooks must be set BEFORE the first resolution of
+  // that graph. Use a query string so the store module re-evaluates.
+  const hookedSession = makeSession();
+  globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: hookedSession } };
   const ui2 = await import('../src/ui/store.js?hooks-seam');
-  const hooked = ui2.pythonRuntime();
-  check('SP5 window.__LOCUS_HOOKS__.pythonRuntime substitutes the instance',
-    !!hooked && createdInstances.length === 0 && typeof hooked.prepare === 'function',
-    JSON.stringify({ hooked: !!hooked, created: createdInstances.length }));
+  const resolved = ui2.runtimeSession();
+  check('SP5 window.__LOCUS_HOOKS__.runtimeSession substitutes the session',
+    resolved === hookedSession && typeof resolved.prepare === 'function'
+      && ui2.pythonRuntime() === hookedSession.interpreter,
+    JSON.stringify({ resolved: resolved === hookedSession }));
   delete globalThis.window;
 }
 
@@ -244,7 +256,6 @@ const createdBefore = createdInstances.length;
   // mutation-policy.js): the first bash call must REFUSE, never run
   // unprotected.
   const savedPolicy = globalThis.LocusMutationPolicy;
-  const savedFactory = globalThis.createPythonRuntime;
   delete globalThis.LocusMutationPolicy;
   const ui3 = await import('../src/ui/store.js?no-policy');
   let refused = null;
@@ -254,13 +265,12 @@ const createdBefore = createdInstances.length;
     !!refused && /mutation policy unavailable/.test(String(refused && refused.message)),
     String(refused && refused.message));
   globalThis.LocusMutationPolicy = savedPolicy;
-  globalThis.createPythonRuntime = savedFactory;
 }
 
 // ---------- SP8: cancel while refreshSkillPresence hangs ----------
 // The task is cancelled DURING the async capability refresh (before any
 // interpreter preparation): once the refresh returns, the stale task must
-// not prepare/reset/reconfigure the canonical interpreter and must not
+// not prepare/reset/reconfigure the canonical runtime session and must not
 // reach the model. The runner's own guards catch it; the Product must not
 // hand the cancelled task's configuration work to the runtime at all.
 {
@@ -269,8 +279,8 @@ const createdBefore = createdInstances.length;
   globalThis.PLUGIN_CATALOG = [];
   globalThis.SKILL_CATALOG = [];
   globalThis.MCP_CATALOG = [];
-  const created8 = [];
-  globalThis.createPythonRuntime = () => { const rt = pythonRuntime(); created8.push(rt); return rt; };
+  const s8 = makeSession();
+  globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: s8 } };
   const ui8 = await import('../src/ui/store.js?presence-cancel');
   const cm8 = ui8.capabilityManager;
   let release8 = null;
@@ -282,8 +292,8 @@ const createdBefore = createdInstances.length;
   ui8.cancelTask();
   release8();
   await done8;
-  check('SP8b the cancelled task never prepared the canonical interpreter',
-    created8.length === 0, JSON.stringify({ created: created8.length }));
+  check('SP8b the cancelled task never prepared the canonical runtime session',
+    s8.prepared.length === 0, JSON.stringify({ prepared: s8.prepared.length }));
   check('SP8c no TaskEnvironment was built for the cancelled task',
     cm8.envBuilt === 0, JSON.stringify({ envBuilt: cm8.envBuilt }));
   check('SP8d no model request was made for the cancelled task',
@@ -297,8 +307,8 @@ const createdBefore = createdInstances.length;
 
 // ---------- SP9: session boundary while refreshSkillPresence hangs ----------
 {
-  const created9 = [];
-  globalThis.createPythonRuntime = () => { const rt = pythonRuntime(); created9.push(rt); return rt; };
+  const s9 = makeSession();
+  globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: s9 } };
   const ui9 = await import('../src/ui/store.js?presence-boundary');
   const cm9 = ui9.capabilityManager;
   let release9 = null;
@@ -308,37 +318,35 @@ const createdBefore = createdInstances.length;
   ui9.newTask();          // the session boundary lands mid-refresh
   release9();
   await done9;
-  const rt9 = created9[0]; // created by the boundary's own onSessionReset
   check('SP9 the boundary-struck task stops cold: no environment, no model',
     cm9.envBuilt === 0 && (ui9.session.ranCount || 0) === 0,
     JSON.stringify({ envBuilt: cm9.envBuilt, ran: ui9.session.ranCount }));
-  check('SP9b the stale task neither prepared nor reset the interpreter again',
-    !!rt9 && rt9.prepared.length === 0 && rt9.resets.length === 1,
-    JSON.stringify({ prepared: rt9 && rt9.prepared.length, resets: rt9 && rt9.resets.length }));
+  check('SP9b the stale task neither prepared the session nor reset it again (the boundary owns the one reset)',
+    s9.prepared.length === 0 && s9.resets.length === 1,
+    JSON.stringify({ prepared: s9.prepared.length, resets: s9.resets.length }));
   check('SP9c the stale task ended and admission reopened',
     ui9.store.busy === false, JSON.stringify({ busy: ui9.store.busy }));
 }
 
 // ---------- SP10: normal flow still prepares — with the task signal ----------
 {
-  const created10 = [];
-  globalThis.createPythonRuntime = () => { const rt = pythonRuntime(); created10.push(rt); return rt; };
+  const s10 = makeSession();
+  globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: s10 } };
   const ui10 = await import('../src/ui/store.js?presence-normal');
   const cm10 = ui10.capabilityManager;
   const done10 = ui10.submit('normal presence task');
   await done10;
-  const rt10 = created10[0];
-  check('SP10 a live task hands its OWN signal to the interpreter prepare',
-    !!rt10 && rt10.prepared.length === 1 && !!rt10.prepared[0].signal
-      && rt10.prepared[0].signal.aborted === false,
-    JSON.stringify({ prepared: rt10 && rt10.prepared.length, signal: !!(rt10 && rt10.prepared[0] && rt10.prepared[0].signal) }));
+  check('SP10 a live task hands its OWN signal to the session prepare',
+    s10.prepared.length === 1 && !!s10.prepared[0].signal
+      && s10.prepared[0].signal.aborted === false,
+    JSON.stringify({ prepared: s10.prepared.length, signal: !!(s10.prepared[0] && s10.prepared[0].signal) }));
   check('SP10b the model ran exactly once for the normal task',
     ui10.session.ranCount === 1, JSON.stringify({ ran: ui10.session.ranCount }));
   const done10b = ui10.submit('second normal task');
   await done10b;
   check('SP10c same-key tasks cause no interpreter churn (prepare only, zero resets)',
-    rt10.prepared.length === 2 && rt10.resets.length === 0,
-    JSON.stringify({ prepared: rt10.prepared.length, resets: rt10.resets.length }));
+    s10.prepared.length === 2 && s10.resets.length === 0,
+    JSON.stringify({ prepared: s10.prepared.length, resets: s10.resets.length }));
 }
 
 // Presence-fixture globals are section-local: remove them so nothing after
@@ -348,6 +356,7 @@ delete globalThis.CAPABILITY_CATALOG;
 delete globalThis.PLUGIN_CATALOG;
 delete globalThis.SKILL_CATALOG;
 delete globalThis.MCP_CATALOG;
+delete globalThis.window;
 
 console.log('\n' + passed + ' passed, ' + failed + ' failed');
 process.exit(failed ? 1 : 0);
