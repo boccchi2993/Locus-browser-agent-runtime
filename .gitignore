@@ -6,3 +6,6 @@ dist/
 .ui-review/
 tests/real-world-50/.generated/
 tests/real-world-50/__pycache__/
+# e2e run artifacts: local pyodide asset disk cache / scratch probes
+tmp-f04b-probe/
+tmp-plugin-spike/
