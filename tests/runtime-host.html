@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Locus Runtime — standalone host</title>
+</head>
+<body>
+<!--
+  M2a (repository split): MINIMAL STANDALONE RUNTIME HOST (a test/example
+  page, never a second product implementation).
+
+  It loads ONLY the runtime core classic scripts (telemetry / workspace /
+  vfs / network / shell) and imports the public runtime entry + worker
+  assets as ES modules. No Harness, no Product page, no Vue, no
+  persistence, no Locus DOM: worker sources arrive through
+  createRuntime({ workerAssets }), status arrives through
+  session.onStatus — there is no #sb-python element to write to and no
+  #py-worker-src element to read.
+-->
+<script src="../src/telemetry.js"></script>
+<script src="../src/workspace.js"></script>
+<script src="../src/vfs.js"></script>
+<script src="../src/network.js"></script>
+<script src="../src/shell.js"></script>
+<script type="module">
+import { createRuntime } from '../src/runtime/index.js';
+import { PY_WORKER_SOURCE, GREP_WORKER_SOURCE } from '../src/runtime/worker-assets.js';
+
+const log = [];
+const errors = [];
+window.addEventListener('error', (e) => errors.push(String(e.message || e)));
+window.addEventListener('unhandledrejection', (e) => errors.push('unhandledrejection: ' + String(e.reason && e.reason.message || e.reason)));
+
+const statusEvents = [];
+const host = createRuntime({
+  workerAssets: { pyWorkerSource: PY_WORKER_SOURCE, grepWorkerSource: GREP_WORKER_SOURCE },
+});
+const session = host.createSession();
+session.onStatus((snap) => { statusEvents.push(snap); });
+
+// The session's task filesystem: a plain runtime VFS with a scratch
+// workspace mount (the host decides mounts — exactly what the Product
+// adapter does in Locus).
+const vfs = new VirtualWorkspace({ listCommands: () => Object.keys(SHELL_COMMANDS) });
+vfs.mount('/mnt/workspace', new MemoryWorkspace({ name: 'workspace' }), 'read-write');
+
+let executionSeq = 0;
+async function run(input) {
+  const id = ++executionSeq;
+  const t0 = performance.now();
+  const res = await session.execute({ kind: 'shell', input, context: { filesystem: vfs } });
+  return { id, ms: Math.round(performance.now() - t0), ok: res.ok, output: res.output, isError: !!res.isError };
+}
+
+async function runPython(code) {
+  const id = ++executionSeq;
+  const t0 = performance.now();
+  const res = await session.execute({ kind: 'python', input: code, context: { filesystem: vfs } });
+  return { id, ms: Math.round(performance.now() - t0), ok: res.ok, output: res.stdout, stderr: res.stderr, error: res.error };
+}
+
+window.__host = {
+  host,
+  session,
+  vfs,
+  run,
+  runPython,
+  log,
+  errors,
+  statusEvents,
+  capabilities: () => host.capabilities(),
+  cdnFetches: () => performance.getEntriesByType('resource')
+    .filter((r) => r.name.indexOf('cdn.jsdelivr.net') !== -1).map((r) => r.name),
+  ready: true,
+};
+document.title = 'runtime-host-ready';
+</script>
+</body>
+</html>

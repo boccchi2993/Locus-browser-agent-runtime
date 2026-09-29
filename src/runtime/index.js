@@ -125,6 +125,10 @@ function createRuntimeSession(core, workerAssets, onReleased) {
 
   // Prepare serialization: concurrent prepares apply in call order.
   let prepareTail = Promise.resolve();
+  // Terminal session state: set by dispose(); execute/prepare refuse with
+  // this reason afterwards (the interpreter instance refuses on its own
+  // too — this is the session-level expression of the same boundary).
+  let sessionDisposed = null;
 
   const session = {
     // ---- between-task configuration (contract §3.1 prepare) ----
@@ -143,27 +147,27 @@ function createRuntimeSession(core, workerAssets, onReleased) {
       if (signal && signal.aborted) return Promise.reject(cancelled('python preparation'));
       const generationBefore = py._resetGeneration;
       const inflight = py._inflightSettlement();
+      // Cancellation plane registered SYNCHRONOUSLY at call time — a cancel
+      // landing while this prepare waits for the serialization tail OR the
+      // in-flight barrier must refuse it, never surface after the wait.
+      let onAbort = null;
+      const abortSettled = signal
+        ? new Promise((resolve) => {
+          onAbort = resolve;
+          signal.addEventListener('abort', onAbort, { once: true });
+        })
+        : null;
       const prev = prepareTail;
       let release;
       prepareTail = new Promise((r) => { release = r; });
+      const race = (p) => Promise.race(abortSettled ? [p, abortSettled] : [p]);
+      const stopped = () => { if (signal && onAbort) signal.removeEventListener('abort', onAbort); };
       return (async () => {
         try {
-          await prev;
+          await race(prev);
+          if (signal && signal.aborted) throw cancelled('python preparation');
           if (inflight) {
-            let onAbort = null;
-            let abortSettled = null;
-            if (signal) {
-              abortSettled = new Promise((resolve) => {
-                onAbort = resolve;
-                if (signal.aborted) resolve();
-                else signal.addEventListener('abort', onAbort, { once: true });
-              });
-            }
-            try {
-              await Promise.race(abortSettled ? [inflight, abortSettled] : [inflight]);
-            } finally {
-              if (signal && onAbort) signal.removeEventListener('abort', onAbort);
-            }
+            await race(inflight);
             if (signal && signal.aborted) throw cancelled('python preparation');
           }
           // Post-barrier validation — the no-late-effect gate.
@@ -174,6 +178,7 @@ function createRuntimeSession(core, workerAssets, onReleased) {
           if (signal && signal.aborted) throw cancelled('python preparation');
           return py.prepare(req);
         } finally {
+          stopped();
           release();
         }
       })();
@@ -187,6 +192,7 @@ function createRuntimeSession(core, workerAssets, onReleased) {
     // `ok` (compute AND commit success; partial failure is never a
     // success — the underlying report keeps every field).
     async execute(req) {
+      if (sessionDisposed) throw new Error(sessionDisposed);
       const kind = req && req.kind;
       const ctx = (req && req.context) || {};
       const opts = {
@@ -235,6 +241,7 @@ function createRuntimeSession(core, workerAssets, onReleased) {
     },
     dispose(reason) {
       const why = 'runtime session disposed' + (reason ? ': ' + reason : '');
+      sessionDisposed = why;
       py.dispose(why);
       if (unsubInstance) { unsubInstance(); unsubInstance = null; }
       listeners.clear();

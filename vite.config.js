@@ -54,6 +54,15 @@ export default defineConfig({
   build: {
     target: 'es2020',
     outDir: 'dist',
+    // M2a: the standalone runtime host (tests/runtime-host.html) is a REAL
+    // build input so the gates run the packaged entry/worker-asset bundle,
+    // not the dev-server sources.
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        runtimeHost: 'tests/runtime-host.html',
+      },
+    },
   },
   server: {
     port: 5173,
