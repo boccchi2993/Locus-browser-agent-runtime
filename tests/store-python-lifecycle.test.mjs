@@ -41,7 +41,7 @@ const pythonRuntime = () => ({
   extensionKey() { return this.prepared.length ? (this.prepared[this.prepared.length - 1].key ?? null) : null; },
   async prepare(req) {
     const wanted = req && req.python ? req.python.key : null;
-    this.prepared.push({ key: wanted, python: req ? req.python : undefined });
+    this.prepared.push({ key: wanted, python: req ? req.python : undefined, signal: req ? req.signal : undefined });
     return { rebuiltInterpreter: false };
   },
   reset(reason) { this.resets.push(reason ?? null); },
@@ -82,6 +82,7 @@ class FakeAgentSession {
   cancel() { if (this.task && this.task.controller) this.task.controller.abort(); }
   async run(input, opts) {
     if (this.task) throw new Error('AgentSession already has a running task');
+    this.ranCount = (this.ranCount || 0) + 1;
     const o = opts || {};
     this.lastRunOpts = o;
     const emit = (o.emit && typeof o.emit === 'function') ? o.emit : this.emit;
@@ -120,6 +121,22 @@ globalThis.ApprovalController = (0, eval)(
 globalThis.VirtualWorkspace = (0, eval)(
   readFileSync(join(root, 'src', 'workspace.js'), 'utf8') + '\n'
   + readFileSync(join(root, 'src', 'vfs.js'), 'utf8') + '\n;VirtualWorkspace');
+
+// ---------- gated capability manager (prepare-phase liveness, M1b fix) ----
+// Refreshes can hang (durability re-observation): these sections park a
+// REAL submit() inside refreshSkillPresence and prove the stale task never
+// prepares/resets/reconfigures the canonical interpreter afterwards.
+class FakeCapabilityManager {
+  constructor(opts) { this.opts = opts; this.refreshes = 0; this.envBuilt = 0; this.gate = null; }
+  async refreshSkillPresence() { this.refreshes++; if (this.gate) await this.gate(); }
+  buildTaskEnvironment() {
+    this.envBuilt++;
+    return { capabilities: [], plugins: [], skills: [], mcps: [], pythonExtensionKey: null };
+  }
+  pythonExtensionPayload() { return null; }
+  taskVfsMounts() { return []; }
+  listCapabilities() { return []; }
+}
 
 const ui = await import('../src/ui/store.js');
 const { store, session, submit, newTask } = ui;
@@ -239,6 +256,98 @@ const createdBefore = createdInstances.length;
   globalThis.LocusMutationPolicy = savedPolicy;
   globalThis.createPythonRuntime = savedFactory;
 }
+
+// ---------- SP8: cancel while refreshSkillPresence hangs ----------
+// The task is cancelled DURING the async capability refresh (before any
+// interpreter preparation): once the refresh returns, the stale task must
+// not prepare/reset/reconfigure the canonical interpreter and must not
+// reach the model. The runner's own guards catch it; the Product must not
+// hand the cancelled task's configuration work to the runtime at all.
+{
+  globalThis.CapabilityManager = FakeCapabilityManager;
+  globalThis.CAPABILITY_CATALOG = [];
+  globalThis.PLUGIN_CATALOG = [];
+  globalThis.SKILL_CATALOG = [];
+  globalThis.MCP_CATALOG = [];
+  const created8 = [];
+  globalThis.createPythonRuntime = () => { const rt = pythonRuntime(); created8.push(rt); return rt; };
+  const ui8 = await import('../src/ui/store.js?presence-cancel');
+  const cm8 = ui8.capabilityManager;
+  let release8 = null;
+  cm8.gate = () => new Promise((r) => { release8 = r; });
+  const done8 = ui8.submit('presence cancel task');
+  await sleep(30);
+  check('SP8 the task is parked inside refreshSkillPresence',
+    cm8.refreshes === 1 && !!release8, JSON.stringify({ refreshes: cm8.refreshes }));
+  ui8.cancelTask();
+  release8();
+  await done8;
+  check('SP8b the cancelled task never prepared the canonical interpreter',
+    created8.length === 0, JSON.stringify({ created: created8.length }));
+  check('SP8c no TaskEnvironment was built for the cancelled task',
+    cm8.envBuilt === 0, JSON.stringify({ envBuilt: cm8.envBuilt }));
+  check('SP8d no model request was made for the cancelled task',
+    (ui8.session.ranCount || 0) === 0, JSON.stringify({ ran: ui8.session.ranCount }));
+  cm8.gate = null; // the follow-up must not hang on the section's gate
+  const followUp8 = ui8.submit('follow-up after cancel');
+  check('SP8e the cancelled task ended and admission reopened',
+    ui8.store.busy === false && !!followUp8, JSON.stringify({ busy: ui8.store.busy }));
+  await followUp8;
+}
+
+// ---------- SP9: session boundary while refreshSkillPresence hangs ----------
+{
+  const created9 = [];
+  globalThis.createPythonRuntime = () => { const rt = pythonRuntime(); created9.push(rt); return rt; };
+  const ui9 = await import('../src/ui/store.js?presence-boundary');
+  const cm9 = ui9.capabilityManager;
+  let release9 = null;
+  cm9.gate = () => new Promise((r) => { release9 = r; });
+  const done9 = ui9.submit('presence boundary task');
+  await sleep(30);
+  ui9.newTask();          // the session boundary lands mid-refresh
+  release9();
+  await done9;
+  const rt9 = created9[0]; // created by the boundary's own onSessionReset
+  check('SP9 the boundary-struck task stops cold: no environment, no model',
+    cm9.envBuilt === 0 && (ui9.session.ranCount || 0) === 0,
+    JSON.stringify({ envBuilt: cm9.envBuilt, ran: ui9.session.ranCount }));
+  check('SP9b the stale task neither prepared nor reset the interpreter again',
+    !!rt9 && rt9.prepared.length === 0 && rt9.resets.length === 1,
+    JSON.stringify({ prepared: rt9 && rt9.prepared.length, resets: rt9 && rt9.resets.length }));
+  check('SP9c the stale task ended and admission reopened',
+    ui9.store.busy === false, JSON.stringify({ busy: ui9.store.busy }));
+}
+
+// ---------- SP10: normal flow still prepares — with the task signal ----------
+{
+  const created10 = [];
+  globalThis.createPythonRuntime = () => { const rt = pythonRuntime(); created10.push(rt); return rt; };
+  const ui10 = await import('../src/ui/store.js?presence-normal');
+  const cm10 = ui10.capabilityManager;
+  const done10 = ui10.submit('normal presence task');
+  await done10;
+  const rt10 = created10[0];
+  check('SP10 a live task hands its OWN signal to the interpreter prepare',
+    !!rt10 && rt10.prepared.length === 1 && !!rt10.prepared[0].signal
+      && rt10.prepared[0].signal.aborted === false,
+    JSON.stringify({ prepared: rt10 && rt10.prepared.length, signal: !!(rt10 && rt10.prepared[0] && rt10.prepared[0].signal) }));
+  check('SP10b the model ran exactly once for the normal task',
+    ui10.session.ranCount === 1, JSON.stringify({ ran: ui10.session.ranCount }));
+  const done10b = ui10.submit('second normal task');
+  await done10b;
+  check('SP10c same-key tasks cause no interpreter churn (prepare only, zero resets)',
+    rt10.prepared.length === 2 && rt10.resets.length === 0,
+    JSON.stringify({ prepared: rt10.prepared.length, resets: rt10.resets.length }));
+}
+
+// Presence-fixture globals are section-local: remove them so nothing after
+// this file's sections observes a capability manager by accident.
+delete globalThis.CapabilityManager;
+delete globalThis.CAPABILITY_CATALOG;
+delete globalThis.PLUGIN_CATALOG;
+delete globalThis.SKILL_CATALOG;
+delete globalThis.MCP_CATALOG;
 
 console.log('\n' + passed + ' passed, ' + failed + ' failed');
 process.exit(failed ? 1 : 0);

@@ -211,7 +211,7 @@ export function pythonRuntime() {
 // With no python plugins (null key) this returns the runtime to core-only.
 // A validation failure is all-or-nothing inside prepare: the previously
 // configured payload survives intact.
-async function preparePythonRuntimeForEnvironment(env) {
+async function preparePythonRuntimeForEnvironment(env, signal) {
   const rt = ensurePythonRuntime();
   if (!rt) return;
   const wanted = env ? env.pythonExtensionKey : null;
@@ -221,7 +221,10 @@ async function preparePythonRuntimeForEnvironment(env) {
   const payload = wanted === null || !capabilityManager
     ? null
     : capabilityManager.pythonExtensionPayload(env);
-  await rt.prepare({ python: payload });
+  // The TASK's signal rides along: the runtime refuses to configure for a
+  // task whose signal already aborted (cancellation-shaped, so the
+  // runner's existing classification reads it as a cancellation).
+  await rt.prepare({ python: payload, signal: signal });
 }
 
 const UPLOAD_ROOT = '/mnt/upload';
@@ -1074,8 +1077,18 @@ async function prepareTask(task) {
     // async operations keep touching the OLD provider, and the
     // generation/abort guards drop its results.
     if (capabilityManager) await capabilityManager.refreshSkillPresence();
+    // The refresh AWAITED: a cancel or session boundary that landed while
+    // it hung ends THIS task here. The canonical interpreter is never
+    // prepared/reset/reconfigured for a task that will not run, and no
+    // model request can follow (the runner's guards classify the outcome;
+    // the epoch in the ready result below stays the SUBMIT-time pin, so a
+    // boundary is detected instead of adopted by accident).
+    if (preRunStopped()) return stopReady();
     const taskEnvironment = capabilityManager ? capabilityManager.buildTaskEnvironment() : null;
-    await preparePythonRuntimeForEnvironment(taskEnvironment);
+    await preparePythonRuntimeForEnvironment(taskEnvironment, task.signal);
+    // prepare awaited too (runtime-side signal refusal): the same liveness
+    // rule before any task-scoped mount is bound for this task.
+    if (preRunStopped()) return stopReady();
     const taskVfs = vfs.fork();
     if (capabilityManager && taskEnvironment) {
       if (taskEnvironment.skills.length && typeof SkillInstanceWorkspace === 'function') {
