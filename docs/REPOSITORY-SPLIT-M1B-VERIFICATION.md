@@ -66,7 +66,51 @@ Run 1 results are preserved verbatim in the branch's working notes (`tmp-e2e-run
 - Deployed-build (Cloudflare Pages) checks: packaging is M2/M3.
 - Standalone-Runtime independence proof (shell.js running WITHOUT extensions.js/tools.js in scope): the M1b factory still reads `EXTENSION_ID_PATTERN`/`EXTENSION_PY_MODULE_PATTERN` globals at configure time (unchanged from M1a; payload-port becomes contract data in M2) — recorded in INVENTORY §2.3.
 
-## 6. M2 next step (precise scope)
+## 6. M1b follow-up round (2026-09-29): lifecycle gaps found by review, fixed test-first
+
+Three gaps in the M1b round were reported by review and fixed on the same branch (append commits, no history rewrite; base `26cac7f`, PR #4 head unchanged until this round):
+
+### 6.1 Root causes
+
+1. **Stale write-back after reset/dispose** (`src/shell.js` `_runOnce`): the reset generation was checked before the worker post ONLY. Once the worker had answered, a run parked at an async pre-commit VFS check (stat before mkdir, readBytes for the external-write/delete verification) kept committing mkdir/write/remove/rmdir into the VFS after the boundary — and could return `error: null` as if nothing had happened. Nothing checked validity between the awaited checks and the side-effect calls.
+2. **`busyExecutions` did not cover the whole run** (`src/shell.js` `snapshot()`): the count was `_pending.size + _queuedRuns.size`. After the worker answered (pending removed), a run still in its commit phase counted 0; reset() also cleared `_queuedRuns` synchronously, so a boundary masqueraded as the settlement of runs whose promises had not settled yet (the storage-mutation gate could reopen early on that lie).
+3. **Prepare-phase signal/liveness gap** (`src/ui/store.js` `prepareTask`): `task.signal` was not handed to the interpreter prepare, and no liveness check ran between the async capability refresh (`refreshSkillPresence`) and the interpreter configuration. A task cancelled or boundary-struck while the refresh hung still built the TaskEnvironment, prepared (and on a key change reset!) the canonical interpreter, and — observed by SP9 against the old code — ran the FULL model request to completion after the boundary.
+
+### 6.2 Fixes (each pinned by tests that failed on `26cac7f` first)
+
+| Fix | File | Shape |
+|---|---|---|
+| Commit-phase invalidation | `src/shell.js` | `invalidated()` (disposed + generation) is checked after the worker reply and before EVERY commit side effect (mkdir after its stat, write after the concurrency pre-check, delete after the verification read, rmdir — new gate before `remove`). Stopped operations land in `notPersisted` with the boundary reason; the report carries the reason in `error` — never an empty success over a partially-invalidated run. Already-dispatched provider operations are waited out, not rolled back, and nothing further starts |
+| Full-lifetime counting | `src/shell.js` | `_activeRuns` tracks every run from seat acquisition to final settlement (boot, collection, worker execution, whole commit phase); released exactly once in the run's own `finally`. `busyExecutions = queued + active`. reset/dispose only MARK queued entries killed (no set clearing) — synchronous invalidation never masquerades as settlement |
+| Prepare-phase liveness + signal | `src/ui/store.js` | `preRunStopped()` is checked after `refreshSkillPresence` (before any environment build / interpreter prepare) and after prepare; `preparePythonRuntimeForEnvironment(env, signal)` hands the task's signal to `rt.prepare` |
+| Cancellation-shaped prepare refusal | `src/shell.js` | a prepare whose signal already aborted throws an AbortError (`makeCancelledError('python preparation')`) — existing classification reads it as cancelled, never as an independent error |
+
+Preserved unchanged (pinned by the existing suites): the adoptEpoch legitimate-rebind semantics (S14; the epoch in the ready result stays the submit-time pin so a boundary is detected, not accidentally adopted), the `persistence_error` priority (task-runner classification table untouched), same-key no-rebuild, invalid-payload-leaves-old-config-intact, text-only-tasks-boot-nothing (LC1/LC2, SP1/SP4, SP10c).
+
+### 6.3 New evidence (all failing on `26cac7f`, green after the fixes)
+
+- `tests/python-lifecycle.test.cjs` **LC8a–LC8t + LC2c2** (first run: 13 failures — `["mkdir /mnt/workspace/newdir"]`, `["write /mnt/workspace/in.txt"]`, `["remove /mnt/workspace/file.txt","remove /mnt/workspace/sub"]` all executed after the boundary; `busyExecutions: 0` while committing and right after the synchronous reset): barrier tests drive `createPythonRuntime().run()` with a controlled worker; the run parks at the async pre-commit VFS check; reset/dispose lands; the barrier releases. Assertions: no mkdir/write/remove/rmdir starts; honest report (boundary reason + `notPersisted`, never `error: null`); `busyExecutions` stays ≥1 through the commit phase and across the synchronous boundary (reset → 1, not 0); queued + committing = 2 without double counting; failure / task-cancel / boundary each release tracking exactly once; the instance is reusable after reset; a dispatched-but-unanswered worker run is failed by the boundary and never reported as success. LC2c2 pins the AbortError shape of the refused prepare. Final: **73/73**.
+- `tests/store-python-lifecycle.test.mjs` **SP8–SP10** (first run: 6 failures; SP9's detail was the live proof that the old code ran the FULL model request after the boundary — `envBuilt: 1, ran: 1`): a gated fake CapabilityManager parks a REAL `submit()` inside `refreshSkillPresence`; cancel (SP8) / `newTask()` boundary (SP9) lands; after the gate releases the stale task built no environment, never prepared/reset the canonical interpreter and made no model request; admission reopened. SP10 is the positive control: a live task hands its OWN signal to the interpreter prepare and runs the model exactly once, with no churn on same-key follow-ups. Final: **21/21**.
+
+### 6.4 Gates for this round
+
+| Command | Result | Notes |
+|---|---|---|
+| Named regression suites | PASS | task-runner 99/99, conversation-routing 25/25, submit-presentation 22/22, mutation-policy 35/35, store-python-lifecycle 21/21, python-lifecycle 73/73 |
+| `npm test` | PASS | 46/46 suites |
+| `npm run build` | PASS | dist freshness verified (`_activeRuns`/`boundaryStop` present in `dist/src/shell.js`) |
+| `npm run test:e2e` | see §7 | full browser round incl. the python/plugin/approval/skill/persistence gates |
+
+### 6.5 Not executed / out of scope
+
+- real-world-50, NET 32–37 manual tasks, deployed-build checks: unchanged policy (M0 record remains the reference).
+- No assertion was loosened anywhere; no retry added anywhere; both barrier repros are in-repo suites (not /tmp scripts).
+
+## 7. M1b follow-up browser gates
+
+Full `npm run test:e2e` after the §6 fixes (single sequential run, exit 0, **16/16 suite entries**): runtime, active-content, presentation, responsive, **persistence**, wire, **approval**, image, grep, **python-authority**, **capabilities**, **skill-instances**, network, **python-browser-authority (102/102)**, **python-bootstrap-integrity (27/27)**, **trusted-plugin-runtime (33/33)** — i.e. every affected gate named by the review round: browser Python (authority / browser-authority / bootstrap-integrity), plugins (trusted-plugin-runtime), approvals, skills (skill-instances + capabilities), persistence. Notably python-authority drives `window.__locus.pythonRuntime().reset()` on the PRODUCTION instance with a full re-bootstrap, and trusted-plugin-runtime R2 re-verifies `reset()` + re-boot with a configured payload — both now exercising the new commit-phase invalidation and full-lifetime counting paths on the real asset chain. No assertion loosened, no retry added; first and only run of this round is the recorded gate.
+
+## 8. M2 next step (precise scope)
 
 1. RuntimeHost/RuntimeSession wrapper (contract §3.1 target shape): worker assets as string modules, `ExecutionRequest`/`ExecutionResult` port, status events replacing `#sb-python` + the 1s poll, `LOCUS_HOME_SKELETON` as a mount argument, `EXTENSION_*` patterns as payload-port contract data.
 2. Harness port injection (§3.2/§3.7): `buildSystemPrompt` via injected description port; `executeTool` split into registry + product adapter; `Telemetry` as an injected sink; independence suites (each core's test entry loads only its own files + fakes).

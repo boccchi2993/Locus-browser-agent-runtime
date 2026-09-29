@@ -78,39 +78,76 @@ PythonRuntimeInstance = {
   // validate-then-swap. Validation (the exact configureExtensions shape
   // gates) happens BEFORE the teardown: a failure leaves the old payload
   // fully intact — never a half-applied reset. A prepare whose signal is
-  // already aborted is refused and applies nothing. prepare is
+  // already aborted is refused and applies nothing; the refusal is
+  // CANCELLATION-SHAPED (AbortError), so the caller's existing
+  // cancellation classification reads it as a cancellation, never as an
+  // independent prepare error. prepare is
   // SYNCHRONOUS by construction (no awaits between compare and commit),
   // so no stale/cancelled caller can interleave; callers cannot assume
-  // async completion because there is none.
+  // async completion because there is none. The Product additionally
+  // self-checks task liveness after every async preparation step
+  // (refreshSkillPresence, prepare) and never hands a cancelled or
+  // boundary-struck task's configuration to the runtime at all.
   prepare(req: { signal?: AbortSignal, python?: PluginPayload | null })
     → { rebuiltInterpreter: boolean }
 
   // The execution port (shell python lands here via opts.pythonRuntime;
   // serialized queue, mirror/commit phases unchanged). Missing injection
-  // fails the tool call loudly — there is no global fallback.
+  // fails the tool call loudly — there is no global fallback. A run is
+  // VALID for its whole lifetime — queued, seat acquisition, boot, file
+  // collection, worker execution AND the complete write-back (commit)
+  // phase: a reset()/dispose() that lands at ANY await boundary
+  // invalidates the run, which then starts NO further VFS side effect
+  // (mkdir, write, file removal, directory removal). Operations ALREADY
+  // dispatched to the provider (a worker run in flight, a commit call in
+  // flight) cannot be rolled back; the run waits out their settlement,
+  // commits nothing further, and reports honestly (boundary reason in
+  // `error`, stopped operations in `notPersisted`) — never an empty
+  // success masking the invalidation, never a partial result presented
+  // as complete.
   run(code, vfs, opts) → Promise<ExecutionReport>
 
   // Session/rebuild boundary. SYNCHRONOUS effect: aborts the in-flight
   // boot, fails every pending request, drains queued-but-unstarted runs,
-  // tears the worker stack down to cold. Callers must NOT assume their
-  // own in-flight run() promise has settled when reset() returns — it
-  // settles at that run's next await boundary (with the reset reason as
-  // its error, or as a cancellation if the task signal aborted). The
-  // instance stays REUSABLE afterwards. A boundary landing while a run is
-  // suspended between seat acquisition and the worker post is caught by
-  // the reset generation: the run rejects with the boundary reason and
-  // never reaches the next generation's interpreter.
+  // tears the worker stack down to cold. Three DISTINCT moments must not
+  // be conflated:
+  //   (1) SYNCHRONOUS INVALIDATION — what reset() itself does, before it
+  //       returns: kill the worker stack, mark queued runs killed, bump
+  //       the generation every run re-checks;
+  //   (2) RUN SETTLEMENT — when each affected run's promise actually
+  //       settles, at that run's next await boundary (with the boundary
+  //       reason as its error, or as a cancellation if the task signal
+  //       aborted). Synchronous invalidation is NOT settlement: the
+  //       killed/committing runs stay counted in busyExecutions until
+  //       they truly settle, so admission/quiesce gates never reopen
+  //       early on a lie;
+  //   (3) ALREADY-DISPATCHED PROVIDER EFFECTS — operations already handed
+  //       to the provider (posted worker execution, in-flight commit).
+  //       These CANNOT be rolled back; after their settlement nothing
+  //       further runs and the report says exactly what committed and
+  //       what never ran.
+  // The instance stays REUSABLE afterwards. A boundary landing while a
+  // run is suspended between seat acquisition and the worker post is
+  // caught by the reset generation: the run rejects with the boundary
+  // reason and never reaches the next generation's interpreter.
   reset(reason?: string): void
 
   // Terminal. Everything reset does, plus permanent refusal of
   // prepare/run/configureExtensions (throws with the disposal reason).
   // IDEMPOTENT — a second dispose keeps the first reason. Late worker
   // messages cannot revive the instance (creator destroyed; the disposed
-  // flag blocks new work). Returns nothing; disposal is synchronous.
+  // flag blocks new work). Returns nothing; disposal is synchronous
+  // (invalidation sense — affected runs still settle at their own next
+  // await boundary, exactly like reset).
   dispose(reason?: string): void
 
   // Canonical state read: { interpreter: 'cold'|'loading'|'ready',
-  // busyExecutions, extensionKey, disposed }.
+  // busyExecutions, extensionKey, disposed }. busyExecutions counts
+  // QUEUED (not yet started) + ACTIVE runs, where ACTIVE spans the whole
+  // post-seat lifetime — boot, file collection, worker execution and the
+  // commit/write-back phase — released exactly once at each run's own
+  // settlement (never by reset/dispose). Queued and active runs are
+  // counted once each; a boundary never falsifies the count.
   snapshot(): RuntimeSnapshot
 }
 ```
