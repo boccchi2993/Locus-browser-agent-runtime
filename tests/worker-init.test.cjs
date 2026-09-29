@@ -1,15 +1,12 @@
 // Pyodide worker init recovery test (F14): a failed first load must NOT be
-// cached forever — the next run retries. Extracts the REAL worker source
-// from index.html and drives ensureLockedPyodide with a stubbed loadPyodide.
+// cached forever — the next run retries. Drives the REAL worker source
+// (the runtime asset module) with a stubbed loadPyodide.
 // Run: node tests/worker-init.test.cjs
 
-const fs = require('fs');
 const vm = require('vm');
-const path = require('path');
 
-const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-const m = html.match(/<script type="text\/worker" id="py-worker-src">([\s\S]*?)<\/script>/);
-if (!m) { console.error('worker source not found in index.html'); process.exit(1); }
+// M2a: the worker source is a runtime asset module (never index.html).
+const { PY_WORKER_SOURCE: workerSrc } = require('./helpers/runtime.cjs');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -43,7 +40,7 @@ async function run() {
       };
     },
   });
-  vm.runInContext(m[1], c);
+  vm.runInContext(workerSrc, c);
 
   // Protocol v3: the boot parks on the in-memory assets waiter — start the
   // first attempt, THEN deliver the bootstrap assets (unit stubs — the

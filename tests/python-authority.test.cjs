@@ -28,10 +28,8 @@ const fs = require('fs');
 const vm = require('vm');
 const path = require('path');
 
-const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-const m = html.match(/<script type="text\/worker" id="py-worker-src">([\s\S]*?)<\/script>/);
-if (!m) { console.error('worker source not found in index.html'); process.exit(1); }
-const workerSrc = m[1];
+// M2a: the worker source is a runtime asset module (never index.html).
+const { PY_WORKER_SOURCE: workerSrc } = require('./helpers/runtime.cjs');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {

@@ -38,6 +38,10 @@
 import { reactive, computed } from 'vue';
 import { createTaskRunner, isPersistenceFailure } from '../harness/task-runner.js';
 import { createProviderSessions } from '../harness/provider-session.js';
+// M2a (repository split): the worker sources are RUNTIME assets — the
+// product passes them into the runtime explicitly; nothing is read back
+// out of this page's DOM.
+import { PY_WORKER_SOURCE, GREP_WORKER_SOURCE } from '../runtime/worker-assets.js';
 
 /* global AgentSession, Model, callModel, executeTool, buildSystemPrompt,
    LocalDirectoryWorkspace, ensureWorkspacePermission, createPythonRuntime, LocusMutationPolicy,
@@ -169,7 +173,9 @@ function ensurePythonRuntime() {
   if (h && h.pythonRuntime) {
     pythonRuntimeResolved = h.pythonRuntime;
   } else if (typeof createPythonRuntime === 'function') {
-    pythonRuntimeResolved = createPythonRuntime();
+    // M2a: the Pyodide worker source is a runtime asset passed in
+    // explicitly (src/runtime/worker-assets.js) — never this page's DOM.
+    pythonRuntimeResolved = createPythonRuntime({ pyWorkerSource: PY_WORKER_SOURCE });
   } else {
     pythonRuntimeResolved = null;
   }
@@ -199,6 +205,13 @@ function taskMutationPolicy() {
 export function pythonRuntime() {
   const rt = ensurePythonRuntime();
   return rt || null;
+}
+
+// M2a: the runtime worker assets this page was built with (e2e seam for
+// suites that instrument the documented worker seam; never used by the
+// product execution chain, which passes sources through the runtime).
+export function runtimeWorkerAssets() {
+  return { pyWorkerSource: PY_WORKER_SOURCE, grepWorkerSource: GREP_WORKER_SOURCE };
 }
 
 // Configure the interpreter with the plugin payload set THIS task's
@@ -389,6 +402,9 @@ function wiredToolExecutor(tool, input, workspace, opts) {
     // exactly the instance task preparation configured (see the lifecycle
     // block above).
     pythonRuntime: pythonRuntime(),
+    // M2a: the grep regex worker source is a runtime asset passed through
+    // the shell opts (transitional until RuntimeSession owns the injection).
+    grepWorkerSource: GREP_WORKER_SOURCE,
     // M1b: the product mutation policy — mv/rm refusals (skill identity
     // among them) come from IT, never from hardcoded runtime rules.
     mutationPolicy: taskMutationPolicy(),

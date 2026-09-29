@@ -431,8 +431,21 @@ function validateWheelArtifact(pluginId, wheel) {
 // The product keeps ONE active instance per page and keeps lazy boot: a
 // text-only task constructs the instance object but never creates a
 // worker, downloads assets or starts Pyodide.
-function createPythonRuntime() {
+//
+// M2a (repository split): the Pyodide worker source is a RUNTIME asset —
+// the instance receives it as `opts.pyWorkerSource` (from the host's
+// workerAssets bundle; src/runtime/worker-assets.js is the canonical
+// module). There is deliberately NO page-DOM source and NO fallback:
+// constructing without a source is an assembly bug and fails here.
+function createPythonRuntime(opts) {
+  const pyWorkerSource = opts && opts.pyWorkerSource;
+  if (typeof pyWorkerSource !== 'string' || !pyWorkerSource.trim()) {
+    throw new Error('createPythonRuntime: pyWorkerSource (a non-empty worker source string) is required');
+  }
   const rt = {
+  // The worker source for EVERY boot of this instance (immutable after
+  // construction; hosts pass the same frozen bundle to every session).
+  _pyWorkerSource: pyWorkerSource,
   worker: null, // facade over the creator-relayed worker (null = cold)
   status: 'cold', // cold | loading | ready
   _reqId: 0,
@@ -504,12 +517,6 @@ function createPythonRuntime() {
     throwIfCancelled(signal, 'python execution');
     this._setStatus('loading');
     this._ensureCreator();
-    const srcEl = document.getElementById('py-worker-src');
-    if (!srcEl || !srcEl.textContent) {
-      this._destroyCreator();
-      this._setStatus('cold');
-      throw new Error('python worker source not found');
-    }
     const b = pythonBootstrapBudgets(budgets);
     const boot = openBootstrapAbort(signal);
     this._boot = boot;
@@ -521,7 +528,7 @@ function createPythonRuntime() {
       throwIfCancelled(signal, 'python execution');
       throwIfBootAborted(boot);
       if (!this._creator) throw new Error('python creator iframe lost');
-      this._creator.contentWindow.postMessage({ type: 'spawn', workerSrc: srcEl.textContent }, '*');
+      this._creator.contentWindow.postMessage({ type: 'spawn', workerSrc: this._pyWorkerSource }, '*');
       this.worker = {
         postMessage: (msg) => { this._postToWorker(msg); },
         onerror: (e) => this._onWorkerFatal(e),
@@ -2308,8 +2315,9 @@ async function shFind(ctx, args) {
 
 // ---------- grep regex worker isolation ----------
 // The grep pattern is MODEL-CONTROLLED: its RegExp is compiled and every
-// match is executed ONLY inside a dedicated Web Worker (source:
-// #grep-worker-src in index.html). A catastrophic-backtracking pattern can
+// match is executed ONLY inside a dedicated Web Worker (source injected as
+// `workerSource` — the runtime-owned GREP_WORKER_SOURCE asset; see
+// src/runtime/worker-assets.js). A catastrophic-backtracking pattern can
 // therefore never hold the UI event loop — the session TERMINATES the
 // worker at the hard timeout, on cancellation, on worker death and at the
 // command boundary. There is deliberately NO main-thread fallback: when a
@@ -2319,18 +2327,21 @@ const GREP_REGEX_TIMEOUT_MS = 1000;
 
 const GrepRegexRuntime = {
   // TEST-ONLY seam: Node unit tests inject a deterministic fake worker.
-  // Production never sets this and always constructs a real Blob Worker.
+  // Production never sets this and always constructs a real Blob Worker
+  // from the injected source.
   _workerFactory: null,
 
-  // Throws when the environment cannot provide a Worker; the caller must
-  // fail the grep command — never fall back to main-thread regex.
-  createWorker() {
+  // Throws when the environment cannot provide a Worker or the caller
+  // passed no source; the caller must fail the grep command — never fall
+  // back to main-thread regex.
+  createWorker(workerSource) {
     if (this._workerFactory) return this._workerFactory();
-    const el = document.getElementById('grep-worker-src');
-    if (!el || !el.textContent) throw new Error('grep worker source not found');
-    const blob = new Blob([el.textContent], { type: 'text/javascript' });
-    // Same construction pattern as PythonRuntime: the Blob URL exists only
-    // to construct the Worker and is revoked immediately.
+    if (typeof workerSource !== 'string' || !workerSource.trim()) {
+      throw new Error('grep worker source not provided');
+    }
+    const blob = new Blob([workerSource], { type: 'text/javascript' });
+    // Same construction pattern as the Python runtime: the Blob URL exists
+    // only to construct the Worker and is revoked immediately.
     const url = URL.createObjectURL(blob);
     try {
       return new Worker(url);
@@ -2352,10 +2363,12 @@ function grepRegexError(message, kind) {
 // TERMINATE the worker, so no regex state or stale reply survives the
 // command. Every request settles exactly once; the first of
 // { reply, timeout, abort, worker death } wins and the losers clean up.
-function createGrepRegexSession(pattern, flags) {
+// `workerSource` is the runtime-owned grep worker asset (injected through
+// the shell opts by the host/session — never read from a page DOM).
+function createGrepRegexSession(pattern, flags, workerSource) {
   let worker = null;
   try {
-    worker = GrepRegexRuntime.createWorker();
+    worker = GrepRegexRuntime.createWorker(workerSource);
   } catch (e) {
     throw grepRegexError('grep: regex worker unavailable', 'worker_unavailable');
   }
@@ -2485,7 +2498,7 @@ async function shGrep(ctx, args, stdin) {
   const signal = ctx.opts && ctx.opts.signal;
   let session = null;
   try {
-    session = createGrepRegexSession(pattern, flagI ? 'i' : '');
+    session = createGrepRegexSession(pattern, flagI ? 'i' : '', ctx.opts && ctx.opts.grepWorkerSource);
     await session.init(signal);
     if (!paths.length && (stdin === null || stdin === undefined)) {
       return shErr('grep: missing file operand (or pipe input into grep)');

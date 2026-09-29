@@ -86,7 +86,8 @@ class TreeWS extends M.WorkspaceAdapter {
 function b64(s) { return Buffer.from(s, 'utf8').toString('base64'); }
 
 // M1b: python runs on an injected instance (what the product wiring does).
-const pyrt = M.createPythonRuntime();
+const { freshRuntime } = require('./helpers/runtime.cjs');
+const pyrt = freshRuntime(M);
 function withPyrt(opts) { return Object.assign({ pythonRuntime: pyrt }, opts || {}); }
 function mockWorkerResult(result) {
   pyrt._ensureWorker = () => {};

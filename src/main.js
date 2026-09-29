@@ -143,6 +143,9 @@ if (e2eMode) {
   // ?e2e=1). Browser python e2e drives prepare/reset/worker-state through
   // it — the SAME object task preparation and shell execution use.
   window.__locus.pythonRuntime = () => ui.pythonRuntime();
+  // M2a seam: the runtime worker assets this build carries (worker-source
+  // instrumentation in e2e; never part of the product chain).
+  window.__locus.runtimeAssets = () => ui.runtimeWorkerAssets();
   window.__locus.approvals = {
     // Harness-shaped request passthrough for fake tool executors (the exact
     // shape a real consumer will use).

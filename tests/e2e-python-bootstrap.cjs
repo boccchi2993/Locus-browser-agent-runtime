@@ -84,14 +84,21 @@ function buildPage(shellUrl, workerSrc, localAssets) {
     + '  return __nativeFetch(url, init);'
     + '};'
     + 'var __el = document.createElement("script");'
-    + '__el.type = "text/worker";'
-    + '__el.id = "py-worker-src";'
-    + '__el.textContent = ' + JSON.stringify(workerSrc) + ';'
-    + 'document.head.appendChild(__el);'
+    // M2a: the worker source is a runtime asset handed to the factory —
+    // this page carries no #py-worker-src element. SetWorkerSource swaps
+    // the source by REBUILDING the instance, carrying the verified asset
+    // cache over (content-hash-pinned Pyodide bytes are stateless and
+    // independent of the worker build — the same retention the old
+    // same-instance swap exercised).
+    + 'window.__f04cWorkerSrc = ' + JSON.stringify(workerSrc) + ';'
     + 'window.__f04c = { ready: true };'
-    + 'window.__pyrt = createPythonRuntime();' // standalone harness page: own instance from the shell.js factory
-    + 'window.__f04cWorkerSrc = document.getElementById("py-worker-src").textContent;'
-    + 'window.__f04cSetWorkerSource = function (t) { document.getElementById("py-worker-src").textContent = t; };'
+    + 'window.__pyrt = createPythonRuntime({ pyWorkerSource: window.__f04cWorkerSrc });'
+    + 'window.__f04cSetWorkerSource = function (t) {'
+    + '  window.__f04cWorkerSrc = t;'
+    + '  var previous = window.__pyrt;'
+    + '  window.__pyrt = createPythonRuntime({ pyWorkerSource: t });'
+    + '  if (previous && previous._assets) window.__pyrt._assets = previous._assets;'
+    + '};'
     + 'window.__f04cRun = function (code, opts) {'
     + '  return window.__pyrt.run(code, null, Object.assign({ cwd: "/tmp" }, opts || {}))'
     + '    .then(function (r) { return { ok: true, result: r }; },'
@@ -197,10 +204,8 @@ async function main() {
       + ' files, disk cache at ' + ASSET_CACHE_DIR + ' when present, CDN otherwise)');
     assetBytes.set('__shell__', await fs.readFile(path.join(__dirname, '..', 'src', 'shell.js')));
     for (const a of PY_MANIFEST) assetBytes.set(a.name, await loadAsset(a.name));
-    const html = await fs.readFile(path.join(__dirname, '..', 'index.html'), 'utf8');
-    const wm = html.match(/<script type="text\/worker" id="py-worker-src">([\s\S]*?)<\/script>/);
-    if (!wm) throw new Error('py-worker-src not found in index.html');
-    const workerSrc = wm[1];
+    // M2a: the worker source comes from the runtime asset module.
+    const workerSrc = require('./helpers/runtime.cjs').PY_WORKER_SOURCE;
 
     // ===================== HOSTED MODE ==================================
     {

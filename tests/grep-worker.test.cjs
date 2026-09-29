@@ -13,6 +13,7 @@ const fs = require('fs');
 const vm = require('vm');
 const path = require('path');
 const { installGrepFakeWorker, FakeGrepWorker } = require('./helpers/grep-fake-worker.cjs');
+const { GREP_WORKER_SOURCE } = require('./helpers/runtime.cjs');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -22,12 +23,10 @@ function check(name, cond, detail) {
 
 // ---------- Part A harness: real worker source in a vm ----------
 function makeWorker() {
-  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  const m = html.match(/<script type="text\/worker" id="grep-worker-src">([\s\S]*?)<\/script>/);
-  if (!m) { console.error('grep-worker-src not found in index.html'); process.exit(1); }
+  // M2a: the worker source is a runtime asset module (never index.html).
   const replies = [];
   const self = { postMessage: (msg) => replies.push(msg) };
-  vm.runInNewContext(m[1], { self: self });
+  vm.runInNewContext(GREP_WORKER_SOURCE, { self: self });
   return { send: (msg) => self.onmessage({ data: msg }), replies: replies };
 }
 

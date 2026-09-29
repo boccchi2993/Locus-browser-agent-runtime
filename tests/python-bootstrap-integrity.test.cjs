@@ -137,7 +137,8 @@ function installFakeFetch(overrides, log) {
 // per instance, so no manual state reset is needed (or possible to get
 // wrong: two freshRuntime() calls can never share Maps/Sets/queues).
 function freshRuntime(mod) {
-  return mod.createPythonRuntime();
+  const { freshRuntime } = require('./helpers/runtime.cjs');
+  return freshRuntime(mod);
 }
 
 const errText = (e) => String(e && e.message ? e.message : e);

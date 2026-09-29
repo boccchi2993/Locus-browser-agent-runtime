@@ -40,7 +40,8 @@ const hexPrefix = (u8, n) => Array.from((u8 || []).slice(0, n)).join(',');
 
 // M1b: python runs on an INJECTED interpreter instance (what the product
 // wiring does). One suite instance; every bash call gets it via opts.
-const pyrt = M.createPythonRuntime();
+const { freshRuntime } = require('./helpers/runtime.cjs');
+const pyrt = freshRuntime(M);
 const rawExecuteTool = M.executeTool;
 M.executeTool = (name, input, ws, opts) => rawExecuteTool(name, input, ws, Object.assign({ pythonRuntime: pyrt }, opts || {}));
 
@@ -83,8 +84,8 @@ const OK_RESULT = {
 const okResult = (over) => Object.assign({}, OK_RESULT, over);
 
 // ---------- real worker source with a fake Pyodide (worker-side tests) ----------
-const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-const workerSrc = html.match(/<script type="text\/worker" id="py-worker-src">([\s\S]*?)<\/script>/)[1];
+// M2a: the worker source is a runtime asset module (never index.html).
+const { PY_WORKER_SOURCE: workerSrc } = require('./helpers/runtime.cjs');
 
 function makeFakePy(mutate) {
   const files = new Map([['/', 'DIR'], ['/tmp', 'DIR']]); // ABS path -> Uint8Array | 'DIR'

@@ -65,7 +65,8 @@ function b64(s) { return Buffer.from(s, 'utf8').toString('base64'); }
 // One instance is created for this suite and handed to every bash call
 // via opts.pythonRuntime (exactly what the product wiring does); the
 // worker boundary stub is installed on that instance.
-const pyrt = M.createPythonRuntime();
+const { freshRuntime } = require('./helpers/runtime.cjs');
+const pyrt = freshRuntime(M);
 function withPyrt(opts) { return Object.assign({ pythonRuntime: pyrt }, opts || {}); }
 
 // Stub the worker boundary: postMessage resolves the pending request with
