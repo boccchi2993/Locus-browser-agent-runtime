@@ -2,7 +2,6 @@
 <html>
 <head><meta charset="UTF-8"><title>e2e</title></head>
 <body>
-<div id="sb-python"></div>
 <pre id="out">RUNNING</pre>
 <script src="../src/telemetry.js"></script>
 <script src="../src/workspace.js"></script>
@@ -14,10 +13,12 @@
 <script src="../src/model.js"></script>
 <script src="../src/agent.js"></script>
 <script type="module">
-// M2a: the worker sources are RUNTIME ASSETS imported from the module —
-// this harness page carries no #py-worker-src / #grep-worker-src DOM and
-// never extracts anything from a product page.
+// M2a: the worker sources are RUNTIME ASSETS imported from the module and
+// bash routes through the PUBLIC runtime entry — this harness page carries
+// no #py-worker-src / #grep-worker-src DOM and never extracts anything
+// from a product page.
 import { PY_WORKER_SOURCE, GREP_WORKER_SOURCE } from '../src/runtime/worker-assets.js';
+import { createRuntime } from '../src/runtime/index.js';
 (async () => {
   const lines = [];
   const log = (m) => { lines.push(m); document.getElementById('out').textContent = lines.join('\n'); };
@@ -74,13 +75,16 @@ import { PY_WORKER_SOURCE, GREP_WORKER_SOURCE } from '../src/runtime/worker-asse
 
     // M1b: the shell executes python on an INJECTED interpreter instance
     // (what the product wiring does). This local wrapper shadows the global
-    // executeTool and adds the instance to every bash call; the reset/worker
-    // assertions below drive the SAME instance. M2a: the worker sources are
-    // the imported runtime assets — the instance and the grep session both
-    // receive theirs explicitly.
-    const pyRuntime = createPythonRuntime({ pyWorkerSource: PY_WORKER_SOURCE });
+    // executeTool and routes every bash call through the M2a public entry
+    // session (which injects the instance and the grep worker asset
+    // itself); the reset/worker assertions below drive the SAME instance.
+    const __host = createRuntime({
+      workerAssets: { pyWorkerSource: PY_WORKER_SOURCE, grepWorkerSource: GREP_WORKER_SOURCE },
+    });
+    const __session = __host.createSession();
+    const pyRuntime = __session.pythonRuntime();
     const executeTool = (name, input, wsArg, opts) => window.executeTool(name, input, wsArg,
-      Object.assign({ pythonRuntime: pyRuntime, grepWorkerSource: GREP_WORKER_SOURCE }, opts || {}));
+      Object.assign({ runtimeSession: __session }, opts || {}));
 
     // ---------- existing smoke: ls / cat / unsupported / cloud ----------
     check('smoke ls', (await executeTool('bash', 'ls', ws)).output === 'sales.csv');

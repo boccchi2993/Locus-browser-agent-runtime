@@ -89,12 +89,13 @@ function buildPage(shellUrl, workerSrc, localAssets) {
     // the source by REBUILDING the instance, carrying the verified asset
     // cache over (content-hash-pinned Pyodide bytes are stateless and
     // independent of the worker build — the same retention the old
-    // same-instance swap exercised).
+    // same-instance swap exercised). __f04cWorkerSrc stays the GOOD
+    // source forever: the OLD DOM-based driver mutated only the tag and
+    // E7b restored via this variable, so it must never be overwritten.
     + 'window.__f04cWorkerSrc = ' + JSON.stringify(workerSrc) + ';'
     + 'window.__f04c = { ready: true };'
     + 'window.__pyrt = createPythonRuntime({ pyWorkerSource: window.__f04cWorkerSrc });'
     + 'window.__f04cSetWorkerSource = function (t) {'
-    + '  window.__f04cWorkerSrc = t;'
     + '  var previous = window.__pyrt;'
     + '  window.__pyrt = createPythonRuntime({ pyWorkerSource: t });'
     + '  if (previous && previous._assets) window.__pyrt._assets = previous._assets;'

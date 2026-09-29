@@ -66,16 +66,20 @@ async function main() {
     const echo = await evaluate(cdp, 'window.__host.run("echo standalone-host")');
     check('B2 shell echo through the public entry', echo.ok && echo.output === 'standalone-host', JSON.stringify(echo));
     const wr = await evaluate(cdp, 'window.__host.run("echo data > /mnt/workspace/f.txt && cat /mnt/workspace/f.txt")');
-    check('B2b VFS write + read', wr.ok && wr.output === 'data', JSON.stringify(wr));
+    check('B2b VFS write + read', wr.ok && wr.output === 'data\n', JSON.stringify(wr));
     check('B2c the interpreter stayed cold; no #sb-python / worker-source elements exist',
       (await evaluate(cdp, 'window.__host.session.status().interpreter')) === 'cold'
       && (await evaluate(cdp, '!!document.getElementById("sb-python") || !!document.getElementById("py-worker-src") || !!document.getElementById("grep-worker-src")')) === false,
       JSON.stringify(await evaluate(cdp, 'window.__host.session.status()')));
 
     // ---- B3: grep real worker + catastrophic pattern containment ----
-    await evaluate(cdp, 'window.__host.run("printf abc > /mnt/workspace/a.txt")');
-    const grep = await evaluate(cdp, 'window.__host.run("grep -n b /mnt/workspace/a.txt")');
-    check('B3 grep works through the packaged worker asset', grep.ok && grep.output.includes('abc'), JSON.stringify(grep));
+    // The adversarial input is the e2e-grep shape: all-a run plus a
+    // non-matching tail (only that shape backtracks catastrophically under
+    // ^(a+)+$; a plain 'abc' fails fast and burns nothing).
+    await evaluate(cdp,
+      'window.__host.run("echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX > /mnt/workspace/a.txt")');
+    const grep = await evaluate(cdp, 'window.__host.run("grep -c X /mnt/workspace/a.txt")');
+    check('B3 grep works through the packaged worker asset', grep.ok && grep.output.trim() === '1', JSON.stringify(grep));
     // Main-thread heartbeat while a catastrophic pattern burns the worker.
     const beats = await evaluate(cdp, `(async () => {
       let beats = 0;
@@ -99,8 +103,8 @@ async function main() {
     check('B4 real Python executed on the packaged asset chain',
       py.ok && (py.output || '').includes('py-ok 3'),
       JSON.stringify(py).slice(0, 300));
-    check('B4b the interpreter reported ready and back to idle',
-      (await evaluate(cdp, 'window.__host.session.status().interpreter')) === 'cold'
+    check('B4b the interpreter settled back to idle (warm READY — the worker stays up)',
+      (await evaluate(cdp, 'window.__host.session.status().interpreter')) === 'ready'
       && (await evaluate(cdp, 'window.__host.session.status().busyExecutions')) === 0,
       JSON.stringify(await evaluate(cdp, 'window.__host.session.status()')));
     const pyWrite = await evaluate(cdp,
@@ -134,7 +138,7 @@ async function main() {
       return { a: ra.output, b: rb.output, refused, alive: rAfter.output, survivorAlive: h.session.status().disposed === null };
     })()`, 60000);
     check('C two sessions are execution- and filesystem-isolated',
-      c.a === 'A' && c.b === 'B', JSON.stringify({ a: c.a, b: c.b }));
+      c.a === 'A\n' && c.b === 'B\n', JSON.stringify({ a: c.a, b: c.b }));
     check('C2 the disposed session refuses; the survivor still executes',
       /disposed/.test(c.refused || '') && c.alive === 'alive' && c.survivorAlive === true,
       JSON.stringify(c));
