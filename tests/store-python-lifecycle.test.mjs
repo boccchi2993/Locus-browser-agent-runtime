@@ -56,6 +56,11 @@ globalThis.createPythonRuntime = () => {
   return rt;
 };
 
+// index.html loads src/mutation-policy.js as a classic script before the
+// store module runs; mirror that here.
+globalThis.LocusMutationPolicy = (0, eval)(
+  readFileSync(join(root, 'src', 'mutation-policy.js'), 'utf8') + String.fromCharCode(10) + ';LocusMutationPolicy');
+
 // ---------- stub runtime globals BEFORE importing the store ----------
 class FakeAgentSession {
   constructor(deps) {
@@ -180,6 +185,27 @@ const createdBefore = createdInstances.length;
     JSON.stringify({ prepared: canonical.prepared.length, created: createdInstances.length }));
 }
 
+// ---------- SP6: the product mutation policy rides every bash call -------
+{
+  toolCalls.length = 0;
+  await session.toolExecutor('bash', 'mv /home/locus/.skills/x /tmp/x', ui.vfs, { signal: new AbortController().signal });
+  const injected = toolCalls[0] && toolCalls[0].opts && toolCalls[0].opts.mutationPolicy;
+  check('SP6 the executor opts carry a REAL product mutation policy',
+    !!injected && typeof injected.checkMove === 'function' && typeof injected.checkRemove === 'function'
+      && typeof injected.isPolicyRefusal === 'function',
+    JSON.stringify({ present: !!injected }));
+  const refusal = injected.checkMove({
+    source: '/home/locus/.skills/cap-a/synthetic-skill.skill',
+    destination: '/home/locus/renamed.skill',
+    recursive: true,
+  });
+  const allowed = injected.checkMove({ source: '/tmp/a.txt', destination: '/tmp/b.txt', recursive: true });
+  check('SP6b the injected policy enforces the skill identity and nothing else',
+    refusal.allowed === false && refusal.reason.includes('Skill instance paths are stable')
+      && allowed.allowed === true,
+    JSON.stringify({ refusal, allowed }));
+}
+
 // ---------- SP5: the hooks seam substitutes the instance ----------
 {
   // Fresh module graph: hooks must be set BEFORE the first pythonRuntime()
@@ -193,6 +219,25 @@ const createdBefore = createdInstances.length;
     !!hooked && createdInstances.length === 0 && typeof hooked.prepare === 'function',
     JSON.stringify({ hooked: !!hooked, created: createdInstances.length }));
   delete globalThis.window;
+}
+
+// ---------- SP7: a missing policy implementation fails LOUDLY ----------
+{
+  // Fresh graph without the policy global (the product forgot to load
+  // mutation-policy.js): the first bash call must REFUSE, never run
+  // unprotected.
+  const savedPolicy = globalThis.LocusMutationPolicy;
+  const savedFactory = globalThis.createPythonRuntime;
+  delete globalThis.LocusMutationPolicy;
+  const ui3 = await import('../src/ui/store.js?no-policy');
+  let refused = null;
+  try { await ui3.session.toolExecutor('bash', 'echo hi', ui3.vfs, {}); }
+  catch (e) { refused = e; }
+  check('SP7 a missing product policy refuses execution loudly',
+    !!refused && /mutation policy unavailable/.test(String(refused && refused.message)),
+    String(refused && refused.message));
+  globalThis.LocusMutationPolicy = savedPolicy;
+  globalThis.createPythonRuntime = savedFactory;
 }
 
 console.log('\n' + passed + ' passed, ' + failed + ' failed');

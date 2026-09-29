@@ -28,6 +28,7 @@ global.window = { location: { protocol: 'https:' } };
 global.document = { getElementById: () => null };
 const shellSrc = ['src/telemetry.js', 'src/workspace.js', 'src/vfs.js', 'src/network.js', 'src/shell.js', 'src/tools.js']
   .map((f) => read(f)).join('\n;\n');
+const POLICY = eval(read('src/mutation-policy.js') + '\n;({ LocusMutationPolicy });');
 const SH = eval(shellSrc + '\n;({ executeTool, VirtualWorkspace, MemoryWorkspace, SHELL_COMMANDS, GrepRegexRuntime, Telemetry });');
 const { installGrepFakeWorker } = require('./helpers/grep-fake-worker.cjs');
 installGrepFakeWorker(SH);
@@ -527,7 +528,10 @@ async function run() {
         taskEnvironment: env,
       },
     }), 'read-write');
-    const run = (cmd) => SH.executeTool('bash', cmd, taskVfs, { signal: ac.signal });
+    // M1b: the skill-identity mv/rm protection is PRODUCT policy injected
+    // via opts.mutationPolicy (store.js wiring); the shell no longer
+    // hardcodes ~/.skills rules.
+    const run = (cmd) => SH.executeTool('bash', cmd, taskVfs, { signal: ac.signal, mutationPolicy: POLICY.LocusMutationPolicy.create() });
 
     const mv1 = await run('mv /home/locus/.skills/cap-a/synthetic-skill.skill /home/locus/renamed.skill');
     check('S1 mv of a skill instance is refused with the identity contract',

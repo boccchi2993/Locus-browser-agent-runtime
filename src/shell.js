@@ -1010,6 +1010,11 @@ function createPythonRuntime() {
   // }
   async _runOnce(code, vfs, opts, expectedGeneration) {
     const signal = opts && opts.signal;
+    // The injected mutation policy decides which provider errors are
+    // REFUSALS (reported as conflicts — honest changeset accounting)
+    // rather than generic write failures. No policy = no refusals.
+    const policy = opts && opts.mutationPolicy;
+    const isRefusal = (e) => !!(policy && typeof policy.isPolicyRefusal === 'function' && policy.isPolicyRefusal(e));
     await this._ensureWorker(signal, opts && opts.bootstrapBudgets);
     throwIfCancelled(signal, 'python execution');
 
@@ -1146,7 +1151,7 @@ function createPythonRuntime() {
       } catch (e) {
         // A skill-boundary refusal is a DECISION (harness-owned layout),
         // reported as a refused conflict — never a silent skip.
-        if (isSkillMutationError(e)) conflicts.push({ path: d, reason: e.message });
+        if (isRefusal(e)) conflicts.push({ path: d, reason: e.message });
         else writeFailed.push('mkdir ' + d + ': ' + (e && e.message ? e.message : String(e)));
       }
     }
@@ -1211,7 +1216,7 @@ function createPythonRuntime() {
         // SkillInstanceWorkspace: declined confirmations, TOCTOU
         // conflicts and undeclared paths are honest REFUSALS (changeset
         // reports the skill as not persisted), not generic I/O errors.
-        if (isSkillMutationError(e)) conflicts.push({ path: f.path, reason: e.message });
+        if (isRefusal(e)) conflicts.push({ path: f.path, reason: e.message });
         else writeFailed.push(f.path + ': ' + (e && e.message ? e.message : String(e)));
       }
     }
@@ -1268,7 +1273,7 @@ function createPythonRuntime() {
           deleted.push(p);
         } catch (e) {
           if (e && e.name === 'NotFoundError') continue; // already gone
-          if (isSkillMutationError(e)) conflicts.push({ path: p, reason: e.message });
+          if (isRefusal(e)) conflicts.push({ path: p, reason: e.message });
           else writeFailed.push('delete ' + p + ': ' + (e && e.message ? e.message : String(e)));
         }
       }
@@ -1313,7 +1318,7 @@ function createPythonRuntime() {
           deleted.push(p);
         } catch (e) {
           if (e && e.name === 'NotFoundError') continue; // already gone
-          if (isSkillMutationError(e)) conflicts.push({ path: p, reason: e.message });
+          if (isRefusal(e)) conflicts.push({ path: p, reason: e.message });
           else writeFailed.push('rmdir ' + p + ': ' + (e && e.message ? e.message : String(e)));
         }
       }
@@ -1929,34 +1934,21 @@ function writableErrMsg(e) {
   return e && e.message ? e.message : String(e);
 }
 
-// ---------- capability skill instance boundary (mutable skill closure) ----
-// Skill instance identity IS the path (capabilityId + skillId) under
-// /home/locus/.skills. Two shell operations can never apply to it:
-//   mv — a move would split the mutation across an approval-bound write
-//        and an approval-bound delete; a half-approved half-move is
-//        exactly the incoherent state the path identity forbids.
-//   rm -r on the skills root or a capability directory — capability-wide
-//        deletion is exclusively the user's Remove action in Settings.
-// Single-file writes/deletes route through the task's guarded
-// SkillInstanceWorkspace mount (echo >, >>, curl -o, rm <file>, python
-// commits all ask there); these checks only close the two structural
-// holes the guard cannot see (mv is read+write+delete at the shell layer,
-// and rm -r would walk into per-file approvals).
-const SKILL_INSTANCE_SHELL_ROOT = '/home/locus/.skills';
-const SKILL_IDENTITY_BOUNDARY_MSG =
-  'Skill instance paths are stable; edit the skill in place, '
-  + 'delete the individual skill with approval, or remove/re-add the capability.';
-
-function underSkillInstances(abs) {
-  return abs === SKILL_INSTANCE_SHELL_ROOT || abs.startsWith(SKILL_INSTANCE_SHELL_ROOT + '/');
-}
-
-// True when a guard error came from the skill mutation boundary (declined
-// confirmation, TOCTOU conflict, undeclared path, size bound). The python
-// commit phase reports these as REFUSED conflicts — honest changeset
-// accounting — instead of generic write failures.
-function isSkillMutationError(e) {
-  return !!e && typeof e.code === 'string' && e.code.indexOf('skill_mutation_') === 0;
+// ---------- mutation policy (M1b, repository split) ----------
+// Product/Harness filesystem-mutation rules (the Locus skill-identity
+// protection among them) live OUTSIDE the generic runtime: the shell
+// consumes the operation-aware MutationPolicy port from
+// opts.mutationPolicy (contract docs/REPOSITORY-SPLIT-CONTRACTS.md 3.7 —
+// checkMove / checkRemove / isPolicyRefusal). The policy is injected per
+// execution by the product wiring; the GENERIC runtime ships none and is
+// deliberately neutral (plain mv/rm wherever the VFS allows). Refusals
+// compose as `<command>: <policy reason>` — the reason text is the
+// policy's, byte-stable, and this layer adds only the command prefix.
+// The VFS's own read-only / protected-root / path-safety enforcement and
+// the task fork's SkillInstanceWorkspace per-file approval guard are
+// RUNTIME concerns and stay in force regardless of the policy.
+function policyRefusal(verdict) {
+  return (verdict && verdict.reason) || 'refused by the mutation policy';
 }
 
 // The parent of an absolute target must be an existing directory. Mount
@@ -2862,6 +2854,7 @@ function throwMutationCancelled(signal, what, done) {
 
 async function shMv(ctx, args) {
   const signal = ctx.opts && ctx.opts.signal;
+  const policy = ctx.opts && ctx.opts.mutationPolicy;
   const operands = [];
   for (const t of args) {
     if (!t.quoted && t.text.charAt(0) === '-' && t.text.length > 1) {
@@ -2905,11 +2898,27 @@ async function shMv(ctx, args) {
     if (ctx.vfs.isProtectedRoot(srcAbs)) {
       return shErr('mv: ' + srcDisplay + ': refusing to move protected path: ' + srcAbs);
     }
-    // Skill instance identity is path-stable: any move touching ~/.skills
-    // (source OR destination) is refused outright — never split into an
-    // approved write plus an approved delete.
-    if (underSkillInstances(srcAbs) || underSkillInstances(destAbs)) {
-      return shErr('mv: ' + srcDisplay + ': ' + SKILL_IDENTITY_BOUNDARY_MSG);
+    // The FINAL destination (mv-into-directory appends the basename) —
+    // computed here so the injected policy judges the real target.
+    let finalAbs = destAbs;
+    if (destStat && destStat.kind === 'directory') {
+      finalAbs = joinAbs(destAbs, baseName(srcAbs));
+    }
+    // Product/Harness mutation rules ride the injected policy (M1b): any
+    // move touching a protected tree (source OR final destination) is
+    // refused by IT, with its byte-stable reason — never split into an
+    // approved write plus an approved delete. No policy injected = the
+    // generic runtime's neutral behavior.
+    if (policy) {
+      const verdict = policy.checkMove({
+        source: srcAbs,
+        destination: finalAbs,
+        destinationKind: destStat ? destStat.kind : null,
+        recursive: true,
+      });
+      if (!verdict || verdict.allowed !== true) {
+        return shErr('mv: ' + srcDisplay + ': ' + policyRefusal(verdict));
+      }
     }
     let srcStat;
     try {
@@ -2922,12 +2931,8 @@ async function shMv(ctx, args) {
       return shErr('mv: ' + srcDisplay + ': source is on a read-only filesystem; move cannot remove source');
     }
 
-    // An existing destination directory means "move INTO it"; any other
-    // existing destination is a loud failure (no implicit overwrite, no -f).
-    let finalAbs = destAbs;
-    if (destStat && destStat.kind === 'directory') {
-      finalAbs = joinAbs(destAbs, baseName(srcAbs));
-    }
+    // finalAbs was computed above (before the policy check); the rules
+    // below are unchanged.
     if (finalAbs === srcAbs) return shErr('mv: ' + srcDisplay + ' and ' + destDisplay + ' are the same file');
     if (destStat && destStat.kind !== 'directory') {
       return shErr('mv: ' + destDisplay + ': destination exists');
@@ -3095,6 +3100,7 @@ async function mvDirectory(ctx, srcAbs, finalAbs, signal) {
 
 async function shRm(ctx, args) {
   const signal = ctx.opts && ctx.opts.signal;
+  const policy = ctx.opts && ctx.opts.mutationPolicy;
   let force = false, recursive = false;
   const operands = [];
   for (const t of args) {
@@ -3141,16 +3147,20 @@ async function shRm(ctx, args) {
       errors.push('rm: ' + op + ': ' + writableErrMsg(e));
       continue;
     }
-    if (st.kind === 'directory') {
-      // Capability-wide deletion is exclusively the user's Remove action
-      // in Settings: no recursive shell removal of the skills root or a
-      // capability's instance directory, however spelled. A single
-      // declared <skill>.skill file is still deletable (with approval).
-      if (underSkillInstances(abs)) {
-        errors.push('rm: refusing to remove capability skill directory: ' + abs + '. '
-          + SKILL_IDENTITY_BOUNDARY_MSG);
+    // Product/Harness mutation rules ride the injected policy (M1b), for
+    // files and directories alike: the Locus policy refuses directory
+    // removal under the skills root (capability-wide deletion is
+    // exclusively the user's Remove action in Settings) and leaves single
+    // declared skill FILES on their per-file approval path. The VFS's
+    // protected-root refusal above stays a RUNTIME check.
+    if (policy) {
+      const verdict = policy.checkRemove({ target: abs, kind: st.kind, recursive: recursive });
+      if (!verdict || verdict.allowed !== true) {
+        errors.push('rm: ' + policyRefusal(verdict));
         continue;
       }
+    }
+    if (st.kind === 'directory') {
       if (!recursive) {
         errors.push('rm: ' + op + ': is a directory');
         continue;

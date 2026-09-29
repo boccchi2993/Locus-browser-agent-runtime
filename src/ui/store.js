@@ -40,7 +40,7 @@ import { createTaskRunner, isPersistenceFailure } from '../harness/task-runner.j
 import { createProviderSessions } from '../harness/provider-session.js';
 
 /* global AgentSession, Model, callModel, executeTool, buildSystemPrompt,
-   LocalDirectoryWorkspace, ensureWorkspacePermission, createPythonRuntime,
+   LocalDirectoryWorkspace, ensureWorkspacePermission, createPythonRuntime, LocusMutationPolicy,
    Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS,
    CapabilityManager, CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
    SkillSourceStore, SkillInstanceStorage, SkillInstanceWorkspace,
@@ -179,6 +179,23 @@ function ensurePythonRuntime() {
 // Canonical accessor for callers outside this module (the UI status poll
 // and the ?e2e=1 seam). Returns null when this deployment has no python
 // runtime.
+
+// ---------- product mutation policy (M1b, repository split) ----------
+// The Locus skill-identity protection is PRODUCT policy, not runtime:
+// LocusMutationPolicy (src/mutation-policy.js) owns the /home/locus/.skills
+// rules; the generic runtime shell only consumes the operation-aware port
+// (checkMove / checkRemove / isPolicyRefusal) via opts.mutationPolicy.
+// EVERY bash execution carries it — a missing policy implementation fails
+// LOUDLY here instead of silently running shell mutations unprotected.
+let mutationPolicyResolved = null;
+function taskMutationPolicy() {
+  if (mutationPolicyResolved) return mutationPolicyResolved;
+  if (typeof LocusMutationPolicy === 'undefined' || typeof LocusMutationPolicy.create !== 'function') {
+    throw new Error('Locus mutation policy unavailable; refusing to run shell commands without the skill-protection policy');
+  }
+  mutationPolicyResolved = LocusMutationPolicy.create();
+  return mutationPolicyResolved;
+}
 export function pythonRuntime() {
   const rt = ensurePythonRuntime();
   return rt || null;
@@ -369,6 +386,9 @@ function wiredToolExecutor(tool, input, workspace, opts) {
     // exactly the instance task preparation configured (see the lifecycle
     // block above).
     pythonRuntime: pythonRuntime(),
+    // M1b: the product mutation policy — mv/rm refusals (skill identity
+    // among them) come from IT, never from hardcoded runtime rules.
+    mutationPolicy: taskMutationPolicy(),
   });
   const h = hooks();
   if (h && typeof h.toolExecutor === 'function') return h.toolExecutor(tool, input, workspace, o);

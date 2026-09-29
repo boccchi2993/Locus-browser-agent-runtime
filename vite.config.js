@@ -28,6 +28,7 @@ const RUNTIME_SCRIPTS = [
   'src/tools.js',
   'src/approval.js',
   'src/agent.js',
+  'src/mutation-policy.js',
   'src/ui/projector.js',
   'src/ui/markdown.js',
 ];
