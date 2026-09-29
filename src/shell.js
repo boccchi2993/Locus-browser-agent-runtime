@@ -393,7 +393,46 @@ function validateWheelArtifact(pluginId, wheel) {
   return { filename: filename, format: 'python-wheel', size: wheel.size, sha256: wheel.sha256, bytes: copy };
 }
 
-const PythonRuntime = {
+// M1b (repository split): the interpreter is an INSTANCE, not a page-global
+// singleton. createPythonRuntime() builds one interpreter with ALL of its
+// mutable state owned per instance: the worker facade, boot promise and
+// timers, pending-request map, request sequence, execution queue, plugin
+// payload set and the disposed flag. Two instances share nothing mutable —
+// resetting or disposing one can never touch another (pinned by
+// tests/python-lifecycle.test.cjs).
+//
+// Explicitly shared across instances (all immutable or stateless): the
+// frozen PYTHON_BOOTSTRAP_MANIFEST, the budget constants/clocks, the
+// py-creator document and every helper in this file. The VERIFIED ASSET
+// CACHE (_assets) is intentionally PER INSTANCE: it holds verified bytes
+// for this interpreter’s boots only; sharing it across instances would
+// re-couple lifecycles that M1b exists to separate.
+//
+// Lifecycle (contract docs/REPOSITORY-SPLIT-CONTRACTS.md §3.1, M1b form):
+//   prepare(req)  — between tasks: compare the wanted plugin payload with
+//                    the configured one; validate-then-swap (all-or-nothing,
+//                    never boots, never fetches). Returns
+//                    { rebuiltInterpreter }.
+//   run(code, vfs, opts) — the execution port (serialized queue, mirrors,
+//                    commit phases unchanged).
+//   reset(reason) — session/rebuild boundary: invalidates the in-flight
+//                    boot, pending requests and queued runs SYNCHRONOUSLY.
+//                    reset() returns immediately — an abort’s effect on a
+//                    caller’s in-flight run() promise lands at that run’s
+//                    next await boundary, not inside reset() itself. The
+//                    instance stays reusable afterwards.
+//   dispose(reason) — terminal: everything reset does, plus permanent
+//                    refusal of prepare/run/configureExtensions. Idempotent.
+//                    Late worker messages cannot revive the instance (the
+//                    creator iframe is gone; the disposed flag blocks new
+//                    work).
+//   snapshot()    — canonical state read for callers outside the runtime.
+//
+// The product keeps ONE active instance per page and keeps lazy boot: a
+// text-only task constructs the instance object but never creates a
+// worker, downloads assets or starts Pyodide.
+function createPythonRuntime() {
+  const rt = {
   worker: null, // facade over the creator-relayed worker (null = cold)
   status: 'cold', // cold | loading | ready
   _reqId: 0,
@@ -427,6 +466,18 @@ const PythonRuntime = {
   // installed after the declared package set, and fail the boot
   // closed when broken.
   _extensions: null,
+  // Terminal state (dispose()): the disposal reason, or null while the
+  // instance accepts work. Permanent — there is no un-dispose.
+  _disposed: null,
+  // Reset generation: bumped by EVERY reset()/dispose(). A queued run
+  // captures the generation at call time and re-checks it after the seat
+  // is taken and again before the worker post, so a boundary that lands
+  // while a run is suspended between seat and post still invalidates it
+  // (the drained-set alone cannot see runs that already left the queue).
+  _resetGeneration: 0,
+  // The reason carried by the latest reset/dispose, used as the
+  // invalidation error for runs caught by the generation check.
+  _resetReason: null,
 
   // Everything below runs in the TRUSTED harness phase: creator iframe
   // spawn, verified asset acquisition, bootstrap delivery, lock
@@ -438,6 +489,7 @@ const PythonRuntime = {
   // which phase failed. A failure tears the whole stack down so the next
   // run rebuilds from scratch (verified assets stay cached).
   async _ensureWorker(signal, budgets) {
+    if (this._disposed) throw new Error(this._disposed);
     if (this.worker) return;
     throwIfCancelled(signal, 'python execution');
     this._setStatus('loading');
@@ -696,15 +748,93 @@ const PythonRuntime = {
     this._setStatus('cold');
   },
 
+  // ---- M1b lifecycle: prepare ----
+  // Between-task configuration point. Compares the wanted python plugin
+  // payload with the configured one and reconfigures ONLY on a key change.
+  // This is pure configuration work: it never creates the creator iframe,
+  // never spawns a worker, never downloads an asset — the interpreter
+  // stays lazily booted and a text-only task performs zero Python asset
+  // acquisition. A no-change prepare (same key) touches nothing: no reset,
+  // no reconfiguration, no interpreter churn.
+  //
+  // All-or-nothing: the new payload is validated (the exact
+  // configureExtensions shape gates) BEFORE the old interpreter is torn
+  // down, so a validation failure leaves the previously configured payload
+  // fully intact — never a half-applied reset with no payload.
+  //
+  // Synchronous by construction: there is no await between the comparison,
+  // validation, teardown and commit, so a stale or cancelled caller can
+  // never interleave — a late apply cannot overwrite a newer task’s
+  // configuration. An already-aborted req.signal is refused before any
+  // state changes. Returns { rebuiltInterpreter: boolean }.
+  //
+  // Caller contract: prepare runs BETWEEN tasks. A key change tears down
+  // the configured interpreter (reset), which would kill an in-flight
+  // execution — waiting for in-flight work is the harness task runner’s
+  // admission + storage-mutation quiesce gate’s job, not prepare’s.
+  prepare(req) {
+    if (this._disposed) throw new Error(this._disposed);
+    const signal = req && req.signal;
+    if (signal && signal.aborted) {
+      throw new Error('python preparation cancelled' + (signal.reason ? ': ' + signal.reason : ''));
+    }
+    const wanted = req && req.python ? req.python.key : null;
+    if (this.extensionKey() === wanted) return { rebuiltInterpreter: false };
+    // Validate + stage the new payload BEFORE tearing anything down.
+    const staged = wanted === null ? null : this.buildExtensions(req.python);
+    this.reset('python runtime reset (interpreter rebuilt for a changed plugin set)');
+    this._extensions = staged;
+    return { rebuiltInterpreter: true };
+  },
+
+  // ---- M1b lifecycle: dispose ----
+  // Terminal teardown for page teardown / runtime replacement. Everything
+  // reset() does (invalidate boot, pending requests, queued runs) plus a
+  // permanent refusal of prepare/run/configureExtensions. IDEMPOTENT: a
+  // second dispose keeps the FIRST reason and does not throw. Late worker
+  // messages cannot revive the instance: the creator iframe is destroyed
+  // (so _onWindowMessage drops everything) and the disposed flag blocks
+  // new work.
+  dispose(reason) {
+    const why = this._disposed || ('python runtime disposed' + (reason ? ': ' + reason : ''));
+    this._resetReason = why;
+    this._resetGeneration++;
+    this._failBoot(makeCancelledError(why));
+    if (this.worker || this._pending.size) {
+      this._killWorker(why);
+    }
+    for (const entry of this._queuedRuns) {
+      entry.killed = true;
+      entry.reason = why;
+    }
+    this._queuedRuns.clear();
+    this._disposed = why;
+  },
+
+  // ---- M1b lifecycle: state reads ----
+  // Canonical snapshot for callers outside the runtime (UI status,
+  // harness adapters, tests). No internal Maps/Sets are exposed.
+  snapshot() {
+    return {
+      interpreter: this.status,
+      busyExecutions: this._pending.size + this._queuedRuns.size,
+      extensionKey: this.extensionKey(),
+      disposed: this._disposed,
+    };
+  },
+
   // Session boundary: drop the entire interpreter (globals, imported
   // modules, /tmp files, pending state). Called on workspace switch and
   // on explicit session reset so no Python state leaks across sessions.
-  reset() {
+  reset(reason) {
+    const why = reason || 'python runtime reset (session boundary)';
+    this._resetReason = why;
+    this._resetGeneration++;
     // An in-flight bootstrap belongs to the dying session: abort its
     // acquisition (verified assets stay cached - they are stateless bytes).
-    this._failBoot(makeCancelledError('python runtime reset (session boundary)'));
+    this._failBoot(makeCancelledError(why));
     if (this.worker || this._pending.size) {
-      this._killWorker('python runtime reset (session boundary)');
+      this._killWorker(why);
     }
     // Drain queued-but-unstarted runs too: the boundary is the queue's
     // boundary. Timeouts, cancellations and worker crashes kill the worker
@@ -712,7 +842,7 @@ const PythonRuntime = {
     // fresh worker (its own timer starts when it gets the seat).
     for (const entry of this._queuedRuns) {
       entry.killed = true;
-      entry.reason = 'python runtime reset (session boundary)';
+      entry.reason = why;
     }
     this._queuedRuns.clear();
   },
@@ -741,11 +871,8 @@ const PythonRuntime = {
   //    Every invariant a worker cannot be trusted to catch is enforced
   //    HERE: a metadata/bytes disagreement is a trusted-harness bug and
   //    must fail before the boot send, never inside the interpreter.
-  configureExtensions(ext) {
-    if (ext === null || ext === undefined) {
-      this._extensions = null;
-      return;
-    }
+  buildExtensions(ext) {
+    if (ext === null || ext === undefined) return null;
     if (!ext || typeof ext !== 'object' || typeof ext.key !== 'string' || !ext.key
         || !Array.isArray(ext.modules)) {
       throw new Error('PythonRuntime.configureExtensions: invalid extension payload');
@@ -801,7 +928,16 @@ const PythonRuntime = {
       }
       return Object.freeze({ pluginId: m.pluginId, files: files, imports: m.imports.slice() });
     });
-    this._extensions = Object.freeze({ key: ext.key, modules: Object.freeze(modules) });
+    return Object.freeze({ key: ext.key, modules: Object.freeze(modules) });
+  },
+
+  // Configure the extension payload for FUTURE boots (trusted harness
+  // only). Thin assign over buildExtensions — kept as the compatibility
+  // entry for direct payload setters; the task path uses prepare(), which
+  // stages the payload before any teardown. Refuses a disposed instance.
+  configureExtensions(ext) {
+    if (this._disposed) throw new Error(this._disposed);
+    this._extensions = this.buildExtensions(ext);
   },
 
   _failAllPending(errorMessage) {
@@ -827,15 +963,23 @@ const PythonRuntime = {
   // See _runOnce for the per-run contract. opts.bootstrapBudgets is a
   // TEST-ONLY seam shrinking the bootstrap budgets (never used in prod).
   async run(code, vfs, opts) {
+    if (this._disposed) throw new Error(this._disposed);
     const entry = { killed: false, reason: null };
     this._queuedRuns.add(entry);
+    const gen = this._resetGeneration;
     const turn = this._queue.then(() => {
       // Seat acquired. delete() returning false means reset() drained this
       // entry while it was queued — the session boundary already won.
       if (!this._queuedRuns.delete(entry)) {
-        throw new Error(entry.reason || 'python runtime reset (session boundary)');
+        throw new Error(entry.reason || this._resetReason || 'python runtime reset (session boundary)');
       }
-      return this._runOnce(code, vfs, opts);
+      // The boundary may also land AFTER the seat was taken but before the
+      // run posted (this turn was suspended at an await): the generation
+      // check invalidates it here, before _runOnce starts.
+      if (gen !== this._resetGeneration) {
+        throw new Error(this._resetReason || 'python runtime reset (session boundary)');
+      }
+      return this._runOnce(code, vfs, opts, gen);
     });
     // A failed or killed run must not poison the callers queued behind it;
     // the chain always advances, so timeouts/cancellations/releases cannot
@@ -864,7 +1008,7 @@ const PythonRuntime = {
   //   uncollected: [paths],             — python outputs over the worker caps (changeset incomplete)
   //   stdoutTruncated, stderrTruncated, — output notice flags (NOT commit failures)
   // }
-  async _runOnce(code, vfs, opts) {
+  async _runOnce(code, vfs, opts, expectedGeneration) {
     const signal = opts && opts.signal;
     await this._ensureWorker(signal, opts && opts.bootstrapBudgets);
     throwIfCancelled(signal, 'python execution');
@@ -912,6 +1056,13 @@ const PythonRuntime = {
     // yet) — never start the worker run on a cancelled task.
     throwIfCancelled(signal, 'python execution');
 
+    // Last boundary before the worker post: a reset()/dispose() that
+    // landed while this run was suspended in the boot/mirror awaits
+    // invalidates it here — it must never reach the (possibly replaced)
+    // interpreter of the next generation.
+    if (expectedGeneration !== undefined && expectedGeneration !== this._resetGeneration) {
+      throw new Error(this._resetReason || 'python runtime reset (session boundary)');
+    }
     const id = ++this._reqId;
     const onAbort = () => this._killWorker('python execution cancelled');
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
@@ -1191,7 +1342,9 @@ const PythonRuntime = {
       outputBytes: outFiles.reduce((n, f) => n + b64ByteLength(f.b64), 0),
     };
   },
-};
+  };
+  return rt;
+}
 
 // Optimistic concurrency check before committing a create/modify.
 // Returns null when the write is safe, or {path, reason} when the real
@@ -3352,7 +3505,7 @@ async function runPython(args, ctx, opts) {
   return await runPythonCode(code, ctx.vfs, pythonOpts(ctx));
 }
 
-// Options handed to PythonRuntime: the caller's opts plus the ABSOLUTE VFS
+// Options handed to the injected python runtime instance: the caller’s opts plus the ABSOLUTE VFS
 // cwd of this invocation (Python's os.chdir target).
 function pythonOpts(ctx) {
   return Object.assign({}, ctx.opts, { cwd: ctx.cwd });
@@ -3362,10 +3515,19 @@ async function runPythonCode(code, vfs, opts) {
   if (!code || !code.trim()) {
     return { success: false, stdout: '', stderr: 'python: empty code', io: { in: 0, out: 0 } };
   }
+  // M1b lifecycle: the interpreter instance arrives INJECTED in opts
+  // (Product wiring). There is deliberately no global fallback — a python
+  // execution without an injected instance is an assembly bug and fails
+  // as an honest tool failure instead of silently resurrecting a
+  // page-global runtime.
+  const rt = opts && opts.pythonRuntime;
+  if (!rt) {
+    return { success: false, stdout: '', stderr: 'python: no runtime instance injected', io: { in: utf8ByteLength(code), out: 0 } };
+  }
 
   let res;
   try {
-    res = await PythonRuntime.run(code, vfs, opts);
+    res = await rt.run(code, vfs, opts);
   } catch (e) {
     if (isCancelledError(e)) {
       return { success: false, stdout: '', stderr: 'python: execution cancelled', cancelled: true, io: { in: utf8ByteLength(code), out: 0 } };

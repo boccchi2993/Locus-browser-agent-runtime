@@ -14,7 +14,7 @@ const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js',
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
 const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, normalizeVfsPath, VirtualWorkspace, UploadWorkspace,'
-  + ' PythonRuntime, GrepRegexRuntime, runShellCommand, executeTool,'
+  + ' createPythonRuntime, GrepRegexRuntime, runShellCommand, executeTool,'
   + ' Telemetry, SHELL_COMMANDS, shellHelpText, shellSystemPromptSection, SHELL_PIPE_MAX_BYTES });');
 // Node has no real Worker: grep regex execution runs through the TEST-ONLY deterministic fake.
 const { installGrepFakeWorker } = require('./helpers/grep-fake-worker.cjs');
@@ -85,11 +85,14 @@ class TreeWS extends M.WorkspaceAdapter {
 
 function b64(s) { return Buffer.from(s, 'utf8').toString('base64'); }
 
+// M1b: python runs on an injected instance (what the product wiring does).
+const pyrt = M.createPythonRuntime();
+function withPyrt(opts) { return Object.assign({ pythonRuntime: pyrt }, opts || {}); }
 function mockWorkerResult(result) {
-  M.PythonRuntime._ensureWorker = () => {};
-  M.PythonRuntime.worker = {
+  pyrt._ensureWorker = () => {};
+  pyrt.worker = {
     postMessage(msg) {
-      const p = M.PythonRuntime._pending.get(msg.id);
+      const p = pyrt._pending.get(msg.id);
       queueMicrotask(() => {
         clearTimeout(p.timer);
         M.PythonRuntime._pending.delete(msg.id);
@@ -252,19 +255,19 @@ async function run() {
     // passed through to the worker as Python's cwd (protocol v2)
     const wsP = new TreeWS({ 'sub/script.py': 'print(1)\n' });
     let lastMsg = null;
-    M.PythonRuntime._ensureWorker = () => {};
-    M.PythonRuntime.worker = {
+    pyrt._ensureWorker = () => {};
+    pyrt.worker = {
       postMessage(msg) {
         lastMsg = msg;
-        const p = M.PythonRuntime._pending.get(msg.id);
+        const p = pyrt._pending.get(msg.id);
         queueMicrotask(() => {
           clearTimeout(p.timer);
-          M.PythonRuntime._pending.delete(msg.id);
+          pyrt._pending.delete(msg.id);
           p.resolve({ stdout: 'ok', stderr: '', error: null, files: [], deleted: [] });
         });
       },
     };
-    const c14 = await M.executeTool('bash', 'cd sub && python script.py', wsP);
+    const c14 = await M.executeTool('bash', 'cd sub && python script.py', wsP, withPyrt());
     check('C14 cd && python script.py resolves script under cwd', c14.success && c14.output.includes('ok'), c14.output);
     check('C14b worker receives the shell cwd (ABS) and a mounts array',
       !!lastMsg && lastMsg.cwd === '/mnt/workspace/sub'
@@ -272,7 +275,7 @@ async function run() {
       && lastMsg.mounts.some((m) => m.root === '/mnt/workspace'
         && m.files.some((f) => f.path === '/mnt/workspace/sub/script.py')),
       JSON.stringify(lastMsg && { cwd: lastMsg.cwd, roots: lastMsg.mounts && lastMsg.mounts.map((m) => m.root) }));
-    const c15 = await M.executeTool('bash', 'cd sub && python missing.py', wsP);
+    const c15 = await M.executeTool('bash', 'cd sub && python missing.py', wsP, withPyrt());
     check('C15 missing script error', !c15.success && c15.output.includes("can't open file"), c15.output);
   }
 

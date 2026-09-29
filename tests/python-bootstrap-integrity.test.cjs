@@ -59,7 +59,7 @@ function evalModule(source) {
   global.document = { getElementById: () => null };
   const M = eval(source + '\n;({ PYTHON_TIMEOUT_MS, PYTHON_ASSET_TIMEOUT_MS, PYTHON_ASSET_STALL_MS,'
     + ' PYTHON_BOOTSTRAP_TIMEOUT_MS, PYODIDE_BASE, PYTHON_BOOTSTRAP_MANIFEST, PYTHON_BOOTSTRAP_CORE_ASSETS,'
-    + ' PYTHON_RUNTIME_PACKAGE_FILES, PYTHON_INSTALLER_SUPPORT_FILES, PythonRuntime, pythonBootstrapBudgets, makeBudgetClock, readBodyBounded, validateWheelArtifact });');
+    + ' PYTHON_RUNTIME_PACKAGE_FILES, PYTHON_INSTALLER_SUPPORT_FILES, createPythonRuntime, pythonBootstrapBudgets, makeBudgetClock, readBodyBounded, validateWheelArtifact });');
   delete global.window;
   delete global.document;
   return M;
@@ -132,19 +132,12 @@ function installFakeFetch(overrides, log) {
   };
 }
 
+// M1b: instances come from the factory — every mutable field
+// (assets/boot/creator/pending/queue/extensions/disposed) is initialized
+// per instance, so no manual state reset is needed (or possible to get
+// wrong: two freshRuntime() calls can never share Maps/Sets/queues).
 function freshRuntime(mod) {
-  const rt = Object.create(mod.PythonRuntime);
-  rt._assets = null;
-  rt._boot = null;
-  rt._creator = null;
-  rt._creatorReady = null;
-  rt._pending = new Map();
-  rt._reqId = 0;
-  rt._queuedRuns = new Set();
-  rt._queue = Promise.resolve();
-  rt.worker = null;
-  rt.status = 'cold';
-  return rt;
+  return mod.createPythonRuntime();
 }
 
 const errText = (e) => String(e && e.message ? e.message : e);

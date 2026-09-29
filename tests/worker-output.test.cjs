@@ -154,7 +154,7 @@ global.document = { getElementById: () => null };
 const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js', 'tools.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
-const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, VirtualWorkspace, SHELL_COMMANDS, PythonRuntime, executeTool });');
+const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, VirtualWorkspace, SHELL_COMMANDS, createPythonRuntime, executeTool });');
 
 function bareVfs(adapter) {
   const vfs = new M.VirtualWorkspace({ listCommands: () => Object.keys(M.SHELL_COMMANDS) });
@@ -188,14 +188,20 @@ class MemWS extends M.WorkspaceAdapter {
   }
 }
 
+// M1b: python runs on an INJECTED interpreter instance (what the product
+// wiring does). One suite instance; every bash call gets it via opts.
+const pyrt = M.createPythonRuntime();
+const rawExecuteTool = M.executeTool;
+M.executeTool = (name, input, ws, opts) => rawExecuteTool(name, input, ws, Object.assign({ pythonRuntime: pyrt }, opts || {}));
+
 function mockWorkerResult(result) {
-  M.PythonRuntime._ensureWorker = () => {};
-  M.PythonRuntime.worker = {
+  pyrt._ensureWorker = () => {};
+  pyrt.worker = {
     postMessage(msg) {
-      const p = M.PythonRuntime._pending.get(msg.id);
+      const p = pyrt._pending.get(msg.id);
       queueMicrotask(() => {
         clearTimeout(p.timer);
-        M.PythonRuntime._pending.delete(msg.id);
+        pyrt._pending.delete(msg.id);
         p.resolve(result);
       });
     },
