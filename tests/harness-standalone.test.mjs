@@ -609,6 +609,136 @@ async function main() {
       JSON.stringify({ a: urlsA, b: urlsB }));
   }
 
+  // ---------- F1 (review round): the snapshot is a DEEP, independent copy ----------
+  {
+    const schemaSource = {
+      type: 'object',
+      properties: { input: { type: 'string', description: 'the query' } },
+      required: ['input'],
+    };
+    const defs = [{
+      name: 'lookup',
+      description: 'Look things up (lookup).',
+      inputSchema: schemaSource,
+    }];
+    const bodies = [];
+    let release = null;
+    const gate = new Promise((r) => { release = r; });
+    let parkedOnce = false;
+    const session = createAgentSession({
+      modelClient: async (body) => {
+        bodies.push(body);
+        if (!parkedOnce) {
+          // Barrier: the snapshot AND the first request were built, the
+          // model has not answered. Mutate the SHARED nested schema now.
+          parkedOnce = true;
+          await gate;
+          schemaSource.properties.input.type = 'number';
+          schemaSource.required.length = 0;
+          schemaSource.properties.added = { type: 'string' };
+          return fakeEnvelope('', { toolCalls: [{ id: 't1', name: 'lookup', input: { input: 'q1' } }] });
+        }
+        return fakeEnvelope('done');
+      },
+      toolPort: {
+        definitions: () => defs,
+        execute: async () => ({ output: 'OUT(q1)', success: true, backend: 'fake' }),
+      },
+      emit: () => {},
+    });
+    const runPromise = session.run('deep snapshot', {});
+    await new Promise((r) => {
+      const t = setInterval(() => { if (bodies.length === 1) { clearInterval(t); r(); } }, 2);
+    });
+    release();
+    await runPromise;
+    const sent = bodies[0].tools[0].inputSchema;
+    check('F1 nested schema mutation mid-task cannot reach the sent request',
+      sent.properties.input.type === 'string' && sent.required.length === 1 && !sent.properties.added,
+      JSON.stringify(sent));
+    check('F1 the snapshot structure is deeply frozen',
+      Object.isFrozen(sent) && Object.isFrozen(sent.properties) && Object.isFrozen(sent.required)
+      && Object.isFrozen(sent.properties.input),
+      JSON.stringify([Object.isFrozen(sent), Object.isFrozen(sent.properties), Object.isFrozen(sent.required)]));
+    check('F1 a write into the snapshot copy is rejected (strict mode)',
+      (() => { try { sent.properties.extra = 1; return false; } catch (e) { return true; } })(),
+      'strict-mode write allowed on the snapshot copy');
+    check('F1 the CALLER still owns its objects (mutation visible in the source)',
+      schemaSource.properties.input.type === 'number' && schemaSource.required.length === 0
+      && !!schemaSource.properties.added,
+      JSON.stringify(schemaSource));
+    check('F1 the tool-result round trip request is unaffected too',
+      bodies.length === 2 && !JSON.stringify(bodies[1].tools[0].inputSchema).includes('"added"'),
+      JSON.stringify(bodies[1].tools));
+
+    // The next task reads the UPDATED (restored) legal definitions.
+    bodies.length = 0;
+    schemaSource.properties.input.type = 'string';
+    schemaSource.required.push('input');
+    delete schemaSource.properties.added;
+    defs[0].description = 'UPDATED description.';
+    await session.run('task two', {});
+    check('F1 the next task reads the updated definitions',
+      bodies.length === 1 && bodies[0].system.includes('UPDATED description.')
+      && bodies[0].tools[0].inputSchema.properties.input.type === 'string',
+      JSON.stringify({ system: bodies[0].system.slice(0, 140), tools: bodies[0].tools }));
+
+    // Two instances never share one schema snapshot.
+    const shared = [{ name: 'lookup', description: 'shared.', inputSchema: { type: 'object', properties: { input: { type: 'string' } } } }];
+    const portShared = { definitions: () => shared, execute: async () => ({ output: 'x', success: true, backend: 'fake' }) };
+    const bodiesA = [], bodiesB = [];
+    const sa = createAgentSession({ modelClient: async (b) => { bodiesA.push(b); return fakeEnvelope('a'); }, toolPort: portShared, emit: () => {} });
+    const sb = createAgentSession({ modelClient: async (b) => { bodiesB.push(b); return fakeEnvelope('b'); }, toolPort: portShared, emit: () => {} });
+    await sa.run('a', {});
+    shared[0].inputSchema.properties.input.type = 'integer';
+    await sb.run('b', {});
+    check('F1 two sessions never share one schema snapshot',
+      bodiesA[0].tools[0].inputSchema.properties.input.type === 'string'
+      && bodiesB[0].tools[0].inputSchema.properties.input.type === 'integer',
+      JSON.stringify([bodiesA[0].tools, bodiesB[0].tools]));
+
+    // Non-transportable definitions fail BEFORE any model request with
+    // tool_registry_invalid — zero model calls, zero tool executions.
+    const modelCalls = { n: 0 };
+    const execs = [];
+    const runIllegal = async (illegalDefs) => {
+      modelCalls.n = 0;
+      execs.length = 0;
+      const events = [];
+      const s = createAgentSession({
+        modelClient: async () => { modelCalls.n++; return fakeEnvelope('should not run'); },
+        toolPort: {
+          definitions: () => illegalDefs,
+          execute: async () => { execs.push(1); return { output: 'x', success: true, backend: 'fake' }; },
+        },
+        emit: (e) => events.push(e),
+      });
+      await s.run('illegal registry', {});
+      return events;
+    };
+    const assertIllegal = (events, label) => check('F1 ' + label + ' fails before any model request (zero executions)',
+      modelCalls.n === 0 && execs.length === 0
+      && events.some((e) => e.type === 'error' && e.code === 'tool_registry_invalid')
+      && events.some((e) => e.type === 'task_end' && e.reason === 'error'),
+      JSON.stringify({ calls: modelCalls.n, execs: execs.length, events: events.map((e) => e.type + ':' + (e.code || e.reason || '')) }));
+
+    assertIllegal(await runIllegal([
+      { name: 'lookup', description: 'd', inputSchema: { type: 'object', properties: { input: { type: 'string', transform: () => 'x' } } } },
+    ]), 'a function inside inputSchema');
+
+    const circular = { name: 'lookup', description: 'd', inputSchema: { type: 'object' } };
+    circular.inputSchema.self = circular;
+    assertIllegal(await runIllegal([circular]), 'a circular reference');
+
+    assertIllegal(await runIllegal([
+      { name: 'lookup', description: 'd', inputSchema: { type: 'object', createdAt: new Date(0) } },
+    ]), 'a non-plain object (Date) inside inputSchema');
+
+    assertIllegal(await runIllegal([
+      { name: 'lookup', description: 'd', inputSchema: { type: 'object', note: undefined } },
+    ]), 'an undefined field (would be silently dropped by JSON)');
+  }
+
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
 }

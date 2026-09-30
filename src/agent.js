@@ -98,8 +98,9 @@ function parseToolCall(raw) {
 // one frozen copy for the whole task: the system prompt's tool list, the
 // model request's tools, the native-call validator, the strict text
 // fallback's name check and the unknown-tool error's available list. The
-// caller's objects are copied, never frozen; a later change to the
-// definitions source cannot rebind a running task.
+// caller's objects are DEEPLY copied (transportable JSON data only — see
+// deepCopyToolData), never frozen; a later change to the definitions
+// source cannot rebind a running task.
 function toolRegistryError(message) {
   const e = new Error(message);
   e.name = 'ToolRegistryError';
@@ -122,6 +123,52 @@ function validateToolDefinition(def, index) {
   }
 }
 
+// Deep-copy TRANSPORTABLE JSON data (review round F1). A tool definition
+// crosses a serialization boundary — it is rendered into the system prompt
+// and serialized into every provider request — so its data must survive a
+// JSON round-trip intact. Legal: null, booleans, finite numbers, strings,
+// arrays and plain objects, recursively copied and frozen. Anything else
+// (functions, symbols, bigints, undefined fields, non-finite numbers,
+// non-plain objects like Date/Map, circular references) would be silently
+// dropped or corrupted by a JSON round-trip, so it fails LOUDLY with a
+// ToolRegistryError before any model request — never a silent field drop.
+// The copies share no structure with the source, and the source is never
+// written or frozen.
+function deepCopyToolData(value, path, seen) {
+  if (value === null) return null;
+  const t = typeof value;
+  if (t === 'string' || t === 'boolean') return value;
+  if (t === 'number') {
+    if (!Number.isFinite(value)) {
+      throw toolRegistryError('tool definition ' + path + ' is not transportable JSON data: non-finite number');
+    }
+    return value;
+  }
+  if (t === 'undefined' || t === 'function' || t === 'symbol' || t === 'bigint') {
+    throw toolRegistryError('tool definition ' + path + ' is not transportable JSON data: ' + t);
+  }
+  if (seen.indexOf(value) !== -1) {
+    throw toolRegistryError('tool definition ' + path + ' is not transportable JSON data: circular reference');
+  }
+  if (Array.isArray(value)) {
+    seen.push(value);
+    const copy = value.map((v, i) => deepCopyToolData(v, path + '[' + i + ']', seen));
+    seen.pop();
+    return Object.freeze(copy);
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    throw toolRegistryError('tool definition ' + path + ' is not transportable JSON data: non-plain object');
+  }
+  seen.push(value);
+  const out = {};
+  for (const k of Object.keys(value)) {
+    out[k] = deepCopyToolData(value[k], path + '.' + k, seen);
+  }
+  seen.pop();
+  return Object.freeze(out);
+}
+
 function createToolSnapshot(port) {
   if (!port || typeof port.definitions !== 'function' || typeof port.execute !== 'function') {
     throw toolRegistryError('AgentSession: toolPort ({ definitions(), execute({ name, input, context }) }) is required');
@@ -134,7 +181,7 @@ function createToolSnapshot(port) {
   for (let i = 0; i < list.length; i++) {
     validateToolDefinition(list[i], i);
     if (byName[list[i].name]) throw toolRegistryError('duplicate tool definition: ' + list[i].name);
-    const def = Object.freeze(Object.assign({}, list[i]));
+    const def = deepCopyToolData(list[i], '#' + i, []);
     definitions.push(def);
     names.push(def.name);
     byName[def.name] = def;
