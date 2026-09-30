@@ -46,6 +46,7 @@ const SUITES = [
   'runtime-self-assembly.test.mjs',
   'runtime-session-lifecycle.test.mjs',
   'runtime-boundary.test.cjs',
+  'harness-replay.test.mjs',
   'harness-standalone.test.mjs',
   'harness-boundary.test.cjs',
   'harness-prompt-parity.test.mjs',

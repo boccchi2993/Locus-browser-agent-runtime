@@ -37,6 +37,12 @@
 
 export { createTaskRunner, isPersistenceFailure } from './task-runner.js';
 export { createProviderSessions } from './provider-session.js';
+// Review round F3: the durable-prefix validation ALGORITHMS are Harness
+// semantics — re-exported here so a standalone host restores provider
+// sessions with the REAL validators, never injected fakes.
+export {
+  replayValidationError, validateReplayPrefix, validateNormalizedPrefix,
+} from './replay-validation.js';
 
 // ---------- core resolution ----------
 function readCoreTable() {

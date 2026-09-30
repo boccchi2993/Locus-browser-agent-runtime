@@ -21,6 +21,9 @@ const vfsSrc = fs.readFileSync(path.join(root, 'src', 'vfs.js'), 'utf8');
 const approvalSrc = fs.readFileSync(path.join(root, 'src', 'approval.js'), 'utf8');
 const taskRunnerSrc = fs.readFileSync(path.join(root, 'src', 'harness', 'task-runner.js'), 'utf8');
 const providerSessionSrc = fs.readFileSync(path.join(root, 'src', 'harness', 'provider-session.js'), 'utf8');
+// Review round F3: the validator algorithms are a harness module now —
+// inline the REAL implementation (its own import is stripped below).
+const replayValidationSrc = fs.readFileSync(path.join(root, 'src', 'harness', 'replay-validation.js'), 'utf8');
 const productPromptSrc = fs.readFileSync(path.join(root, 'src', 'ui', 'product-prompt.js'), 'utf8');
 const modelAdaptersSrc = fs.readFileSync(path.join(root, 'src', 'model-adapters.js'), 'utf8');
 const modelSrc = fs.readFileSync(path.join(root, 'src', 'model.js'), 'utf8');
@@ -78,8 +81,11 @@ function loadStore(sessionData) {
     approvalSrc + '\n' +
     // M1a: the store imports the harness task-runner/provider-session ESM
     // modules; strip their export keywords and inline them like the rest.
+    // Review round F3: provider-session imports the validator algorithms —
+    // inline the REAL implementation and strip the import statement.
     taskRunnerSrc.replace(/^export /gm, '') + '\n' +
-    providerSessionSrc.replace(/^export /gm, '') + '\n' +
+    replayValidationSrc.replace(/^export /gm, '') + '\n' +
+    providerSessionSrc.replace(/^import[\s\S]*?from\s+'[^']*';[\s\S]*?\n/gm, '').replace(/^export /gm, '') + '\n' +
     // M2b: the product prompt inputs module (pure, no vue).
     productPromptSrc.replace(/^export /gm, '') + '\n' +
     'const SHELL_COMMANDS = {};\n' +

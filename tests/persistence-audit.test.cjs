@@ -52,6 +52,12 @@ function openAiSession(checkpoint) {
 }
 
 async function run() {
+  // Review round F3: the durable-prefix validation ALGORITHMS are Harness
+  // code now (src/harness/replay-validation.js); persistence.js keeps
+  // one-way delegates that resolve the single implementation through the
+  // published table. Evaluate the module once so the audited P.validate*
+  // calls keep exercising the REAL algorithm.
+  await import(require('url').pathToFileURL(path.join(root, 'src', 'harness', 'replay-validation.js')).href);
   // ---------- F-05: the raw prefix is a validated protocol boundary ----------
   {
     const good = openAiSession(2);

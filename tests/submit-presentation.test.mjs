@@ -88,7 +88,6 @@ globalThis.createProviderIdentity = (config) => ({
 });
 globalThis.ApprovalController = (0, eval)(
   readFileSync(join(root, 'src', 'approval.js'), 'utf8') + '\n;ApprovalController');
-globalThis.validateNormalizedPrefix = () => {};
 globalThis.projectNormalizedHistory = (rows) => rows || [];
 
 // M2b: the suite acts as the HOST — it seeds the declared harness core

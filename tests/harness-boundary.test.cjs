@@ -32,6 +32,7 @@ const HARNESS_OWNED = new Set([
   'src/harness/index.js',
   'src/harness/task-runner.js',
   'src/harness/provider-session.js',
+  'src/harness/replay-validation.js',
   'src/harness/core.js',
   'src/model-adapters.js',
   'src/model.js',
@@ -43,6 +44,7 @@ const HARNESS_OWNED = new Set([
 const CLOSURE_REQUIRED = [
   'src/harness/task-runner.js',
   'src/harness/provider-session.js',
+  'src/harness/replay-validation.js',
   'src/harness/core.js',
   'src/model-adapters.js',
   'src/model.js',

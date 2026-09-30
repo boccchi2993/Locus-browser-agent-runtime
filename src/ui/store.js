@@ -643,8 +643,9 @@ function providerSessionsAdapter() {
     providerConfig: providerConfig,
     createProviderIdentity: createProviderIdentity,
     projectHistory: (messages, dialect) => projectNormalizedHistory(messages, dialect),
-    validateReplayPrefix: (meta, frames, adapter) => validateReplayPrefix(meta, frames, adapter),
-    validateNormalizedPrefix: (conversationId, rows) => validateNormalizedPrefix(conversationId, rows),
+    // Review round F3: the replay validators are Harness semantics — the
+    // defaults in createProviderSessions (src/harness/replay-validation.js)
+    // apply; the Product provides only storage/config/projection adapters.
     durableId: durableId,
     now: () => new Date().toISOString(),
   });
