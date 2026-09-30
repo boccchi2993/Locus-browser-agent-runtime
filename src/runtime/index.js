@@ -249,8 +249,13 @@ function createRuntimeSession(core, workerAssets, onReleased) {
 
   // ---- prepare serialization chain ----
   // Concurrent prepares apply in call order: each enqueues one exclusive
-  // chain segment. A cancelled queued prepare returns promptly but its
-  // SEGMENT still completes in order, so a later prepare can never jump
+  // chain segment. The segment and the CALLER'S ANSWER are two different
+  // promises (review round 2): the segment settles only when the previous
+  // segment has TRULY settled AND this turn completed (applied, or a
+  // refused/skipped exit) — caller cancellation never ends it early. The
+  // caller receives a cancellable OBSERVATION of the segment instead:
+  // abort answers the caller promptly with AbortError while the segment
+  // keeps its queue position, so a later prepare/execute can never jump
   // ahead of an unfinished earlier one.
   let prepareTail = Promise.resolve();
   // The interpreter generation the CHAIN last observed or produced. While
@@ -289,58 +294,82 @@ function createRuntimeSession(core, workerAssets, onReleased) {
     // runs. A configuration can never land late for a task that died
     // while its prepare was waiting.
     prepare(req) {
+      // Immediate refusals — nothing queued yet, nothing to release.
       if (sessionDisposed) return Promise.reject(new Error(sessionDisposed));
       if (py._disposed) return Promise.reject(new Error(py._disposed));
       const signal = req && req.signal;
       if (signal && signal.aborted) return Promise.reject(cancelled('python preparation'));
-      // Cancellation plane registered SYNCHRONOUSLY at call time — a cancel
-      // landing while this prepare waits for the chain or the in-flight
-      // barrier must refuse it, never surface after the wait.
-      let onAbort = null;
-      const abortSettled = signal
-        ? new Promise((resolve) => {
-          onAbort = resolve;
-          signal.addEventListener('abort', onAbort, { once: true });
-        })
-        : null;
+
       const prev = prepareTail;
-      let release;
-      prepareTail = new Promise((r) => { release = r; });
       const boundaryAtCall = boundaryGeneration;
+      // Settlement barrier over everything in flight AT CALL TIME (public
+      // executes + any instance-level runs from the documented test seam).
+      // Call-time, not apply-time: executes admitted later queue behind
+      // the chain and must never extend (or deadlock against) an earlier
+      // prepare's barrier.
       const inflightBarrier = sessionSettlementSnapshot();
-      const race = (p) => Promise.race(abortSettled ? [p, abortSettled] : [p]);
-      const stopped = () => { if (signal && onAbort) signal.removeEventListener('abort', onAbort); };
-      return (async () => {
-        try {
-          await race(prev);
-          if (signal && signal.aborted) throw cancelled('python preparation');
-          if (inflightBarrier) {
-            await race(inflightBarrier);
-            if (signal && signal.aborted) throw cancelled('python preparation');
-          }
-          // Post-barrier validation — the no-late-effect gate. Captured
-          // against the SESSION algebra: a concurrent prepare's legitimate
-          // interpreter rebuild (already applied ahead of us on the chain)
-          // is not an external reset.
-          if (sessionDisposed) throw new Error(sessionDisposed);
-          if (py._disposed) throw new Error(py._disposed);
-          if (boundaryGeneration !== boundaryAtCall) {
-            throw new Error('python runtime reset while preparation waited for in-flight executions;'
-              + ' configuration not applied (' + (boundaryReason || 'session boundary') + ')');
-          }
-          if (py._resetGeneration !== chainPyGeneration) {
-            throw new Error('python runtime was reset outside the preparation chain while preparation waited;'
-              + ' configuration not applied');
-          }
-          if (signal && signal.aborted) throw cancelled('python preparation');
-          const result = py.prepare(req);
-          chainPyGeneration = py._resetGeneration;
-          return result;
-        } finally {
-          stopped();
-          release();
+
+      // The INTERNAL QUEUE SEGMENT. It waits out prev's TRUE settlement —
+      // deliberately no race against the abort here: racing and releasing
+      // on cancel would hand this segment's queue position to a later
+      // entry while an earlier segment is still unfinished (review round
+      // 2, gap F2). The caller is answered early instead (below).
+      const internalSegment = (async () => {
+        await prev;
+        // Our turn. Liveness before anything applies; a cancelled prepare
+        // skips its configuration but still ENDS ITS SEGMENT IN ORDER.
+        if (sessionDisposed) throw new Error(sessionDisposed);
+        if (py._disposed) throw new Error(py._disposed);
+        if (boundaryGeneration !== boundaryAtCall) {
+          throw new Error('python runtime reset while preparation waited for in-flight executions;'
+            + ' configuration not applied (' + (boundaryReason || 'session boundary') + ')');
         }
+        if (signal && signal.aborted) throw cancelled('python preparation');
+        if (inflightBarrier) await inflightBarrier;
+        // Post-barrier validation — the no-late-effect gate. Captured
+        // against the SESSION algebra: a concurrent prepare's legitimate
+        // interpreter rebuild (already applied ahead of us on the chain)
+        // is not an external reset.
+        if (sessionDisposed) throw new Error(sessionDisposed);
+        if (py._disposed) throw new Error(py._disposed);
+        if (boundaryGeneration !== boundaryAtCall) {
+          throw new Error('python runtime reset while preparation waited for in-flight executions;'
+            + ' configuration not applied (' + (boundaryReason || 'session boundary') + ')');
+        }
+        if (py._resetGeneration !== chainPyGeneration) {
+          throw new Error('python runtime was reset outside the preparation chain while preparation waited;'
+            + ' configuration not applied');
+        }
+        if (signal && signal.aborted) throw cancelled('python preparation');
+        // The instance's synchronous validate-then-swap. A failure rejects
+        // THIS segment only — the chain barrier below is failure-proofed,
+        // so the next entry still runs (a failing prepare never wedges).
+        const result = py.prepare(req);
+        chainPyGeneration = py._resetGeneration;
+        return result;
       })();
+
+      // prepareTail = the segment's SETTLEMENT barrier, with both outcomes
+      // handled: a rejected segment must never poison the queue behind it.
+      prepareTail = internalSegment.then(() => undefined, () => undefined);
+
+      // The CALLER's answer: a cancellable observation of the segment.
+      // abort → prompt AbortError; the segment keeps its queue position
+      // and every later entry keeps waiting for it. The abort listener is
+      // registered synchronously here and removed when the observation
+      // ends (either side); the segment's own rejection is always handled
+      // (by this chain AND by prepareTail), so a caller that cancelled
+      // early can never produce an unhandled rejection.
+      if (!signal) return internalSegment;
+      return new Promise((resolve, reject) => {
+        const onAbort = () => reject(cancelled('python preparation'));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+        internalSegment.then(
+          (v) => { signal.removeEventListener('abort', onAbort); resolve(v); },
+          (e) => { signal.removeEventListener('abort', onAbort); reject(e); },
+        );
+      });
     },
 
     // ---- the execution port ----

@@ -145,6 +145,21 @@ function attachControlledWorker(rt) {
   };
 }
 
+// Record the TRUE configuration-application order: wraps the instance's
+// SYNCHRONOUS prepare so the log records only keys that actually APPLIED
+// (a validation failure throws before its key is logged). Status reads
+// (extensionKey) alone cannot prove application ORDER.
+function recordApplies(s, log) {
+  const py = s.pythonRuntime();
+  const orig = py.prepare;
+  py.prepare = function (req) {
+    const r = orig.call(py, req);
+    log.push(req && req.python ? req.python.key : null);
+    return r;
+  };
+}
+
+
 async function parkedComposite(s, vfs, firstPath, secondPath) {
   // echo first > firstPath; echo second > secondPath — the first write is
   // parked INSIDE the VFS (dispatched, unsettled).
@@ -473,10 +488,16 @@ async function parkedComposite(s, vfs, firstPath, secondPath) {
 }
 
 // ---- P3: cancelling a QUEUED prepare returns promptly but holds the chain ----
+// Strengthened (review round 2): "extensionKey still null" alone proves
+// nothing — C could be blocked by its OWN settlement snapshot while the
+// chain position was already released. The probe execute below is blocked
+// by the CHAIN only, and recordApplies proves the real application order.
 {
   const host = await createRuntime({ workerAssets: WA });
   const s = host.createSession();
   const vfs = makeVfs();
+  const applyLog = [];
+  recordApplies(s, applyLog);
   const { run: runPromise } = await parkedComposite(s, vfs, '/tmp/p3a', '/tmp/p3b');
   await vfs.waitFor('write:park:/tmp/p3a');
 
@@ -491,17 +512,32 @@ async function parkedComposite(s, vfs, firstPath, secondPath) {
   check('P3a the cancelled queued prepare returns promptly (cancellation-shaped)',
     rb && rb.name === 'AbortError' && rb.cancelled === true, errText(rb));
   await tick();
+
+  // A new execute admitted AFTER the cancel: it is queued behind the chain
+  // itself, so it must not start while any earlier segment is unfinished.
+  const keyAtProbe = { value: null };
+  vfs.onEvent = (ev) => { if (ev === 'write:enter:/tmp/p3probe.txt') keyAtProbe.value = s.status().extensionKey; };
+  const probe = s.execute({ kind: 'shell', input: 'echo p3 > /tmp/p3probe.txt', context: { filesystem: vfs } });
+  await tick(); await tick();
   check('P3b the cancel did NOT release the serialization barrier (nothing applied while the first waits)',
     s.status().extensionKey === null, JSON.stringify(s.status()));
+  check('P3b2 the cancel released no chain position: nothing applied AND the probe never started',
+    applyLog.length === 0 && !vfs.log.includes('write:enter:/tmp/p3probe.txt'),
+    JSON.stringify({ applyLog, probeEntered: vfs.log.includes('write:enter:/tmp/p3probe.txt') }));
 
   vfs.openGate();
   await runPromise;
   const ra = await pa;
   const rc = await pc;
+  await probe;
   check('P3c the chain kept call order: A applied, then C applied (B never did)',
     ra && ra.rebuiltInterpreter === true && rc && rc.rebuiltInterpreter === true
     && s.status().extensionKey === 'env-p3c',
     JSON.stringify({ a: errText(ra), c: errText(rc), key: s.status().extensionKey }));
+  check('P3d the recorded application order is A then C — B never applied',
+    JSON.stringify(applyLog) === JSON.stringify(['env-p3a', 'env-p3c']), JSON.stringify(applyLog));
+  check('P3e the probe ran only after the chain applied (its first effect saw the chain config)',
+    keyAtProbe.value === 'env-p3c', String(keyAtProbe.value));
   host.dispose();
 }
 
@@ -570,6 +606,199 @@ async function parkedComposite(s, vfs, firstPath, secondPath) {
   await pb;
   check('P6b B applied only after the admitted execute settled; final config is B',
     s.status().extensionKey === 'env-p6b', JSON.stringify(s.status()));
+  host.dispose();
+}
+
+// ============================================================
+// Review round 2 — gap F2: the prepare's INTERNAL queue segment is
+// independent of the caller's cancellation. prepareTail must represent
+// "the internal queue segment completed", never "the caller got its
+// answer": a cancelled waiting prepare returns promptly to ITS caller
+// but must NOT release its chain position while an earlier segment (and
+// the executions that segment waits for) is unfinished.
+// ============================================================
+
+// ---- Q-A: old execute unsettled → prepare A → prepare B(cancelled) → new execute ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const applyLog = [];
+  recordApplies(s, applyLog);
+  const { run: oldRun } = await parkedComposite(s, vfs, '/tmp/f2a', '/tmp/f2b');
+  await vfs.waitFor('write:park:/tmp/f2a');
+
+  let paSettled = false;
+  const pa = s.prepare({ python: payload('env-f2a') }).then(
+    (r) => { paSettled = true; return r; },
+    (e) => { paSettled = true; throw e; });
+  const acB = new AbortController();
+  const pb = s.prepare({ signal: acB.signal, python: payload('env-f2b') }).catch((e) => e);
+  await tick();
+  acB.abort();
+  const rb = await pb;
+  check('Q-Aa the cancelled waiting prepare returned promptly (cancellation-shaped)',
+    rb && rb.name === 'AbortError' && rb.cancelled === true, errText(rb));
+
+  const keyAtProbe = { value: null };
+  vfs.onEvent = (ev) => { if (ev === 'write:enter:/tmp/f2probe.txt') keyAtProbe.value = s.status().extensionKey; };
+  const probe = s.execute({ kind: 'shell', input: 'echo probe > /tmp/f2probe.txt', context: { filesystem: vfs } });
+  await tick(); await tick();
+  check('Q-Ab with the old execute unsettled: A unfinished, nothing applied, the probe never started',
+    paSettled === false && applyLog.length === 0
+    && !vfs.log.includes('write:enter:/tmp/f2probe.txt')
+    && s.status().extensionKey === null,
+    JSON.stringify({ paSettled, applyLog, probeEntered: vfs.log.includes('write:enter:/tmp/f2probe.txt'), key: s.status().extensionKey }));
+
+  vfs.openGate();
+  const oldRes = await oldRun;
+  await probe;
+  await pa;
+  check('Q-Ac the probe ran only after A applied (config visible at its first effect)',
+    keyAtProbe.value === 'env-f2a', String(keyAtProbe.value));
+  check('Q-Ad the recorded application order is A only; B never applied',
+    JSON.stringify(applyLog) === JSON.stringify(['env-f2a']) && s.status().extensionKey === 'env-f2a',
+    JSON.stringify({ applyLog, key: s.status().extensionKey }));
+  check('Q-Ae the old execute completed cleanly (no boundary in this scenario)',
+    oldRes.ok === true, JSON.stringify(oldRes));
+  host.dispose();
+}
+
+// ---- Q-B: the A/B/C queue, B cancelled — the REAL application order is recorded ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const applyLog = [];
+  recordApplies(s, applyLog);
+  const { run: oldRun } = await parkedComposite(s, vfs, '/tmp/qb0', '/tmp/qb1');
+  await vfs.waitFor('write:park:/tmp/qb0');
+  const pa = s.prepare({ python: payload('env-qb-a') }).catch((e) => e);
+  const acB = new AbortController();
+  const pb = s.prepare({ signal: acB.signal, python: payload('env-qb-b') }).catch((e) => e);
+  const pc = s.prepare({ python: payload('env-qb-c') }).catch((e) => e);
+  await tick();
+  acB.abort();
+  const rb = await pb;
+  vfs.openGate();
+  await oldRun;
+  const [ra, rc] = await Promise.all([pa, pc]);
+  check('Q-Ba the cancelled queue member refused cancellation-shaped',
+    rb instanceof Error && rb.name === 'AbortError', errText(rb));
+  check('Q-Bb the recorded application order is A then C — B never applied (not just the final key)',
+    JSON.stringify(applyLog) === JSON.stringify(['env-qb-a', 'env-qb-c'])
+    && ra && ra.rebuiltInterpreter === true && rc && rc.rebuiltInterpreter === true,
+    JSON.stringify({ applyLog, a: errText(ra), c: errText(rc) }));
+  host.dispose();
+}
+
+// ---- Q-C: cancelling SEVERAL queue members releases nothing ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const applyLog = [];
+  recordApplies(s, applyLog);
+  const { run: oldRun } = await parkedComposite(s, vfs, '/tmp/qc0', '/tmp/qc1');
+  await vfs.waitFor('write:park:/tmp/qc0');
+  const pa = s.prepare({ python: payload('env-qc-a') }).catch((e) => e);
+  const acs = [new AbortController(), new AbortController(), new AbortController()];
+  const pbs = acs.map((ac, i) => s.prepare({ signal: ac.signal, python: payload('env-qc-x' + i) }).catch((e) => e));
+  await tick();
+  for (const ac of acs) ac.abort();
+  const rbs = await Promise.all(pbs);
+  const keyAtProbe = { value: null };
+  vfs.onEvent = (ev) => { if (ev === 'write:enter:/tmp/qcprobe.txt') keyAtProbe.value = s.status().extensionKey; };
+  const probe = s.execute({ kind: 'shell', input: 'echo probe > /tmp/qcprobe.txt', context: { filesystem: vfs } });
+  await tick(); await tick();
+  check('Q-Ca the cancelled members released no chain position: the probe never started, nothing applied',
+    !vfs.log.includes('write:enter:/tmp/qcprobe.txt') && s.status().extensionKey === null,
+    JSON.stringify({ probeEntered: vfs.log.includes('write:enter:/tmp/qcprobe.txt'), key: s.status().extensionKey }));
+  vfs.openGate();
+  await oldRun;
+  await pa;
+  await probe;
+  check('Q-Cb every cancelled member refused cancellation-shaped',
+    rbs.every((r) => r instanceof Error && r.name === 'AbortError'), JSON.stringify(rbs.map(errText)));
+  check('Q-Cc the probe ran only after A applied; no cancelled configuration ever applied',
+    keyAtProbe.value === 'env-qc-a' && s.status().extensionKey === 'env-qc-a',
+    JSON.stringify({ atProbe: keyAtProbe.value, final: s.status().extensionKey }));
+  host.dispose();
+}
+
+// ---- Q-D: a failing prepare plus a REAL boundary/dispose — the chain stays honest, nothing hangs ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: oldRun } = await parkedComposite(s, vfs, '/tmp/qd0', '/tmp/qd1');
+  await vfs.waitFor('write:park:/tmp/qd0');
+  const bad = s.prepare({ python: { key: 'env-qd-bad', modules: [{ pluginId: 'BAD ID', imports: [] }] } }).catch((e) => e);
+  const good = s.prepare({ python: payload('env-qd-good') }).catch((e) => e);
+  await tick();
+  s.reset('qd boundary');
+  vfs.openGate();
+  await oldRun;
+  const rb = await bad;
+  const rg = await good;
+  check('Q-Da the failing (and boundary-crossed) prepare refused without wedging the chain',
+    rb instanceof Error, errText(rb));
+  check('Q-Db the prepare behind it refused with the boundary reason',
+    rg instanceof Error && /qd boundary/.test(errText(rg)), errText(rg));
+  const fresh = await s.prepare({ python: payload('env-qd-fresh') });
+  check('Q-Dc the chain drained: a fresh prepare applies and an execute works',
+    fresh.rebuiltInterpreter === true && s.status().extensionKey === 'env-qd-fresh',
+    JSON.stringify(s.status()));
+  const after = await s.execute({ kind: 'shell', input: 'echo usable', context: { filesystem: vfs } });
+  check('Q-Dd the session executes normally after the drained chain', after.ok === true, JSON.stringify(after));
+
+  // dispose while a failing prepare and its successor are WAITING in the
+  // queue (the parked execute holds the head segment's barrier)
+  const s2 = host.createSession();
+  const vfs2 = makeVfs();
+  const { run: oldRun2 } = await parkedComposite(s2, vfs2, '/tmp/qd2', '/tmp/qd3');
+  await vfs2.waitFor('write:park:/tmp/qd2');
+  const bad2 = s2.prepare({ python: { key: 'env-qd2-bad', modules: [{ pluginId: 'BAD ID', imports: [] }] } }).catch((e) => e);
+  const good2 = s2.prepare({ python: payload('env-qd2-good') }).catch((e) => e);
+  await tick();
+  s2.dispose('qd disposal');
+  vfs2.openGate();
+  await oldRun2;
+  const rb2 = await bad2;
+  const rg2 = await good2;
+  check('Q-De dispose refuses both WAITING segments with the disposal reason (nothing hangs)',
+    rb2 instanceof Error && /disposed/.test(errText(rb2))
+    && rg2 instanceof Error && /disposed/.test(errText(rg2)), errText(rb2) + ' / ' + errText(rg2));
+  let refused = null;
+  try { await s2.execute({ kind: 'shell', input: 'echo x', context: { filesystem: makeVfs() } }); }
+  catch (e) { refused = e; }
+  check('Q-Df the disposed session refuses new executes', !!refused && /disposed/.test(errText(refused)), errText(refused));
+  host.dispose();
+}
+
+// ---- Q-E: normal prepare/execute interleave — no circular waiting ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: oldRun } = await parkedComposite(s, vfs, '/tmp/qe0', '/tmp/qe1');
+  await vfs.waitFor('write:park:/tmp/qe0');
+  const pa = s.prepare({ python: payload('env-qe-a') });
+  const keyAt = {};
+  vfs.onEvent = (ev) => {
+    if (ev === 'write:enter:/tmp/qefirst.txt') keyAt.first = s.status().extensionKey;
+    if (ev === 'write:enter:/tmp/qesecond.txt') keyAt.second = s.status().extensionKey;
+  };
+  const e1 = s.execute({ kind: 'shell', input: 'echo e1 > /tmp/qefirst.txt', context: { filesystem: vfs } });
+  const pb = s.prepare({ python: payload('env-qe-b') });
+  const e2 = s.execute({ kind: 'shell', input: 'echo e2 > /tmp/qesecond.txt', context: { filesystem: vfs } });
+  vfs.openGate();
+  await oldRun;
+  await Promise.all([pa, e1, pb, e2]);
+  check('Q-Ea prepare/execute interleave settles without circular waiting: e1 ran after A, e2 after B',
+    keyAt.first === 'env-qe-a' && keyAt.second === 'env-qe-b', JSON.stringify(keyAt));
+  check('Q-Eb everything settled with the final configuration B',
+    s.status().extensionKey === 'env-qe-b' && s.status().busyExecutions === 0, JSON.stringify(s.status()));
   host.dispose();
 }
 
