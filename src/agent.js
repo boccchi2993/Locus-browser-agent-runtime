@@ -108,32 +108,68 @@ function toolRegistryError(message) {
   return e;
 }
 
+// Read one definition field for VALIDATION through its property
+// descriptor only: an accessor is rejected without its getter ever
+// running, and a non-enumerable field is rejected up front (a JSON
+// round-trip would silently drop it). Absent fields fall through to the
+// ordinary shape checks below.
+function validatedOwnField(def, key, label) {
+  const d = Object.getOwnPropertyDescriptor(def, key);
+  if (!d) return undefined;
+  if (!('value' in d)) {
+    throw toolRegistryError(label + ' is an accessor property (getters never run during registry validation)');
+  }
+  if (!d.enumerable) {
+    throw toolRegistryError(label + ' is a non-enumerable property (a JSON round-trip would silently drop it)');
+  }
+  return d.value;
+}
+
 function validateToolDefinition(def, index) {
   if (!def || typeof def !== 'object' || Array.isArray(def)) {
     throw toolRegistryError('tool definition #' + index + ' is not an object');
   }
-  if (typeof def.name !== 'string' || !def.name.trim()) {
+  const name = validatedOwnField(def, 'name', 'tool definition #' + index + ' name');
+  if (typeof name !== 'string' || !name.trim()) {
     throw toolRegistryError('tool definition #' + index + ' has no usable name');
   }
-  if (typeof def.description !== 'string') {
-    throw toolRegistryError('tool definition "' + def.name + '" has no string description');
+  const description = validatedOwnField(def, 'description', 'tool definition "' + name + '" description');
+  if (typeof description !== 'string') {
+    throw toolRegistryError('tool definition "' + name + '" has no string description');
   }
-  if (!def.inputSchema || typeof def.inputSchema !== 'object' || Array.isArray(def.inputSchema)) {
-    throw toolRegistryError('tool definition "' + def.name + '" has no inputSchema object');
+  const inputSchema = validatedOwnField(def, 'inputSchema', 'tool definition "' + name + '" inputSchema');
+  if (!inputSchema || typeof inputSchema !== 'object' || Array.isArray(inputSchema)) {
+    throw toolRegistryError('tool definition "' + name + '" has no inputSchema object');
   }
 }
 
-// Deep-copy TRANSPORTABLE JSON data (review round F1). A tool definition
-// crosses a serialization boundary — it is rendered into the system prompt
-// and serialized into every provider request — so its data must survive a
-// JSON round-trip intact. Legal: null, booleans, finite numbers, strings,
-// arrays and plain objects, recursively copied and frozen. Anything else
-// (functions, symbols, bigints, undefined fields, non-finite numbers,
-// non-plain objects like Date/Map, circular references) would be silently
-// dropped or corrupted by a JSON round-trip, so it fails LOUDLY with a
-// ToolRegistryError before any model request — never a silent field drop.
-// The copies share no structure with the source, and the source is never
-// written or frozen.
+// Deep-copy TRANSPORTABLE JSON data (review round F1, hardened in round
+// 2). A tool definition crosses a serialization boundary — it is rendered
+// into the system prompt and serialized into every provider request — so
+// its data must survive a JSON round-trip intact. Legal: null, booleans,
+// finite numbers, strings, arrays and plain objects, recursively copied
+// and frozen, with EVERY own enumerable data key a JSON round-trip keeps
+// preserved verbatim: "__proto__", "constructor" and "prototype" are
+// ordinary legal JSON keys, never a forbidden-field list (the copies are
+// built with Object.defineProperty precisely because `out[k] = v` would
+// reinterpret an own "__proto__" key as a prototype setter and silently
+// lose or rewrite it). Anything a JSON round-trip would silently drop or
+// rewrite fails LOUDLY with a ToolRegistryError before any model request:
+// functions, symbols (as values AND as keys), bigints, undefined fields,
+// non-finite numbers, non-plain objects like Date/Map, circular
+// references, accessor properties (getters NEVER run — the copy reads
+// property descriptors, not values), non-enumerable own properties, array
+// holes and non-index array properties (a source array is copied through
+// its audited index descriptors, never via its own map()). Repeated
+// references to a shared acyclic sub-object stay legal; only a true cycle
+// is rejected. The copies share no structure with the source, and the
+// source is never written, never getter-invoked and never frozen.
+const ARRAY_INDEX_KEY = /^(0|[1-9][0-9]*)$/;
+
+function toolDataPropError(path, key, why) {
+  return toolRegistryError('tool definition ' + path + '.' + key + ' is not transportable JSON data: ' + why);
+}
+
 function deepCopyToolData(value, path, seen) {
   if (value === null) return null;
   const t = typeof value;
@@ -151,8 +187,40 @@ function deepCopyToolData(value, path, seen) {
     throw toolRegistryError('tool definition ' + path + ' is not transportable JSON data: circular reference');
   }
   if (Array.isArray(value)) {
+    if (Object.getOwnPropertySymbols(value).length) {
+      throw toolRegistryError('tool definition ' + path + ' is not transportable JSON data: symbol-keyed property');
+    }
+    const length = value.length;
+    // Audit EVERY own property through descriptors BEFORE copying: only
+    // canonical indices below length as enumerable data elements (plus the
+    // standard non-configurable length) are transportable; anything else —
+    // a hole, an extra key, an accessor — would be silently rewritten by
+    // a JSON round-trip.
+    const elements = [];
+    for (const key of Object.getOwnPropertyNames(value)) {
+      if (key === 'length') continue; // the standard array length is allowed
+      if (!ARRAY_INDEX_KEY.test(key) || Number(key) >= length) {
+        throw toolRegistryError('tool definition ' + path + ' is not transportable JSON data: non-index array property "' + key + '"');
+      }
+      const d = Object.getOwnPropertyDescriptor(value, key);
+      if (!d.enumerable) throw toolDataPropError(path, key, 'non-enumerable element');
+      if (!('value' in d)) throw toolDataPropError(path, key, 'accessor element (getters never run during the snapshot)');
+      elements.push(d);
+    }
+    if (elements.length !== length) {
+      throw toolRegistryError('tool definition ' + path + ' is not transportable JSON data: sparse array (holes would serialize as null)');
+    }
     seen.push(value);
-    const copy = value.map((v, i) => deepCopyToolData(v, path + '[' + i + ']', seen));
+    const copy = [];
+    // An array's own index keys enumerate in ascending order, so the
+    // audited elements are exactly indices 0..length-1; the copy is built
+    // only from those descriptors — the source's methods are never called.
+    for (let i = 0; i < length; i++) {
+      Object.defineProperty(copy, String(i), {
+        value: deepCopyToolData(elements[i].value, path + '[' + i + ']', seen),
+        enumerable: true, writable: true, configurable: true,
+      });
+    }
     seen.pop();
     return Object.freeze(copy);
   }
@@ -160,10 +228,19 @@ function deepCopyToolData(value, path, seen) {
   if (proto !== Object.prototype && proto !== null) {
     throw toolRegistryError('tool definition ' + path + ' is not transportable JSON data: non-plain object');
   }
+  if (Object.getOwnPropertySymbols(value).length) {
+    throw toolRegistryError('tool definition ' + path + ' is not transportable JSON data: symbol-keyed property');
+  }
   seen.push(value);
   const out = {};
-  for (const k of Object.keys(value)) {
-    out[k] = deepCopyToolData(value[k], path + '.' + k, seen);
+  for (const key of Object.getOwnPropertyNames(value)) {
+    const d = Object.getOwnPropertyDescriptor(value, key);
+    if (!d.enumerable) throw toolDataPropError(path, key, 'non-enumerable property (a JSON round-trip would silently drop it)');
+    if (!('value' in d)) throw toolDataPropError(path, key, 'accessor property (getters never run during the snapshot)');
+    Object.defineProperty(out, key, {
+      value: deepCopyToolData(d.value, path + '.' + key, seen),
+      enumerable: true, writable: true, configurable: true,
+    });
   }
   seen.pop();
   return Object.freeze(out);
@@ -180,8 +257,11 @@ function createToolSnapshot(port) {
   const byName = Object.create(null);
   for (let i = 0; i < list.length; i++) {
     validateToolDefinition(list[i], i);
-    if (byName[list[i].name]) throw toolRegistryError('duplicate tool definition: ' + list[i].name);
     const def = deepCopyToolData(list[i], '#' + i, []);
+    // The duplicate check reads the SNAPSHOT copy's name — with the
+    // descriptor-guarded validation above, no accessor on the caller's
+    // object ever runs during assembly.
+    if (byName[def.name]) throw toolRegistryError('duplicate tool definition: ' + def.name);
     definitions.push(def);
     names.push(def.name);
     byName[def.name] = def;

@@ -739,6 +739,182 @@ async function main() {
     ]), 'an undefined field (would be silently dropped by JSON)');
   }
 
+  // ---------- F1b (review round 2): every LEGAL JSON key survives; hostile shapes fail loudly ----------
+  // The snapshot must preserve ALL own enumerable data keys a JSON
+  // round-trip preserves — including "__proto__", which plain assignment
+  // (out[k] = v) would silently reinterpret as a prototype mutation — and
+  // must reject (never silently drop) symbol keys, accessor properties,
+  // non-enumerable properties, array holes and non-index array properties,
+  // WITHOUT ever invoking a getter or the source's own map().
+  // (E: the F1 block above keeps the caller-ownership / task isolation /
+  // next-task-fresh-read / deep-freeze / two-instance assertions.)
+  {
+    // A. JSON.parse constructs "__proto__" as an OWN data key — legal JSON.
+    const schemaText = '{"type":"object","properties":{"__proto__":{"type":"string","maxLength":8}},"required":["__proto__"]}';
+    const protoDefs = [{ name: 'lookup', description: 'Look things up.', inputSchema: JSON.parse(schemaText) }];
+    const protoBodies = [];
+    const protoSession = createAgentSession({
+      modelClient: async (body) => { protoBodies.push(body); return fakeEnvelope('done'); },
+      toolPort: { definitions: () => protoDefs, execute: async () => ({ output: 'x', success: true, backend: 'fake' }) },
+      emit: () => {},
+    });
+    await protoSession.run('proto own key', {});
+    const sent = protoBodies[0].tools[0].inputSchema;
+    const sentProtoDesc = Object.getOwnPropertyDescriptor(sent.properties, '__proto__');
+    check('F1b A: own "__proto__" key survives as an OWN data property',
+      !!sentProtoDesc && 'value' in sentProtoDesc && sentProtoDesc.value.type === 'string'
+      && sentProtoDesc.value.maxLength === 8,
+      JSON.stringify(sent));
+    check('F1b A: JSON serialization is field-identical before and after the copy',
+      JSON.stringify(sent) === schemaText, JSON.stringify(sent));
+    check('F1b A: the copy\'s prototypes are NOT rewritten by the key',
+      Object.getPrototypeOf(sent) === Object.prototype
+      && Object.getPrototypeOf(sent.properties) === Object.prototype
+      && Object.getPrototypeOf(sent.required) === Array.prototype,
+      'prototype check');
+    // The provider wire path (real adapter + real JSON.stringify) keeps it.
+    const wireAdapter = getProviderAdapter({ dialect: 'openai', apiBase: 'https://x' });
+    const wireBody = wireAdapter.serializeRequest({
+      model: 'm', max_tokens: 10,
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: protoBodies[0].tools,
+    });
+    const onWire = JSON.parse(JSON.stringify(wireBody)).tools[0].function.parameters;
+    const wireProtoDesc = Object.getOwnPropertyDescriptor(onWire.properties, '__proto__');
+    check('F1b A: the OpenAI wire serialization keeps the own "__proto__" key',
+      !!wireProtoDesc && 'value' in wireProtoDesc && wireProtoDesc.value.maxLength === 8,
+      JSON.stringify(wireBody.tools));
+
+    // B. "constructor"/"prototype"/"toString" are ordinary string keys —
+    // there is NO forbidden-key list.
+    const plainKeysText = '{"type":"object","properties":{"constructor":{"type":"string"},"prototype":{"type":"number"},"toString":{"type":"boolean"}}}';
+    const plainBodies = [];
+    const plainSession = createAgentSession({
+      modelClient: async (body) => { plainBodies.push(body); return fakeEnvelope('done'); },
+      toolPort: { definitions: () => [{ name: 'lookup', description: 'Look things up.', inputSchema: JSON.parse(plainKeysText) }], execute: async () => ({ output: 'x', success: true, backend: 'fake' }) },
+      emit: () => {},
+    });
+    await plainSession.run('plain keys', {});
+    check('F1b B: "constructor"/"prototype"/"toString" keys preserved verbatim',
+      JSON.stringify(plainBodies[0].tools[0].inputSchema) === plainKeysText,
+      JSON.stringify(plainBodies[0].tools[0].inputSchema));
+
+    // C. Non-transportable SHAPES (JSON would silently drop or rewrite
+    // them) fail as tool_registry_invalid BEFORE any model request, with
+    // ZERO tool executions — and getters / hostile map() never run.
+    const hostileCalls = { n: 0 };
+    const hostileExecs = [];
+    const runHostile = async (defs) => {
+      hostileCalls.n = 0;
+      hostileExecs.length = 0;
+      const events = [];
+      const s = createAgentSession({
+        modelClient: async () => { hostileCalls.n++; return fakeEnvelope('should not run'); },
+        toolPort: {
+          definitions: () => defs,
+          execute: async () => { hostileExecs.push(1); return { output: 'x', success: true, backend: 'fake' }; },
+        },
+        emit: (e) => events.push(e),
+      });
+      await s.run('hostile registry', {});
+      return events;
+    };
+    const assertHostile = (events, label) => check('F1b C: ' + label + ' fails before any model request',
+      hostileCalls.n === 0 && hostileExecs.length === 0
+      && events.some((e) => e.type === 'error' && e.code === 'tool_registry_invalid')
+      && events.some((e) => e.type === 'task_end' && e.reason === 'error'),
+      JSON.stringify({ calls: hostileCalls.n, execs: hostileExecs.length, events: events.map((e) => e.type + ':' + (e.code || e.reason || '')) }));
+
+    const symbolSchema = { type: 'object' };
+    symbolSchema[Symbol('handler')] = () => 'never transported';
+    assertHostile(await runHostile([
+      { name: 'lookup', description: 'd', inputSchema: symbolSchema },
+    ]), 'a function under a Symbol key');
+
+    const taggedRequired = ['input'];
+    taggedRequired.tag = () => 'dropped-by-map';
+    assertHostile(await runHostile([
+      { name: 'lookup', description: 'd', inputSchema: { type: 'object', required: taggedRequired } },
+    ]), 'a function in an extra non-index array property');
+
+    const sparseRequired = ['a', 'b'];
+    delete sparseRequired[0]; // hole at index 0
+    assertHostile(await runHostile([
+      { name: 'lookup', description: 'd', inputSchema: { type: 'object', required: sparseRequired } },
+    ]), 'a sparse array (holes would serialize as null)');
+
+    let objectGetterCalls = 0;
+    const accessorSchema = { type: 'object' };
+    Object.defineProperty(accessorSchema, 'dynamic', {
+      enumerable: true,
+      get() { objectGetterCalls++; return 'value'; },
+    });
+    assertHostile(await runHostile([
+      { name: 'lookup', description: 'd', inputSchema: accessorSchema },
+    ]), 'an accessor property (object)');
+    check('F1b C: the object getter was never executed', objectGetterCalls === 0, String(objectGetterCalls));
+
+    let elementGetterCalls = 0;
+    const enumValues = ['a', 'b'];
+    Object.defineProperty(enumValues, 1, {
+      enumerable: true,
+      get() { elementGetterCalls++; return 'b'; },
+    });
+    assertHostile(await runHostile([
+      { name: 'lookup', description: 'd', inputSchema: { type: 'object', properties: { mode: { type: 'string', enum: enumValues } } } },
+    ]), 'an accessor array element');
+    check('F1b C: the array-element getter was never executed', elementGetterCalls === 0, String(elementGetterCalls));
+
+    let mapCalls = 0;
+    const hostileRequired = ['a'];
+    hostileRequired.map = function () { mapCalls++; return ['HIJACKED']; };
+    assertHostile(await runHostile([
+      { name: 'lookup', description: 'd', inputSchema: { type: 'object', required: hostileRequired } },
+    ]), 'an own map() override (the source method is never trusted)');
+    check('F1b C: the hostile map() was never invoked', mapCalls === 0, String(mapCalls));
+
+    const sneakySchema = { type: 'object' };
+    Object.defineProperty(sneakySchema, 'hiddenRule', { value: 'config', enumerable: false, writable: true, configurable: true });
+    assertHostile(await runHostile([
+      { name: 'lookup', description: 'd', inputSchema: sneakySchema },
+    ]), 'a non-enumerable business property');
+
+    // D. Ordinary JSON shapes still copy losslessly.
+    const sharedSub = { type: 'string', description: 'shared' };
+    const richSchema = {
+      type: 'object',
+      nullable: null,
+      flags: [true, false, null, 1.5, -0.25, 'text'],
+      nested: { deep: ['a', ['b', { leaf: null }]] },
+      matrix: [[1, 2], [3, 4]],
+      properties: { a: sharedSub, b: sharedSub },
+    };
+    const richBodies = [];
+    const richSession = createAgentSession({
+      modelClient: async (body) => { richBodies.push(body); return fakeEnvelope('rich ok'); },
+      toolPort: {
+        definitions: () => [{ name: 'lookup', description: 'd', inputSchema: richSchema }],
+        execute: async () => ({ output: 'x', success: true, backend: 'fake' }),
+      },
+      emit: () => {},
+    });
+    await richSession.run('rich shapes', {});
+    const richSent = richBodies[0].tools[0].inputSchema;
+    check('F1b D: dense arrays / null / nesting copy losslessly (serialization identical)',
+      richBodies.length === 1 && JSON.stringify(richSent) === JSON.stringify(richSchema),
+      JSON.stringify(richSent));
+    check('F1b D: every level still frozen',
+      Object.isFrozen(richSent) && Object.isFrozen(richSent.flags) && Object.isFrozen(richSent.nested.deep)
+      && Object.isFrozen(richSent.properties.a),
+      'freeze check');
+    check('F1b D: the shared acyclic sub-object stays legal (two independent equal copies)',
+      richSent.properties.a !== richSent.properties.b
+      && JSON.stringify(richSent.properties.a) === JSON.stringify(sharedSub)
+      && JSON.stringify(richSent.properties.b) === JSON.stringify(sharedSub)
+      && Object.isFrozen(richSent.properties.a) && Object.isFrozen(richSent.properties.b),
+      JSON.stringify([richSent.properties.a, richSent.properties.b]));
+  }
+
   // ---------- F2 (review round): relay/transport captured at call entry ----------
   {
     // false→true: the eligibility flips WHILE the direct request is parked;
