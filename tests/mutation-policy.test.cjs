@@ -41,6 +41,7 @@ const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js',
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
 const M = eval(src + '\n;({ createPythonRuntime, runShellCommand, VirtualWorkspace, MemoryWorkspace, SHELL_COMMANDS });');
+const { freshRuntime } = require('./helpers/runtime.cjs');
 const { LocusMutationPolicy } = eval(
   fs.readFileSync(path.join(__dirname, '..', 'src', 'mutation-policy.js'), 'utf8') + '\n;({ LocusMutationPolicy });');
 
@@ -281,7 +282,7 @@ async function run() {
 
   // ============ MP9. isPolicyRefusal in the python commit phase =========
   {
-    const rt = M.createPythonRuntime();
+    const rt = freshRuntime(M);
     rt._ensureWorker = async () => {};
     rt.worker = {
       postMessage(msg) {

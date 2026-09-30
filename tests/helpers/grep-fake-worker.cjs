@@ -1,24 +1,16 @@
 // TEST-ONLY deterministic fake for the grep regex worker seam
-// (GrepRegexRuntime._workerFactory). It runs the REAL worker source
-// extracted from index.html inside a `vm` context, so unit tests exercise
+// (GrepRegexRuntime._workerFactory). It runs the REAL worker source (the
+// runtime asset module) inside a `vm` context, so unit tests exercise
 // the shipped algorithm — not a copy of it — while remaining
 // controllable: replies are delivered asynchronously, and tests can drop
 // replies (timeout), crash the worker, or deliver stale replies after
 // termination. Browser e2e always uses real Web Workers.
-const fs = require('fs');
 const vm = require('vm');
-const path = require('path');
-
-function grepWorkerSource() {
-  const html = fs.readFileSync(path.join(__dirname, '..', '..', 'index.html'), 'utf8');
-  const m = html.match(/<script type="text\/worker" id="grep-worker-src">([\s\S]*?)<\/script>/);
-  if (!m) throw new Error('grep-worker-src not found in index.html');
-  return m[1];
-}
+const { GREP_WORKER_SOURCE } = require('./runtime.cjs');
 
 let sourceCache = null;
 function workerSource() {
-  if (!sourceCache) sourceCache = grepWorkerSource();
+  if (!sourceCache) sourceCache = GREP_WORKER_SOURCE;
   return sourceCache;
 }
 

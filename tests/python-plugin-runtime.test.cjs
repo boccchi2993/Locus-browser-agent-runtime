@@ -90,7 +90,8 @@ const SHELL = evalShell();
 // M1b: instances come from the factory — every mutable field is
 // initialized per instance (no Object.create over a shared singleton).
 function freshRuntime() {
-  return SHELL.createPythonRuntime();
+  const { freshRuntime } = require('./helpers/runtime.cjs');
+  return freshRuntime(SHELL);
 }
 
 function wheelModule(overrides) {
@@ -279,11 +280,9 @@ expectConfigureThrow('V15 zero wheels rejected',
       && stored.every((b, i) => b === WHEEL_BYTES[i]), storedSha);
 }
 
-// ---------- WORKER: real py-worker-src in a recording sandbox ----------
-const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-const wm = html.match(/<script type="text\/worker" id="py-worker-src">([\s\S]*?)<\/script>/);
-if (!wm) { console.error('worker source not found in index.html'); process.exit(1); }
-const workerSrc = wm[1];
+// ---------- WORKER: real py worker source (runtime asset) in a recording sandbox ----------
+// M2a: the worker source is a runtime asset module (never index.html).
+const { PY_WORKER_SOURCE: workerSrc } = require('./helpers/runtime.cjs');
 
 const SITE_DIR = '/lib/python3.12/site-packages';
 const LOADER_MESSAGE = 'Python package installation is controlled by the Locus runtime';

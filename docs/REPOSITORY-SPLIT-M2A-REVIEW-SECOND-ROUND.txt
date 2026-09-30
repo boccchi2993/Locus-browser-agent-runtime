@@ -1,0 +1,100 @@
+Repository split M2a — review round 2: PRE-FIX failure evidence (verbatim).
+Produced on branch refactor/repository-split-m2a @ 7f0eee070d25d3505928c9990bf4225b6b59117c
+(implementation UNFIXED; only tests/runtime-session-lifecycle.test.mjs extended with the
+strengthened P3 and the new X/Q sections). Run: node tests/runtime-session-lifecycle.test.mjs
+17 failures = 13 x gap F1 (result classification) + 4 x gap F2 (prepare queue segment).
+===============================================================================
+
+PASS R1a the composite shell is tracked while its write is dispatched (busy=1) | {"interpreter":"cold","busyExecutions":1,"extensionKey":null,"disposed":null}
+PASS R1b the post-boundary side effect never dispatched (second write absent) | ["write:enter:/tmp/first","write:park:/tmp/first","write:resume:/tmp/first","write:commit:/tmp/first"]
+PASS R1c the already-dispatched write settled and is recorded honestly (no fake rollback) | ["write:enter:/tmp/first","write:park:/tmp/first","write:resume:/tmp/first","write:commit:/tmp/first"]
+PASS R1d the boundary-stopped run is never a clean success | {"ok":false,"output":"bash: cancelled","isError":true,"io":{"in":50,"out":15},"boundary":"runtime session reset: review boundary"}
+PASS R1e busy returns to zero only after true settlement | {"interpreter":"cold","busyExecutions":0,"extensionKey":null,"disposed":null}
+PASS R1f the session stays usable after reset | {"ok":true,"output":"usable","isError":false,"io":{"in":11,"out":6}}
+PASS R2a dispose stops the composite shell (no post-boundary write) | ["write:enter:/tmp/d1","write:park:/tmp/d1","write:resume:/tmp/d1","write:commit:/tmp/d1"]
+PASS R2b the disposed-run report is honest, busy drains to zero | {"res":false,"status":{"interpreter":"cold","busyExecutions":0,"extensionKey":null,"disposed":"python runtime disposed: runtime session disposed: review dispose"}}
+PASS R2c a disposed session refuses new executes | runtime session disposed: review dispose
+PASS R2d host.dispose stops in-flight composite shells too | {"log":["write:enter:/tmp/h1","write:park:/tmp/h1","write:resume:/tmp/h1","write:commit:/tmp/h1"],"ok":false}
+PASS R2e host.dispose drains busy to zero | {"interpreter":"cold","busyExecutions":0,"extensionKey":null,"disposed":"python runtime disposed: runtime session disposed: runtime host disposed: review host dispose"}
+PASS R3a prepare waits while a shell write is dispatched (nothing applied) | {"settled":false,"key":null}
+PASS R3b prepare applies only after the full execution settled | {"interpreter":"cold","busyExecutions":0,"extensionKey":"env-r3","disposed":null}
+PASS R3c busy was zero at apply time | {"interpreter":"cold","busyExecutions":0,"extensionKey":"env-r3","disposed":null}
+PASS R4a the new execute does not start while the prepare barrier is pending | ["write:enter:/tmp/r4a","write:park:/tmp/r4a"]
+PASS R4b the admitted execute ran only AFTER the prepare applied (config visible at its first effect) | env-r4
+PASS R4c final configuration is the prepare’s | {"interpreter":"cold","busyExecutions":0,"extensionKey":"env-r4","disposed":null}
+PASS R5a0 the network execute is tracked while authorization is pending (busy=1) | {"interpreter":"cold","busyExecutions":1,"extensionKey":null,"disposed":null}
+PASS R5a the post-approval side effect was refused: fetch never dispatched | []
+PASS R5a2 the compound tail after the network op never ran | []
+PASS R5a3 the boundary-stopped network run is honest and busy drained | {"ok":false,"status":{"interpreter":"cold","busyExecutions":0,"extensionKey":null,"disposed":null}}
+PASS R5b the dispatched request settled exactly once (no re-dispatch after the boundary) | ["http://test.local/data"]
+PASS R5b2 the compound tail never ran and busy drained | {"log":[],"status":{"interpreter":"cold","busyExecutions":0,"extensionKey":null,"disposed":null}}
+PASS R5b3 the result is settled and honest | {"ok":false,"output":"curl: cancelled\nbash: cancelled","isError":true,"io":{"in":53,"out":31},"boundary":"runtime session reset: review boundary net response"}
+PASS R6a the grep execution is tracked while parked (busy=1) | {"interpreter":"cold","busyExecutions":1,"extensionKey":null,"disposed":null}
+PASS R6b the grep settled (real worker source) and the compound tail was refused | {"log":["read:enter:/tmp/g.txt","read:park:/tmp/g.txt","read:resume:/tmp/g.txt"],"ok":false}
+PASS R6c busy drained to zero after the grep settled | {"interpreter":"cold","busyExecutions":0,"extensionKey":null,"disposed":null}
+PASS R7a resetting A stopped A’s composite shell | {"log":["write:enter:/tmp/a1","write:park:/tmp/a1","write:resume:/tmp/a1","write:commit:/tmp/a1"],"ok":false}
+PASS R7b B never noticed A’s boundary | {"ok":true,"log":["write:enter:/tmp/b1.txt","write:commit:/tmp/b1.txt","write:enter:/tmp/b2.txt","write:commit:/tmp/b2.txt"],"status":{"interpreter":"cold","busyExecutions":0,"extensionKey":null,"disposed":null}}
+PASS R7c the prepare crossed by A’s boundary refused with that boundary’s reason | python runtime reset while preparation waited for in-flight executions; configuration not applied (runtime session reset: review boundary A)
+PASS R7c2 A prepares normally again after its own boundary (sessions stay usable) | {"interpreter":"cold","busyExecutions":0,"extensionKey":"env-r7c","disposed":null}
+PASS R7d B prepares normally | {"interpreter":"cold","busyExecutions":0,"extensionKey":"env-r7b","disposed":null}
+PASS R8a two in-flight executions count once each at the session (busy=2) | {"interpreter":"cold","busyExecutions":2,"extensionKey":null,"disposed":null}
+PASS R8b the python settle released exactly its own seat (busy=1) | {"interpreter":"cold","busyExecutions":1,"extensionKey":null,"disposed":null}
+PASS R8c the shell settle released the last seat (busy=0) | {"busy":0,"ok":false}
+PASS P1 concurrent prepares apply in call order without misjudging the rebuild | {"a":"[object Object]","b":"[object Object]","key":"env-b"}
+PASS P1b both prepares report the rebuild | {"a":{"rebuiltInterpreter":true},"b":{"rebuiltInterpreter":true}}
+PASS P2 a reset crossing a waiting prepare refuses the configuration | python runtime reset while preparation waited for in-flight executions; configuration not applied (runtime session reset: review boundary p2)
+PASS P2b the session prepares normally after the boundary | {"interpreter":"cold","busyExecutions":0,"extensionKey":"env-p2b","disposed":null}
+PASS P3a the cancelled queued prepare returns promptly (cancellation-shaped) | python preparation cancelled
+PASS P3b the cancel did NOT release the serialization barrier (nothing applied while the first waits) | {"interpreter":"cold","busyExecutions":2,"extensionKey":null,"disposed":null}
+PASS P3b2 the cancel released no chain position: nothing applied AND the probe never started | {"applyLog":[],"probeEntered":false}
+PASS P3c the chain kept call order: A applied, then C applied (B never did) | {"a":"[object Object]","c":"[object Object]","key":"env-p3c"}
+PASS P3d the recorded application order is A then C — B never applied | ["env-p3a","env-p3c"]
+PASS P3e the probe ran only after the chain applied (its first effect saw the chain config) | env-p3c
+PASS P4 a failing prepare rejects and the next one still applies | {"bad":"PythonRuntime.configureExtensions: module pluginId must match /^[a-z0-9][a-z0-9._-]*$/: BAD ID","key":"env-p4"}
+PASS P5 every crossed prepare refused with the boundary reason | ["python runtime reset while preparation waited for in-flight executions; configuration not applied (runtime session reset: review boundary p5)","python runtime reset while preparation waited for in-flight executions; configuration not applied (runtime session reset: review boundary p5)","python runtime reset while preparation waited for in-flight executions; configuration not applied (runtime ses
+PASS P5b nothing was applied | {"interpreter":"cold","busyExecutions":0,"extensionKey":null,"disposed":null}
+PASS P5c the chain drained; the session prepares normally afterwards | {"interpreter":"cold","busyExecutions":0,"extensionKey":"env-p5-fresh","disposed":null}
+PASS P6a the admitted execute ran after A applied and BEFORE B applied | {"enter":"env-p6a","commit":"env-p6a"}
+PASS P6b B applied only after the admitted execute settled; final config is B | {"interpreter":"cold","busyExecutions":0,"extensionKey":"env-p6b","disposed":null}
+PASS X-A1a the run is tracked while its last write is dispatched (busy=1) | {"interpreter":"cold","busyExecutions":1,"extensionKey":null,"disposed":null}
+PASS X-A1b the boundary does not fake settlement: busy stays 1 until the provider settles | {"interpreter":"cold","busyExecutions":1,"extensionKey":null,"disposed":null}
+FAIL X-A1c the superseded run is never a clean success | {"ok":true,"output":"pre","isError":false,"io":{"in":36,"out":3},"backend":"browser","operation":"filesystem","boundary":"runtime session reset: x-a1 boundary"}
+FAIL X-A1d the original output is kept and the boundary explanation appended | {"ok":true,"output":"pre","isError":false,"io":{"in":36,"out":3},"backend":"browser","operation":"filesystem","boundary":"runtime session reset: x-a1 boundary"}
+PASS X-A1e the additive boundary field names the boundary | "runtime session reset: x-a1 boundary"
+PASS X-A1f the existing fields are preserved (io/backend/operation) | {"backend":"browser","operation":"filesystem","io":{"in":36,"out":3}}
+PASS X-A1g busy drains to zero only after the true settlement | {"interpreter":"cold","busyExecutions":0,"extensionKey":null,"disposed":null}
+FAIL X-A2 dispose over the unsettled last write classifies the run as failed | {"ok":true,"output":"pre","isError":false,"io":{"in":36,"out":3},"backend":"browser","operation":"filesystem","boundary":"runtime session disposed: x-a2 disposal"}
+FAIL X-A3 host.dispose over the unsettled last write classifies the run as failed | {"ok":true,"output":"pre","isError":false,"io":{"in":36,"out":3},"backend":"browser","operation":"filesystem","boundary":"runtime session disposed: runtime host disposed: x-a3 host disposal"}
+FAIL X-Ba a caller abort over the unsettled last write is never a clean success | {"ok":true,"output":"pre","isError":false,"io":{"in":35,"out":3},"backend":"browser","operation":"filesystem"}
+FAIL X-Bb the original output is kept and the cancellation explanation appended | {"ok":true,"output":"pre","isError":false,"io":{"in":35,"out":3},"backend":"browser","operation":"filesystem"}
+PASS X-Bc a caller abort is not reported as a session boundary
+FAIL X-Ca the run failed (double boundary does not restore success) | {"ok":true,"output":"pre","isError":false,"io":{"in":35,"out":3},"backend":"browser","operation":"filesystem","boundary":"runtime session reset: second reason"}
+FAIL X-Cb the report names the FIRST invalidating boundary, never a later one | {"output":"pre","boundary":"runtime session reset: second reason"}
+PASS X-D without an invalidation the clean success is untouched (no note, no boundary field) | {"ok":true,"output":"pre","isError":false,"io":{"in":35,"out":3},"backend":"browser","operation":"filesystem"}
+PASS X-Ea the run failed | {"ok":false,"output":"pre\nbash: echo: cannot write /tmp/xe.txt: provider device failure","isError":true,"io":{"in":35,"out":65},"boundary":"runtime session reset: x-e boundary"}
+FAIL X-Eb the real provider error is preserved AND the boundary reason appended | {"ok":false,"output":"pre\nbash: echo: cannot write /tmp/xe.txt: provider device failure","isError":true,"io":{"in":35,"out":65},"boundary":"runtime session reset: x-e boundary"}
+FAIL X-Fa the aborted python run is never a clean success | {"ok":true,"success":true,"stdout":"py-x-f\n[written: /tmp/xf.txt]","stderr":"","io":{"in":39,"out":35}}
+FAIL X-Fb the original stdout is kept and the cancellation note appended | {"stdout":"py-x-f\n[written: /tmp/xf.txt]","stderr":""}
+PASS X-Fc the already-dispatched commit is kept (no fabricated rollback) | commit write missing
+FAIL X-Ga executeTool reports success=false (not merely a boundary annotation) | {"output":"pre","success":true,"backend":"browser","operation":"filesystem"}
+FAIL X-Gb the tool output keeps the original text and carries the explanation | {"output":"pre","success":true,"backend":"browser","operation":"filesystem"}
+PASS Q-Aa the cancelled waiting prepare returned promptly (cancellation-shaped) | python preparation cancelled
+FAIL Q-Ab with the old execute unsettled: A unfinished, nothing applied, the probe never started | {"paSettled":false,"applyLog":[],"probeEntered":true,"key":null}
+FAIL Q-Ac the probe ran only after A applied (config visible at its first effect) | null
+PASS Q-Ad the recorded application order is A only; B never applied | {"applyLog":["env-f2a"],"key":"env-f2a"}
+PASS Q-Ae the old execute completed cleanly (no boundary in this scenario) | {"ok":true,"output":"","isError":false,"io":{"in":45,"out":0},"backend":"browser","operation":"filesystem"}
+PASS Q-Ba the cancelled queue member refused cancellation-shaped | python preparation cancelled
+PASS Q-Bb the recorded application order is A then C — B never applied (not just the final key) | {"applyLog":["env-qb-a","env-qb-c"],"a":"[object Object]","c":"[object Object]"}
+FAIL Q-Ca the cancelled members released no chain position: the probe never started, nothing applied | {"probeEntered":true,"key":null}
+PASS Q-Cb every cancelled member refused cancellation-shaped | ["python preparation cancelled","python preparation cancelled","python preparation cancelled"]
+FAIL Q-Cc the probe ran only after A applied; no cancelled configuration ever applied | {"atProbe":null,"final":"env-qc-a"}
+PASS Q-Da the failing (and boundary-crossed) prepare refused without wedging the chain | python runtime reset while preparation waited for in-flight executions; configuration not applied (runtime session reset: qd boundary)
+PASS Q-Db the prepare behind it refused with the boundary reason | python runtime reset while preparation waited for in-flight executions; configuration not applied (runtime session reset: qd boundary)
+PASS Q-Dc the chain drained: a fresh prepare applies and an execute works | {"interpreter":"cold","busyExecutions":0,"extensionKey":"env-qd-fresh","disposed":null}
+PASS Q-Dd the session executes normally after the drained chain | {"ok":true,"output":"usable","isError":false,"io":{"in":11,"out":6}}
+PASS Q-De dispose refuses both WAITING segments with the disposal reason (nothing hangs) | runtime session disposed: qd disposal / runtime session disposed: qd disposal
+PASS Q-Df the disposed session refuses new executes | runtime session disposed: qd disposal
+PASS Q-Ea prepare/execute interleave settles without circular waiting: e1 ran after A, e2 after B | {"first":"env-qe-a","second":"env-qe-b"}
+PASS Q-Eb everything settled with the final configuration B | {"interpreter":"cold","busyExecutions":0,"extensionKey":"env-qe-b","disposed":null}
+
+74 passed, 17 failed

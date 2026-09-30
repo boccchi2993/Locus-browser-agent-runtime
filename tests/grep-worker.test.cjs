@@ -13,6 +13,7 @@ const fs = require('fs');
 const vm = require('vm');
 const path = require('path');
 const { installGrepFakeWorker, FakeGrepWorker } = require('./helpers/grep-fake-worker.cjs');
+const { GREP_WORKER_SOURCE } = require('./helpers/runtime.cjs');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -22,12 +23,10 @@ function check(name, cond, detail) {
 
 // ---------- Part A harness: real worker source in a vm ----------
 function makeWorker() {
-  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  const m = html.match(/<script type="text\/worker" id="grep-worker-src">([\s\S]*?)<\/script>/);
-  if (!m) { console.error('grep-worker-src not found in index.html'); process.exit(1); }
+  // M2a: the worker source is a runtime asset module (never index.html).
   const replies = [];
   const self = { postMessage: (msg) => replies.push(msg) };
-  vm.runInNewContext(m[1], { self: self });
+  vm.runInNewContext(GREP_WORKER_SOURCE, { self: self });
   return { send: (msg) => self.onmessage({ data: msg }), replies: replies };
 }
 
@@ -121,7 +120,34 @@ const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js',
 const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, VirtualWorkspace, SHELL_COMMANDS,'
   + ' GrepRegexRuntime, GREP_REGEX_TIMEOUT_MS, executeTool });');
 
+// M2a: bash routes through the PUBLIC runtime entry (the eval'd
+// shell.js published the declared core registry). Worker sources are
+// never booted by this suite.
+const { createRuntime } = require('../src/runtime/index.js');
+// M2a review: the public entry assembles asynchronously — the session is
+// resolved before the checks drive them.
+const __hostPromise = createRuntime({
+  workerAssets: { pyWorkerSource: '/* not booted in this suite */', grepWorkerSource: '/* not booted in this suite */' },
+});
+let __session = null;
+const exec = (tool, input, workspace, opts) => M.executeTool(tool, input, workspace,
+  Object.assign({ runtimeSession: __session }, opts || {}));
+
 const Fake = installGrepFakeWorker(M);
+
+// The session's admission queue moves the worker creation into the exec
+// microtask chain — a synchronous last(Fake.instances) capture after
+// exec() can be stale. Arm the scan drop at CREATION time instead:
+// deterministic under any admission schedule.
+function armNextWorkerScanDrop() {
+  const prev = M.GrepRegexRuntime._workerFactory;
+  M.GrepRegexRuntime._workerFactory = (...a) => {
+    M.GrepRegexRuntime._workerFactory = prev;
+    const wk = prev(...a);
+    wk.dropCmds = new Set(['scan']);
+    return wk;
+  };
+}
 
 // Hierarchical in-memory workspace (same model as shell-compat3.test.cjs).
 class TreeWS extends M.WorkspaceAdapter {
@@ -217,7 +243,7 @@ async function partB() {
   // GW1: valid regex, file operand — output unchanged, worker lifecycle clean
   let vfs = fixture({ 'f.txt': enc('foo here\nbar\nother foo\n') });
   let w0 = Fake.instances.length;
-  let r = await M.executeTool('bash', 'grep foo f.txt', vfs, {});
+  let r = await exec('bash', 'grep foo f.txt', vfs, {});
   let w = last(Fake.instances);
   check('GW1 file grep output unchanged', r.output === 'foo here\nother foo' && r.success, JSON.stringify(r));
   check('GW1 worker created for the command', Fake.instances.length === w0 + 1, 'instances=' + Fake.instances.length);
@@ -228,23 +254,23 @@ async function partB() {
 
   // GW2: -i unchanged
   vfs = fixture({ 'f.txt': enc('FOO upper\nfoo lower\n') });
-  r = await M.executeTool('bash', 'grep -i foo f.txt', vfs, {});
+  r = await exec('bash', 'grep -i foo f.txt', vfs, {});
   check('GW2 -i output unchanged', r.output === 'FOO upper\nfoo lower' && r.success, JSON.stringify(r));
   check('GW2 -i reaches the worker as flag i', last(Fake.instances).sent[0].flags === 'i', JSON.stringify(last(Fake.instances).sent[0]));
 
   // GW3: -n unchanged
   vfs = fixture({ 'f.txt': enc('foo\nbar\nfoo\n') });
-  r = await M.executeTool('bash', 'grep -n foo f.txt', vfs, {});
+  r = await exec('bash', 'grep -n foo f.txt', vfs, {});
   check('GW3 -n output unchanged', r.output === '1:foo\n3:foo' && r.success, JSON.stringify(r));
 
   // GW4: -c counts the TRUE total, above the 500-match presentation cap
   const big = new Array(1200).fill('matchline').join('\n') + '\n';
   vfs = fixture({ 'big.txt': enc(big) });
-  r = await M.executeTool('bash', 'grep -c matchline big.txt', vfs, {});
+  r = await exec('bash', 'grep -c matchline big.txt', vfs, {});
   check('GW4 -c exact count above presentation cap', r.output === '1200' && r.success, JSON.stringify(r));
 
   // GW4b: normal mode caps matches at 500 + truncation notice (worker budget)
-  r = await M.executeTool('bash', 'grep matchline big.txt', vfs, {});
+  r = await exec('bash', 'grep matchline big.txt', vfs, {});
   const outLines = r.output.split('\n');
   check('GW4b normal grep capped at 500 worker-returned matches + truncation notice',
     outLines.length === 501 && outLines[0] === 'matchline' && outLines[499] === 'matchline'
@@ -257,7 +283,7 @@ async function partB() {
     'sub/inner.txt': enc('bar\nfoo deep\n'),
     'sub/deeper/leaf.txt': enc('foo leaf\n'),
   });
-  r = await M.executeTool('bash', 'grep -r foo .', vfs, {});
+  r = await exec('bash', 'grep -r foo .', vfs, {});
   check('GW5 recursive output unchanged',
     r.output === './sub/deeper/leaf.txt:foo leaf\n./sub/inner.txt:foo deep\n./top.txt:foo top' && r.success,
     JSON.stringify(r));
@@ -265,7 +291,7 @@ async function partB() {
   // GW6: invalid regex — bounded failure, no engine detail, worker still cleaned up
   vfs = fixture({ 'f.txt': enc('content\n') });
   w0 = Fake.instances.length;
-  r = await M.executeTool('bash', "grep '(' f.txt", vfs, {});
+  r = await exec('bash', "grep '(' f.txt", vfs, {});
   w = last(Fake.instances);
   check('GW6 invalid regex fails with the bounded message',
     !r.success && r.output === 'grep: invalid pattern (patterns use JavaScript regex syntax)', JSON.stringify(r));
@@ -276,7 +302,7 @@ async function partB() {
   // GW7: stdin grep goes through the worker too
   vfs = fixture({});
   w0 = Fake.instances.length;
-  r = await M.executeTool('bash', 'echo hello-foo | grep foo', vfs, {});
+  r = await exec('bash', 'echo hello-foo | grep foo', vfs, {});
   w = last(Fake.instances);
   check('GW7 stdin grep output unchanged', r.output === 'hello-foo' && r.success, JSON.stringify(r));
   check('GW7 stdin grep used a fresh worker', Fake.instances.length === w0 + 1, 'instances=' + Fake.instances.length);
@@ -285,7 +311,7 @@ async function partB() {
   // GW10: ONE worker per command across multiple operands
   vfs = fixture({ 'a.txt': enc('foo a\n'), 'b.txt': enc('nope\nfoo b\n') });
   w0 = Fake.instances.length;
-  r = await M.executeTool('bash', 'grep foo a.txt b.txt', vfs, {});
+  r = await exec('bash', 'grep foo a.txt b.txt', vfs, {});
   w = last(Fake.instances);
   check('GW10 multi-file grep constructs exactly one worker',
     Fake.instances.length === w0 + 1 && r.output === 'a.txt:foo a\nb.txt:foo b', 'instances=' + Fake.instances.length);
@@ -296,7 +322,7 @@ async function partB() {
   // GW9/GB: recursive grep posts one scan per file through the same worker
   vfs = fixture({ 'd/1.txt': enc('foo\n'), 'd/2.txt': enc('bar\n') });
   w0 = Fake.instances.length;
-  r = await M.executeTool('bash', 'grep -r foo d', vfs, {});
+  r = await exec('bash', 'grep -r foo d', vfs, {});
   w = last(Fake.instances);
   check('GW9 recursive grep uses one worker and per-file scans',
     Fake.instances.length === w0 + 1 && r.output === 'd/1.txt:foo'
@@ -307,9 +333,11 @@ async function partB() {
   vfs = fixture({ 'f.txt': enc('foo\n') });
   w0 = Fake.instances.length;
   const t0 = Date.now();
-  const p1 = M.executeTool('bash', 'grep foo f.txt', vfs, {});
+  const p1 = exec('bash', 'grep foo f.txt', vfs, {});
+  armNextWorkerScanDrop();
+  await until(() => Fake.instances.length > w0, 1000);
   w = last(Fake.instances);
-  w.dropCmds = new Set(['scan']); // init completes; the scan never answers
+    w.dropCmds = new Set(['scan']); // init completes; the scan never answers
   r = await p1;
   const elapsed = Date.now() - t0;
   check('T1 hanging regex scan fails with the bounded timeout message',
@@ -320,7 +348,7 @@ async function partB() {
   w.lateDeliver({ id: w.sent.find((m) => m.cmd === 'scan').id, type: 'result', count: 999 });
   await sleep(20);
   check('T1 late reply after timeout ignored, no unhandled rejection', unhandled.length === 0, JSON.stringify(unhandled.map((e) => e.message)));
-  r = await M.executeTool('bash', 'grep foo f.txt', vfs, {});
+  r = await exec('bash', 'grep foo f.txt', vfs, {});
   check('T1 next grep after timeout recovers with a fresh worker',
     r.success && r.output === 'foo' && Fake.instances.length === w0 + 2, JSON.stringify(r) + ' instances=' + Fake.instances.length);
 
@@ -328,9 +356,11 @@ async function partB() {
   vfs = fixture({ 'f.txt': enc('foo\n') });
   w0 = Fake.instances.length;
   const ac = new AbortController();
-  const p2 = M.executeTool('bash', 'grep foo f.txt', vfs, { signal: ac.signal });
+  const p2 = exec('bash', 'grep foo f.txt', vfs, { signal: ac.signal });
+  armNextWorkerScanDrop();
+  await until(() => Fake.instances.length > w0, 1000);
   w = last(Fake.instances);
-  w.dropCmds = new Set(['scan']);
+    w.dropCmds = new Set(['scan']);
   await until(() => w.sent.some((m) => m.cmd === 'scan'));
   ac.abort();
   r = await p2;
@@ -344,15 +374,17 @@ async function partB() {
   // W1: worker crash mid-command → bounded failure, worker dead, next grep recovers
   vfs = fixture({ 'f.txt': enc('foo\n') });
   w0 = Fake.instances.length;
-  const p3 = M.executeTool('bash', 'grep foo f.txt', vfs, {});
+  const p3 = exec('bash', 'grep foo f.txt', vfs, {});
+  armNextWorkerScanDrop();
+  await until(() => Fake.instances.length > w0, 1000);
   w = last(Fake.instances);
-  w.dropCmds = new Set(['scan']);
+    w.dropCmds = new Set(['scan']);
   await until(() => w.sent.some((m) => m.cmd === 'scan'));
   w.crash();
   r = await p3;
   check('W1 worker crash fails bounded', !r.success && r.output === 'grep: regex worker failed', JSON.stringify(r));
   check('W1 crash terminates the worker', w.terminateCount === 1, 'terminateCount=' + w.terminateCount);
-  r = await M.executeTool('bash', 'grep foo f.txt', vfs, {});
+  r = await exec('bash', 'grep foo f.txt', vfs, {});
   check('W1 next grep after crash recovers with a new worker',
     r.success && r.output === 'foo' && Fake.instances.length === w0 + 2, JSON.stringify(r));
 
@@ -360,33 +392,44 @@ async function partB() {
   vfs = fixture({ 'f.txt': enc('foo\n') });
   w0 = Fake.instances.length;
   M.GrepRegexRuntime._workerFactory = () => { throw new Error('no workers in this browser'); };
-  r = await M.executeTool('bash', 'grep foo f.txt', vfs, {});
+  r = await exec('bash', 'grep foo f.txt', vfs, {});
   check('U1 worker unavailable fails closed with a bounded message',
     !r.success && r.output === 'grep: regex worker unavailable' && r.output !== 'foo', JSON.stringify(r));
   check('U1 no worker instance was created', Fake.instances.length === w0, 'instances=' + Fake.instances.length);
   M.GrepRegexRuntime._workerFactory = () => new Fake();
-  r = await M.executeTool('bash', 'grep foo f.txt', vfs, {});
+  r = await exec('bash', 'grep foo f.txt', vfs, {});
   check('U1 grep recovers once workers are available again', r.success && r.output === 'foo', JSON.stringify(r));
 
   // R1: result and abort race — whichever settles first wins, exactly once
   vfs = fixture({ 'f.txt': enc('foo\n') });
   const acR1 = new AbortController();
-  const pR1 = M.executeTool('bash', 'grep foo f.txt', vfs, { signal: acR1.signal });
+  const pR1 = exec('bash', 'grep foo f.txt', vfs, { signal: acR1.signal });
+  armNextWorkerScanDrop();
+  await until(() => Fake.instances.length > w0, 1000);
   w = last(Fake.instances);
-  w.dropCmds = new Set(['scan']);
+    w.dropCmds = new Set(['scan']);
   await until(() => w.sent.some((m) => m.cmd === 'scan'));
   const scanIdR1 = w.sent.find((m) => m.cmd === 'scan').id;
   w.lateDeliver({ id: scanIdR1, type: 'result', matches: [{ lineNumber: 1, line: 'foo' }], hitMatchLimit: false });
-  acR1.abort(); // after settlement — must be a no-op
+  acR1.abort(); // after the worker reply — no second settlement, no re-delivery
   r = await pR1;
-  check('R1 result beats a following abort — single clean settlement',
-    r.success && r.output === 'foo' && w.terminateCount === 1, JSON.stringify(r) + ' tc=' + w.terminateCount);
+  // Round-2 classification contract: the abort landed before the execute
+  // settled and the machinery never reported it, so the session classifies
+  // the run honestly — failed, with the delivered result text KEPT in the
+  // output and exactly one worker settlement (the old pin asked for a
+  // clean success; the run's own result was never lost, only named).
+  check('R1 single settlement: reply delivered exactly once, abort named, result text kept',
+    w.terminateCount === 1 && r.success === false
+    && /foo/.test(String(r.output)) && /cancelled/i.test(String(r.output)),
+    JSON.stringify(r) + ' tc=' + w.terminateCount);
 
   vfs = fixture({ 'f.txt': enc('foo\n') });
   const acR2 = new AbortController();
-  const pR2 = M.executeTool('bash', 'grep foo f.txt', vfs, { signal: acR2.signal });
+  const pR2 = exec('bash', 'grep foo f.txt', vfs, { signal: acR2.signal });
+  armNextWorkerScanDrop();
+  await until(() => Fake.instances.length > w0, 1000);
   w = last(Fake.instances);
-  w.dropCmds = new Set(['scan']);
+    w.dropCmds = new Set(['scan']);
   await until(() => w.sent.some((m) => m.cmd === 'scan'));
   acR2.abort();
   w.lateDeliver({ id: w.sent.find((m) => m.cmd === 'scan').id, type: 'result', matches: [{ lineNumber: 1, line: 'foo' }], hitMatchLimit: false });
@@ -414,6 +457,7 @@ function partC() {
 }
 
 (async () => {
+  __session = (await __hostPromise).createSession();
   partA();
   await partB();
   partC();

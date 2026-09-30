@@ -14,6 +14,21 @@ const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'network.js', 'shell.js',
   .join('\n;\n');
 const M = eval(src + '\n;({ Telemetry, WorkspaceAdapter, normalizeWorkspacePath, VirtualWorkspace, SHELL_COMMANDS, NetworkRuntime, runShellCommand, executeTool, RELAY_CLIENT_TIMEOUT_MS });');
 
+// M2a: bash routes through the PUBLIC runtime entry. The eval'd shell.js
+// published the declared core registry, so a real host+session can be
+// built here exactly the way a standalone host does (worker sources are
+// never booted — this suite runs text commands only).
+const { createRuntime } = require('../src/runtime/index.js');
+// M2a review: the public entry assembles asynchronously — the host and
+// session are resolved before the checks drive them.
+const __hostPromise = createRuntime({
+  workerAssets: { pyWorkerSource: '/* not booted in this suite */', grepWorkerSource: '/* not booted in this suite */' },
+});
+let __host = null;
+let __session = null;
+const exec = (tool, input, workspace, opts) => M.executeTool(tool, input, workspace,
+  Object.assign({ runtimeSession: __session }, opts || {}));
+
 // Any unhandled rejection during the run is a test failure (cleanup paths
 // must attach rejection handlers — see N25/N29).
 const unhandled = [];
@@ -73,12 +88,14 @@ function reset() { calls = []; routes = []; M.Telemetry.records.length = 0; }
 function lastRec() { return M.Telemetry.records[M.Telemetry.records.length - 1]; }
 
 async function run() {
+  __host = await __hostPromise;
+  __session = __host.createSession();
   const ws = new MemWS();
 
   // ---------- 1. curl text → stdout ----------
   reset();
   on((u) => u === 'https://example.test/data.json', () => jsonResponse('{"hello":"world"}'));
-  const t1 = await M.executeTool('bash', 'curl https://example.test/data.json', ws);
+  const t1 = await exec('bash', 'curl https://example.test/data.json', ws);
   check('N1 curl text stdout', t1.success && t1.output.includes('{"hello":"world"}'), JSON.stringify(t1.output));
   check('N1b backend browser-direct', t1.backend === 'browser-direct', t1.backend);
   check('N1c telemetry operation=network', lastRec().operation === 'network' && lastRec().backend === 'browser-direct'
@@ -87,7 +104,7 @@ async function run() {
   // ---------- 2. curl -o text file → workspace bytes ----------
   reset();
   on((u) => u === 'https://example.test/data.json', () => jsonResponse('{"hello":"world"}'));
-  const t2 = await M.executeTool('bash', 'curl -o raw.json https://example.test/data.json', ws);
+  const t2 = await exec('bash', 'curl -o raw.json https://example.test/data.json', ws);
   check('N2 curl -o text written', t2.success && t2.output === '[written to /mnt/workspace/raw.json, 17 bytes]',
     JSON.stringify(t2.output));
   check('N2b workspace content exact', new TextDecoder().decode(ws.files['raw.json'] || []) === '{"hello":"world"}');
@@ -96,7 +113,7 @@ async function run() {
   reset();
   on((u) => u === 'https://example.test/i.png', () =>
     new Response(PNG_BYTES, { status: 200, headers: { 'content-type': 'image/png' } }));
-  const t3 = await M.executeTool('bash', 'curl -o image.png https://example.test/i.png', ws);
+  const t3 = await exec('bash', 'curl -o image.png https://example.test/i.png', ws);
   const written = ws.files['image.png'];
   check('N3 curl -o binary written', t3.success && !!written, JSON.stringify(t3.output));
   check('N3b bytes byte-perfect', !!written && written.length === PNG_BYTES.length
@@ -107,7 +124,7 @@ async function run() {
   reset();
   on((u) => u === 'https://example.test/i.png', () =>
     new Response(PNG_BYTES, { status: 200, headers: { 'content-type': 'image/png' } }));
-  const t4 = await M.executeTool('bash', 'curl https://example.test/i.png', ws);
+  const t4 = await exec('bash', 'curl https://example.test/i.png', ws);
   check('N4 binary stdout hint', t4.output.includes('binary response') && t4.output.includes('image/png')
     && t4.output.includes('use curl -o') && !t4.output.includes('PNG\r\n'),
     JSON.stringify(t4.output));
@@ -115,29 +132,29 @@ async function run() {
   // ---------- 5. scheme policy: http(s) only ----------
   reset();
   on(() => { throw new Error('no fetch allowed for unsupported schemes'); });
-  const t5 = await M.executeTool('bash', 'curl file:///etc/passwd', ws);
+  const t5 = await exec('bash', 'curl file:///etc/passwd', ws);
   check('N5 file: rejected', !t5.success && t5.output.includes('unsupported URL scheme: file:'), t5.output);
-  const t5b = await M.executeTool('bash', 'curl ftp://example.com/x', ws);
+  const t5b = await exec('bash', 'curl ftp://example.com/x', ws);
   check('N5b-1 ftp: rejected', !t5b.success && t5b.output.includes('unsupported URL scheme: ftp:'), t5b.output);
-  const t5c = await M.executeTool('bash', 'curl data:text/html,hello', ws);
+  const t5c = await exec('bash', 'curl data:text/html,hello', ws);
   check('N5b-2 data: rejected', !t5c.success && t5c.output.includes('unsupported URL scheme: data:'), t5c.output);
   check('N5b no fetch attempted for unsupported schemes', calls.length === 0, 'calls=' + calls.length);
   // http: is a supported scheme in v1 — an ordinary request is attempted.
   reset();
   on((u) => u === 'http://example.com/', () => jsonResponse('{"plain":1}'));
-  const t5d = await M.executeTool('bash', 'curl http://example.com', ws);
+  const t5d = await exec('bash', 'curl http://example.com', ws);
   check('N5c http: is an ordinary request now', t5d.success && t5d.output.includes('{"plain":1}'), t5d.output);
 
   // ---------- 6. headers are sent; methods need an approval consumer ----------
   reset();
   on((u) => u === 'https://example.com/h', () => jsonResponse('{"ok":1}'));
-  const t6 = await M.executeTool('bash', 'curl -H "X-Test: 1" https://example.com/h', ws);
+  const t6 = await exec('bash', 'curl -H "X-Test: 1" https://example.com/h', ws);
   check('N6 -H accepted and forwarded', t6.success && calls[0].opts.headers && calls[0].opts.headers['x-test'] === '1',
     JSON.stringify(t6.output) + ' | ' + JSON.stringify(calls[0].opts.headers));
   reset();
-  const t6b = await M.executeTool('bash', 'curl -X POST https://example.com', ws);
+  const t6b = await exec('bash', 'curl -X POST https://example.com', ws);
   check('N6b side-effecting without approval consumer fails closed',
-    !t6b.success && t6b.output.includes('require an approval consumer') && calls.length === 0,
+    !t6b.success && t6b.output.includes('require an execution authorization port') && calls.length === 0,
     t6b.output + ' | calls=' + calls.length);
 
   // ---------- 7/8. network/CORS failure → transparent edge relay ----------
@@ -147,7 +164,7 @@ async function run() {
     check('N8 relay URL encodes target', u === '/fetch?url=' + encodeURIComponent('https://blocked.test/data.json'), u);
     return jsonResponse('{"via":"relay"}', { 'x-locus-final-url': 'https://blocked.test/data.json' });
   });
-  const t7 = await M.executeTool('bash', 'curl https://blocked.test/data.json', ws);
+  const t7 = await exec('bash', 'curl https://blocked.test/data.json', ws);
   check('N7 CORS failure falls back to relay', t7.success && t7.output.includes('{"via":"relay"}'), JSON.stringify(t7.output));
   check('N7b backend edge-relay', t7.backend === 'edge-relay' && lastRec().backend === 'edge-relay', t7.backend);
   check('N7c exactly 2 fetches (direct + relay)', calls.length === 2, calls.map((c) => c.url).join(','));
@@ -156,7 +173,7 @@ async function run() {
   reset();
   global.window.location.protocol = 'file:';
   on((u) => u === 'https://blocked.test/x', () => { throw new TypeError('Failed to fetch'); });
-  const t8 = await M.executeTool('bash', 'curl https://blocked.test/x', ws);
+  const t8 = await exec('bash', 'curl https://blocked.test/x', ws);
   check('N8b file:// clear error (no backend internals in the wording)',
     !t8.success && t8.output.includes('no request-forwarding service is available')
     && !/relay|browser|Cloudflare|CORS/i.test(t8.output), t8.output);
@@ -168,7 +185,7 @@ async function run() {
   on((u) => u === 'https://example.test/missing', () =>
     new Response('{"error":"not found"}', { status: 404, headers: { 'content-type': 'application/json' } }));
   on((u) => u.startsWith('/fetch?'), () => { throw new Error('relay must NOT be called'); });
-  const t9 = await M.executeTool('bash', 'curl https://example.test/missing', ws);
+  const t9 = await exec('bash', 'curl https://example.test/missing', ws);
   check('N9 404 reported, not relayed', !t9.success && t9.output.includes('HTTP 404')
     && calls.length === 1 && t9.backend === 'browser-direct',
     t9.output + ' | calls=' + calls.length + ' | backend=' + t9.backend);
@@ -178,7 +195,7 @@ async function run() {
   on((u) => u === 'https://blocked.test/i.png', () => { throw new TypeError('Failed to fetch'); });
   on((u) => u.startsWith('/fetch?'), () =>
     new Response(PNG_BYTES, { status: 200, headers: { 'content-type': 'image/png', 'x-locus-final-url': 'https://blocked.test/i.png' } }));
-  const t10 = await M.executeTool('bash', 'curl -o r.png https://blocked.test/i.png', ws);
+  const t10 = await exec('bash', 'curl -o r.png https://blocked.test/i.png', ws);
   const wb = ws.files['r.png'];
   check('N10 relay binary byte-perfect', t10.success && t10.backend === 'edge-relay' && !!wb
     && wb.length === PNG_BYTES.length && wb.every((b, i) => b === PNG_BYTES[i]),
@@ -190,31 +207,31 @@ async function run() {
   on((u) => u.startsWith('/fetch?'), () =>
     new Response(JSON.stringify({ error: { message: 'Upstream timed out after 30000ms' } }),
       { status: 504, headers: { 'content-type': 'application/json', 'x-locus-relay-error': '1' } }));
-  const t11 = await M.executeTool('bash', 'curl https://blocked.test/slow', ws);
+  const t11 = await exec('bash', 'curl https://blocked.test/slow', ws);
   check('N11 relay error surfaced', !t11.success && t11.output.includes('Upstream timed out after 30000ms'), t11.output);
   check('N11b model-facing wording hides the backend topology',
     !/relay|browser|Cloudflare|CORS/i.test(t11.output), t11.output);
 
   // ---------- 13. cloud_bash still unsuccessful ----------
   reset();
-  const t13 = await M.executeTool('cloud_bash', 'curl https://example.com', ws);
+  const t13 = await exec('cloud_bash', 'curl https://example.com', ws);
   check('N13 cloud_bash success=false', t13.success === false && t13.output === 'Cloud execution is not configured.'
     && lastRec().backend === 'cloud' && lastRec().success === false);
 
   // ---------- ordinary commands keep backend=browser ----------
   reset();
-  const t14 = await M.executeTool('bash', 'echo hi', ws);
+  const t14 = await exec('bash', 'echo hi', ws);
   check('N14 non-network bash keeps backend=browser', t14.backend === 'browser' && lastRec().backend === 'browser'
     && !lastRec().operation, JSON.stringify(lastRec()));
 
   // ---------- 15. direct requests are anonymous by construction (F13) ----------
   reset();
   on((u) => u === 'https://example.test/anon', () => jsonResponse('{"ok":1}'));
-  await M.executeTool('bash', 'curl https://example.test/anon', ws);
+  await exec('bash', 'curl https://example.test/anon', ws);
   check('N15 direct fetch omits credentials', calls[0].opts.credentials === 'omit', JSON.stringify(calls[0].opts));
 
   reset();
-  const t15b = await M.executeTool('bash', 'curl https://user:pass@example.test/x', ws);
+  const t15b = await exec('bash', 'curl https://user:pass@example.test/x', ws);
   check('N15b URL userinfo rejected', !t15b.success && t15b.output.includes('credentials in URLs')
     && calls.length === 0, t15b.output);
 
@@ -238,7 +255,7 @@ async function run() {
   on((u) => u === 'https://example.test/huge', () =>
     new Response('x', { status: 200, headers: { 'content-type': 'text/plain', 'content-length': String(20 * 1024 * 1024) } }));
   on((u) => u.startsWith('/fetch?'), () => { throw new Error('relay must NOT be called on size cap'); });
-  const t17 = await M.executeTool('bash', 'curl https://example.test/huge', ws);
+  const t17 = await exec('bash', 'curl https://example.test/huge', ws);
   check('N17 oversized response rejected, not relayed', !t17.success && t17.output.includes('too large')
     && calls.length === 1, t17.output + ' | calls=' + calls.length);
 
@@ -247,17 +264,17 @@ async function run() {
   on((u) => true, () => { throw new Error('no fetch allowed'); });
   const bare18 = new M.VirtualWorkspace({ listCommands: () => Object.keys(M.SHELL_COMMANDS) });
   // an unmounted /mnt/workspace target fails BEFORE the fetch
-  const t18 = await M.executeTool('bash', 'curl -o /mnt/workspace/file.bin https://example.test/x', bare18);
+  const t18 = await exec('bash', 'curl -o /mnt/workspace/file.bin https://example.test/x', bare18);
   check('N18 curl -o unmounted workspace: fails before network', !t18.success && t18.output.includes('not mounted')
     && calls.length === 0, t18.output + ' | calls=' + calls.length);
   // a read-only target fails BEFORE the fetch too
-  const t18b = await M.executeTool('bash', 'curl -o /mnt/upload/file.bin https://example.test/x', bare18);
+  const t18b = await exec('bash', 'curl -o /mnt/upload/file.bin https://example.test/x', bare18);
   check('N18b curl -o read-only mount: fails before network', !t18b.success
     && t18b.output.includes('read-only filesystem') && calls.length === 0, t18b.output + ' | calls=' + calls.length);
   // but the bare machine CAN download: /mnt/download works without a workspace
   reset();
   on((u) => true, () => new Response('downloaded', { status: 200, headers: { 'content-type': 'application/octet-stream' } }));
-  const t18c = await M.executeTool('bash', 'curl -o /mnt/download/file.bin https://example.test/x', bare18);
+  const t18c = await exec('bash', 'curl -o /mnt/download/file.bin https://example.test/x', bare18);
   check('N18c curl -o /mnt/download succeeds WITHOUT a workspace', t18c.success && calls.length === 1
     && new TextDecoder().decode(await bare18.readBytes('/mnt/download/file.bin')) === 'downloaded'
     && t18c.output === '[written to /mnt/download/file.bin, 10 bytes]',
@@ -423,17 +440,17 @@ async function run() {
   // ---------- 30. GET/HEAD + body is an explicit local error (no silent drop) ----------
   reset();
   on(() => { throw new Error('no fetch allowed for GET/HEAD + body'); });
-  const t30 = await M.executeTool('bash', "curl -X GET -d 'x=1' https://example.test/x", ws);
+  const t30 = await exec('bash', "curl -X GET -d 'x=1' https://example.test/x", ws);
   check('G1 -X GET -d → explicit local error, zero attempts',
     !t30.success && t30.output.includes('unsupported request combination')
     && t30.output.includes('GET') && calls.length === 0, t30.output + ' calls=' + calls.length);
-  const t30b = await M.executeTool('bash', "curl -I -d 'x=1' https://example.test/x", ws);
+  const t30b = await exec('bash', "curl -I -d 'x=1' https://example.test/x", ws);
   check('G2 -I -d → explicit local error, zero attempts',
     !t30b.success && t30b.output.includes('unsupported request combination')
     && t30b.output.includes('HEAD') && calls.length === 0, t30b.output + ' calls=' + calls.length);
-  const t30c = await M.executeTool('bash', "curl -d 'x=1' https://example.test/x", ws);
+  const t30c = await exec('bash', "curl -d 'x=1' https://example.test/x", ws);
   check('G3 POST -d is NOT caught by the GET-body guard (fails later at approvals)',
-    !t30c.success && t30c.output.includes('require an approval consumer'), t30c.output);
+    !t30c.success && t30c.output.includes('require an execution authorization port'), t30c.output);
 
   // ---------- 31. curl -I shows HEAD response headers ----------
   reset();
@@ -441,7 +458,7 @@ async function run() {
     status: 200,
     headers: { 'content-type': 'text/plain', 'x-test-header': 'yes', 'content-length': '123' },
   }));
-  const t31 = await M.executeTool('bash', 'curl -I https://example.test/h', ws);
+  const t31 = await exec('bash', 'curl -I https://example.test/h', ws);
   check('H1 direct HEAD → headers shown, backend browser-direct',
     t31.success && t31.output.includes('HTTP 200') && t31.output.includes('x-test-header: yes')
       && t31.output.includes('content-length: 123') && t31.backend === 'browser-direct',
@@ -451,7 +468,7 @@ async function run() {
   reset();
   on((u) => u === 'https://example.test/h', () => new Response(null, { status: 404, headers: {} }));
   on(() => { throw new Error('relay must NOT be called for a HEAD 404'); });
-  const t31b = await M.executeTool('bash', 'curl -I https://example.test/h', ws);
+  const t31b = await exec('bash', 'curl -I https://example.test/h', ws);
   check('H3 HEAD 404 → headers reported, no fallback',
     !t31b.success && t31b.output.includes('HTTP 404') && calls.length === 1, t31b.output + ' calls=' + calls.length);
 
@@ -463,7 +480,7 @@ async function run() {
       JSON.stringify(sent));
     return new Response(null, { status: 200, headers: { 'content-type': 'text/plain', 'x-head': 'relay' } });
   });
-  const t31c = await M.executeTool('bash', 'curl -I https://blocked.test/h', ws);
+  const t31c = await exec('bash', 'curl -I https://blocked.test/h', ws);
   check('H2b HEAD fallback shows headers via the envelope leg', t31c.success
     && t31c.output.includes('HTTP 200') && t31c.output.includes('x-head: relay')
     && t31c.backend === 'edge-relay', JSON.stringify(t31c.output) + ' backend=' + t31c.backend);
@@ -473,7 +490,7 @@ async function run() {
   on((u) => u === 'https://example.test/h', () => new Response('SHOULD-NOT-SHOW', {
     status: 200, headers: { 'content-type': 'text/plain' },
   }));
-  const t31d = await M.executeTool('bash', 'curl -I https://example.test/h', ws);
+  const t31d = await exec('bash', 'curl -I https://example.test/h', ws);
   check('H5 HEAD body from a buggy server is never output',
     t31d.success && t31d.output.includes('HTTP 200') && !t31d.output.includes('SHOULD-NOT-SHOW'),
     JSON.stringify(t31d.output));
@@ -482,7 +499,7 @@ async function run() {
   reset();
   on((u) => u === 'https://example.test/missing?token=SECRET_QUERY_123', () =>
     new Response('{"error":"nf"}', { status: 404, headers: { 'content-type': 'application/json' } }));
-  const t32 = await M.executeTool('bash', 'curl "https://example.test/missing?token=SECRET_QUERY_123"', ws);
+  const t32 = await exec('bash', 'curl "https://example.test/missing?token=SECRET_QUERY_123"', ws);
   check('N-F04a wire request still carries the query', calls.length === 1
     && calls[0].url.includes('token=SECRET_QUERY_123'), calls[0] && calls[0].url);
   check('N-F04b tool output hides the query secret',
@@ -497,7 +514,7 @@ async function run() {
   on((u) => u.startsWith('/fetch?'), () =>
     new Response(JSON.stringify({ error: { message: 'Upstream timed out after 30000ms' } }),
       { status: 504, headers: { 'content-type': 'application/json', 'x-locus-relay-error': '1' } }));
-  const t32b = await M.executeTool('bash', 'curl "https://blocked.test/s?token=SECRET_QUERY_123"', ws);
+  const t32b = await exec('bash', 'curl "https://blocked.test/s?token=SECRET_QUERY_123"', ws);
   check('N-F04d relay-leg error output/telemetry hide the query secret',
     !t32b.output.includes('SECRET_QUERY_123')
     && !JSON.stringify(M.Telemetry.records).includes('SECRET_QUERY_123'), t32b.output);

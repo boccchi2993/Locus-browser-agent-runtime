@@ -153,6 +153,8 @@ Status: **M1 completed.** M1a landed on `refactor/repository-split-m1a` (task li
 - Update source-evaluating tests to exercise public entries where they assert independence.
 - Exit: both cores build and run their own tests without the product source tree or each other.
 
+Status: **M2a completed** on `refactor/repository-split-m2a` (stacked on M1b @ `83fdfbb`): the Runtime public entry landed (`src/runtime/index.js`: `createRuntime → RuntimeHost → RuntimeSession`), worker assets shipped as Runtime modules (`src/runtime/worker-assets.js` — no `#py-worker-src`/`#grep-worker-src` DOM anywhere), status events via `session.onStatus` (no `#sb-python` write or 1s poll), `LOCUS_HOME_SKELETON` as a constructor argument, Runtime-owned payload-identity contract data, `ConversationHistoryWorkspace` moved to Product files, the §3.5 execution-authorization port replacing chat identities in the Runtime's network layer, and the Product chain routed through the entry with no second execution path. Independence evidence: [REPOSITORY-SPLIT-M2A-VERIFICATION.md](REPOSITORY-SPLIT-M2A-VERIFICATION.md) (standalone Node gate, packaged-browser host gate, prepare-barrier and two-session isolation suites, dependency-boundary structural checks). **M2b remains pending** (Harness port injection: description port, ToolPort registry/adapter split, Telemetry sink, persistence-port semantics); M3 (repository extraction) is untouched.
+
 ### M3 — Extract the two core repositories
 
 - Create Runtime and Harness repositories with public API documentation, minimal examples, tests, CI, license and source provenance.

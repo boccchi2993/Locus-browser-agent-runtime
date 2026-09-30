@@ -14,6 +14,7 @@
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const { PY_WORKER_SOURCE } = require('./helpers/runtime.cjs');
 
 const read = (p) => fs.readFileSync(path.join(__dirname, '..', p), 'utf8');
 
@@ -510,9 +511,10 @@ async function run() {
   })());
 
   // ================= worker plugin install (real worker source, VM) =================
-  const html = read('index.html');
-  const wm = html.match(/<script type="text\/worker" id="py-worker-src">([\s\S]*?)<\/script>/);
-  check('W0 worker source present in index.html', !!wm);
+  // M2a: the worker source lives in the runtime asset module; the product
+  // page must NOT carry it anymore.
+  check('W0 worker source lives in the runtime assets, not index.html',
+    PY_WORKER_SOURCE.includes('ensureLockedPyodide') && !read('index.html').includes('py-worker-src'));
 
   function bootWorker(extensionModules, loadPyodideImpl) {
     let recorded = null;
@@ -538,7 +540,7 @@ async function run() {
         loadPackage: async () => { recorded = recorded || []; recorded.push({ kind: 'loadPackage' }); },
       })),
     });
-    vm.runInContext(wm[1], c);
+    vm.runInContext(PY_WORKER_SOURCE, c);
     const boot = vm.runInContext('ensureLockedPyodide()', c);
     vm.runInContext(`self.onmessage({ data: ${JSON.stringify({
       id: 1, cmd: 'bootstrap',

@@ -38,10 +38,15 @@
 import { reactive, computed } from 'vue';
 import { createTaskRunner, isPersistenceFailure } from '../harness/task-runner.js';
 import { createProviderSessions } from '../harness/provider-session.js';
+// M2a (repository split): the PUBLIC runtime entry. The product chain
+// (prepare / execute / reset / dispose) goes through it — no page-global
+// runtime, no second interpreter, no worker sources read from this page.
+import { createRuntime } from '../runtime/index.js';
+import { PY_WORKER_SOURCE, GREP_WORKER_SOURCE } from '../runtime/worker-assets.js';
 
 /* global AgentSession, Model, callModel, executeTool, buildSystemPrompt,
-   LocalDirectoryWorkspace, ensureWorkspacePermission, createPythonRuntime, LocusMutationPolicy,
-   Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS,
+   LocalDirectoryWorkspace, ensureWorkspacePermission, LocusMutationPolicy,
+   Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS, LOCUS_HOME_SKELETON,
    CapabilityManager, CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
    SkillSourceStore, SkillInstanceStorage, SkillInstanceWorkspace,
    PersistenceServiceInstance, OPFSWorkspace, ConversationHistoryWorkspace,
@@ -50,8 +55,13 @@ import { createProviderSessions } from '../harness/provider-session.js';
 // ONE persistent VFS for the whole page lifetime. All static mounts
 // (home/tmp/upload/download/bin/usrbin) are wired inside the constructor;
 // /mnt/workspace is added/replaced by mountFolder(). The command list is
-// injected lazily so this module never depends on script load order.
-const vfs = new VirtualWorkspace({ listCommands: () => Object.keys(SHELL_COMMANDS) });
+// injected lazily so this module never depends on script load order. M2a:
+// the durable home skeleton is PRODUCT input passed explicitly — the
+// generic VFS no longer reads a product global.
+const vfs = new VirtualWorkspace({
+  listCommands: () => Object.keys(SHELL_COMMANDS),
+  homeSkeleton: typeof LOCUS_HOME_SKELETON !== 'undefined' ? LOCUS_HOME_SKELETON.slice() : undefined,
+});
 export { vfs };
 
 // Capability Composition v1: page-session CapabilityManager over the
@@ -149,42 +159,100 @@ export function setMcpConnectionState(id, state) {
   return next;
 }
 
-// ---------- python interpreter lifecycle (M1b, repository split) ----------
-// The Product OWNS the ONE canonical interpreter instance for the page
-// (contract REPOSITORY-SPLIT-CONTRACTS 3.1 / 3.4-Q3). It is created here —
-// lazily on first use, so deployments and Node tests without the shell
-// runtime simply get none — and the SAME instance is (a) configured by task
-// preparation (prepare), (b) reset at session boundaries, and (c) injected
-// into every shell execution (opts.pythonRuntime), so preparation and
-// execution can never split onto two interpreters. There is deliberately
-// NO page-global fallback: a shell python command without an injected
-// instance fails loudly (runPythonCode), it never resurrects a global.
-// Tests may substitute the instance via window.__LOCUS_HOOKS__.pythonRuntime
-// before first use; production resolves the createPythonRuntime factory
-// from shell.js.
-let pythonRuntimeResolved; // undefined = unresolved; null = resolved: none available
-function ensurePythonRuntime() {
-  if (pythonRuntimeResolved !== undefined) return pythonRuntimeResolved;
+// ---------- runtime session lifecycle (M2a + review round) ----------
+// The product constructs ONE RuntimeHost per page (contract §3.4-Q3) and
+// drives ONE RuntimeSession: task preparation configures it (prepare),
+// session boundaries reset it (reset), and EVERY bash execution routes
+// through it (executeTool → session.execute) — preparation and execution
+// can never split onto two interpreters because the session owns the only
+// one. Worker sources are runtime assets passed in here; nothing is read
+// from this page's DOM. Tests may substitute the session via
+// window.__LOCUS_HOOKS__.runtimeSession before first use.
+//
+// The public entry assembles ASYNCHRONOUSLY (it delegates to this page's
+// classic core registry and imports its own core otherwise), so
+// resolution has two forms: the sync accessor returns the resolved
+// session (or null before resolution / when none is available) and
+// honors the test seam at every read; the task path awaits
+// whenRuntimeSession(), which performs the one-time assembly.
+let runtimeSessionResolved; // undefined = unresolved; null = resolved: none available
+let runtimeSessionBootstrap = null;
+
+function resolveSessionFromHooks() {
   const h = hooks();
-  if (h && h.pythonRuntime) {
-    pythonRuntimeResolved = h.pythonRuntime;
-  } else if (typeof createPythonRuntime === 'function') {
-    pythonRuntimeResolved = createPythonRuntime();
-  } else {
-    pythonRuntimeResolved = null;
+  if (h && h.runtimeSession) {
+    runtimeSessionResolved = h.runtimeSession;
+    return true;
   }
-  return pythonRuntimeResolved;
+  return false;
 }
 
-// Canonical accessor for callers outside this module (the UI status poll
-// and the ?e2e=1 seam). Returns null when this deployment has no python
-// runtime.
+// Sync read for the seams and the reset hook: the resolved session, or
+// null while unresolved / unavailable. A reset landing before any task
+// ran can only miss a cold (never-booted) interpreter, so null is safe
+// there.
+function ensureRuntimeSession() {
+  if (runtimeSessionResolved === undefined && resolveSessionFromHooks()) return runtimeSessionResolved;
+  return runtimeSessionResolved === undefined ? null : runtimeSessionResolved;
+}
 
+// Task-path resolution: the seam wins; otherwise ONE createRuntime
+// assembly, memoized. A host without a workable runtime core resolves to
+// null — every bash/python attempt then fails loudly at the tool boundary.
+function whenRuntimeSession() {
+  if (runtimeSessionResolved !== undefined) return Promise.resolve(runtimeSessionResolved);
+  if (resolveSessionFromHooks()) return Promise.resolve(runtimeSessionResolved);
+  if (!runtimeSessionBootstrap) {
+    runtimeSessionBootstrap = createRuntime({
+      workerAssets: { pyWorkerSource: PY_WORKER_SOURCE, grepWorkerSource: GREP_WORKER_SOURCE },
+    }).then((host) => {
+      if (runtimeSessionResolved === undefined) runtimeSessionResolved = host.createSession();
+      return runtimeSessionResolved;
+    }, () => {
+      if (runtimeSessionResolved === undefined) runtimeSessionResolved = null;
+      return runtimeSessionResolved;
+    });
+  }
+  return runtimeSessionBootstrap;
+}
+
+export { whenRuntimeSession };
+
+// Canonical accessor for callers outside this module (the ?e2e=1 seam and
+// the status subscription). Returns null when this deployment has no
+// runtime session.
+export function runtimeSession() {
+  return ensureRuntimeSession();
+}
+
+// The underlying interpreter instance (test/e2e seams; documented on the
+// session as Runtime-internal). Kept so existing browser suites drive the
+// SAME object the session drives.
+export function pythonRuntime() {
+  const s = ensureRuntimeSession();
+  return s ? s.pythonRuntime() : null;
+}
+
+// M2a: the runtime worker assets this page was built with (e2e seam for
+// suites that instrument the documented worker seam; never used by the
+// product execution chain, which passes sources through the runtime).
+export function runtimeWorkerAssets() {
+  return { pyWorkerSource: PY_WORKER_SOURCE, grepWorkerSource: GREP_WORKER_SOURCE };
+}
+
+// Configure the interpreter with the plugin payload set THIS task's
+// TaskEnvironment needs (instance.prepare): a changed extension key means
+// the configured interpreter holds a different plugin set, so prepare
+// validates the NEW payload first, then rebuilds the payload set — the
+// next boot installs it before READY (never a lazy install-on-import).
+// Same-key preparation is a no-op and nothing here boots the interpreter
+// or downloads assets: a text-only task performs zero Python work.
+// With no python plugins (null key) this returns the runtime to core-only.
 // ---------- product mutation policy (M1b, repository split) ----------
 // The Locus skill-identity protection is PRODUCT policy, not runtime:
 // LocusMutationPolicy (src/mutation-policy.js) owns the /home/locus/.skills
-// rules; the generic runtime shell only consumes the operation-aware port
-// (checkMove / checkRemove / isPolicyRefusal) via opts.mutationPolicy.
+// rules; the generic runtime only consumes the operation-aware port
+// (checkMove / checkRemove / isPolicyRefusal) via the execution context.
 // EVERY bash execution carries it — a missing policy implementation fails
 // LOUDLY here instead of silently running shell mutations unprotected.
 let mutationPolicyResolved = null;
@@ -196,24 +264,22 @@ function taskMutationPolicy() {
   mutationPolicyResolved = LocusMutationPolicy.create();
   return mutationPolicyResolved;
 }
-export function pythonRuntime() {
-  const rt = ensurePythonRuntime();
-  return rt || null;
-}
 
-// Configure the interpreter with the plugin payload set THIS task's
-// TaskEnvironment needs (instance.prepare): a changed extension key means
-// the configured interpreter holds a different plugin set, so prepare
-// validates the NEW payload first, then rebuilds the payload set — the
-// next boot installs it before READY (never a lazy install-on-import).
-// Same-key preparation is a no-op and nothing here boots the interpreter
-// or downloads assets: a text-only task performs zero Python work.
-// With no python plugins (null key) this returns the runtime to core-only.
-// A validation failure is all-or-nothing inside prepare: the previously
-// configured payload survives intact.
+// Configure the session's interpreter with the plugin payload set THIS
+// task's TaskEnvironment needs (session.prepare): a changed extension key
+// means the configured interpreter holds a different plugin set, so
+// prepare waits for in-flight executions, validates the NEW payload
+// first, then rebuilds the payload set — the next boot installs it before
+// READY (never a lazy install-on-import). Same-key preparation is a
+// no-op and nothing here boots the interpreter or downloads assets: a
+// text-only task performs zero Python work. With no python plugins (null
+// key) this returns the runtime to core-only. A validation failure is
+// all-or-nothing inside prepare: the previously configured payload
+// survives intact. A cancel/reset/dispose landing while prepare waited
+// for the in-flight barrier refuses the configuration (no late effect).
 async function preparePythonRuntimeForEnvironment(env, signal) {
-  const rt = ensurePythonRuntime();
-  if (!rt) return;
+  const s = await whenRuntimeSession();
+  if (!s) return;
   const wanted = env ? env.pythonExtensionKey : null;
   // A null key means the core-only runtime: the payload is cleared
   // explicitly (buildExtensions validates strict shapes and rejects
@@ -222,9 +288,10 @@ async function preparePythonRuntimeForEnvironment(env, signal) {
     ? null
     : capabilityManager.pythonExtensionPayload(env);
   // The TASK's signal rides along: the runtime refuses to configure for a
-  // task whose signal already aborted (cancellation-shaped, so the
-  // runner's existing classification reads it as a cancellation).
-  await rt.prepare({ python: payload, signal: signal });
+  // task whose signal already aborted or dies while the prepare barrier
+  // waits (cancellation-shaped, so the runner's existing classification
+  // reads it as a cancellation).
+  await s.prepare({ python: payload, signal: signal });
 }
 
 const UPLOAD_ROOT = '/mnt/upload';
@@ -376,22 +443,36 @@ function wiredModelClient(body, opts) {
   });
 }
 
-function wiredToolExecutor(tool, input, workspace, opts) {
-  // NetworkRuntime approval consumer context (docs/NETWORK-RUNTIME.md):
-  // side-effecting network requests ask through the page's ApprovalController.
-  // The approval provider is injected here — the shell neither constructs
-  // approvals nor knows their internals. Read-only in the hooks path.
+// M2a (repository split): the PRODUCT side of the execution-authorization
+// boundary (contract §3.5). The Runtime's network port receives a
+// semantic-neutral request ({ kind, action, resource, policyKey }) with NO
+// chat identity; this adapter adds the Product-side identity (live
+// conversation + session generation) when forwarding to the page's
+// ApprovalController — byte-identical approval payloads downstream.
+function productNetworkAuthorization() {
+  const conversationId = runningConversationId || store.liveConversationId || null;
+  const taskGeneration = session.generation;
+  return {
+    request: (req, opts) => approvals.request(Object.assign({}, req, {
+      conversationId,
+      taskGeneration,
+    }), opts),
+  };
+}
+
+async function wiredToolExecutor(tool, input, workspace, opts) {
   const o = Object.assign({}, opts || {}, {
-    approvals: approvals,
-    conversationId: runningConversationId || store.liveConversationId || null,
-    taskGeneration: session.generation,
-    // M1b: the canonical interpreter instance — shell python executes on
-    // exactly the instance task preparation configured (see the lifecycle
-    // block above).
-    pythonRuntime: pythonRuntime(),
+    // M2a: bash routes through the public RuntimeSession entry — the
+    // session injects the interpreter instance and the grep worker asset
+    // itself; this wiring carries neither. The entry assembles
+    // asynchronously, so the task path awaits the one-time resolution.
+    runtimeSession: await whenRuntimeSession(),
     // M1b: the product mutation policy — mv/rm refusals (skill identity
     // among them) come from IT, never from hardcoded runtime rules.
     mutationPolicy: taskMutationPolicy(),
+    // M2a: the execution authorization port (product adapter supplies the
+    // chat identity on its side; the runtime request carries none).
+    authorization: productNetworkAuthorization(),
   });
   const h = hooks();
   if (h && typeof h.toolExecutor === 'function') return h.toolExecutor(tool, input, workspace, o);
@@ -559,10 +640,10 @@ export const session = new AgentSession({
   toolExecutor: wiredToolExecutor,
   buildSystemPrompt: buildSystemPrompt,
   emit: handleRuntimeEvent,
-  // M1b: the session boundary resets the SAME canonical instance the
-  // task preparation configured (interpreter globals/modules/tmp die
-  // here; verified assets and the lifecycle object survive).
-  onSessionReset: () => { const rt = ensurePythonRuntime(); if (rt) rt.reset(); },
+  // M2a: the session boundary resets the runtime SESSION (the interpreter
+  // inside it dies: globals/modules/tmp — verified assets and the session
+  // object survive), the SAME session task preparation configured.
+  onSessionReset: () => { const s = ensureRuntimeSession(); if (s) s.reset(); },
 });
 
 // ---------- harness task runner (M1a) ----------
@@ -1641,10 +1722,17 @@ async function bootPersistence() {
       rows.forEach((c) => { if (c.runState === 'running') { c.runState = 'interrupted'; c.status = 'interrupted'; } });
       store.conversations = rows;
       const continuation = rows.find((c) => c.items && c.items.length || c.status && c.status !== 'idle') || rows[0];
+      // Rebind the session ONLY onto a DIFFERENT conversation: the
+      // brand-new conversation this very boot created has no durable
+      // transcript, and restoreInto would just reset a runtime session
+      // that has no state to drop — a spurious boundary that (since the
+      // session owns execution invalidation) would cancel unrelated
+      // in-flight work. Archived conversations still rebind and replay.
+      const rebindNeeded = continuation.id !== store.liveConversationId;
       store.activeConversationId = continuation.id;
       store.liveConversationId = continuation.id;
       const providerSessions = providerSessionsAdapter();
-      if (providerSessions) await providerSessions.restoreInto(session, continuation);
+      if (providerSessions && rebindNeeded) await providerSessions.restoreInto(session, continuation);
       for (const c of rows) await persistConversation(c);
     }
     await restoreWorkspaceHandle();

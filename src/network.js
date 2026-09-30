@@ -58,7 +58,12 @@
 //
 //  The runtime knows nothing about curl, shells, VFS, providers or
 //  the model. The shell is a consumer: it parses CLI flags and passes
-//  a normalized request + policyContext (approval provider).
+//  a normalized request + authorization (the Runtime-defined execution
+//  authorization port, REPOSITORY-SPLIT-CONTRACTS §3.5). The port
+//  carries NO chat identity: { conversationId, taskGeneration } and
+//  friends are Harness/Product fields that the Product adapter adds on
+//  its side of the boundary when it forwards the request to its
+//  approval controller.
 // ============================================================
 
 // Ordinary download deadline (distinct from the model inference deadline).
@@ -124,7 +129,9 @@ const NetworkRuntime = {
   //    body          string (UTF-8) | Uint8Array | ArrayBuffer | null
   //                  (side-effecting methods only)
   //    signal        task AbortSignal (cancellation, not rollback)
-  //    policyContext { approvals, conversationId, taskGeneration }
+  //    authorization { request(req, opts) → { outcome, scope } }  — the
+  //                  execution authorization port (§3.5); req carries the
+  //                  plain-text action/resource/policyKey and NO identity
   //    timeoutMs      direct-attempt deadline (default 60s)
   //    relayTimeoutMs relay-attempt deadline (default 45s)
   //  }
@@ -166,28 +173,26 @@ const NetworkRuntime = {
 
     const externalSignal = opts.signal || null;
 
-    // ---- approval (side-effecting methods only; the Approval
-    // Framework's production consumer contract — docs/APPROVALS.md).
+    // ---- approval (side-effecting methods only; the Runtime-defined
+    // execution authorization port — docs/APPROVALS.md consumer contract).
+    // The port brings its own identity context on the consumer side; the
+    // Runtime passes none (contract §3.5).
     if (!readLike) {
-      const policyContext = opts.policyContext && typeof opts.policyContext === 'object'
-        ? opts.policyContext : null;
-      const approvals = policyContext && policyContext.approvals;
-      if (!approvals || typeof approvals.request !== 'function') {
+      const authorization = opts.authorization && typeof opts.authorization.request === 'function'
+        ? opts.authorization : null;
+      if (!authorization) {
         throw makeNetError('network_approval_unavailable',
-          'side-effecting network requests require an approval consumer (none is wired)');
+          'side-effecting network requests require an execution authorization port (none is wired)');
       }
       const summary = method + ' ' + canonicalOrigin + parsed.pathname;
       const detail = body && body.byteLength
         ? 'Request body size: ' + formatByteSize(body.byteLength)
         : null;
-      const decision = await approvals.request({
+      const decision = await authorization.request({
         kind: 'permission',
         action: { type: 'network-request', summary: summary, detail: detail },
         resource: { type: 'network-origin', key: canonicalOrigin, label: canonicalOrigin },
         policyKey: NETWORK_WRITE_POLICY_PREFIX + canonicalOrigin,
-        conversationId: policyContext.conversationId || null,
-        taskGeneration: Number.isFinite(policyContext.taskGeneration)
-          ? policyContext.taskGeneration : null,
       }, { signal: externalSignal });
       if (decision.outcome !== 'allow') {
         // Deny ≠ cancel: a denial is a deterministic user decision; a
@@ -913,3 +918,9 @@ function bytesToBase64(bytes) {
   }
   return btoa(out);
 }
+
+// M2a review: explicit cross-file publish (see telemetry.js). shell.js
+// dispatches curl through NetworkRuntime and renders URLs through
+// safeNetworkUrlForDisplay.
+globalThis.NetworkRuntime = NetworkRuntime;
+globalThis.safeNetworkUrlForDisplay = safeNetworkUrlForDisplay;

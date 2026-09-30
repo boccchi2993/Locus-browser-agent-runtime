@@ -28,7 +28,7 @@ const PAGE_HELPERS = `
   if (window.__gwE2e) return 'ready';
   const L = window.__locus;
   const exec = (cmd, opts) => window.executeTool('bash', cmd, L.vfs,
-    Object.assign({ approvals: L.approvals && L.approvals.controller }, opts || {}));
+    Object.assign({ runtimeSession: L.runtime() }, opts || {}));
   window.__gwE2e = {
     beats: null,
     exec,
@@ -51,8 +51,10 @@ const PAGE_HELPERS = `
       exec("grep '^(a+)+$' adversarial.txt")),
     // TEST-ONLY instrumentation through the documented worker seam: wraps
     // the REAL Blob-Worker construction to count create/terminate pairs.
+    // M2a: the source comes from the runtime assets (the product page no
+    // longer carries a #grep-worker-src element).
     instrument: () => {
-      const src = document.getElementById('grep-worker-src').textContent;
+      const src = window.__locus.runtimeAssets().grepWorkerSource;
       GrepRegexRuntime._workerFactory = () => {
         window.__gwE2e.created++;
         const blob = new Blob([src], { type: 'text/javascript' });

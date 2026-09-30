@@ -122,7 +122,7 @@ async function run() {
   on((u, o) => u === '/fetch' && o.method === 'POST', () => jsonResponse('{"posted":1}'));
   const approvals = fakeApprovals();
   const r3d = await RT.request({ method: 'POST', url: 'https://api.example.test/submit',
-    body: 'hello', policyContext: { approvals } });
+    body: 'hello', authorization: { request: approvals.request.bind(approvals) } });
   check('R4 cross-origin POST → relay first', r3d.backend === 'edge-relay' && calls.length === 1
     && calls[0].url === '/fetch' && calls[0].opts.method === 'POST', JSON.stringify(calls));
 
@@ -130,7 +130,7 @@ async function run() {
   pageLoc({ protocol: 'https:', host: 'app.test' });
   reset();
   on((u, o) => u === 'https://app.test/api' && o.method === 'POST', () => jsonResponse('{"same":1}'));
-  const r3e = await RT.request({ method: 'POST', url: 'https://app.test/api', policyContext: { approvals } });
+  const r3e = await RT.request({ method: 'POST', url: 'https://app.test/api', authorization: { request: approvals.request.bind(approvals) } });
   check('R5 same-origin POST → direct', r3e.backend === 'browser-direct' && calls.length === 1, JSON.stringify(calls));
   pageLoc({ protocol: 'https:' });
 
@@ -177,7 +177,7 @@ async function run() {
   reset();
   on((u, o) => u === '/fetch' && o.method === 'POST', () => { throw new TypeError('relay connection lost'); });
   e = await errOf(RT.request({ method: 'POST', url: 'https://api.example.test/pay',
-    body: 'x', policyContext: { approvals: fakeApprovals() } }));
+    body: 'x', authorization: { request: fakeApprovals().request } }));
   check('S1 ambiguous POST failure → one attempt only, ambiguous flag',
     e && e.networkCode === 'network_relay_failed' && e.ambiguous === true && calls.length === 1
     && /NOT retried/.test(e.message), e && e.networkCode + ' calls=' + calls.length);
@@ -187,7 +187,7 @@ async function run() {
   reset();
   on((u) => u === 'https://app.test/pay', () => { throw new TypeError('Failed to fetch'); });
   e = await errOf(RT.request({ method: 'POST', url: 'https://app.test/pay',
-    policyContext: { approvals: fakeApprovals() } }));
+    authorization: { request: fakeApprovals().request } }));
   check('S2 same-origin POST TypeError → network_direct_failed, one attempt',
     e && e.networkCode === 'network_direct_failed' && e.ambiguous === true && calls.length === 1,
     e && e.networkCode + ' calls=' + calls.length);
@@ -199,7 +199,7 @@ async function run() {
     Response.json({ error: { code: 'network_relay_failed', message: 'fetch: upstream request failed' } },
       { status: 502, headers: { 'x-locus-relay-error': '1' } }));
   e = await errOf(RT.request({ method: 'POST', url: 'https://api.example.test/pay2',
-    body: 'x', policyContext: { approvals: fakeApprovals() } }));
+    body: 'x', authorization: { request: fakeApprovals().request } }));
   check('S1b relay upstream failure → ambiguous, one attempt',
     e && e.networkCode === 'network_relay_failed' && e.ambiguous === true && calls.length === 1,
     e && e.networkCode + ' ambiguous=' + !!(e && e.ambiguous) + ' calls=' + calls.length);
@@ -208,7 +208,7 @@ async function run() {
   reset();
   on((u, o) => u === '/fetch' && o.method === 'POST', () => new Response('{"err":"no"}', { status: 403 }));
   const r5 = await RT.request({ method: 'POST', url: 'https://api.example.test/submit',
-    policyContext: { approvals: fakeApprovals() } });
+    authorization: { request: fakeApprovals().request } });
   check('S3 relay POST 403 is authoritative', r5.status === 403 && calls.length === 1, 'calls=' + calls.length);
 
   // ============ 6. approval consumer semantics (real controller) ============
@@ -217,7 +217,7 @@ async function run() {
     reset();
     const c = new M.ApprovalController({});
     const p = RT.request({ method: 'PUT', url: 'https://api.example.test/v1/thing',
-      body: '{"a":1}', policyContext: { approvals: c } });
+      body: '{"a":1}', authorization: { request: c.request.bind(c) } });
     check('A1 pending approval is registered', !!c.pending && c.pending.kind === 'permission', c.pending && c.pending.id);
     c.resolve(c.pending.id, { outcome: 'deny', scope: 'once' });
     e = await errOf(p);
@@ -230,12 +230,12 @@ async function run() {
     on((u, o) => u === '/fetch' && o.method === 'POST', () => jsonResponse('{"ok":1}'));
     const c = new M.ApprovalController({});
     const p = RT.request({ method: 'POST', url: 'https://api.example.test/v1/thing',
-      policyContext: { approvals: c } });
+      authorization: { request: c.request.bind(c) } });
     c.resolve(c.pending.id, { outcome: 'allow', scope: 'once' });
     const ok = await p;
     check('A3 allow once → one relay request', ok.backend === 'edge-relay' && calls.length === 1, 'calls=' + calls.length);
     const p2 = RT.request({ method: 'POST', url: 'https://api.example.test/v1/thing',
-      policyContext: { approvals: c } });
+      authorization: { request: c.request.bind(c) } });
     await tick();
     check('A4 next write asks again (no grant)', !!c.pending, 'pending=' + !!c.pending);
     c.resolve(c.pending.id, { outcome: 'deny', scope: 'once' });
@@ -249,18 +249,18 @@ async function run() {
     on((u, o) => u === '/fetch' && o.method === 'POST', () => jsonResponse('{"ok":1}'));
     const c = new M.ApprovalController({});
     const p = RT.request({ method: 'POST', url: 'https://api.example.test/v1/a',
-      policyContext: { approvals: c } });
+      authorization: { request: c.request.bind(c) } });
     c.resolve(c.pending.id, { outcome: 'allow', scope: 'session' });
     await p;
     check('A5 policyKey is canonical network-write origin', c.hasSessionGrant('network-write:https://api.example.test'),
       Object.keys({}).length ? '' : 'grant lookup failed');
     const p2 = RT.request({ method: 'DELETE', url: 'https://api.example.test/v1/a/1',
-      policyContext: { approvals: c } });
+      authorization: { request: c.request.bind(c) } });
     const ok2 = await p2;
     check('A6 session grant covers other methods on the SAME origin without ask',
       ok2.backend === 'edge-relay' && calls.length === 2, 'calls=' + calls.length);
     const p3 = RT.request({ method: 'POST', url: 'https://other.example.test/v1/b',
-      policyContext: { approvals: c } });
+      authorization: { request: c.request.bind(c) } });
     await tick();
     check('A7 other origin still asks', !!c.pending, 'pending=' + !!c.pending);
     c.resolve(c.pending.id, { outcome: 'deny', scope: 'once' });
@@ -281,7 +281,7 @@ async function run() {
       const approvals = { request: () => { leaked++; return Promise.resolve({ outcome: 'allow' }); } };
       reset();
       on((u, o) => u === '/fetch' && o.method === 'POST', () => jsonResponse('{}'));
-      await RT.request({ method: 'POST', url: t, policyContext: { approvals } });
+      await RT.request({ method: 'POST', url: t, authorization: { request: approvals.request.bind(approvals) } });
     }
     check('A8 sibling/variant origins never inherit the grant', leaked === tries.length,
       'asked=' + leaked + '/' + tries.length);
@@ -291,7 +291,7 @@ async function run() {
     reset();
     const c = new M.ApprovalController({});
     const p = RT.request({ method: 'POST', url: 'https://api.example.test/x',
-      policyContext: { approvals: c } });
+      authorization: { request: c.request.bind(c) } });
     c.cancel(c.pending.id, 'task cancelled');
     e = await errOf(p);
     check('A9 cancel while pending → network_aborted (not denied), zero fetches',
@@ -311,7 +311,7 @@ async function run() {
     const controller = new AbortController();
     const approvals = { request: () => { controller.abort(); return Promise.resolve({ outcome: 'allow' }); } };
     e = await errOf(RT.request({ method: 'POST', url: 'https://api.example.test/x',
-      signal: controller.signal, policyContext: { approvals } }));
+      signal: controller.signal, authorization: { request: approvals.request.bind(approvals) } }));
     check('A11 TOCTOU: abort between allow and dispatch → zero fetches',
       e && e.networkCode === 'network_aborted' && calls.length === 0, e && e.networkCode + ' calls=' + calls.length);
   }
@@ -322,7 +322,7 @@ async function run() {
     const approvals = fakeApprovals();
     await RT.request({ method: 'POST', url: 'https://Api.Example.TEST:443/v1/thing?key=secret',
       headers: { authorization: 'Bearer sekrit' }, body: 'hello world',
-      policyContext: { approvals } });
+      authorization: { request: approvals.request.bind(approvals) } });
     const a = approvals.asks[0];
     check('A12 policyKey canonicalized (default port, lowercased host)',
       a.policyKey === 'network-write:https://api.example.test', a.policyKey);
@@ -340,7 +340,7 @@ async function run() {
     reset();
     const approvals = fakeApprovals();
     e = await errOf(RT.request({ method: 'POST', url: 'https://api.example.test/x',
-      body: new Uint8Array(M.NETWORK_MAX_REQUEST_BYTES + 1), policyContext: { approvals } }));
+      body: new Uint8Array(M.NETWORK_MAX_REQUEST_BYTES + 1), authorization: { request: approvals.request.bind(approvals) } }));
     check('A16 oversized body → network_request_too_large before approval',
       e && e.networkCode === 'network_request_too_large' && approvals.asks.length === 0 && calls.length === 0,
       e && e.networkCode + ' asks=' + approvals.asks.length);
@@ -362,7 +362,7 @@ async function run() {
   on((u, o) => u === 'https://app.test/r' && o.method === 'POST', () =>
     new Response(null, { status: 307, headers: { location: 'https://elsewhere.test/catch' } }));
   e = await errOf(RT.request({ method: 'POST', url: 'https://app.test/r',
-    policyContext: { approvals: fakeApprovals() } }));
+    authorization: { request: fakeApprovals().request } }));
   check('D2 direct POST 3xx → network_redirect_blocked, one attempt',
     e && e.networkCode === 'network_redirect_blocked' && calls.length === 1,
     e && e.networkCode + ' calls=' + calls.length);
@@ -374,7 +374,7 @@ async function run() {
     Response.json({ error: { code: 'network_redirect_blocked', message: 'Cross-origin redirect blocked' } },
       { status: 403, headers: { 'x-locus-relay-error': '1' } }));
   e = await errOf(RT.request({ method: 'POST', url: 'https://api.example.test/r',
-    policyContext: { approvals: fakeApprovals() } }));
+    authorization: { request: fakeApprovals().request } }));
   check('D3 relay redirect block → network_redirect_blocked',
     e && e.networkCode === 'network_redirect_blocked', e && e.networkCode);
 
@@ -429,7 +429,7 @@ async function run() {
     on((u, o) => u === '/fetch' && o.method === 'POST', () => jsonResponse('{"ok":1}'));
     e = await errOf(RT.request({ method: 'POST', url: 'https://api.example.test/x',
       body: new Uint8Array(M.NETWORK_MAX_REQUEST_BYTES).fill(1),
-      policyContext: { approvals: fakeApprovals() } }));
+      authorization: { request: fakeApprovals().request } }));
     check('B1 request body at limit is accepted', e === null && calls.length === 1, e && e.networkCode);
   }
   {
@@ -437,7 +437,7 @@ async function run() {
     const big = new Uint8Array(M.NETWORK_MAX_RESPONSE_BYTES + 1);
     on((u, o) => u === '/fetch' && o.method === 'POST', () => new Response(big, { status: 200 }));
     e = await errOf(RT.request({ method: 'POST', url: 'https://api.example.test/x',
-      policyContext: { approvals: fakeApprovals() } }));
+      authorization: { request: fakeApprovals().request } }));
     check('B2 streaming response over cap → network_response_too_large (no crash)',
       e && e.networkCode === 'network_response_too_large', e && e.networkCode);
   }
@@ -451,7 +451,7 @@ async function run() {
     });
     const png = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF, 0xFE, 0x80]);
     await RT.request({ method: 'PUT', url: 'https://api.example.test/blob', body: png,
-      policyContext: { approvals: fakeApprovals() } });
+      authorization: { request: fakeApprovals().request } });
     check('B3 binary body byte-exact through envelope',
       envelopeSeen && envelopeSeen.bodyBase64 && btoa(String.fromCharCode(...png)) === envelopeSeen.bodyBase64,
       envelopeSeen && envelopeSeen.bodyBase64);
@@ -463,7 +463,7 @@ async function run() {
     on((u, o) => u === '/fetch' && o.method === 'POST', () =>
       new Response(png, { status: 200, headers: { 'content-type': 'image/png' } }));
     const r10 = await RT.request({ method: 'POST', url: 'https://api.example.test/blob',
-      policyContext: { approvals: fakeApprovals() } });
+      authorization: { request: fakeApprovals().request } });
     check('B4 binary response byte-exact', r10.bytes.length === png.length
       && r10.bytes.every((b, i) => b === png[i]) && r10.headers['content-type'] === 'image/png', '');
   }
@@ -534,7 +534,7 @@ async function run() {
     reset();
     const approvalsS = fakeApprovals();
     e = await errOf(RT.request({ method: 'POST', url: 'http://[::ffff:a00:1]/x',
-      body: 'x', policyContext: { approvals: approvalsS } }));
+      body: 'x', authorization: { request: approvalsS.request.bind(approvalsS) } }));
     check('S mapped-IPv6 POST refused pre-approval, zero attempts',
       e && e.networkCode === 'network_private_address_blocked' && approvalsS.asks.length === 0
       && calls.length === 0, e && e.networkCode + ' asks=' + approvalsS.asks.length);
@@ -607,7 +607,7 @@ async function run() {
     on((u, o) => u === 'https://app.test/pay' && o.method === 'POST', () => { throw new TypeError('Failed to fetch'); });
     on(() => { throw new Error('relay must NOT be called for side effects'); });
     e = await errOf(RT.request({ method: 'POST', url: 'https://app.test/pay',
-      policyContext: { approvals: fakeApprovals() } }));
+      authorization: { request: fakeApprovals().request } }));
     check('F5 POST transport TypeError → network_direct_failed, one attempt',
       e && e.networkCode === 'network_direct_failed' && e.ambiguous === true && calls.length === 1,
       (e && e.networkCode) + ' calls=' + calls.length);

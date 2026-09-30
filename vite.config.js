@@ -19,6 +19,7 @@ const RUNTIME_SCRIPTS = [
   'src/model.js',
   'src/workspace.js',
   'src/vfs.js',
+  'src/conversation-history-workspace.js',
   'src/extensions.js',
   'src/capability-package.js',
   'src/attachments.js',
@@ -53,6 +54,15 @@ export default defineConfig({
   build: {
     target: 'es2020',
     outDir: 'dist',
+    // M2a: the standalone runtime host (tests/runtime-host.html) is a REAL
+    // build input so the gates run the packaged entry/worker-asset bundle,
+    // not the dev-server sources.
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        runtimeHost: 'tests/runtime-host.html',
+      },
+    },
   },
   server: {
     port: 5173,

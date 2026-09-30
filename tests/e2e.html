@@ -2,7 +2,6 @@
 <html>
 <head><meta charset="UTF-8"><title>e2e</title></head>
 <body>
-<div id="sb-python"></div>
 <pre id="out">RUNNING</pre>
 <script src="../src/telemetry.js"></script>
 <script src="../src/workspace.js"></script>
@@ -13,7 +12,13 @@
 <script src="../src/model-adapters.js"></script>
 <script src="../src/model.js"></script>
 <script src="../src/agent.js"></script>
-<script>
+<script type="module">
+// M2a: the worker sources are RUNTIME ASSETS imported from the module and
+// bash routes through the PUBLIC runtime entry — this harness page carries
+// no #py-worker-src / #grep-worker-src DOM and never extracts anything
+// from a product page.
+import { PY_WORKER_SOURCE, GREP_WORKER_SOURCE } from '../src/runtime/worker-assets.js';
+import { createRuntime } from '../src/runtime/index.js';
 (async () => {
   const lines = [];
   const log = (m) => { lines.push(m); document.getElementById('out').textContent = lines.join('\n'); };
@@ -22,24 +27,6 @@
   window.addEventListener('error', (e) => check('window error: ' + (e && e.message), false));
   window.addEventListener('unhandledrejection', (e) => check('unhandled rejection: ' + (e && e.reason && e.reason.message || e && e.reason), false));
   try {
-    // Pull the real worker source out of index.html so we test the shipped artifact.
-    const html = await (await fetch('../index.html')).text();
-    const m = html.match(/<script type="text\/worker" id="py-worker-src">([\s\S]*?)<\/script>/);
-    if (!m) throw new Error('worker source not found in index.html');
-    const wtag = document.createElement('script');
-    wtag.id = 'py-worker-src';
-    wtag.type = 'text/worker';
-    wtag.textContent = m[1];
-    document.body.appendChild(wtag);
-    // Same for the grep regex worker: extract the shipped source so the
-    // isolation boundary is exercised for real on the file:// harness.
-    const gm = html.match(/<script type="text\/worker" id="grep-worker-src">([\s\S]*?)<\/script>/);
-    if (!gm) throw new Error('grep worker source not found in index.html');
-    const gtag = document.createElement('script');
-    gtag.id = 'grep-worker-src';
-    gtag.type = 'text/worker';
-    gtag.textContent = gm[1];
-    document.body.appendChild(gtag);
 
     // Test-only in-memory workspace implementing the adapter interface.
     class MemWS extends WorkspaceAdapter {
@@ -61,8 +48,14 @@
     }
 
     // Wrap a legacy adapter the way asVfs does, keeping a handle on the VFS.
+    // M2a: the home skeleton is an explicit constructor argument — this
+    // harness pins the PRODUCT-shaped skeleton (the W3 section exercises
+    // ~/.skills), exactly the way the product passes LOCUS_HOME_SKELETON.
     function mkVfs(adapter) {
-      const vfs = new VirtualWorkspace({ listCommands: () => Object.keys(SHELL_COMMANDS) });
+      const vfs = new VirtualWorkspace({
+        listCommands: () => Object.keys(SHELL_COMMANDS),
+        homeSkeleton: ['.skills', '.config/locus/mcp', '.cache/locus'],
+      });
       if (adapter) vfs.mount('/mnt/workspace', adapter, 'external-read-write');
       return vfs;
     }
@@ -88,10 +81,16 @@
 
     // M1b: the shell executes python on an INJECTED interpreter instance
     // (what the product wiring does). This local wrapper shadows the global
-    // executeTool and adds the instance to every bash call; the reset/worker
-    // assertions below drive the SAME instance.
-    const pyRuntime = createPythonRuntime();
-    const executeTool = (name, input, wsArg, opts) => window.executeTool(name, input, wsArg, Object.assign({ pythonRuntime: pyRuntime }, opts || {}));
+    // executeTool and routes every bash call through the M2a public entry
+    // session (which injects the instance and the grep worker asset
+    // itself); the reset/worker assertions below drive the SAME instance.
+    const __host = await createRuntime({
+      workerAssets: { pyWorkerSource: PY_WORKER_SOURCE, grepWorkerSource: GREP_WORKER_SOURCE },
+    });
+    const __session = __host.createSession();
+    const pyRuntime = __session.pythonRuntime();
+    const executeTool = (name, input, wsArg, opts) => window.executeTool(name, input, wsArg,
+      Object.assign({ runtimeSession: __session }, opts || {}));
 
     // ---------- existing smoke: ls / cat / unsupported / cloud ----------
     check('smoke ls', (await executeTool('bash', 'ls', ws)).output === 'sales.csv');

@@ -30,6 +30,18 @@ const M = eval(
   '\n;({ NetworkRuntime, safeNetworkUrlForDisplay, nativeResultContent, executeTool, Telemetry, AgentSession, buildSystemPrompt, VirtualWorkspace });'
 );
 
+// M2a: bash routes through the PUBLIC runtime entry (the eval'd shell.js
+// published the core registry). Worker sources are never booted here.
+const { createRuntime } = require('../src/runtime/index.js');
+// M2a review: the public entry assembles asynchronously — the host and
+// session are resolved before the checks drive them.
+const __hostPromise = createRuntime({
+  workerAssets: { pyWorkerSource: '/* not booted in this suite */', grepWorkerSource: '/* not booted in this suite */' },
+});
+let __host = null;
+let __session = null;
+const withSession = (opts) => Object.assign({ runtimeSession: __session }, opts || {});
+
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
   if (cond) { passed++; console.log('PASS ' + name); }
@@ -70,6 +82,8 @@ function newSession(overrides) {
 const WS = { name: 'visibility-test' };
 
 async function run() {
+  __host = await __hostPromise;
+  __session = __host.createSession();
   // ================= R-NF04C: malformed URL is never echoed raw =================
 
   // --- V1. the runtime error itself is the bounded constant ---
@@ -138,7 +152,7 @@ async function run() {
   {
     M.Telemetry.records.length = 0;
     const res = await M.executeTool('bash',
-      'curl "ht tp://example.com/?token=SECRET_INVALID_URL_123"', newVfs(), {});
+      'curl "ht tp://example.com/?token=SECRET_INVALID_URL_123"', newVfs(), withSession({}));
     check('V4 tool fails with bounded output mentioning invalid URL',
       res.success === false && res.output.includes('invalid URL'), JSON.stringify(res.output));
     check('V4b tool output never echoes the sentinel or the raw input',
@@ -165,7 +179,7 @@ async function run() {
             : envelope('done');
         };
       })(),
-      toolExecutor: (tool, input, ws, opts) => M.executeTool(tool, input, newVfs(), opts),
+      toolExecutor: (tool, input, ws, opts) => M.executeTool(tool, input, newVfs(), withSession(opts)),
     });
     await session.run('fetch that url', { workspace: WS });
     const tr = session.history.find((m) => m.role === 'tool_result');
@@ -268,7 +282,7 @@ async function run() {
   // --- V10. telemetry retention regression: backend survives everywhere it should ---
   {
     M.Telemetry.records.length = 0;
-    const ok = await M.executeTool('bash', 'echo retention-check', newVfs(), {});
+    const ok = await M.executeTool('bash', 'echo retention-check', newVfs(), withSession({}));
     check('V10 ordinary execution still succeeds', ok.success === true, JSON.stringify(ok.output));
     const rec = M.Telemetry.records[M.Telemetry.records.length - 1];
     check('V10b telemetry still records backend: browser',

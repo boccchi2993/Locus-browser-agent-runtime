@@ -357,9 +357,11 @@ const VFS_SKELETON = {
   '/mnt/plugins': [],
 };
 
-const VFS_HOME_SKELETON = typeof LOCUS_HOME_SKELETON !== 'undefined'
-  ? LOCUS_HOME_SKELETON.slice()
-  : ['.skills', '.config/locus/mcp', '.cache/locus'];
+// M2a (repository split): the durable home layout is a CONSTRUCTOR
+// ARGUMENT, not a product global. The Product passes its skeleton
+// (LOCUS_HOME_SKELETON) explicitly; a generic host constructing the VFS
+// without one gets this neutral, non-Locus default.
+const VFS_DEFAULT_HOME_SKELETON = ['.config', '.cache'];
 
 const VFS_PROTECTED_ROOTS = new Set([
   '/', '/usr', '/home', '/home/locus', '/mnt',
@@ -372,9 +374,16 @@ class VirtualWorkspace {
     this.isLocusVFS = true;
     this.mounts = []; // ordered [{ path, provider, authority }]
 
+    // The caller's home skeleton (Product supplies LOCUS_HOME_SKELETON);
+    // relative dir paths created inside the /home/locus memory provider.
+    const homeSkeleton = Array.isArray(opts.homeSkeleton)
+      ? opts.homeSkeleton.slice()
+      : VFS_DEFAULT_HOME_SKELETON;
+    // Remembered for resetHome()/resetEphemeral() rebuilds.
+    this._homeSkeleton = homeSkeleton;
     const home = new MemoryWorkspace({
       name: 'home',
-      dirs: VFS_HOME_SKELETON,
+      dirs: homeSkeleton,
     });
     const sysbin = new SystemBinWorkspace(opts.listCommands);
 
@@ -611,7 +620,7 @@ class VirtualWorkspace {
   resetHome() {
     this.mount('/home/locus', new MemoryWorkspace({
       name: 'home',
-      dirs: VFS_HOME_SKELETON,
+      dirs: this._homeSkeleton,
     }), 'read-write');
   }
 
@@ -625,3 +634,12 @@ class VirtualWorkspace {
     this.mount('/mnt/upload', new UploadWorkspace({ name: 'upload' }), 'read-only');
   }
 }
+
+// M2a review: explicit cross-file publish (see telemetry.js). shell.js
+// constructs VirtualWorkspace/MemoryWorkspace and calls
+// normalizeVfsPath/vfsError; the entry exposes the workspace
+// constructors to hosts. Bare globals keep both load modes working.
+globalThis.normalizeVfsPath = normalizeVfsPath;
+globalThis.vfsError = vfsError;
+globalThis.MemoryWorkspace = MemoryWorkspace;
+globalThis.VirtualWorkspace = VirtualWorkspace;

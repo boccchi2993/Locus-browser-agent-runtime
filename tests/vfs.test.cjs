@@ -159,7 +159,10 @@ async function run() {
 
   // ---------- V35-V38. VirtualWorkspace integration ----------
   let shellCmds = ['ls', 'grep'];
-  const vfs2 = new M.VirtualWorkspace({ listCommands: () => shellCmds });
+  // M2a: the home skeleton is an explicit constructor argument — this
+  // suite pins the PRODUCT-shaped skeleton the same way the product passes
+  // LOCUS_HOME_SKELETON; V36c pins the neutral generic default.
+  const vfs2 = new M.VirtualWorkspace({ listCommands: () => shellCmds, homeSkeleton: ['.skills', '.config/locus/mcp', '.cache/locus'] });
   check('V35 /usr/bin reflects injected commands', names(await vfs2.list('/usr/bin')) === 'grep ls');
   shellCmds.push('wc');
   check('V35b /bin aliases the same provider', names(await vfs2.list('/bin')) === 'grep ls wc');

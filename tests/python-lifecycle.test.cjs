@@ -44,6 +44,7 @@ const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'extensions.js', 'shell.j
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
 const M = eval(src + '\n;({ createPythonRuntime, runShellCommand, VirtualWorkspace, SHELL_COMMANDS });');
+const { freshRuntime } = require('./helpers/runtime.cjs');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -102,7 +103,7 @@ async function run() {
     const realFetch = global.fetch;
     global.fetch = (url) => { fetchCalls.push(String(url)); return Promise.reject(new Error('prepare must not fetch')); };
     try {
-      const rt = M.createPythonRuntime();
+      const rt = freshRuntime(M);
       const first = await rt.prepare({ python: payload('env-a') });
       check('LC1 first prepare configures and reports the rebuild',
         first.rebuiltInterpreter === true && rt.extensionKey() === 'env-a', JSON.stringify(first));
@@ -136,7 +137,7 @@ async function run() {
 
   // ================= LC2. prepare is all-or-nothing =================
   {
-    const rt = M.createPythonRuntime();
+    const rt = freshRuntime(M);
     await rt.prepare({ python: payload('env-good') });
 
     let threw = null;
@@ -171,8 +172,8 @@ async function run() {
 
   // ============ LC3. two instances share nothing mutable ============
   {
-    const a = M.createPythonRuntime();
-    const b = M.createPythonRuntime();
+    const a = freshRuntime(M);
+    const b = freshRuntime(M);
     check('LC3 pending maps, queues, queued-run sets are distinct objects',
       a._pending !== b._pending && a._queue !== b._queue && a._queuedRuns !== b._queuedRuns,
       'state must be per instance');
@@ -223,7 +224,7 @@ async function run() {
 
   // ============ LC4. execution state, reset, late messages ============
   {
-    const rt = M.createPythonRuntime();
+    const rt = freshRuntime(M);
     await rt.prepare({ python: payload('env-x') });
     let ctl = attachControlledWorker(rt);
     rt.status = 'ready';
@@ -292,7 +293,7 @@ async function run() {
 
   // ================= LC5. dispose is terminal and idempotent =================
   {
-    const rt = M.createPythonRuntime();
+    const rt = freshRuntime(M);
     await rt.prepare({ python: payload('env-d') });
     const ctl = attachControlledWorker(rt);
     rt.status = 'ready';
@@ -324,7 +325,7 @@ async function run() {
     try { await rt.prepare({ python: payload('env-after') }); } catch (e) { refusals.prepare = errText(e); }
     try { await rt.run('MORE', null, {}); } catch (e) { refusals.run = errText(e); }
     try { rt.configureExtensions(payload('env-after')); } catch (e) { refusals.configure = errText(e); }
-    try { await M.createPythonRuntime()._ensureWorker.call(rt, null, null); } catch (e) { refusals.boot = errText(e); }
+    try { await freshRuntime(M)._ensureWorker.call(rt, null, null); } catch (e) { refusals.boot = errText(e); }
     check('LC5d prepare/run/configureExtensions/boot all refuse after dispose',
       /disposed/.test(refusals.prepare || '') && /disposed/.test(refusals.run || '')
         && /disposed/.test(refusals.configure || '') && /disposed/.test(refusals.boot || ''),
@@ -346,7 +347,7 @@ async function run() {
       JSON.stringify(rt.snapshot()));
 
     // Dispose without a live worker (cold instance) is also safe.
-    const cold = M.createPythonRuntime();
+    const cold = freshRuntime(M);
     cold.dispose('cold dispose');
     check('LC5h disposing a never-booted instance is safe and terminal',
       cold.snapshot().disposed === 'python runtime disposed: cold dispose'
@@ -356,8 +357,8 @@ async function run() {
 
   // ============ LC6. shell executes on the injected instance ============
   {
-    const shared = M.createPythonRuntime();
-    const other = M.createPythonRuntime();
+    const shared = freshRuntime(M);
+    const other = freshRuntime(M);
     const ctlShared = attachControlledWorker(shared);
     const ctlOther = attachControlledWorker(other);
     const vfs = new M.VirtualWorkspace({ listCommands: () => Object.keys(M.SHELL_COMMANDS) });
@@ -393,7 +394,7 @@ async function run() {
 
     // prepare + shell execution converge on ONE instance (the product's
     // wiring contract, proven at the seam the store uses).
-    const rt = M.createPythonRuntime();
+    const rt = freshRuntime(M);
     await rt.prepare({ python: payload('env-shared') });
     const ctl = attachControlledWorker(rt); // attach AFTER prepare: a rebuild kills any attached interpreter
     const vfs2 = new M.VirtualWorkspace({ listCommands: () => Object.keys(M.SHELL_COMMANDS) });
@@ -413,7 +414,7 @@ async function run() {
 
   // ================= LC7. snapshot() =================
   {
-    const rt = M.createPythonRuntime();
+    const rt = freshRuntime(M);
     check('LC7 cold snapshot', JSON.stringify(rt.snapshot())
       === JSON.stringify({ interpreter: 'cold', busyExecutions: 0, extensionKey: null, disposed: null }),
       JSON.stringify(rt.snapshot()));
@@ -491,7 +492,7 @@ async function run() {
     }
 
     // ---- LC8-a: reset lands while the run is parked at the mkdir pre-check
-    const rtA = M.createPythonRuntime();
+    const rtA = freshRuntime(M);
     const ctlA = attachControlledWorker(rtA);
     rtA.status = 'ready';
     const fbA = barrierVfs({ '/mnt/workspace/in.txt': 'data' }, 'read-write',
@@ -529,7 +530,7 @@ async function run() {
 
     // ---- LC8-b: dispose lands while parked at the write pre-check
     // (external mount → optimistic-concurrency readBytes gate).
-    const rtB = M.createPythonRuntime();
+    const rtB = freshRuntime(M);
     const ctlB = attachControlledWorker(rtB);
     rtB.status = 'ready';
     const fbB = barrierVfs({ '/mnt/workspace/in.txt': 'data' }, 'external-read-write',
@@ -558,7 +559,7 @@ async function run() {
 
     // ---- LC8-c: reset lands at the delete-verification read; BOTH the
     // pending file deletion and the directory deletion must stay unstarted.
-    const rtC = M.createPythonRuntime();
+    const rtC = freshRuntime(M);
     const ctlC = attachControlledWorker(rtC);
     rtC.status = 'ready';
     const fbC = barrierVfs({ '/mnt/workspace/file.txt': 'data', '/mnt/workspace/sub/x.txt': 'x' }, 'external-read-write',
@@ -582,7 +583,7 @@ async function run() {
 
     // ---- LC8-d: queued vs active are counted once each; every settle path
     // (boundary, failure, cancellation) releases exactly once.
-    const rtD = M.createPythonRuntime();
+    const rtD = freshRuntime(M);
     const ctlD = attachControlledWorker(rtD);
     rtD.status = 'ready';
     const fbD = barrierVfs({ '/mnt/workspace/in.txt': 'data' }, 'read-write',
@@ -607,7 +608,7 @@ async function run() {
       JSON.stringify({ out: outD1.error, queued: errText(errD2), busy: rtD.snapshot().busyExecutions }));
 
     // A failing run (worker error) releases its tracking too.
-    const rtD2 = M.createPythonRuntime();
+    const rtD2 = freshRuntime(M);
     const ctlD2 = attachControlledWorker(rtD2);
     rtD2.status = 'ready';
     const failRun = rtD2.run('FAIL', null, { cwd: '/tmp' });
@@ -619,7 +620,7 @@ async function run() {
       JSON.stringify({ error: outFail.error, busy: rtD2.snapshot().busyExecutions }));
 
     // A task-signal cancellation releases its tracking too.
-    const rtD3 = M.createPythonRuntime();
+    const rtD3 = freshRuntime(M);
     const ctlD3 = attachControlledWorker(rtD3);
     rtD3.status = 'ready';
     const acD3 = new AbortController();
@@ -635,7 +636,7 @@ async function run() {
     // ---- LC8-e: an in-flight run whose worker NEVER answers is failed by
     // the boundary (provider operation already dispatched — no rollback,
     // but also no continuation, and never reported as success).
-    const rtE = M.createPythonRuntime();
+    const rtE = freshRuntime(M);
     attachControlledWorker(rtE);
     rtE.status = 'ready';
     const runE = rtE.run('NEVER-ANSWERS', null, { cwd: '/tmp' });
@@ -712,7 +713,7 @@ async function run() {
     // Drive one run to its parked last side effect: real runtime.run entry,
     // controlled worker answering with `reply`, then wait for the gate.
     async function parkAtLastEffect(reply, files, opts) {
-      const rt = M.createPythonRuntime();
+      const rt = freshRuntime(M);
       const ctl = attachControlledWorker(rt);
       rt.status = 'ready';
       const fb = dispatchBarrierVfs(files, opts);

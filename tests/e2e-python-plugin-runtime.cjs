@@ -98,13 +98,10 @@ function buildPage(shellUrl, workerSrc, localAssets, wheelB64, wheelSha, wheelSi
     + '  if (url.indexOf(__cdnPrefix) === 0) url = __localAssets + url.slice(__cdnPrefix.length);'
     + '  return __nativeFetch(url, init);'
     + '};'
-    + 'var __el = document.createElement("script");'
-    + '__el.type = "text/worker";'
-    + '__el.id = "py-worker-src";'
-    + '__el.textContent = ' + JSON.stringify(workerSrc) + ';'
-    + 'document.head.appendChild(__el);'
+    // M2a: the worker source is a runtime asset handed to the factory —
+    // this page carries no #py-worker-src element.
+    + 'window.__pyrt = createPythonRuntime({ pyWorkerSource: ' + JSON.stringify(workerSrc) + ' });'
     + 'window.__tpr = { ready: true, configError: null };'
-    + 'window.__pyrt = createPythonRuntime();' // standalone harness page: own instance from the shell.js factory
     + 'function wheelBytes(tamper) {'
     + '  var bin = atob(' + JSON.stringify(wheelB64) + ');'
     + '  var bytes = new Uint8Array(bin.length);'
@@ -237,10 +234,8 @@ async function main() {
     assetBytes.set('__shell__', await fs.readFile(path.join(__dirname, '..', 'src', 'shell.js')));
     assetBytes.set('__extensions__', await fs.readFile(path.join(__dirname, '..', 'src', 'extensions.js')));
     for (const a of PY_MANIFEST) assetBytes.set(a.name, await loadAsset(a.name));
-    const html = await fs.readFile(path.join(__dirname, '..', 'index.html'), 'utf8');
-    const wm = html.match(/<script type="text\/worker" id="py-worker-src">([\s\S]*?)<\/script>/);
-    if (!wm) throw new Error('py-worker-src not found in index.html');
-    const workerSrc = wm[1];
+    // M2a: the worker source comes from the runtime asset module.
+    const workerSrc = require('./helpers/runtime.cjs').PY_WORKER_SOURCE;
 
     pageHtml = buildPage('shell.js', workerSrc, ASSETS + '/',
       wheelBytesBuf.toString('base64'), wheelSha, wheelSize);

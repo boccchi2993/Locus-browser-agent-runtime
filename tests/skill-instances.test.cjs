@@ -32,6 +32,15 @@ const POLICY = eval(read('src/mutation-policy.js') + '\n;({ LocusMutationPolicy 
 const SH = eval(shellSrc + '\n;({ executeTool, VirtualWorkspace, MemoryWorkspace, SHELL_COMMANDS, GrepRegexRuntime, Telemetry });');
 const { installGrepFakeWorker } = require('./helpers/grep-fake-worker.cjs');
 installGrepFakeWorker(SH);
+// M2a: bash routes through the PUBLIC runtime entry (core registry from
+// the eval'd shell.js); worker sources are never booted in this suite.
+const { createRuntime } = require('../src/runtime/index.js');
+// M2a review: the public entry assembles asynchronously — the session is
+// resolved before the checks drive them.
+const __hostPromise = createRuntime({
+  workerAssets: { pyWorkerSource: '/* not booted */', grepWorkerSource: '/* not booted */' },
+});
+let __session = null;
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -113,6 +122,7 @@ function guardFor(manager, storage, taskEnvironment, signalOrNull) {
 }
 
 async function run() {
+  __session = (await __hostPromise).createSession();
   // ================= Definition / Instance model =================
   const rig0 = rig();
   check('D1 production-style manager keeps source store and instances separate',
@@ -531,7 +541,7 @@ async function run() {
     // M1b: the skill-identity mv/rm protection is PRODUCT policy injected
     // via opts.mutationPolicy (store.js wiring); the shell no longer
     // hardcodes ~/.skills rules.
-    const run = (cmd) => SH.executeTool('bash', cmd, taskVfs, { signal: ac.signal, mutationPolicy: POLICY.LocusMutationPolicy.create() });
+    const run = (cmd) => SH.executeTool('bash', cmd, taskVfs, { signal: ac.signal, mutationPolicy: POLICY.LocusMutationPolicy.create(), runtimeSession: __session });
 
     const mv1 = await run('mv /home/locus/.skills/cap-a/synthetic-skill.skill /home/locus/renamed.skill');
     check('S1 mv of a skill instance is refused with the identity contract',

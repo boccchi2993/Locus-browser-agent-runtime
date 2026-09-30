@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Locus Runtime — standalone host</title>
+</head>
+<body>
+<!--
+  M2a review round: TRULY STANDALONE RUNTIME HOST (a test/example page,
+  never a second product implementation).
+
+  NO classic scripts at all — the page imports the public entry as one ES
+  module and the entry assembles its own core (telemetry/workspace/vfs/
+  network/shell through src/runtime/core.js). No global VFS constructors:
+  hosts build filesystems through the entry's
+  createWorkspace/createMemoryWorkspace exports. No Harness, no Product
+  page, no Vue, no persistence, no Locus DOM: worker sources arrive
+  through createRuntime({ workerAssets }), status arrives through
+  session.onStatus.
+-->
+<script type="module">
+import { createRuntime, createWorkspace, createMemoryWorkspace, shellCommandNames }
+  from '../src/runtime/index.js';
+import { PY_WORKER_SOURCE, GREP_WORKER_SOURCE } from '../src/runtime/worker-assets.js';
+
+const log = [];
+const errors = [];
+window.addEventListener('error', (e) => errors.push(String(e.message || e)));
+window.addEventListener('unhandledrejection', (e) => errors.push('unhandledrejection: ' + String(e.reason && e.reason.message || e.reason)));
+
+const statusEvents = [];
+(async () => {
+const host = await createRuntime({
+  workerAssets: { pyWorkerSource: PY_WORKER_SOURCE, grepWorkerSource: GREP_WORKER_SOURCE },
+});
+const session = host.createSession();
+session.onStatus((snap) => { statusEvents.push(snap); });
+
+// The session's task filesystem: plain runtime VFS exports with a scratch
+// workspace mount (the host decides mounts — exactly what the Product
+// adapter does in Locus). No classic global anywhere.
+function makeVfs() {
+  const vfs = createWorkspace();
+  vfs.mount('/mnt/workspace', createMemoryWorkspace({ name: 'workspace' }), 'read-write');
+  return vfs;
+}
+const vfs = makeVfs();
+
+let executionSeq = 0;
+async function run(input, context) {
+  const id = ++executionSeq;
+  const t0 = performance.now();
+  const res = await session.execute({ kind: 'shell', input, context: Object.assign({ filesystem: vfs }, context || {}) });
+  return { id, ms: Math.round(performance.now() - t0), ok: res.ok, output: res.output, isError: !!res.isError, boundary: res.boundary };
+}
+
+async function runPython(code) {
+  const id = ++executionSeq;
+  const t0 = performance.now();
+  const res = await session.execute({ kind: 'python', input: code, context: { filesystem: vfs } });
+  return { id, ms: Math.round(performance.now() - t0), ok: res.ok, output: res.stdout, stderr: res.stderr, error: res.error };
+}
+
+// A parking VFS for the lifecycle gate: a DEDICATED session whose write()
+// stalls on a path behind an openable gate, so the page can hold an
+// execute mid-flight and observe the boundary semantics live
+// (deterministic — the gate opens only when the driver asks).
+function makeParkingVfs() {
+  const inner = makeVfs();
+  const session = host.createSession();
+  const p = { session, vfs: inner, log: [], gate: Promise.resolve(), open: () => {}, parkPath: null };
+  p.hold = (path) => {
+    p.parkPath = path;
+    p.gate = new Promise((r) => { p.open = r; });
+  };
+  const innerWrite = inner.write.bind(inner);
+  inner.write = async (path, text) => {
+    p.log.push('write:enter:' + path);
+    if (path === p.parkPath) {
+      p.log.push('write:park:' + path);
+      await p.gate;
+      p.log.push('write:resume:' + path);
+    }
+    const out = await innerWrite(path, text);
+    p.log.push('write:commit:' + path);
+    return out;
+  };
+  return p;
+}
+
+window.__host = {
+  host,
+  session,
+  vfs,
+  makeVfs,
+  makeParkingVfs,
+  run,
+  runPython,
+  log,
+  errors,
+  statusEvents,
+  capabilities: () => host.capabilities(),
+  assembly: () => ({
+    classicScriptTags: document.querySelectorAll('script[src]:not([type="module"])').length,
+    shellCommands: shellCommandNames().length,
+    registryPresent: !!window.__LOCUS_RUNTIME_CORE__,
+  }),
+  cdnFetches: () => performance.getEntriesByType('resource')
+    .filter((r) => r.name.indexOf('cdn.jsdelivr.net') !== -1).map((r) => r.name),
+  ready: true,
+};
+document.title = 'runtime-host-ready';
+})().catch((e) => {
+  errors.push('boot failed: ' + (e && e.message ? e.message : String(e)));
+  document.title = 'runtime-host-boot-failed';
+});
+</script>
+</body>
+</html>
