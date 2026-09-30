@@ -122,7 +122,7 @@ Branch head after the round: `refactor/repository-split-m2b` @ the four commits 
 
 ### Round evidence discipline
 
-- First-failure: the F1/F2 test blocks were written and run against the untouched `3792fe8` sources BEFORE the source fixes (15 FAIL), then re-run after each fix; the intermediate F1-only green state was committed separately (`4859ac2` test+fix, then `f79ac18`).
+- First-failure: the F1/F2 test blocks were written and run against the untouched `3792fe8` sources BEFORE the source fixes (15 FAIL), then re-run after each fix; the intermediate F1-only green state was committed on its own before the F2 fix landed (two source commits, then the gate + docs commit — note for the record: the branch's commit objects were constructed through the Git Data API during push, which normalizes dates to UTC and strips trailing message newlines, so local pre-push SHAs differ from the pushed ones; trees and content are byte-identical).
 - Historical results (M2b's original 53-suite/17-suite records in §2) are carried, not re-implicated: every gate listed above was re-executed during this round; nothing is claimed from the old run for changed code paths.
 - No real model, relay, or paid API anywhere: all F2 relay paths ran over fake transports; the browser host page's model is a scripted fake transport through the real client factory.
 
