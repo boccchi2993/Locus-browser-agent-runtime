@@ -739,6 +739,186 @@ async function main() {
     ]), 'an undefined field (would be silently dropped by JSON)');
   }
 
+  // ---------- F2 (review round): relay/transport captured at call entry ----------
+  {
+    // false→true: the eligibility flips WHILE the direct request is parked;
+    // the parked request must never gain a /proxy attempt.
+    let eligible = false;
+    let release = null;
+    const gate = new Promise((r) => { release = r; });
+    const urls = [];
+    const client = createModelClient({
+      config: { apiKey: 'k', apiBase: 'https://relay.test', model: 'm', dialect: 'openai' },
+      transport: async (url) => {
+        urls.push(String(url));
+        if (urls.length === 1) await gate; // park ONLY the first direct attempt
+        throw new TypeError('fetch failed: network down');
+      },
+      relayEligible: () => eligible,
+    });
+    const p = client.call({ messages: [{ role: 'user', content: 'hi' }] }).then(() => 'ok', (e) => e.name);
+    await new Promise((r) => {
+      const t = setInterval(() => { if (urls.length === 1) { clearInterval(t); r(); } }, 2);
+    });
+    eligible = true; // external state changes mid-request
+    release();
+    const outcome = await p;
+    check('F2 false→true mid-request: the parked request gains NO relay attempt',
+      outcome === 'TypeError' && urls.length >= 1 && !urls.some((u) => u.indexOf('/proxy') !== -1),
+      JSON.stringify({ urls, outcome }));
+
+    // true→false: the permission was captured at entry — the request still
+    // relays; the relay's 404 (no x-locus-relay header) rethrows the direct
+    // error (unchanged policy).
+    let eligible2 = true;
+    let release2 = null;
+    const gate2 = new Promise((r) => { release2 = r; });
+    const urls2 = [];
+    const client2 = createModelClient({
+      config: { apiKey: 'k', apiBase: 'https://relay.test', model: 'm', dialect: 'openai' },
+      transport: async (url) => {
+        urls2.push(String(url));
+        if (urls2.length === 1) await gate2;
+        if (String(url).indexOf('/proxy') !== -1) {
+          return {
+            ok: false, status: 404,
+            // NOT a real relay answer: no x-locus-relay header → the 404
+            // masks nothing (the direct error is the honest one).
+            headers: { get: (h) => (h === 'content-type' ? 'application/json' : null) },
+            text: async () => JSON.stringify({ error: { message: 'no such function' } }),
+          };
+        }
+        throw new TypeError('fetch failed: network down');
+      },
+      relayEligible: () => eligible2,
+    });
+    const p2 = client2.call({ messages: [{ role: 'user', content: 'hi' }] }).then(() => 'ok', (e) => e.name + ':' + e.message);
+    await new Promise((r) => {
+      const t = setInterval(() => { if (urls2.length === 1) { clearInterval(t); r(); } }, 2);
+    });
+    eligible2 = false; // permission revoked mid-request
+    release2();
+    const outcome2 = await p2;
+    check('F2 true→false mid-request: the request still relays per its entry permission',
+      urls2.some((u) => u.indexOf('/proxy') !== -1) && /^TypeError:fetch failed/.test(outcome2),
+      JSON.stringify({ urls: urls2, outcome: outcome2 }));
+
+    // The NEXT call captures fresh: with eligibility true again, a plain
+    // failing call relays; the getter is read exactly once per call.
+    let reads3 = 0;
+    const urls3 = [];
+    const client3 = createModelClient({
+      config: { apiKey: 'k', apiBase: 'https://relay3.test', model: 'm', dialect: 'openai' },
+      transport: async (url) => {
+        urls3.push(String(url));
+        if (String(url).indexOf('/proxy') !== -1) {
+          return {
+            ok: true, status: 200,
+            headers: { get: (h) => (h === 'content-type' ? 'application/json' : null) },
+            text: async () => JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'via relay' }, finish_reason: 'stop' }] }),
+          };
+        }
+        throw new TypeError('fetch failed: network down');
+      },
+      relayEligible: () => { reads3++; return true; },
+    });
+    const env3 = await client3.call({ messages: [{ role: 'user', content: 'hi' }] });
+    check('F2 the next call captures the fresh value (relay attempted, once)',
+      env3.content === 'via relay' && urls3.some((u) => u.indexOf('/proxy') !== -1) && reads3 === 1,
+      JSON.stringify({ urls: urls3, reads: reads3 }));
+
+    // Exactly ONE eligibility read per call, even across the tools
+    // downgrade (two endpoint-attempt rounds, one capture).
+    let reads4 = 0;
+    const bodies4 = [];
+    const client4 = createModelClient({
+      config: { apiKey: 'k', apiBase: 'https://dg.test', model: 'm', dialect: 'openai' },
+      transport: async (url, init) => {
+        bodies4.push(JSON.parse(init.body));
+        if (bodies4.length === 1) {
+          return {
+            ok: false, status: 400,
+            headers: { get: () => 'application/json' },
+            text: async () => JSON.stringify({ error: { message: 'tools are not supported by this model', type: 'invalid_request_error', param: 'tools' } }),
+          };
+        }
+        return {
+          ok: true, status: 200,
+          headers: { get: () => 'application/json' },
+          text: async () => JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'no-tools ok' }, finish_reason: 'stop' }] }),
+        };
+      },
+      relayEligible: () => { reads4++; return false; },
+    });
+    const env4 = await client4.call({ messages: [{ role: 'user', content: 'hi' }], tools: [{ name: 'lookup', description: 'd', inputSchema: {} }] });
+    check('F2 eligibility is read exactly ONCE per call (downgrade included)',
+      env4.content === 'no-tools ok' && bodies4.length === 2 && reads4 === 1,
+      JSON.stringify({ requests: bodies4.length, reads: reads4 }));
+
+    // Two clients are isolated: each captures its own permission.
+    let readsA = 0, readsB = 0;
+    const mkFailTransport = (urls5) => async (url) => {
+      urls5.push(String(url));
+      throw new TypeError('fetch failed: network down');
+    };
+    const urls5A = [], urls5B = [];
+    const clientA = createModelClient({
+      config: { apiKey: 'k', apiBase: 'https://iso.test', model: 'm', dialect: 'openai' },
+      transport: mkFailTransport(urls5A),
+      relayEligible: () => { readsA++; return true; },
+    });
+    const clientB = createModelClient({
+      config: { apiKey: 'k', apiBase: 'https://iso.test', model: 'm', dialect: 'openai' },
+      transport: mkFailTransport(urls5B),
+      relayEligible: () => { readsB++; return false; },
+    });
+    await Promise.all([
+      clientA.call({ messages: [{ role: 'user', content: 'x' }] }).catch(() => {}),
+      clientB.call({ messages: [{ role: 'user', content: 'x' }] }).catch(() => {}),
+    ]);
+    check('F2 two clients capture their own permission (no shared state)',
+      urls5A.some((u) => u.indexOf('/proxy') !== -1) && !urls5B.some((u) => u.indexOf('/proxy') !== -1)
+      && readsA === 1 && readsB === 1,
+      JSON.stringify({ a: urls5A, b: urls5B, readsA, readsB }));
+
+    // The per-call transport is captured at entry: swapping the SAME opts
+    // object's transport while the first attempt is parked cannot change
+    // the fallback attempt's transport.
+    let release6 = null;
+    const gate6 = new Promise((r) => { release6 = r; });
+    const urls6 = [];
+    const originalTransport = async (url) => {
+      urls6.push('orig:' + String(url));
+      if (urls6.length === 1) await gate6;
+      if (String(url).indexOf('/v1/') !== -1) {
+        return {
+          ok: true, status: 200,
+          headers: { get: () => 'application/json' },
+          text: async () => JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'v1 ok' }, finish_reason: 'stop' }] }),
+        };
+      }
+      return { ok: false, status: 404, headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ error: { message: 'not found' } }) };
+    };
+    const swappedTransport = async (url) => {
+      urls6.push('swap:' + String(url));
+      return { ok: true, status: 200, headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'swapped' }, finish_reason: 'stop' }] }) };
+    };
+    const opts6 = { transport: originalTransport };
+    const client6 = createModelClient({
+      config: { apiKey: 'k', apiBase: 'https://cap.test', model: 'm', dialect: 'openai' },
+    });
+    const p6 = client6.call({ messages: [{ role: 'user', content: 'hi' }] }, opts6).then((e) => e.content, (e) => 'ERR:' + e.name);
+    await new Promise((r) => {
+      const t = setInterval(() => { if (urls6.length === 1) { clearInterval(t); r(); } }, 2);
+    });
+    opts6.transport = swappedTransport; // mutate the SAME opts object mid-request
+    release6();
+    const outcome6 = await p6;
+    check('F2 the per-call transport is captured at entry (mid-request opts mutation ignored)',
+      outcome6 === 'v1 ok' && urls6.length === 2 && urls6.every((u) => u.indexOf('orig:') === 0),
+      JSON.stringify({ urls: urls6, outcome: outcome6 }));
+  }
+
   console.log('\n' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
 }

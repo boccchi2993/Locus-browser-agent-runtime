@@ -183,9 +183,12 @@ function raceSignal(promise, signal) {
 }
 
 // One POST with full-lifecycle deadline (headers AND body), optional
-// external cancellation, and a response size cap. `ctx` is the captured
-// client context (M2b): { config, transport, relayEligible } — never a
-// read of a mutable global mid-request.
+// external cancellation, and a response size cap. `ctx` is the PER-CALL
+// request context captured at call() entry (review round F2):
+// { config, transport, relayAllowed } — the transport and the relay
+// decision of one request are read ONCE, before any await, and every
+// attempt of that request reuses the same captured values. Never a read
+// of a mutable external mid-request.
 async function fetchJsonPost(ctx, fetchUrl, headers, body, opts) {
   const o = opts || {};
   const timeoutMs = o.timeoutMs || MODEL_TIMEOUT_MS;
@@ -201,7 +204,7 @@ async function fetchJsonPost(ctx, fetchUrl, headers, body, opts) {
   let res;
   try {
     try {
-      const transport = o.transport || ctx.transport || fetch;
+      const transport = ctx.transport;
       res = await transport(fetchUrl, {
         method: 'POST',
         headers: headers,
@@ -273,11 +276,14 @@ async function tryFetch(ctx, url, headers, body, parser, opts) {
     const data = await fetchJsonPost(ctx, url, headers, body, opts);
     return parser(data);
   } catch (e) {
-    // 3. Only on genuine network/CORS failure, and only when the injected
-    //    hosting decision says a same-origin /proxy relay exists (the
-    //    product passes "not file://"), try the relay. Parse errors,
-    //    timeouts, HTTP statuses and cancellations are NEVER relayed.
-    if (!isNetworkError(e) || !ctx.relayEligible()) throw e;
+    // 3. Only on genuine network/CORS failure, and only when THIS request's
+    //    entry capture said a same-origin /proxy relay exists (the product
+    //    passes "not file://"), try the relay. The decision is the captured
+    //    relayAllowed boolean: external eligibility flipping after the
+    //    request started can never add or remove a relay attempt for it
+    //    (review round F2). Parse errors, timeouts, HTTP statuses and
+    //    cancellations are NEVER relayed.
+    if (!isNetworkError(e) || !ctx.relayAllowed) throw e;
     const directError = e;
     try {
       const data = await fetchJsonPost(ctx, '/proxy', Object.assign({}, headers, { 'X-Target-URL': url }), body, opts);
@@ -358,7 +364,9 @@ async function runEndpointAttempts(ctx, adapter, headers, requestBody, opts) {
 //   opts.relayEligible  optional () => boolean — whether a same-origin
 //                       /proxy relay exists (product: hosted page, not
 //                       file://). Default: () => false — a standalone
-//                       harness host never relays.
+//                       harness host never relays. Read ONCE per call(),
+//                       at entry, before any await; the captured boolean
+//                       governs the whole request (review round F2).
 function createModelClient(opts) {
   const o = opts || {};
   const c = o.config || {};
@@ -369,18 +377,34 @@ function createModelClient(opts) {
     proxy: typeof c.proxy === 'string' ? c.proxy : '',
     dialect: c.dialect || 'auto',
   });
-  const transport = typeof o.transport === 'function' ? o.transport : null;
+  const clientTransport = typeof o.transport === 'function' ? o.transport : null;
   const relayEligible = typeof o.relayEligible === 'function' ? o.relayEligible : function () { return false; };
-  const ctx = { config: config, transport: transport, relayEligible: relayEligible };
 
-  // Structured model call. opts.signal cancels the request.
+  // Structured model call. opts.signal cancels the request; opts.transport
+  // may override the client transport for this one call.
+  //
+  // REQUEST CONTEXT (review round F2): the relay decision, the transport
+  // and the deadline/cancellation options of ONE request are captured at
+  // call entry, BEFORE any transport await — every endpoint attempt, the
+  // direct→relay fallback and the tools downgrade reuse the same captured
+  // values. External state flipping mid-request (hosting status, a
+  // mutated opts object) can never reshape a request in flight; the next
+  // call() captures fresh values.
   async function call(body, opts2) {
+    const o2 = opts2 || {};
+    const reqCtx = {
+      config: config,
+      transport: typeof o2.transport === 'function' ? o2.transport
+        : (clientTransport || fetch),
+      relayAllowed: !!relayEligible(),
+    };
+    const reqOpts = { timeoutMs: o2.timeoutMs, signal: o2.signal };
     const key = config.apiKey;
     const adapter = getProviderAdapter({ dialect: config.dialect, apiBase: config.apiBase });
     const headers = adapter.buildHeaders({ apiKey: key, apiBase: config.apiBase });
 
     try {
-      return await runEndpointAttempts(ctx, adapter, headers, adapter.serializeRequest(body), opts2);
+      return await runEndpointAttempts(reqCtx, adapter, headers, adapter.serializeRequest(body), reqOpts);
     } catch (e) {
       // One-time tools downgrade: only when the adapter classifies the
       // error as an EXPLICIT request-validation rejection of the tools
@@ -393,7 +417,7 @@ function createModelClient(opts) {
           adapter.isToolingUnsupportedError(e)) {
         const reduced = Object.assign({}, body);
         delete reduced.tools;
-        return await runEndpointAttempts(ctx, adapter, headers, adapter.serializeRequest(reduced), opts2);
+        return await runEndpointAttempts(reqCtx, adapter, headers, adapter.serializeRequest(reduced), reqOpts);
       }
       throw e;
     }
