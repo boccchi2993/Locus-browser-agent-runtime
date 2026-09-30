@@ -159,7 +159,7 @@ export function setMcpConnectionState(id, state) {
   return next;
 }
 
-// ---------- runtime session lifecycle (M2a, repository split) ----------
+// ---------- runtime session lifecycle (M2a + review round) ----------
 // The product constructs ONE RuntimeHost per page (contract §3.4-Q3) and
 // drives ONE RuntimeSession: task preparation configures it (prepare),
 // session boundaries reset it (reset), and EVERY bash execution routes
@@ -168,27 +168,55 @@ export function setMcpConnectionState(id, state) {
 // one. Worker sources are runtime assets passed in here; nothing is read
 // from this page's DOM. Tests may substitute the session via
 // window.__LOCUS_HOOKS__.runtimeSession before first use.
+//
+// The public entry assembles ASYNCHRONOUSLY (it delegates to this page's
+// classic core registry and imports its own core otherwise), so
+// resolution has two forms: the sync accessor returns the resolved
+// session (or null before resolution / when none is available) and
+// honors the test seam at every read; the task path awaits
+// whenRuntimeSession(), which performs the one-time assembly.
 let runtimeSessionResolved; // undefined = unresolved; null = resolved: none available
-function ensureRuntimeSession() {
-  if (runtimeSessionResolved !== undefined) return runtimeSessionResolved;
+let runtimeSessionBootstrap = null;
+
+function resolveSessionFromHooks() {
   const h = hooks();
   if (h && h.runtimeSession) {
     runtimeSessionResolved = h.runtimeSession;
-    return runtimeSessionResolved;
+    return true;
   }
-  try {
-    const host = createRuntime({
-      workerAssets: { pyWorkerSource: PY_WORKER_SOURCE, grepWorkerSource: GREP_WORKER_SOURCE },
-    });
-    runtimeSessionResolved = host.createSession();
-  } catch (e) {
-    // A host without the runtime core (python-less deployment in a bare
-    // Node import of this module) gets none — every bash/python attempt
-    // then fails loudly at the tool boundary instead of silently working.
-    runtimeSessionResolved = null;
-  }
-  return runtimeSessionResolved;
+  return false;
 }
+
+// Sync read for the seams and the reset hook: the resolved session, or
+// null while unresolved / unavailable. A reset landing before any task
+// ran can only miss a cold (never-booted) interpreter, so null is safe
+// there.
+function ensureRuntimeSession() {
+  if (runtimeSessionResolved === undefined && resolveSessionFromHooks()) return runtimeSessionResolved;
+  return runtimeSessionResolved === undefined ? null : runtimeSessionResolved;
+}
+
+// Task-path resolution: the seam wins; otherwise ONE createRuntime
+// assembly, memoized. A host without a workable runtime core resolves to
+// null — every bash/python attempt then fails loudly at the tool boundary.
+function whenRuntimeSession() {
+  if (runtimeSessionResolved !== undefined) return Promise.resolve(runtimeSessionResolved);
+  if (resolveSessionFromHooks()) return Promise.resolve(runtimeSessionResolved);
+  if (!runtimeSessionBootstrap) {
+    runtimeSessionBootstrap = createRuntime({
+      workerAssets: { pyWorkerSource: PY_WORKER_SOURCE, grepWorkerSource: GREP_WORKER_SOURCE },
+    }).then((host) => {
+      if (runtimeSessionResolved === undefined) runtimeSessionResolved = host.createSession();
+      return runtimeSessionResolved;
+    }, () => {
+      if (runtimeSessionResolved === undefined) runtimeSessionResolved = null;
+      return runtimeSessionResolved;
+    });
+  }
+  return runtimeSessionBootstrap;
+}
+
+export { whenRuntimeSession };
 
 // Canonical accessor for callers outside this module (the ?e2e=1 seam and
 // the status subscription). Returns null when this deployment has no
@@ -250,7 +278,7 @@ function taskMutationPolicy() {
 // survives intact. A cancel/reset/dispose landing while prepare waited
 // for the in-flight barrier refuses the configuration (no late effect).
 async function preparePythonRuntimeForEnvironment(env, signal) {
-  const s = ensureRuntimeSession();
+  const s = await whenRuntimeSession();
   if (!s) return;
   const wanted = env ? env.pythonExtensionKey : null;
   // A null key means the core-only runtime: the payload is cleared
@@ -432,12 +460,13 @@ function productNetworkAuthorization() {
   };
 }
 
-function wiredToolExecutor(tool, input, workspace, opts) {
+async function wiredToolExecutor(tool, input, workspace, opts) {
   const o = Object.assign({}, opts || {}, {
     // M2a: bash routes through the public RuntimeSession entry — the
     // session injects the interpreter instance and the grep worker asset
-    // itself; this wiring carries neither.
-    runtimeSession: ensureRuntimeSession(),
+    // itself; this wiring carries neither. The entry assembles
+    // asynchronously, so the task path awaits the one-time resolution.
+    runtimeSession: await whenRuntimeSession(),
     // M1b: the product mutation policy — mv/rm refusals (skill identity
     // among them) come from IT, never from hardcoded runtime rules.
     mutationPolicy: taskMutationPolicy(),

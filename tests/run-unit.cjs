@@ -43,6 +43,8 @@ const SUITES = [
   'python-lifecycle.test.cjs',
   'store-python-lifecycle.test.mjs',
   'runtime-standalone.test.mjs',
+  'runtime-self-assembly.test.mjs',
+  'runtime-session-lifecycle.test.mjs',
   'runtime-boundary.test.cjs',
   'mutation-policy.test.cjs',
   'vfs-audit.test.cjs',

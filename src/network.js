@@ -918,3 +918,9 @@ function bytesToBase64(bytes) {
   }
   return btoa(out);
 }
+
+// M2a review: explicit cross-file publish (see telemetry.js). shell.js
+// dispatches curl through NetworkRuntime and renders URLs through
+// safeNetworkUrlForDisplay.
+globalThis.NetworkRuntime = NetworkRuntime;
+globalThis.safeNetworkUrlForDisplay = safeNetworkUrlForDisplay;

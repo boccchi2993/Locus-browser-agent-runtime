@@ -252,3 +252,9 @@ async function ensureWorkspacePermission(handle) {
   if ((await handle.queryPermission(opts)) === 'granted') return true;
   return (await handle.requestPermission(opts)) === 'granted';
 }
+
+// M2a review: explicit cross-file publish (see telemetry.js). vfs.js
+// extends WorkspaceAdapter at LOAD time and calls normalizeWorkspacePath
+// throughout — on the ESM self-assembly path both must be bare globals.
+globalThis.WorkspaceAdapter = WorkspaceAdapter;
+globalThis.normalizeWorkspacePath = normalizeWorkspacePath;

@@ -1,44 +1,54 @@
 // ============================================================
-//  LOCUS RUNTIME — PUBLIC ENTRY (M2a, repository split)
+//  LOCUS RUNTIME — PUBLIC ENTRY (M2a + review round)
 //
 //  createRuntime → RuntimeHost → RuntimeSession: the importable
 //  boundary the contract drafts (docs/REPOSITORY-SPLIT-CONTRACTS.md
 //  §3.1/§3.6/§3.8) prescribe. Importing this module starts no worker,
-//  downloads no Python and touches no DOM; createRuntime() validates
-//  the injected worker assets; a session constructs its interpreter
-//  instance lazily in every behavioral sense (prepare is pure
-//  configuration; the first python execution boots).
+//  downloads no Python and touches no DOM.
 //
-//  A host needs exactly: this module + the runtime core classic
-//  scripts (telemetry/workspace/vfs/network/shell — registered through
-//  the declared __LOCUS_RUNTIME_CORE__ table) + the worker assets.
-//  No Harness, no Product page, no Vue, no persistence.
+//  ASSEMBLY (review round): the entry assembles its own dependencies.
+//  Two modes, ONE implementation set — never a second copy of state:
+//    1. CLASSIC REGISTRY: the host page loaded the core classic scripts
+//       (telemetry/workspace/vfs/network/shell); shell.js published the
+//       frozen __LOCUS_RUNTIME_CORE__ table. The entry DELEGATES to that
+//       table, so a mixed page keeps exactly one copy of every core
+//       definition (the product page path).
+//    2. SELF-ASSEMBLY: no registry — the entry dynamically imports its
+//       own copy of the SAME five sources through ./core.js (one memoized
+//       import). The core files publish their cross-file names explicitly
+//       so the identical sources work as ES modules. Merely not having
+//       preloaded the classic scripts is therefore NOT an error; a broken
+//       or partial registry, or missing worker assets, still is.
+//  The dynamic import never fires on a registry page: the product bundle
+//  never fetches the self-assembly chunk.
 //
-//  WHAT A SESSION OWNS: one interpreter instance (createPythonRuntime —
-//  all interpreter mutable state stays inside it, M1b), the status
-//  listener fan-out and the prepare serialization tail. WHAT A REQUEST
-//  CARRIES: the task-frozen execution context (filesystem, signal,
-//  mutation policy, authorization port). The session never stores task
-//  state, chat identity, model config or Vue references.
+//  WHAT A SESSION OWNS (review round): one interpreter instance
+//  (createPythonRuntime — all interpreter mutable state stays inside it,
+//  M1b), the status listener fan-out, the prepare serialization chain,
+//  AND the full lifecycle of every accepted public execute — from
+//  admission (queued behind an in-flight prepare barrier) to complete
+//  settlement, INCLUDING composite shell work (VFS writes, grep, curl,
+//  python-inside-shell), which counts exactly once.
+//
+//  TWO SEPARATE INVALIDATION ALGEBRAS:
+//    - the SESSION boundary generation (session.reset/dispose) — a real
+//      boundary: invalidates in-flight executes (via a session-owned
+//      cancellation plane merged with the caller's signal), refuses every
+//      prepare it crossed, and blocks not-yet-started side effects of
+//      queued work. Already-dispatched provider operations are awaited
+//      and reported honestly — never rolled back, never a fake success.
+//    - the INTERPRETER generation (instance reset/dispose) — bumped by
+//      legitimate prepare rebuilds (a key change tears down and rebuilds
+//      the interpreter) as well as by boundaries. A prepare that waited
+//      judges only the SESSION algebra: a concurrent prepare's rebuild is
+//      normal serialized work, not an external reset.
+//
+//  A host needs exactly: this module + the worker assets. VFS helpers
+//  (createWorkspace/createMemoryWorkspace) are exported for hosts; they
+//  delegate to the resolved core — call them after createRuntime().
 // ============================================================
 
-// ---------- core resolution (declared Runtime-internal seam) ----------
-// src/shell.js publishes this frozen table at load (see the registry
-// block at the end of that file). Resolved LAZILY, at createRuntime()
-// time: importing this entry must succeed even before the core loads.
-function runtimeCore() {
-  const core = globalThis.__LOCUS_RUNTIME_CORE__;
-  if (!core || typeof core.createPythonRuntime !== 'function'
-      || typeof core.runShellCommand !== 'function'
-      || typeof core.runPythonCode !== 'function'
-      || typeof core.VirtualWorkspace !== 'function') {
-    throw new Error(
-      'Locus runtime core not loaded: include src/shell.js (and the runtime'
-      + ' classic scripts it builds on: telemetry/workspace/vfs/network) before createRuntime()');
-  }
-  return core;
-}
-
+// ---------- worker asset validation ----------
 function requireWorkerSource(value, name) {
   if (typeof value !== 'string' || !value.trim()) {
     throw new Error('createRuntime: workerAssets.' + name + ' (a non-empty worker source string) is required');
@@ -53,14 +63,96 @@ function cancelled(what) {
   return e;
 }
 
+// ---------- core resolution ----------
+const CORE_REQUIRED = ['createPythonRuntime', 'runShellCommand', 'runPythonCode'];
+
+function validateCore(core) {
+  for (const k of CORE_REQUIRED) {
+    if (!core || typeof core[k] !== 'function') {
+      throw new Error('Locus runtime core is present but incomplete (missing ' + k
+        + '): the core classic set (telemetry/workspace/vfs/network/shell) is'
+        + ' broken or partial — load the five files together');
+    }
+  }
+  return core;
+}
+
+function readCoreRegistry() {
+  return globalThis.__LOCUS_RUNTIME_CORE__ || null;
+}
+
+let coreAssembly = null;
+async function resolveCore() {
+  const reg = readCoreRegistry();
+  if (reg) return validateCore(reg);
+  if (!coreAssembly) {
+    coreAssembly = import('./core.js').then(() => {
+      const core = readCoreRegistry();
+      if (!core) {
+        throw new Error('runtime core self-assembly produced no __LOCUS_RUNTIME_CORE__ registry');
+      }
+      return validateCore(core);
+    });
+  }
+  return coreAssembly;
+}
+
+// The core the most recent createRuntime() resolved (VFS export delegates).
+let assembledCore = null;
+
+function coreConstructor(name) {
+  const core = assembledCore || readCoreRegistry();
+  const Ctor = core && core[name];
+  if (typeof Ctor !== 'function') {
+    throw new Error(name + ' is not available yet: call createRuntime() first'
+      + ' (the runtime assembles its core there)');
+  }
+  return Ctor;
+}
+
 // ---------- the entry ----------
-export function createRuntime(opts) {
+// Async: configuration is validated synchronously (a bad worker asset or
+// a broken registry fails before any assembly work), then the core is
+// resolved (registry delegation or one self-assembly import).
+export async function createRuntime(opts) {
   const o = opts || {};
   const workerAssets = {
     pyWorkerSource: requireWorkerSource(o.workerAssets && o.workerAssets.pyWorkerSource, 'pyWorkerSource'),
     grepWorkerSource: requireWorkerSource(o.workerAssets && o.workerAssets.grepWorkerSource, 'grepWorkerSource'),
   };
-  const core = runtimeCore();
+  const core = await resolveCore();
+  assembledCore = core;
+  return createRuntimeHost(core, workerAssets);
+}
+
+// ---------- VFS exports ----------
+// The task filesystem constructors, delegating to the resolved core — a
+// host imports this module and builds its filesystem without any classic
+// global. createWorkspace supplies the runtime's own shell command surface
+// by default (a host may override listCommands); the home skeleton stays
+// the host's explicit choice (contract §3.6 — neutral default when
+// omitted, exactly like the underlying VirtualWorkspace).
+export function createWorkspace(opts) {
+  const VirtualWorkspace = coreConstructor('VirtualWorkspace');
+  const o = opts || {};
+  const merged = Object.assign({ listCommands: () => shellCommandNames() }, o);
+  return new VirtualWorkspace(merged);
+}
+
+export function createMemoryWorkspace(opts) {
+  const MemoryWorkspace = coreConstructor('MemoryWorkspace');
+  return new MemoryWorkspace(opts);
+}
+
+// The runtime's shell command surface (registry data; [] before assembly).
+export function shellCommandNames() {
+  const core = assembledCore || readCoreRegistry();
+  const cmds = core && core.SHELL_COMMANDS;
+  return cmds ? Object.keys(cmds) : [];
+}
+
+// ---------- RuntimeHost ----------
+function createRuntimeHost(core, workerAssets) {
   const sessions = new Set();
   let hostDisposed = null;
 
@@ -102,15 +194,47 @@ function createRuntimeSession(core, workerAssets, onReleased) {
   // The ONE interpreter instance for this session (M1b lifecycle inside).
   const py = core.createPythonRuntime({ pyWorkerSource: workerAssets.pyWorkerSource });
 
+  // ---- execution tracking (session-owned) ----
+  // Every ACCEPTED public execute is tracked here from admission to
+  // complete settlement. Composite shell work (VFS writes, grep, network,
+  // python-inside-shell) lives INSIDE its one execute entry and is never
+  // counted twice. busyExecutions reports this set's size — the session's
+  // honest "not yet settled" count.
+  const inflight = new Set();
+
+  // ---- session boundary algebra ----
+  // Bumped by reset()/dispose() ONLY. The interpreter's own
+  // _resetGeneration moves for a second reason (a legitimate prepare
+  // rebuild) and is NEVER read as a boundary signal here.
+  let boundaryGeneration = 0;
+  let boundaryReason = null;
+  // Terminal state: set by dispose(); execute/prepare refuse with this
+  // reason afterwards.
+  let sessionDisposed = null;
+  // Per-execute invalidation hooks: a boundary aborts every in-flight
+  // execute's merged cancellation plane. Each hook removes itself in its
+  // execute's finally — exactly one registration, exactly one release.
+  const boundaryListeners = new Set();
+
+  function fireBoundary() {
+    for (const fn of Array.from(boundaryListeners)) {
+      try { fn(); } catch (e) { /* contained: an observer can never break the boundary */ }
+    }
+  }
+
   // ---- status fan-out ----
   // One pump subscription over the instance's event stream for the
   // session's lifetime; session listeners are fanned out from it. The
   // INSTANCE contains observer exceptions per listener already; the
   // session-side fan-out is a plain synchronous loop (the pump callback
-  // itself never throws — a throwing listener would break the instance's
-  // containment loop otherwise).
+  // itself never throws).
   const listeners = new Set();
   let unsubInstance = null;
+  function sessionStatus() {
+    const snap = py.snapshot();
+    snap.busyExecutions = inflight.size;
+    return snap;
+  }
   function ensurePump() {
     if (unsubInstance) return;
     // Subscribe BEFORE adding the listener so the instance's immediate
@@ -118,38 +242,60 @@ function createRuntimeSession(core, workerAssets, onReleased) {
     // delivered exactly once by onStatus itself.
     unsubInstance = py.onStatus(() => {
       for (const fn of Array.from(listeners)) {
-        try { fn(py.snapshot()); } catch (e) { /* contained: observer failure */ }
+        try { fn(sessionStatus()); } catch (e) { /* contained: observer failure */ }
       }
     });
   }
 
-  // Prepare serialization: concurrent prepares apply in call order.
+  // ---- prepare serialization chain ----
+  // Concurrent prepares apply in call order: each enqueues one exclusive
+  // chain segment. A cancelled queued prepare returns promptly but its
+  // SEGMENT still completes in order, so a later prepare can never jump
+  // ahead of an unfinished earlier one.
   let prepareTail = Promise.resolve();
-  // Terminal session state: set by dispose(); execute/prepare refuse with
-  // this reason afterwards (the interpreter instance refuses on its own
-  // too — this is the session-level expression of the same boundary).
-  let sessionDisposed = null;
+  // The interpreter generation the CHAIN last observed or produced. While
+  // a prepare waits, this is the ONLY legitimate way the interpreter
+  // generation may move (a chained prepare's own serialized apply). A move
+  // to any other value means an out-of-band instance reset and refuses the
+  // waiting prepare.
+  let chainPyGeneration = py._resetGeneration;
+
+  // Settlement barrier over everything in flight AT CALL TIME (public
+  // executes + any instance-level runs from the documented test seam).
+  // Call-time, not apply-time: executes admitted later queue behind the
+  // chain and must never extend (or deadlock against) an earlier prepare's
+  // barrier.
+  function sessionSettlementSnapshot() {
+    const proms = [];
+    for (const e of inflight) if (e.done) proms.push(e.done.then(() => {}, () => {}));
+    const pySettle = py._inflightSettlement();
+    if (pySettle) proms.push(pySettle);
+    return proms.length ? Promise.all(proms) : null;
+  }
 
   const session = {
     // ---- between-task configuration (contract §3.1 prepare) ----
-    // Waits for every execution in flight AT CALL TIME to settle (a
-    // barrier of settlement promises — no timers, no busy polling, no
-    // retry), then re-validates before applying ANYTHING:
-    //   disposed            → throws the disposal reason;
-    //   reset during wait   → throws the boundary reason, nothing applied;
-    //   signal aborted      → the cancellation-shaped refusal (M1b form).
+    // Waits for (1) its turn on the serialization chain and (2) every
+    // execution in flight AT CALL TIME to settle — no timers, no polling —
+    // then re-validates before applying ANYTHING:
+    //   disposed (session or instance) → throws the disposal reason;
+    //   session boundary during wait   → throws the boundary reason,
+    //                                    nothing applied;
+    //   out-of-band instance reset     → refuses (never mistaken for a
+    //                                    legitimate chained rebuild);
+    //   signal aborted                 → the cancellation-shaped refusal
+    //                                    (M1b form).
     // Only then the instance's synchronous validate-then-swap prepare
     // runs. A configuration can never land late for a task that died
     // while its prepare was waiting.
     prepare(req) {
+      if (sessionDisposed) return Promise.reject(new Error(sessionDisposed));
       if (py._disposed) return Promise.reject(new Error(py._disposed));
       const signal = req && req.signal;
       if (signal && signal.aborted) return Promise.reject(cancelled('python preparation'));
-      const generationBefore = py._resetGeneration;
-      const inflight = py._inflightSettlement();
       // Cancellation plane registered SYNCHRONOUSLY at call time — a cancel
-      // landing while this prepare waits for the serialization tail OR the
-      // in-flight barrier must refuse it, never surface after the wait.
+      // landing while this prepare waits for the chain or the in-flight
+      // barrier must refuse it, never surface after the wait.
       let onAbort = null;
       const abortSettled = signal
         ? new Promise((resolve) => {
@@ -160,23 +306,36 @@ function createRuntimeSession(core, workerAssets, onReleased) {
       const prev = prepareTail;
       let release;
       prepareTail = new Promise((r) => { release = r; });
+      const boundaryAtCall = boundaryGeneration;
+      const inflightBarrier = sessionSettlementSnapshot();
       const race = (p) => Promise.race(abortSettled ? [p, abortSettled] : [p]);
       const stopped = () => { if (signal && onAbort) signal.removeEventListener('abort', onAbort); };
       return (async () => {
         try {
           await race(prev);
           if (signal && signal.aborted) throw cancelled('python preparation');
-          if (inflight) {
-            await race(inflight);
+          if (inflightBarrier) {
+            await race(inflightBarrier);
             if (signal && signal.aborted) throw cancelled('python preparation');
           }
-          // Post-barrier validation — the no-late-effect gate.
+          // Post-barrier validation — the no-late-effect gate. Captured
+          // against the SESSION algebra: a concurrent prepare's legitimate
+          // interpreter rebuild (already applied ahead of us on the chain)
+          // is not an external reset.
+          if (sessionDisposed) throw new Error(sessionDisposed);
           if (py._disposed) throw new Error(py._disposed);
-          if (py._resetGeneration !== generationBefore) {
-            throw new Error('python runtime reset while preparation waited for in-flight executions; configuration not applied');
+          if (boundaryGeneration !== boundaryAtCall) {
+            throw new Error('python runtime reset while preparation waited for in-flight executions;'
+              + ' configuration not applied (' + (boundaryReason || 'session boundary') + ')');
+          }
+          if (py._resetGeneration !== chainPyGeneration) {
+            throw new Error('python runtime was reset outside the preparation chain while preparation waited;'
+              + ' configuration not applied');
           }
           if (signal && signal.aborted) throw cancelled('python preparation');
-          return py.prepare(req);
+          const result = py.prepare(req);
+          chainPyGeneration = py._resetGeneration;
+          return result;
         } finally {
           stopped();
           release();
@@ -191,60 +350,142 @@ function createRuntimeSession(core, workerAssets, onReleased) {
     // cwd. The result is the honest tool-shaped report plus a normalized
     // `ok` (compute AND commit success; partial failure is never a
     // success — the underlying report keeps every field).
+    //
+    // LIFECYCLE (review round): the execute is tracked from admission to
+    // complete settlement. Admission = queued behind the prepare barrier
+    // in force at call time (a new execute can never penetrate an
+    // in-flight prepare). The caller's signal and the session's own
+    // invalidation plane are MERGED into one internal controller: a
+    // reset/dispose lands at the run's next cancellation checkpoint
+    // (between shell steps, before every write, before every commit)
+    // WITHOUT depending on the caller ever aborting. Already-dispatched
+    // provider operations settle and are reported honestly — a
+    // boundary-stopped run is never rewritten as a success.
     async execute(req) {
       if (sessionDisposed) throw new Error(sessionDisposed);
       const kind = req && req.kind;
+      if (kind !== 'shell' && kind !== 'python') {
+        throw new Error('runtime execute: unsupported kind: ' + String(kind));
+      }
       const ctx = (req && req.context) || {};
-      const opts = {
-        signal: ctx.signal,
-        mutationPolicy: ctx.mutationPolicy,
-        authorization: ctx.authorization,
-        // Runtime-internal injections: the session's OWN interpreter and
-        // grep worker asset — a request can never execute on a foreign
-        // instance or fetch its worker source from anywhere else.
-        pythonRuntime: py,
-        grepWorkerSource: workerAssets.grepWorkerSource,
-        cwd: ctx.cwd,
+      const entry = { done: null };
+      inflight.add(entry);
+      const callerSignal = ctx.signal;
+      const merged = new AbortController();
+      const onCallerAbort = () => {
+        try { merged.abort(callerSignal.reason); } catch (e) { merged.abort(); }
       };
-      if (kind === 'shell') {
-        // filesystem OPTIONAL: absent → the shell's own fallback (a fresh
-        // internal machine — the accepted asVfs semantics, unchanged).
-        const res = await core.runShellCommand(req.input, ctx.filesystem, opts);
-        return Object.assign({ ok: !res.isError }, res);
+      if (callerSignal) {
+        if (callerSignal.aborted) onCallerAbort();
+        else callerSignal.addEventListener('abort', onCallerAbort, { once: true });
       }
-      if (kind === 'python') {
-        const res = await core.runPythonCode(req.input, ctx.filesystem, opts);
-        return Object.assign({ ok: !!res.success }, res);
-      }
-      throw new Error('runtime execute: unsupported kind: ' + String(kind));
+      const boundaryAtCall = boundaryGeneration;
+      // Report annotation for a run the boundary superseded: the session's
+      // cancellation plane may land BEFORE the instance's own generation
+      // check, so the honest report names the boundary through this
+      // additive field — the underlying report keeps every field.
+      const supersededNote = () => (boundaryGeneration !== boundaryAtCall
+        ? { boundary: boundaryReason || 'session boundary' }
+        : null);
+      const onBoundary = () => {
+        if (boundaryGeneration !== boundaryAtCall) {
+          merged.abort(new Error(boundaryReason || 'session boundary'));
+        }
+      };
+      boundaryListeners.add(onBoundary);
+      const prevPrepare = prepareTail;
+      const run = (async () => {
+        try {
+          // ADMISSION: wait out the prepare barrier captured at call time.
+          await prevPrepare;
+          if (sessionDisposed) throw new Error(sessionDisposed);
+          if (boundaryGeneration !== boundaryAtCall) {
+            throw cancelled(boundaryReason || 'session boundary');
+          }
+          if (merged.signal.aborted) throw cancelled('execution');
+          const opts = {
+            signal: merged.signal,
+            mutationPolicy: ctx.mutationPolicy,
+            authorization: ctx.authorization,
+            // Runtime-internal injections: the session's OWN interpreter and
+            // grep worker asset — a request can never execute on a foreign
+            // instance or fetch its worker source from anywhere else.
+            pythonRuntime: py,
+            grepWorkerSource: workerAssets.grepWorkerSource,
+            cwd: ctx.cwd,
+          };
+          if (kind === 'shell') {
+            // filesystem OPTIONAL: absent → the shell's own fallback (a fresh
+            // internal machine — the accepted asVfs semantics, unchanged).
+            const res = await core.runShellCommand(req.input, ctx.filesystem, opts);
+            return Object.assign({ ok: !res.isError }, res, supersededNote());
+          }
+          const res = await core.runPythonCode(req.input, ctx.filesystem, opts);
+          return Object.assign({ ok: !!res.success }, res, supersededNote());
+        } finally {
+          // Exactly one release of every registration and the tracking seat.
+          boundaryListeners.delete(onBoundary);
+          if (callerSignal) callerSignal.removeEventListener('abort', onCallerAbort);
+          inflight.delete(entry);
+        }
+      })();
+      // Assigned synchronously (no await separates it from the inflight
+      // add), so a prepare barrier taken at any later moment sees EVERY
+      // accepted execute exactly once.
+      entry.done = run;
+      return run;
     },
 
     // ---- state reads + status subscription (contract §3.8) ----
-    // Canonical snapshot; onStatus delivers the CURRENT snapshot
-    // synchronously on subscribe (no missed-edge window, no polling),
-    // then every change. Observer exceptions are contained per listener;
-    // unsubscribe stops everything for that listener.
+    // Canonical snapshot (interpreter state + the SESSION's busy count);
+    // onStatus delivers the CURRENT snapshot synchronously on subscribe
+    // (no missed-edge window, no polling), then every change. Observer
+    // exceptions are contained per listener; unsubscribe stops everything
+    // for that listener.
     status() {
-      return py.snapshot();
+      return sessionStatus();
     },
     onStatus(fn) {
       if (typeof fn !== 'function') return () => {};
       ensurePump();
       listeners.add(fn);
-      try { fn(py.snapshot()); } catch (e) { /* contained: initial read */ }
+      try { fn(sessionStatus()); } catch (e) { /* contained: initial read */ }
       return () => { listeners.delete(fn); };
     },
 
-    // ---- boundaries (M1b semantics, verbatim) ----
+    // ---- boundaries ----
+    // reset: a session boundary — invalidates every in-flight execute
+    // (their merged cancellation plane fires; already-dispatched provider
+    // operations still settle and report honestly), refuses every prepare
+    // it crossed, and blocks queued-not-started side effects. The
+    // interpreter instance reset (M1b semantics, verbatim) runs with it.
+    // The session stays usable afterwards.
     reset(reason) {
+      boundaryGeneration++;
+      boundaryReason = 'runtime session reset' + (reason ? ': ' + reason : '');
+      fireBoundary();
       py.reset(reason);
+      // The boundary's OWN interpreter reset is chained work, not an
+      // out-of-band mutation: sync the chain algebra so a fresh prepare
+      // after the boundary applies normally.
+      chainPyGeneration = py._resetGeneration;
     },
+    // dispose: terminal. Everything reset does, plus permanent refusal of
+    // execute/prepare. Idempotent: a second dispose keeps the first
+    // reason. busyExecutions drains only as the overtaken executes truly
+    // settle.
     dispose(reason) {
       const why = 'runtime session disposed' + (reason ? ': ' + reason : '');
-      sessionDisposed = why;
-      py.dispose(why);
-      if (unsubInstance) { unsubInstance(); unsubInstance = null; }
-      listeners.clear();
+      if (!sessionDisposed) {
+        sessionDisposed = why;
+        boundaryGeneration++;
+        boundaryReason = why;
+        fireBoundary();
+        py.dispose(why);
+        chainPyGeneration = py._resetGeneration;
+        if (unsubInstance) { unsubInstance(); unsubInstance = null; }
+        listeners.clear();
+      }
       if (onReleased) onReleased();
     },
 

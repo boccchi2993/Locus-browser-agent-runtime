@@ -21,9 +21,12 @@ const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, normalizeV
 // shell.js published the declared core registry). Worker sources are
 // never booted by this suite.
 const { createRuntime } = require('../src/runtime/index.js');
-const __session = createRuntime({
+// M2a review: the public entry assembles asynchronously — the session is
+// resolved before the checks drive it.
+const __hostPromise = createRuntime({
   workerAssets: { pyWorkerSource: '/* not booted in this suite */', grepWorkerSource: '/* not booted in this suite */' },
-}).createSession();
+});
+let __session = null;
 const exec = (tool, input, workspace, opts) => M.executeTool(tool, input, workspace,
   Object.assign({ runtimeSession: __session }, opts || {}));
 // Node has no real Worker: grep regex execution runs through the TEST-ONLY deterministic fake.
@@ -97,7 +100,7 @@ function b64(s) { return Buffer.from(s, 'utf8').toString('base64'); }
 
 // M1b: python runs on an injected instance (what the product wiring does).
 const { freshRuntime } = require('./helpers/runtime.cjs');
-const pyrt = __session.pythonRuntime(); // the session drives THIS instance
+let pyrt = null; // the session drives THIS instance — resolved at run() start
 function withPyrt(opts) { return Object.assign({ pythonRuntime: pyrt }, opts || {}); }
 function mockWorkerResult(result) {
   pyrt._ensureWorker = () => {};
@@ -137,6 +140,8 @@ function check(name, cond, detail) {
 }
 
 async function run() {
+  __session = (await __hostPromise).createSession();
+  pyrt = __session.pythonRuntime();
   // ---------- Q. quoted operators are DATA, never syntax ----------
   {
     const ws = fixture();

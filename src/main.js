@@ -205,12 +205,15 @@ if (e2eMode) {
 // Python interpreter status is owned by the runtime session (M2a): the
 // status EVENT stream replaces the old 1-second poll — the store
 // projection updates on every transition, with the current snapshot
-// delivered synchronously at subscribe time.
+// delivered synchronously at subscribe time. The public entry assembles
+// asynchronously (review round), so the subscription attaches once the
+// one-time session resolution settles (a microtask on a registry page).
 {
-  const rt = ui.runtimeSession();
-  if (rt && typeof rt.onStatus === 'function') {
-    rt.onStatus((snap) => { ui.store.pythonStatus = snap.interpreter; });
-  }
+  ui.whenRuntimeSession().then((rt) => {
+    if (rt && typeof rt.onStatus === 'function') {
+      rt.onStatus((snap) => { ui.store.pythonStatus = snap.interpreter; });
+    }
+  });
 }
 
 // ---------- demo automation ----------

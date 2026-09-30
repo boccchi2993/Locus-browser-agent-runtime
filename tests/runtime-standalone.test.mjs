@@ -53,15 +53,17 @@ check('A1b the worker-asset module imports standalone',
   && typeof assets.GREP_WORKER_SOURCE === 'string' && assets.GREP_WORKER_SOURCE.length > 100,
   JSON.stringify({ py: !!(assets && assets.PY_WORKER_SOURCE), grep: !!(assets && assets.GREP_WORKER_SOURCE) }));
 
-check('A1c createRuntime without the core is a clear assembly error (never a partial runtime)',
-  (() => {
-    try { entry.createRuntime({ workerAssets: { pyWorkerSource: 'x', grepWorkerSource: 'y' } }); return false; }
-    catch (e) { return /runtime core not loaded/.test(errText(e)); }
+check('A1c a BROKEN (partial) registry is a clear assembly error — missing legal configuration',
+  (async () => {
+    globalThis.__LOCUS_RUNTIME_CORE__ = { createPythonRuntime() {} };
+    try { await entry.createRuntime({ workerAssets: { pyWorkerSource: 'x', grepWorkerSource: 'y' } }); return false; }
+    catch (e) { return /incomplete/.test(errText(e)); }
+    finally { delete globalThis.__LOCUS_RUNTIME_CORE__; }
   })(), '');
 check('A1d createRuntime without worker assets is refused before anything else',
-  (() => {
+  (async () => {
     globalThis.__LOCUS_RUNTIME_CORE__ = { createPythonRuntime() {}, runShellCommand() {}, runPythonCode() {}, VirtualWorkspace() {} };
-    try { entry.createRuntime({}); return false; }
+    try { await entry.createRuntime({}); return false; }
     catch (e) { return /workerAssets\.pyWorkerSource/.test(errText(e)); }
     finally { delete globalThis.__LOCUS_RUNTIME_CORE__; }
   })(), '');
@@ -76,7 +78,7 @@ const coreSrc = ['src/telemetry.js', 'src/workspace.js', 'src/vfs.js', 'src/netw
 const CORE = (0, eval)(coreSrc + '\n;({ createPythonRuntime, runShellCommand, VirtualWorkspace, MemoryWorkspace, SHELL_COMMANDS, shellSystemPromptSection })');
 
 const { createRuntime } = entry;
-const host = createRuntime({
+const host = await createRuntime({
   workerAssets: { pyWorkerSource: assets.PY_WORKER_SOURCE, grepWorkerSource: assets.GREP_WORKER_SOURCE },
 });
 check('A2 a host builds over the core-only file set', typeof host.createSession === 'function' && host.contractVersion === 1, '');
@@ -160,7 +162,7 @@ function payload(key) {
 }
 
 {
-  const hostD = createRuntime({ workerAssets: { pyWorkerSource: assets.PY_WORKER_SOURCE, grepWorkerSource: assets.GREP_WORKER_SOURCE } });
+  const hostD = await createRuntime({ workerAssets: { pyWorkerSource: assets.PY_WORKER_SOURCE, grepWorkerSource: assets.GREP_WORKER_SOURCE } });
   const sD = hostD.createSession();
   const pyD = sD.pythonRuntime();
   const ctl = attachControlledWorker(pyD);
@@ -210,8 +212,8 @@ function payload(key) {
   ctl.resolve(workerMsgId, { stdout: 'parked' });
   const runOutcome = await runPromise;
   check('D5 the in-flight run superseded by the boundary settles honestly (never a clean success)',
-    runOutcome.ok === false && /boundary while prepare waits/.test(String(runOutcome.stderr || '')),
-    JSON.stringify({ ok: runOutcome.ok, stderr: runOutcome.stderr }));
+    runOutcome.ok === false && /boundary while prepare waits/.test(String(runOutcome.boundary || '')),
+    JSON.stringify({ ok: runOutcome.ok, boundary: runOutcome.boundary, stderr: runOutcome.stderr }));
 
   // Once quiet, EVERY prepare that the boundary overtook has refused
   // (no-late-effect); a FRESH prepare applies.
@@ -232,8 +234,8 @@ function payload(key) {
 
 // ============ Gate C: two hosts never cross ============
 {
-  const hostA = createRuntime({ workerAssets: { pyWorkerSource: assets.PY_WORKER_SOURCE, grepWorkerSource: assets.GREP_WORKER_SOURCE } });
-  const hostB = createRuntime({ workerAssets: { pyWorkerSource: assets.PY_WORKER_SOURCE, grepWorkerSource: assets.GREP_WORKER_SOURCE } });
+  const hostA = await createRuntime({ workerAssets: { pyWorkerSource: assets.PY_WORKER_SOURCE, grepWorkerSource: assets.GREP_WORKER_SOURCE } });
+  const hostB = await createRuntime({ workerAssets: { pyWorkerSource: assets.PY_WORKER_SOURCE, grepWorkerSource: assets.GREP_WORKER_SOURCE } });
   const sa = hostA.createSession();
   const sb = hostB.createSession();
   const pa = sa.pythonRuntime();

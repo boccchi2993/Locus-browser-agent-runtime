@@ -31,9 +31,12 @@ const M = eval(src + '\n;({ WorkspaceAdapter, MemoryWorkspace, normalizeWorkspac
 // shell.js published the declared core registry). Worker sources are
 // never booted by this suite.
 const { createRuntime } = require('../src/runtime/index.js');
-const __session = createRuntime({
+// M2a review: the public entry assembles asynchronously — the session is
+// resolved before the checks drive them.
+const __hostPromise = createRuntime({
   workerAssets: { pyWorkerSource: '/* not booted in this suite */', grepWorkerSource: '/* not booted in this suite */' },
-}).createSession();
+});
+let __session = null;
 const exec = (tool, input, workspace, opts) => M.executeTool(tool, input, workspace,
   Object.assign({ runtimeSession: __session }, opts || {}));
 
@@ -56,7 +59,7 @@ const hexPrefix = (u8, n) => Array.from((u8 || []).slice(0, n)).join(',');
 // M1b: python runs on an INJECTED interpreter instance (what the product
 // wiring does). One suite instance; every bash call gets it via opts.
 const { freshRuntime } = require('./helpers/runtime.cjs');
-const pyrt = __session.pythonRuntime(); // the session drives THIS instance
+let pyrt = null; // the session drives THIS instance — resolved at run() start
 const rawExecuteTool = M.executeTool;
 M.executeTool = (name, input, ws, opts) => rawExecuteTool(name, input, ws, Object.assign({ pythonRuntime: pyrt }, opts || {}));
 
@@ -207,6 +210,8 @@ async function runWorkerJobs(jobs) {
 }
 
 async function run() {
+  __session = (await __hostPromise).createSession();
+  pyrt = __session.pythonRuntime();
   // ================================================================
   //  F-01 — byte-preserving append
   // ================================================================

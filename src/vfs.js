@@ -634,3 +634,12 @@ class VirtualWorkspace {
     this.mount('/mnt/upload', new UploadWorkspace({ name: 'upload' }), 'read-only');
   }
 }
+
+// M2a review: explicit cross-file publish (see telemetry.js). shell.js
+// constructs VirtualWorkspace/MemoryWorkspace and calls
+// normalizeVfsPath/vfsError; the entry exposes the workspace
+// constructors to hosts. Bare globals keep both load modes working.
+globalThis.normalizeVfsPath = normalizeVfsPath;
+globalThis.vfsError = vfsError;
+globalThis.MemoryWorkspace = MemoryWorkspace;
+globalThis.VirtualWorkspace = VirtualWorkspace;

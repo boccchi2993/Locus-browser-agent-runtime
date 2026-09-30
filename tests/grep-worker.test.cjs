@@ -124,13 +124,30 @@ const M = eval(src + '\n;({ WorkspaceAdapter, normalizeWorkspacePath, VirtualWor
 // shell.js published the declared core registry). Worker sources are
 // never booted by this suite.
 const { createRuntime } = require('../src/runtime/index.js');
-const __session = createRuntime({
+// M2a review: the public entry assembles asynchronously — the session is
+// resolved before the checks drive them.
+const __hostPromise = createRuntime({
   workerAssets: { pyWorkerSource: '/* not booted in this suite */', grepWorkerSource: '/* not booted in this suite */' },
-}).createSession();
+});
+let __session = null;
 const exec = (tool, input, workspace, opts) => M.executeTool(tool, input, workspace,
   Object.assign({ runtimeSession: __session }, opts || {}));
 
 const Fake = installGrepFakeWorker(M);
+
+// The session's admission queue moves the worker creation into the exec
+// microtask chain — a synchronous last(Fake.instances) capture after
+// exec() can be stale. Arm the scan drop at CREATION time instead:
+// deterministic under any admission schedule.
+function armNextWorkerScanDrop() {
+  const prev = M.GrepRegexRuntime._workerFactory;
+  M.GrepRegexRuntime._workerFactory = (...a) => {
+    M.GrepRegexRuntime._workerFactory = prev;
+    const wk = prev(...a);
+    wk.dropCmds = new Set(['scan']);
+    return wk;
+  };
+}
 
 // Hierarchical in-memory workspace (same model as shell-compat3.test.cjs).
 class TreeWS extends M.WorkspaceAdapter {
@@ -317,8 +334,10 @@ async function partB() {
   w0 = Fake.instances.length;
   const t0 = Date.now();
   const p1 = exec('bash', 'grep foo f.txt', vfs, {});
+  armNextWorkerScanDrop();
+  await until(() => Fake.instances.length > w0, 1000);
   w = last(Fake.instances);
-  w.dropCmds = new Set(['scan']); // init completes; the scan never answers
+    w.dropCmds = new Set(['scan']); // init completes; the scan never answers
   r = await p1;
   const elapsed = Date.now() - t0;
   check('T1 hanging regex scan fails with the bounded timeout message',
@@ -338,8 +357,10 @@ async function partB() {
   w0 = Fake.instances.length;
   const ac = new AbortController();
   const p2 = exec('bash', 'grep foo f.txt', vfs, { signal: ac.signal });
+  armNextWorkerScanDrop();
+  await until(() => Fake.instances.length > w0, 1000);
   w = last(Fake.instances);
-  w.dropCmds = new Set(['scan']);
+    w.dropCmds = new Set(['scan']);
   await until(() => w.sent.some((m) => m.cmd === 'scan'));
   ac.abort();
   r = await p2;
@@ -354,8 +375,10 @@ async function partB() {
   vfs = fixture({ 'f.txt': enc('foo\n') });
   w0 = Fake.instances.length;
   const p3 = exec('bash', 'grep foo f.txt', vfs, {});
+  armNextWorkerScanDrop();
+  await until(() => Fake.instances.length > w0, 1000);
   w = last(Fake.instances);
-  w.dropCmds = new Set(['scan']);
+    w.dropCmds = new Set(['scan']);
   await until(() => w.sent.some((m) => m.cmd === 'scan'));
   w.crash();
   r = await p3;
@@ -381,8 +404,10 @@ async function partB() {
   vfs = fixture({ 'f.txt': enc('foo\n') });
   const acR1 = new AbortController();
   const pR1 = exec('bash', 'grep foo f.txt', vfs, { signal: acR1.signal });
+  armNextWorkerScanDrop();
+  await until(() => Fake.instances.length > w0, 1000);
   w = last(Fake.instances);
-  w.dropCmds = new Set(['scan']);
+    w.dropCmds = new Set(['scan']);
   await until(() => w.sent.some((m) => m.cmd === 'scan'));
   const scanIdR1 = w.sent.find((m) => m.cmd === 'scan').id;
   w.lateDeliver({ id: scanIdR1, type: 'result', matches: [{ lineNumber: 1, line: 'foo' }], hitMatchLimit: false });
@@ -394,8 +419,10 @@ async function partB() {
   vfs = fixture({ 'f.txt': enc('foo\n') });
   const acR2 = new AbortController();
   const pR2 = exec('bash', 'grep foo f.txt', vfs, { signal: acR2.signal });
+  armNextWorkerScanDrop();
+  await until(() => Fake.instances.length > w0, 1000);
   w = last(Fake.instances);
-  w.dropCmds = new Set(['scan']);
+    w.dropCmds = new Set(['scan']);
   await until(() => w.sent.some((m) => m.cmd === 'scan'));
   acR2.abort();
   w.lateDeliver({ id: w.sent.find((m) => m.cmd === 'scan').id, type: 'result', matches: [{ lineNumber: 1, line: 'foo' }], hitMatchLimit: false });
@@ -423,6 +450,7 @@ function partC() {
 }
 
 (async () => {
+  __session = (await __hostPromise).createSession();
   partA();
   await partB();
   partC();

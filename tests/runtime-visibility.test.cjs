@@ -33,10 +33,13 @@ const M = eval(
 // M2a: bash routes through the PUBLIC runtime entry (the eval'd shell.js
 // published the core registry). Worker sources are never booted here.
 const { createRuntime } = require('../src/runtime/index.js');
-const __host = createRuntime({
+// M2a review: the public entry assembles asynchronously — the host and
+// session are resolved before the checks drive them.
+const __hostPromise = createRuntime({
   workerAssets: { pyWorkerSource: '/* not booted in this suite */', grepWorkerSource: '/* not booted in this suite */' },
 });
-const __session = __host.createSession();
+let __host = null;
+let __session = null;
 const withSession = (opts) => Object.assign({ runtimeSession: __session }, opts || {});
 
 let passed = 0, failed = 0;
@@ -79,6 +82,8 @@ function newSession(overrides) {
 const WS = { name: 'visibility-test' };
 
 async function run() {
+  __host = await __hostPromise;
+  __session = __host.createSession();
   // ================= R-NF04C: malformed URL is never echoed raw =================
 
   // --- V1. the runtime error itself is the bounded constant ---

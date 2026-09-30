@@ -35,9 +35,12 @@ installGrepFakeWorker(SH);
 // M2a: bash routes through the PUBLIC runtime entry (core registry from
 // the eval'd shell.js); worker sources are never booted in this suite.
 const { createRuntime } = require('../src/runtime/index.js');
-const __session = createRuntime({
+// M2a review: the public entry assembles asynchronously — the session is
+// resolved before the checks drive them.
+const __hostPromise = createRuntime({
   workerAssets: { pyWorkerSource: '/* not booted */', grepWorkerSource: '/* not booted */' },
-}).createSession();
+});
+let __session = null;
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -119,6 +122,7 @@ function guardFor(manager, storage, taskEnvironment, signalOrNull) {
 }
 
 async function run() {
+  __session = (await __hostPromise).createSession();
   // ================= Definition / Instance model =================
   const rig0 = rig();
   check('D1 production-style manager keeps source store and instances separate',

@@ -19,10 +19,13 @@ const M = eval(src + '\n;({ Telemetry, WorkspaceAdapter, normalizeWorkspacePath,
 // built here exactly the way a standalone host does (worker sources are
 // never booted — this suite runs text commands only).
 const { createRuntime } = require('../src/runtime/index.js');
-const __host = createRuntime({
+// M2a review: the public entry assembles asynchronously — the host and
+// session are resolved before the checks drive them.
+const __hostPromise = createRuntime({
   workerAssets: { pyWorkerSource: '/* not booted in this suite */', grepWorkerSource: '/* not booted in this suite */' },
 });
-const __session = __host.createSession();
+let __host = null;
+let __session = null;
 const exec = (tool, input, workspace, opts) => M.executeTool(tool, input, workspace,
   Object.assign({ runtimeSession: __session }, opts || {}));
 
@@ -85,6 +88,8 @@ function reset() { calls = []; routes = []; M.Telemetry.records.length = 0; }
 function lastRec() { return M.Telemetry.records[M.Telemetry.records.length - 1]; }
 
 async function run() {
+  __host = await __hostPromise;
+  __session = __host.createSession();
   const ws = new MemWS();
 
   // ---------- 1. curl text → stdout ----------

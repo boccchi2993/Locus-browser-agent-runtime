@@ -32,9 +32,12 @@ function check(name, cond, detail) {
 
 // The Runtime file set (source of truth: INVENTORY §2 ownership + the M2a
 // design record). telemetry.js is the shared util the runtime consumes.
+// core.js (M2a review) is the self-assembly module: the SAME five sources
+// imported as ES modules when a host carries no classic copies.
 const RUNTIME_FILES = [
   'src/runtime/index.js',
   'src/runtime/worker-assets.js',
+  'src/runtime/core.js',
   'src/telemetry.js',
   'src/workspace.js',
   'src/vfs.js',
@@ -180,6 +183,53 @@ for (const f of RUNTIME_FILES) {
     && !/\bwindow\b/.test(entrySrc.replace(/^\s*\/\/.*$/gm, '')), 'window reference in entry');
   check('G6c the entry performs no DOM work at import or construction',
     !/document\./.test(entrySrc), 'document reference in entry');
+}
+
+// ---------- G7: the entry's TRANSITIVE ESM dependency closure (review round) ----------
+// The self-assembling entry must never reach a Harness/Product file: walk
+// the import graph from src/runtime/index.js (static imports, re-exports
+// and dynamic import() calls) and require every reached file to be part of
+// the Runtime set — and the closure to actually COVER the core (the
+// publishes only work when the five files load in order).
+{
+  const resolveFrom = (fromFile, spec) => {
+    if (!spec.startsWith('.')) return null; // bare specifiers are out of scope here
+    const base = path.join(path.dirname(path.join(ROOT, fromFile)), spec);
+    return path.relative(ROOT, base).split(path.sep).join('/');
+  };
+  const seen = new Set();
+  const walk = (file) => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    // Fresh regex per file: a shared /g regex's lastIndex is corrupted by
+    // the inline recursion below.
+    const IMPORT_RE = /(?:from\s*|import\s+|import\()\s*['"]([^'"]+)['"]/g;
+    const src = read(file);
+    let m;
+    while ((m = IMPORT_RE.exec(src)) !== null) {
+      const rel = resolveFrom(file, m[1]);
+      if (rel) walk(rel);
+    }
+  };
+  walk('src/runtime/index.js');
+  const ALLOWED = new Set(RUNTIME_FILES);
+  const outside = Array.from(seen).filter((f) => !ALLOWED.has(f));
+  check('G7 the entry\u2019s transitive import closure stays inside the Runtime set',
+    outside.length === 0, JSON.stringify(outside));
+  // worker-assets.js is deliberately ABSENT from the closure: its sources
+  // travel as host-injected strings (createRuntime workerAssets), never as
+  // an import of the entry.
+  const CORE_CLOSURE = [
+    'src/runtime/core.js',
+    'src/telemetry.js',
+    'src/workspace.js',
+    'src/vfs.js',
+    'src/network.js',
+    'src/shell.js',
+  ];
+  const MISSING = CORE_CLOSURE.filter((f) => !seen.has(f));
+  check('G7b the closure covers the whole core (self-assembly is complete)',
+    MISSING.length === 0, JSON.stringify(MISSING));
 }
 
 console.log('\n' + passed + ' passed, ' + failed + ' failed');

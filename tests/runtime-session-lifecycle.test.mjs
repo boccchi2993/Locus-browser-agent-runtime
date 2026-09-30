@@ -1,0 +1,577 @@
+// Runtime SESSION LIFECYCLE gates (M2a review round — gaps 1+2).
+//
+// The M2a session tracked ONLY the interpreter instance: a composite shell
+// execution (VFS writes, grep, network, python-inside-shell) was invisible
+// to busyExecutions, to the prepare barrier and to reset/dispose. The
+// review requires the session to own EVERY accepted public execute from
+// admission to full settlement, with its OWN invalidation/cancellation
+// plane (merged with the caller's signal), and to separate the session
+// boundary generation (reset/dispose) from the interpreter's legitimate
+// prepare-rebuild generation.
+//
+// Everything here is DETERMINISTIC: parked VFS writes/reads, a controlled
+// python worker, a held authorization port and a held fetch. No fixed
+// delays — ordering is proven with event barriers and scheduling ticks
+// (setImmediate), never with timeouts.
+//
+// The core is eval'd ONCE here (registry path) so the grep fake-worker
+// seam and the session under test share the SAME implementation copy.
+// Run: node tests/runtime-session-lifecycle.test.mjs
+
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const read = (p) => readFileSync(join(root, p), 'utf8');
+
+let passed = 0, failed = 0;
+function check(name, cond, detail) {
+  const line = (cond ? 'PASS ' : 'FAIL ') + name + (detail !== undefined ? ' | ' + String(detail).slice(0, 400) : '');
+  console.log(line);
+  if (cond) passed++; else failed++;
+}
+const errText = (e) => String(e && e.message ? e.message : e);
+const tick = () => new Promise((r) => setImmediate(r));
+process.on('unhandledRejection', (e) => { console.error('UNHANDLED:', e && e.stack || e); process.exit(3); });
+
+// ---------- the core (classic eval — registry path) ----------
+globalThis.window = { location: { protocol: 'https:' }, addEventListener: () => {} };
+globalThis.document = { getElementById: () => { throw new Error('lifecycle suite touched the DOM'); } };
+const CORE = (0, eval)(['src/telemetry.js', 'src/workspace.js', 'src/vfs.js', 'src/network.js', 'src/shell.js']
+  .map(read).join('\n;\n')
+  + '\n;({ VirtualWorkspace, MemoryWorkspace, SHELL_COMMANDS, createPythonRuntime, GrepRegexRuntime })');
+
+const { installGrepFakeWorker } = await import('./helpers/grep-fake-worker.cjs');
+installGrepFakeWorker(CORE);
+
+const entry = await import('../src/runtime/index.js');
+const { createRuntime } = entry;
+
+const workerAssets = (await import('../src/runtime/worker-assets.js'));
+const WA = { pyWorkerSource: workerAssets.PY_WORKER_SOURCE, grepWorkerSource: workerAssets.GREP_WORKER_SOURCE };
+
+function payload(key) {
+  return { key, modules: [{ pluginId: 'locus-test-plugin', imports: ['locus_test_plugin'], files: { '__init__.py': 'x = 1\n' } }] };
+}
+
+// ---------- deterministic parking VFS ----------
+// A real VirtualWorkspace whose write/read/readBytes can be PARKED on a
+// path predicate behind an openable gate. Every phase transition is
+// emitted to a log and can be awaited — the barriers, not timers, prove
+// ordering.
+class ParkingVfs extends CORE.VirtualWorkspace {
+  constructor(opts) {
+    super(opts);
+    this.log = [];
+    this.onEvent = null;
+    this._parkWrite = null;
+    this._parkRead = null;
+    this._gate = { promise: Promise.resolve(), open: () => {} };
+  }
+  parkWrites(pred) { this._parkWrite = pred; this._arm(); }
+  parkReads(pred) { this._parkRead = pred; this._arm(); }
+  _arm() {
+    let open;
+    this._gate = { promise: new Promise((r) => { open = r; }), open };
+  }
+  openGate() { this._gate.open(); }
+  _emit(ev) {
+    this.log.push(ev);
+    if (this.onEvent) { try { this.onEvent(ev); } catch (e) { /* observer contained */ } }
+    const ws = this._waiters && this._waiters.get(ev);
+    if (ws) { this._waiters.delete(ev); for (const r of ws) r(); }
+  }
+  waitFor(ev) {
+    if (this.log.includes(ev)) return Promise.resolve();
+    if (!this._waiters) this._waiters = new Map();
+    return new Promise((res) => {
+      const ws = this._waiters.get(ev) || [];
+      ws.push(res);
+      this._waiters.set(ev, ws);
+    });
+  }
+  async write(path, text) {
+    this._emit('write:enter:' + path);
+    if (this._parkWrite && this._parkWrite(path)) {
+      this._emit('write:park:' + path);
+      await this._gate.promise;
+      this._emit('write:resume:' + path);
+    }
+    const out = await super.write(path, text);
+    this._emit('write:commit:' + path);
+    return out;
+  }
+  async read(path) {
+    this._emit('read:enter:' + path);
+    if (this._parkRead && this._parkRead(path)) {
+      this._emit('read:park:' + path);
+      await this._gate.promise;
+      this._emit('read:resume:' + path);
+    }
+    return await super.read(path);
+  }
+  async readBytes(path) {
+    this._emit('read:enter:' + path);
+    if (this._parkRead && this._parkRead(path)) {
+      this._emit('read:park:' + path);
+      await this._gate.promise;
+      this._emit('read:resume:' + path);
+    }
+    return await super.readBytes(path);
+  }
+}
+
+function makeVfs() {
+  return new ParkingVfs({ listCommands: () => Object.keys(CORE.SHELL_COMMANDS) });
+}
+
+// Controlled python worker (the D-gate technique): the instance believes a
+// worker exists; the test decides when the run settles.
+function attachControlledWorker(rt) {
+  const posted = [];
+  rt._ensureWorker = async () => {};
+  rt.worker = { postMessage(msg) { posted.push(msg); } };
+  return {
+    posted,
+    resolve(msgId, result) {
+      const p = rt._pending.get(msgId);
+      if (!p) return false;
+      clearTimeout(p.timer);
+      rt._pending.delete(msgId);
+      p.resolve(Object.assign({ stdout: '', stderr: '', error: null, files: [], deleted: [] }, result));
+      return true;
+    },
+  };
+}
+
+async function parkedComposite(s, vfs, firstPath, secondPath) {
+  // echo first > firstPath; echo second > secondPath — the first write is
+  // parked INSIDE the VFS (dispatched, unsettled).
+  vfs.parkWrites((p) => p === firstPath);
+  // The RUN promise is returned inside a plain wrapper: an async function's
+  // bare return of the run promise would chain this helper's completion to
+  // the run's SETTLEMENT instead of the park point (thenable unwrapping).
+  const run = s.execute({
+    kind: 'shell',
+    input: 'echo first > ' + firstPath + '; echo second > ' + secondPath,
+    context: { filesystem: vfs },
+  });
+  await vfs.waitFor('write:park:' + firstPath);
+  return { run };
+}
+
+// ============================================================
+// Gap 1 — the session owns the FULL execution lifecycle
+// ============================================================
+
+// ---- R1: session.reset stops a composite shell at the boundary ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: runPromise } = await parkedComposite(s, vfs, '/tmp/first', '/tmp/second');
+
+  check('R1a the composite shell is tracked while its write is dispatched (busy=1)',
+    s.status().busyExecutions === 1, JSON.stringify(s.status()));
+
+  s.reset('review boundary');
+  vfs.openGate();
+  const res = await runPromise;
+
+  check('R1b the post-boundary side effect never dispatched (second write absent)',
+    !vfs.log.includes('write:enter:/tmp/second'), JSON.stringify(vfs.log));
+  check('R1c the already-dispatched write settled and is recorded honestly (no fake rollback)',
+    vfs.log.includes('write:commit:/tmp/first')
+    && (await vfs.exists('/tmp/first')) === true, JSON.stringify(vfs.log));
+  check('R1d the boundary-stopped run is never a clean success',
+    res.ok === false && /cancelled/.test(String(res.output || '')), JSON.stringify(res));
+  check('R1e busy returns to zero only after true settlement',
+    s.status().busyExecutions === 0, JSON.stringify(s.status()));
+  const after = await s.execute({ kind: 'shell', input: 'echo usable', context: { filesystem: vfs } });
+  check('R1f the session stays usable after reset', after.ok === true && after.output === 'usable', JSON.stringify(after));
+  host.dispose();
+}
+
+// ---- R2: dispose and host.dispose terminate the same way ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: runPromise } = await parkedComposite(s, vfs, '/tmp/d1', '/tmp/d2');
+  await vfs.waitFor('write:park:/tmp/d1');
+  s.dispose('review dispose');
+  vfs.openGate();
+  const res = await runPromise;
+  check('R2a dispose stops the composite shell (no post-boundary write)',
+    !vfs.log.includes('write:enter:/tmp/d2') && vfs.log.includes('write:commit:/tmp/d1'), JSON.stringify(vfs.log));
+  check('R2b the disposed-run report is honest, busy drains to zero',
+    res.ok === false && s.status().busyExecutions === 0, JSON.stringify({ res: res.ok, status: s.status() }));
+  let refused = null;
+  try { await s.execute({ kind: 'shell', input: 'echo x', context: { filesystem: vfs } }); }
+  catch (e) { refused = e; }
+  check('R2c a disposed session refuses new executes', !!refused && /disposed/.test(errText(refused)), errText(refused));
+
+  const host2 = await createRuntime({ workerAssets: WA });
+  const s2 = host2.createSession();
+  const vfs2 = makeVfs();
+  const { run: run2 } = await parkedComposite(s2, vfs2, '/tmp/h1', '/tmp/h2');
+  await vfs2.waitFor('write:park:/tmp/h1');
+  host2.dispose('review host dispose');
+  vfs2.openGate();
+  const res2 = await run2;
+  check('R2d host.dispose stops in-flight composite shells too',
+    !vfs2.log.includes('write:enter:/tmp/h2') && res2.ok === false, JSON.stringify({ log: vfs2.log, ok: res2.ok }));
+  check('R2e host.dispose drains busy to zero', s2.status().busyExecutions === 0, JSON.stringify(s2.status()));
+  host.dispose();
+}
+
+// ---- R3: prepare waits for a NON-python execution ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: runPromise } = await parkedComposite(s, vfs, '/tmp/p1', '/tmp/p2');
+  await vfs.waitFor('write:park:/tmp/p1');
+
+  let prepareSettled = false;
+  const pp = s.prepare({ python: payload('env-r3') }).then((r) => { prepareSettled = true; return r; });
+  await tick();
+  check('R3a prepare waits while a shell write is dispatched (nothing applied)',
+    prepareSettled === false && s.status().extensionKey === null,
+    JSON.stringify({ settled: prepareSettled, key: s.status().extensionKey }));
+
+  vfs.openGate();
+  await runPromise;
+  const applied = await pp;
+  check('R3b prepare applies only after the full execution settled',
+    prepareSettled === true && s.status().extensionKey === 'env-r3', JSON.stringify(s.status()));
+  check('R3c busy was zero at apply time', s.status().busyExecutions === 0, JSON.stringify(s.status()));
+  host.dispose();
+}
+
+// ---- R4: an execute admitted during a prepare wait cannot penetrate the barrier ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: runPromise } = await parkedComposite(s, vfs, '/tmp/r4a', '/tmp/r4b');
+  await vfs.waitFor('write:park:/tmp/r4a');
+
+  const pa = s.prepare({ python: payload('env-r4') }); // waits for the parked write
+  const keyAtE2Enter = { value: null };
+  vfs.onEvent = (ev) => { if (ev === 'write:enter:/tmp/e2.txt') keyAtE2Enter.value = s.status().extensionKey; };
+  const e2 = s.execute({ kind: 'shell', input: 'echo e2 > /tmp/e2.txt', context: { filesystem: vfs } });
+  await tick();
+  check('R4a the new execute does not start while the prepare barrier is pending',
+    !vfs.log.includes('write:enter:/tmp/e2.txt'), JSON.stringify(vfs.log));
+
+  vfs.openGate();
+  await runPromise;
+  await e2;
+  await pa;
+  check('R4b the admitted execute ran only AFTER the prepare applied (config visible at its first effect)',
+    keyAtE2Enter.value === 'env-r4', String(keyAtE2Enter.value));
+  check('R4c final configuration is the prepare\u2019s', s.status().extensionKey === 'env-r4', JSON.stringify(s.status()));
+  host.dispose();
+}
+
+// ---- R5: network authorization wait / response wait under a boundary ----
+{
+  const realFetch = globalThis.fetch;
+  const fetchCalls = [];
+  let heldFetch = null;
+  try {
+    // ---- R5a: boundary while the authorization port holds the POST ----
+    {
+      const host = await createRuntime({ workerAssets: WA });
+      const s = host.createSession();
+      const vfs = makeVfs();
+      let releaseAuth;
+      const authGate = new Promise((r) => { releaseAuth = r; });
+      const port = { request: async () => { await authGate; return { outcome: 'allow' }; } };
+      const runPromise = s.execute({
+        kind: 'shell',
+        input: 'curl -X POST -d hello http://test.local/hook; echo after > /tmp/na.txt',
+        context: { filesystem: vfs, authorization: port },
+      });
+      await tick(); // the run reaches the authorization hold
+      check('R5a0 the network execute is tracked while authorization is pending (busy=1)',
+        s.status().busyExecutions === 1, JSON.stringify(s.status()));
+      s.reset('review boundary net');
+      releaseAuth({ outcome: 'allow' });
+      const res = await runPromise;
+      check('R5a the post-approval side effect was refused: fetch never dispatched',
+        fetchCalls.length === 0, JSON.stringify(fetchCalls));
+      check('R5a2 the compound tail after the network op never ran',
+        !vfs.log.includes('write:enter:/tmp/na.txt'), JSON.stringify(vfs.log));
+      check('R5a3 the boundary-stopped network run is honest and busy drained',
+        res.ok === false && s.status().busyExecutions === 0, JSON.stringify({ ok: res.ok, status: s.status() }));
+      host.dispose();
+    }
+    // ---- R5b: boundary while the RESPONSE is in flight ----
+    {
+      const host = await createRuntime({ workerAssets: WA });
+      const s = host.createSession();
+      const vfs = makeVfs();
+      let releaseFetch;
+      heldFetch = new Promise((r) => { releaseFetch = r; });
+      globalThis.fetch = async (input, init) => {
+        fetchCalls.push(String((input && input.url) || input));
+        await heldFetch;
+        return new Response('net-body', { status: 200, headers: { 'content-type': 'text/plain' } });
+      };
+      const runPromise = s.execute({
+        kind: 'shell',
+        input: 'curl http://test.local/data; echo after > /tmp/nb.txt',
+        context: { filesystem: vfs },
+      });
+      await tick();
+      s.reset('review boundary net response');
+      releaseFetch(new Response('net-body', { status: 200, headers: { 'content-type': 'text/plain' } }));
+      const res = await runPromise;
+      check('R5b the dispatched request settled exactly once (no re-dispatch after the boundary)',
+        fetchCalls.length === 1, JSON.stringify(fetchCalls));
+      check('R5b2 the compound tail never ran and busy drained',
+        !vfs.log.includes('write:enter:/tmp/nb.txt') && s.status().busyExecutions === 0,
+        JSON.stringify({ log: vfs.log, status: s.status() }));
+      check('R5b3 the result is settled and honest', typeof res.ok === 'boolean', JSON.stringify(res).slice(0, 200));
+      host.dispose();
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ---- R6: grep running across a boundary (real worker source, parked read) ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  await s.execute({ kind: 'shell', input: 'echo aaaX > /tmp/g.txt', context: { filesystem: vfs } });
+  vfs.log.length = 0;
+  vfs.parkReads((p) => p === '/tmp/g.txt');
+  const runPromise = s.execute({
+    kind: 'shell',
+    input: 'grep -c X /tmp/g.txt; echo late > /tmp/late.txt',
+    context: { filesystem: vfs },
+  });
+  await vfs.waitFor('read:park:/tmp/g.txt');
+  check('R6a the grep execution is tracked while parked (busy=1)',
+    s.status().busyExecutions === 1, JSON.stringify(s.status()));
+  s.reset('review boundary grep');
+  vfs.openGate();
+  const res = await runPromise;
+  check('R6b the grep settled (real worker source) and the compound tail was refused',
+    !vfs.log.includes('write:enter:/tmp/late.txt') && res.ok === false, JSON.stringify({ log: vfs.log, ok: res.ok }));
+  check('R6c busy drained to zero after the grep settled',
+    s.status().busyExecutions === 0, JSON.stringify(s.status()));
+  host.dispose();
+}
+
+// ---- R7: two sessions never cross ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const sa = host.createSession();
+  const sb = host.createSession();
+  const vfsA = makeVfs();
+  const vfsB = makeVfs();
+  const { run: runA } = await parkedComposite(sa, vfsA, '/tmp/a1', '/tmp/a2');
+  await vfsA.waitFor('write:park:/tmp/a1');
+  // A's prepare is WAITING when the boundary lands; B works throughout.
+  const paPending = sa.prepare({ python: payload('env-r7') }).catch((e) => e);
+  await tick();
+  vfsB.parkWrites(() => false);
+  const runB = sb.execute({ kind: 'shell', input: 'echo b > /tmp/b1.txt; echo b2 > /tmp/b2.txt', context: { filesystem: vfsB } });
+  sa.reset('review boundary A');
+  vfsA.openGate();
+  const resA = await runA;
+  const resB = await runB;
+  const refusalA = await paPending;
+  check('R7a resetting A stopped A’s composite shell', !vfsA.log.includes('write:enter:/tmp/a2') && resA.ok === false,
+    JSON.stringify({ log: vfsA.log, ok: resA.ok }));
+  check('R7b B never noticed A’s boundary', resB.ok === true
+    && vfsB.log.includes('write:commit:/tmp/b2.txt')
+    && sb.status().busyExecutions === 0, JSON.stringify({ ok: resB.ok, log: vfsB.log, status: sb.status() }));
+  check('R7c the prepare crossed by A’s boundary refused with that boundary’s reason',
+    refusalA instanceof Error && /review boundary A/.test(errText(refusalA)), errText(refusalA));
+  const pa2 = await sa.prepare({ python: payload('env-r7c') });
+  check('R7c2 A prepares normally again after its own boundary (sessions stay usable)',
+    pa2.rebuiltInterpreter === true && sa.status().extensionKey === 'env-r7c', JSON.stringify(sa.status()));
+  const pb = await sb.prepare({ python: payload('env-r7b') });
+  check('R7d B prepares normally', pb.rebuiltInterpreter === true && sb.status().extensionKey === 'env-r7b',
+    JSON.stringify(sb.status()));
+  host.dispose();
+}
+
+// ---- R8: settlement order vs busy release ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const py = s.pythonRuntime();
+  const ctl = attachControlledWorker(py);
+  const vfs = makeVfs();
+
+  const pyPromise = s.execute({ kind: 'python', input: 'print("parked")', context: { filesystem: new CORE.VirtualWorkspace({}) } });
+  await tick();
+  const { run: runShell } = await parkedComposite(s, vfs, '/tmp/s1', '/tmp/s2');
+  await vfs.waitFor('write:park:/tmp/s1');
+  check('R8a two in-flight executions count once each at the session (busy=2)',
+    s.status().busyExecutions === 2, JSON.stringify(s.status()));
+
+  ctl.resolve(ctl.posted[0].id, { stdout: 'parked' });
+  await pyPromise;
+  check('R8b the python settle released exactly its own seat (busy=1)',
+    s.status().busyExecutions === 1, JSON.stringify(s.status()));
+
+  s.reset('review boundary r8');
+  vfs.openGate();
+  const res = await runShell;
+  check('R8c the shell settle released the last seat (busy=0)',
+    s.status().busyExecutions === 0 && res.ok === false, JSON.stringify({ busy: s.status().busyExecutions, ok: res.ok }));
+  host.dispose();
+}
+
+// ============================================================
+// Gap 2 — session boundary algebra vs interpreter rebuild algebra
+// ============================================================
+
+// ---- P1: same-stack prepare(A), prepare(B): a legitimate rebuild is not an external reset ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const pa = s.prepare({ python: payload('env-a') });
+  const pb = s.prepare({ python: payload('env-b') });
+  const [ra, rb] = await Promise.all([pa.catch((e) => e), pb.catch((e) => e)]);
+  check('P1 concurrent prepares apply in call order without misjudging the rebuild',
+    !(ra instanceof Error) && !(rb instanceof Error) && s.status().extensionKey === 'env-b',
+    JSON.stringify({ a: errText(ra), b: errText(rb), key: s.status().extensionKey }));
+  check('P1b both prepares report the rebuild', ra.rebuiltInterpreter === true && rb.rebuiltInterpreter === true,
+    JSON.stringify({ a: ra, b: rb }));
+  host.dispose();
+}
+
+// ---- P2: a REAL reset still refuses a prepare it crosses ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: runPromise } = await parkedComposite(s, vfs, '/tmp/p2a', '/tmp/p2b');
+  await vfs.waitFor('write:park:/tmp/p2a');
+  const pp = s.prepare({ python: payload('env-p2') }).catch((e) => e);
+  await tick();
+  s.reset('review boundary p2');
+  vfs.openGate();
+  await runPromise;
+  const refusal = await pp;
+  check('P2 a reset crossing a waiting prepare refuses the configuration',
+    !!refusal && /reset while preparation waited/.test(errText(refusal)), errText(refusal));
+  const fresh = await s.prepare({ python: payload('env-p2b') });
+  check('P2b the session prepares normally after the boundary',
+    fresh.rebuiltInterpreter === true && s.status().extensionKey === 'env-p2b', JSON.stringify(s.status()));
+  host.dispose();
+}
+
+// ---- P3: cancelling a QUEUED prepare returns promptly but holds the chain ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: runPromise } = await parkedComposite(s, vfs, '/tmp/p3a', '/tmp/p3b');
+  await vfs.waitFor('write:park:/tmp/p3a');
+
+  const pa = s.prepare({ python: payload('env-p3a') });
+  const acB = new AbortController();
+  const pb = s.prepare({ signal: acB.signal, python: payload('env-p3b') }).catch((e) => e);
+  const pc = s.prepare({ python: payload('env-p3c') }).catch((e) => e);
+  await tick();
+
+  acB.abort();
+  const rb = await pb;
+  check('P3a the cancelled queued prepare returns promptly (cancellation-shaped)',
+    rb && rb.name === 'AbortError' && rb.cancelled === true, errText(rb));
+  await tick();
+  check('P3b the cancel did NOT release the serialization barrier (nothing applied while the first waits)',
+    s.status().extensionKey === null, JSON.stringify(s.status()));
+
+  vfs.openGate();
+  await runPromise;
+  const ra = await pa;
+  const rc = await pc;
+  check('P3c the chain kept call order: A applied, then C applied (B never did)',
+    ra && ra.rebuiltInterpreter === true && rc && rc.rebuiltInterpreter === true
+    && s.status().extensionKey === 'env-p3c',
+    JSON.stringify({ a: errText(ra), c: errText(rc), key: s.status().extensionKey }));
+  host.dispose();
+}
+
+// ---- P4: a failing prepare does not wedge the chain ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const bad = s.prepare({ python: { key: 'env-bad', modules: [{ pluginId: 'BAD ID', imports: [] }] } }).catch((e) => e);
+  const good = s.prepare({ python: payload('env-p4') });
+  const rb = await bad;
+  const rg = await good;
+  check('P4 a failing prepare rejects and the next one still applies',
+    rb instanceof Error && rg.rebuiltInterpreter === true && s.status().extensionKey === 'env-p4',
+    JSON.stringify({ bad: errText(rb), key: s.status().extensionKey }));
+  host.dispose();
+}
+
+// ---- P5: a real boundary refuses EVERY prepare it crosses (A/B/C queue) ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: runPromise } = await parkedComposite(s, vfs, '/tmp/p5a', '/tmp/p5b');
+  await vfs.waitFor('write:park:/tmp/p5a');
+  const pa = s.prepare({ python: payload('env-p5a') }).catch((e) => e);
+  const pb = s.prepare({ python: payload('env-p5b') }).catch((e) => e);
+  const pc = s.prepare({ python: payload('env-p5c') }).catch((e) => e);
+  await tick();
+  s.reset('review boundary p5');
+  vfs.openGate();
+  await runPromise;
+  const [ra, rb, rc] = await Promise.all([pa, pb, pc]);
+  check('P5 every crossed prepare refused with the boundary reason',
+    [ra, rb, rc].every((r) => r instanceof Error && /reset while preparation waited/.test(errText(r))),
+    JSON.stringify([errText(ra), errText(rb), errText(rc)]));
+  check('P5b nothing was applied', s.status().extensionKey === null, JSON.stringify(s.status()));
+  const fresh = await s.prepare({ python: payload('env-p5-fresh') });
+  check('P5c the chain drained; the session prepares normally afterwards',
+    fresh.rebuiltInterpreter === true && s.status().extensionKey === 'env-p5-fresh', JSON.stringify(s.status()));
+  host.dispose();
+}
+
+// ---- P6: A/B/C queue with an execute admitted mid-wait (old run unsettled) ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: runPromise } = await parkedComposite(s, vfs, '/tmp/p6a', '/tmp/p6b');
+  await vfs.waitFor('write:park:/tmp/p6a');
+
+  const pa = s.prepare({ python: payload('env-p6a') });
+  const keyAt = {};
+  vfs.onEvent = (ev) => {
+    if (ev === 'write:enter:/tmp/e6.txt') keyAt.enter = s.status().extensionKey;
+    if (ev === 'write:commit:/tmp/e6.txt') keyAt.commit = s.status().extensionKey;
+  };
+  const e6 = s.execute({ kind: 'shell', input: 'echo e6 > /tmp/e6.txt', context: { filesystem: vfs } });
+  const pb = s.prepare({ python: payload('env-p6b') });
+
+  vfs.openGate();
+  await runPromise;
+  await e6;
+  check('P6a the admitted execute ran after A applied and BEFORE B applied',
+    keyAt.enter === 'env-p6a' && keyAt.commit === 'env-p6a', JSON.stringify(keyAt));
+  await pa;
+  await pb;
+  check('P6b B applied only after the admitted execute settled; final config is B',
+    s.status().extensionKey === 'env-p6b', JSON.stringify(s.status()));
+  host.dispose();
+}
+
+console.log('\n' + passed + ' passed, ' + failed + ' failed');
+process.exit(failed ? 1 : 0);

@@ -34,4 +34,11 @@ const Telemetry = {
   },
 };
 
-window.__telemetry = Telemetry.records;
+if (typeof window !== 'undefined') window.__telemetry = Telemetry.records;
+
+// M2a review: explicit cross-file publish. On the ESM self-assembly path
+// (src/runtime/core.js) top-level definitions are module-scoped; these
+// aliases keep the classic bare-global cross-file references working in
+// BOTH load modes. Classic loading is unaffected (same bindings).
+globalThis.Telemetry = Telemetry;
+globalThis.utf8ByteLength = utf8ByteLength;
