@@ -98,9 +98,37 @@ Not exercised interactively (covered by the deterministic gates instead): the st
 
 **M2b 完成；M2c 集成兼容性门与 M3 仓库提取尚未完成。**
 
-## 7. Unverified scope this round (honest boundary)
+## 7. Review round (first-pass findings → closed, 2026-10-01)
 
-- The standalone harness entry was proven in Node (H1/H4/H9), not as a BROWSER-built standalone page (no `dist/tests/harness-host.html` analogue was added — the runtime's host page remains the browser-side host evidence; a packaged harness host page is straightforward follow-up work if a browser harness host is wanted before M3).
-- No real model/relay was contacted anywhere (fakes and deterministic transports only); relay fallback (`/proxy`) behavior is carried by the unchanged implementation + the proxy/fetch suites, not re-verified end-to-end this round.
-- The replay validators remain in `persistence.js` (Product file) behind the landed port — their physical relocation, like all file extraction, is M3.
-- Python-related behavior is carried by this round's full e2e (python-authority, python-browser-authority, python-bootstrap-integrity, trusted-plugin-runtime all green); no NEW python-specific gates were added — M2b touched no worker/bootstrap code.
+Branch head after the round: `refactor/repository-split-m2b` @ the four commits on top of `3792fe8` (deep snapshot → request-context capture → replay-validation ownership → standalone browser gate + docs). Design record: M2B-DESIGN §10. All round gates were run in this worktree; first-failure evidence for F1/F2 was captured on the PRISTINE `3792fe8` sources (test file added first, sources untouched): the new F1+F2 blocks ran 54 PASS / 15 FAIL — every F1 deep-copy check and every F2 capture check red, including the two headline repros (a mid-task nested schema mutation reaching the sent `request.tools`; a parked request gaining a `/proxy` attempt when eligibility flipped `false→true` mid-flight). Log preserved out-of-tree (`tmp-f1f2-firstfail.log`, not committed). After the fixes the same file is 69 PASS / 0 FAIL; no pre-existing assertion was changed or loosened.
+
+### What landed
+
+| Commit | Piece |
+|---|---|
+| F1 | `deepCopyToolData` in `src/agent.js` — per-definition deep, frozen, transportable-JSON snapshots; non-transportable content (functions/circular refs/non-plain objects/undefined fields/non-finite numbers) fails `tool_registry_invalid` before any model request |
+| F2 | per-call request context in `createModelClient` (`src/model.js`) — `{ config, transport, relayAllowed }` + captured `{ timeoutMs, signal }` built at call entry before any await; `tryFetch` consults the captured boolean, never the getter |
+| F3 | `src/harness/replay-validation.js` (algorithms verbatim from `persistence.js`); `createProviderSessions` validator defaults + optional injection; entry re-exports; `persistence.js` one-way delegates over the published `__LOCUS_HARNESS_REPLAY_VALIDATION__` table; store passes no validators |
+| F4 | `tests/harness-host.html` as a REAL vite build input + `tests/e2e-harness-host.cjs` (registered `harness-host` in `tests/e2e.cjs`); boundary gate B1 set extended with `replay-validation.js`; docs updated |
+
+### Round gates (all re-run, this worktree, this round)
+
+| Command | Result | Notes |
+|---|---|---|
+| `npm test` | **PASS 54/54 suites, exit 0** (53 + new `harness-replay`) | harness-standalone now 69 checks (F1: 10, F2: 6); harness-boundary 13 (B1 covers the new module); persistence-audit 48 green through the delegates; store-defaults inlines the real module; no M1/M2a/M2b assertion weakened |
+| `npm run build` | PASS | new chunk topology: `harnessHost-*.js` (entry) + shared `index-*.js` (task-runner/provider-session/replay-validation) + `core-*.js` (harness self-assembly); product/runtime chunks unchanged |
+| `npm run test:e2e` | **PASS 18/18 suites, exit 0** | all 17 accepted suites green UNCHANGED plus the new `harness-host` (12 checks) — this run also re-verified the affected Product gates (wire, persistence, image, approval, capabilities, skill-instances, network, python × 4, runtime, runtime-host, presentation, responsive, grep, active-content) against the rewired store |
+| `node tests/e2e-harness-host.cjs` (inside the e2e battery) | 12/12 | zero classic scripts; declared table v1, no product DOM; loaded resources exactly {harnessHost, preload-helper, index, core} chunks + page + browser-automatic favicon — no Runtime/Product chunk, no `dist/src/*` classic script, no product CSS, no CDN; native tool→result→final answer through the real adapter pipeline (`request.tools` serialized to function tools, tool_result paired at `t1`); strict text fallback (prose fence = plain text 0 executions; pure fence executes once); parked task cancels (`task_start,warning,task_end`); restore over the in-memory store with the REAL validators (valid prefix restores; tail corrupted behind checkpoint → `checkpoint_beyond_tail`, `rawReplayInvalid`, replay blocked); zero page errors |
+
+### Round evidence discipline
+
+- First-failure: the F1/F2 test blocks were written and run against the untouched `3792fe8` sources BEFORE the source fixes (15 FAIL), then re-run after each fix; the intermediate F1-only green state was committed separately (`4859ac2` test+fix, then `f79ac18`).
+- Historical results (M2b's original 53-suite/17-suite records in §2) are carried, not re-implicated: every gate listed above was re-executed during this round; nothing is claimed from the old run for changed code paths.
+- No real model, relay, or paid API anywhere: all F2 relay paths ran over fake transports; the browser host page's model is a scripted fake transport through the real client factory.
+
+## 8. Unverified scope this round (honest boundary)
+
+- ~~The standalone harness entry was proven in Node (H1/H4/H9), not as a BROWSER-built standalone page~~ — CLOSED by the review round: `dist/tests/harness-host.html` is a real build input and its browser gate (12 checks over the packaged chunks) runs the full fake-model/fake-ToolPort battery plus real-validator restore. What the browser gate does NOT cover: an interactive human pass on the harness host page (the deterministic driver asserts behavior and resources; the M2b interactive product-page pass in §5 covered the product side).
+- No real model/relay was contacted anywhere (fakes and deterministic transports only, both rounds). The review round re-verified the relay DECISION semantics deterministically (capture-once-at-entry, both flip directions, per-call read count, client isolation — fake transports); an end-to-end run against a deployed `/proxy` relay remains uncovered by design in this repository's gates.
+- ~~The replay validators remain in `persistence.js` — their physical relocation is M3~~ — CLOSED by the review round: the algorithms live in `src/harness/replay-validation.js` (re-exported by the entry); `persistence.js` retains only one-way delegates. What M3 still owns: turning the delegates' classic-script compat surface (and the `Model`/`callModel` wrappers) into plain imports once the eval-based suite model converts.
+- Python-related behavior is carried by this round's full e2e (python-authority, python-browser-authority, python-bootstrap-integrity, trusted-plugin-runtime all green); no NEW python-specific gates were added — neither M2b nor the review round touched worker/bootstrap code.
