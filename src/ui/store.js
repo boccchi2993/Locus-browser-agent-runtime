@@ -455,7 +455,7 @@ function productModelTransportOpts() {
 }
 
 function productModelClient(body, opts) {
-  return createModelClient({ config: productModelConfig() })
+  return createModelClient({ config: productModelConfig(), ...productModelTransportOpts() })
     .call(Object.assign({ model: Model.model }, body), opts);
 }
 
@@ -520,9 +520,12 @@ const productToolPort = {
   },
   async execute(call) {
     const c = call && typeof call === 'object' ? call : {};
-    const workspace = c.filesystem || null;
+    // The task context is the port's narrow per-call binding:
+    // { filesystem, signal } (contract 3.2).
+    const context = c.context && typeof c.context === 'object' ? c.context : {};
+    const workspace = context.filesystem || null;
     const o = {
-      signal: c.signal,
+      signal: context.signal,
       // The public RuntimeSession entry assembles asynchronously, so the
       // task path awaits the one-time resolution (M2a semantics).
       runtimeSession: await whenRuntimeSession(),
