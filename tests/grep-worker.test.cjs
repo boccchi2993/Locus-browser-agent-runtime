@@ -411,10 +411,17 @@ async function partB() {
   await until(() => w.sent.some((m) => m.cmd === 'scan'));
   const scanIdR1 = w.sent.find((m) => m.cmd === 'scan').id;
   w.lateDeliver({ id: scanIdR1, type: 'result', matches: [{ lineNumber: 1, line: 'foo' }], hitMatchLimit: false });
-  acR1.abort(); // after settlement — must be a no-op
+  acR1.abort(); // after the worker reply — no second settlement, no re-delivery
   r = await pR1;
-  check('R1 result beats a following abort — single clean settlement',
-    r.success && r.output === 'foo' && w.terminateCount === 1, JSON.stringify(r) + ' tc=' + w.terminateCount);
+  // Round-2 classification contract: the abort landed before the execute
+  // settled and the machinery never reported it, so the session classifies
+  // the run honestly — failed, with the delivered result text KEPT in the
+  // output and exactly one worker settlement (the old pin asked for a
+  // clean success; the run's own result was never lost, only named).
+  check('R1 single settlement: reply delivered exactly once, abort named, result text kept',
+    w.terminateCount === 1 && r.success === false
+    && /foo/.test(String(r.output)) && /cancelled/i.test(String(r.output)),
+    JSON.stringify(r) + ' tc=' + w.terminateCount);
 
   vfs = fixture({ 'f.txt': enc('foo\n') });
   const acR2 = new AbortController();

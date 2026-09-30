@@ -97,6 +97,7 @@ class ParkingVfs extends CORE.VirtualWorkspace {
       this._emit('write:park:' + path);
       await this._gate.promise;
       this._emit('write:resume:' + path);
+      if (this._failOnResume) throw new Error('provider device failure');
     }
     const out = await super.write(path, text);
     this._emit('write:commit:' + path);
@@ -159,6 +160,28 @@ function recordApplies(s, log) {
   };
 }
 
+
+// Single shell write whose ONLY side effect is dispatched and parked
+// (unsettled): `echo pre && echo data > <path>` — 'pre' is real stdout,
+// the write is the last operation, no step follows it.
+async function parkedLastWrite(s, vfs, path, contextExtra) {
+  vfs.parkWrites((p) => p === path);
+  // The RUN promise is returned inside a plain wrapper: an async function's
+  // bare return of the run promise would chain this helper's completion to
+  // the run's SETTLEMENT instead of the park point (thenable unwrapping).
+  const run = s.execute({
+    kind: 'shell',
+    input: 'echo pre && echo data > ' + path,
+    context: Object.assign({ filesystem: vfs }, contextExtra || {}),
+  });
+  await vfs.waitFor('write:park:' + path);
+  return { run };
+}
+
+// The REAL Product tool router (executeTool), eval'd into the same
+// classic-global scope as the core. X-G drives bash through it exactly
+// like the product chain does (session injected via opts.runtimeSession).
+(0, eval)(read('src/tools.js'));
 
 async function parkedComposite(s, vfs, firstPath, secondPath) {
   // echo first > firstPath; echo second > secondPath — the first write is
@@ -606,6 +629,205 @@ async function parkedComposite(s, vfs, firstPath, secondPath) {
   await pb;
   check('P6b B applied only after the admitted execute settled; final config is B',
     s.status().extensionKey === 'env-p6b', JSON.stringify(s.status()));
+  host.dispose();
+}
+
+// ============================================================
+// Review round 2 — gap F1: the LAST honest result classification.
+//
+// When the boundary (or the caller's abort) lands while the run's LAST
+// provider operation is dispatched-but-unsettled, there is no later
+// cancellation checkpoint inside the shell: the operation settles, the
+// command reports a clean success, and only the SESSION can see that the
+// run was superseded. The public result must be classified accordingly
+// (never a clean success), keeping the original output and every
+// existing field, appending the explicit boundary/cancellation note.
+// ============================================================
+
+
+// ---- X-A: session.reset / session.dispose / host.dispose over the unsettled LAST write ----
+{
+  // X-A1: reset
+  {
+    const host = await createRuntime({ workerAssets: WA });
+    const s = host.createSession();
+    const vfs = makeVfs();
+    const { run: runPromise } = await parkedLastWrite(s, vfs, '/tmp/xa1.txt');
+    check('X-A1a the run is tracked while its last write is dispatched (busy=1)',
+      s.status().busyExecutions === 1, JSON.stringify(s.status()));
+    s.reset('x-a1 boundary');
+    check('X-A1b the boundary does not fake settlement: busy stays 1 until the provider settles',
+      s.status().busyExecutions === 1, JSON.stringify(s.status()));
+    vfs.openGate();
+    const res = await runPromise;
+    check('X-A1c the superseded run is never a clean success',
+      res.ok === false && res.isError === true, JSON.stringify(res));
+    check('X-A1d the original output is kept and the boundary explanation appended',
+      /(^|\n)pre(\n|$)/.test(String(res.output)) && /x-a1 boundary/.test(String(res.output)),
+      JSON.stringify(res));
+    check('X-A1e the additive boundary field names the boundary',
+      res.boundary && /x-a1 boundary/.test(String(res.boundary)), JSON.stringify(res.boundary));
+    check('X-A1f the existing fields are preserved (io/backend/operation)',
+      res.operation === 'filesystem' && res.backend === 'browser'
+      && res.io && typeof res.io.in === 'number' && typeof res.io.out === 'number',
+      JSON.stringify({ backend: res.backend, operation: res.operation, io: res.io }));
+    check('X-A1g busy drains to zero only after the true settlement',
+      s.status().busyExecutions === 0, JSON.stringify(s.status()));
+    host.dispose();
+  }
+  // X-A2: dispose
+  {
+    const host = await createRuntime({ workerAssets: WA });
+    const s = host.createSession();
+    const vfs = makeVfs();
+    const { run: runPromise } = await parkedLastWrite(s, vfs, '/tmp/xa2.txt');
+    s.dispose('x-a2 disposal');
+    vfs.openGate();
+    const res = await runPromise;
+    check('X-A2 dispose over the unsettled last write classifies the run as failed',
+      res.ok === false && res.isError === true && /x-a2 disposal/.test(String(res.output)),
+      JSON.stringify(res));
+    host.dispose();
+  }
+  // X-A3: host.dispose
+  {
+    const host = await createRuntime({ workerAssets: WA });
+    const s = host.createSession();
+    const vfs = makeVfs();
+    const { run: runPromise } = await parkedLastWrite(s, vfs, '/tmp/xa3.txt');
+    host.dispose('x-a3 host disposal');
+    vfs.openGate();
+    const res = await runPromise;
+    check('X-A3 host.dispose over the unsettled last write classifies the run as failed',
+      res.ok === false && res.isError === true && /x-a3 host disposal/.test(String(res.output)),
+      JSON.stringify(res));
+  }
+}
+
+// ---- X-B: the CALLER aborts in the same window ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const ac = new AbortController();
+  const { run: runPromise } = await parkedLastWrite(s, vfs, '/tmp/xb.txt', { signal: ac.signal });
+  ac.abort();
+  vfs.openGate();
+  const res = await runPromise;
+  check('X-Ba a caller abort over the unsettled last write is never a clean success',
+    res.ok === false && res.isError === true, JSON.stringify(res));
+  check('X-Bb the original output is kept and the cancellation explanation appended',
+    /(^|\n)pre(\n|$)/.test(String(res.output)) && /cancelled/i.test(String(res.output)),
+    JSON.stringify(res));
+  check('X-Bc a caller abort is not reported as a session boundary',
+    res.boundary === undefined, JSON.stringify(res.boundary));
+  host.dispose();
+}
+
+// ---- X-C: two resets — the run keeps the FIRST reason that invalidated it ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: runPromise } = await parkedLastWrite(s, vfs, '/tmp/xc.txt');
+  s.reset('first reason');
+  s.reset('second reason');
+  vfs.openGate();
+  const res = await runPromise;
+  check('X-Ca the run failed (double boundary does not restore success)',
+    res.ok === false && res.isError === true, JSON.stringify(res));
+  check('X-Cb the report names the FIRST invalidating boundary, never a later one',
+    /first reason/.test(String(res.output)) && /first reason/.test(String(res.boundary || ''))
+    && !/second reason/.test(String(res.output)) && !/second reason/.test(String(res.boundary || '')),
+    JSON.stringify({ output: res.output, boundary: res.boundary }));
+  host.dispose();
+}
+
+// ---- X-D: control — no boundary, the result stays exactly the underlying one ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: runPromise } = await parkedLastWrite(s, vfs, '/tmp/xd.txt');
+  vfs.openGate();
+  const res = await runPromise;
+  check('X-D without an invalidation the clean success is untouched (no note, no boundary field)',
+    res.ok === true && res.isError === false && res.output === 'pre'
+    && res.boundary === undefined && !/superseded/.test(String(res.output)),
+    JSON.stringify(res));
+  host.dispose();
+}
+
+// ---- X-E: provider failure concurrent with the boundary — the real error is kept ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  const { run: runPromise } = await parkedLastWrite(s, vfs, '/tmp/xe.txt');
+  s.reset('x-e boundary');
+  vfs._failOnResume = true; // the provider op FAILS when it finally settles
+  vfs.openGate();
+  const res = await runPromise;
+  check('X-Ea the run failed', res.ok === false && res.isError === true, JSON.stringify(res));
+  check('X-Eb the real provider error is preserved AND the boundary reason appended',
+    /provider device failure/.test(String(res.output)) && /x-e boundary/.test(String(res.output)),
+    JSON.stringify(res));
+  host.dispose();
+}
+
+// ---- X-F: DIRECT python — caller abort while the last commit write is unsettled ----
+// The instance's own final check judges the interpreter generation, not the
+// caller's signal; a caller abort landing during the LAST dispatched commit
+// write leaves the instance report a clean success. The session's final
+// classification is the honest last word.
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const py = s.pythonRuntime();
+  const ctl = attachControlledWorker(py);
+  const vfs = makeVfs();
+  const ac = new AbortController();
+  vfs.parkWrites((p) => p === '/tmp/xf.txt'); // park the LAST commit write
+  const runPromise = s.execute({
+    kind: 'python',
+    input: 'open("/tmp/xf.txt","w").write("py-x-f")',
+    context: { filesystem: vfs, signal: ac.signal },
+  });
+  await tick();
+  ctl.resolve(ctl.posted[0].id, {
+    stdout: 'py-x-f',
+    files: [{ path: '/tmp/xf.txt', b64: Buffer.from('py-x-f').toString('base64') }],
+  });
+  await vfs.waitFor('write:park:/tmp/xf.txt'); // the commit write is dispatched, unsettled
+  ac.abort();
+  vfs.openGate();
+  const res = await runPromise;
+  check('X-Fa the aborted python run is never a clean success',
+    res.ok === false && res.success === false, JSON.stringify(res));
+  check('X-Fb the original stdout is kept and the cancellation note appended',
+    /py-x-f/.test(String(res.stdout || '')) && /cancelled/i.test(String(res.stderr || '')),
+    JSON.stringify({ stdout: res.stdout, stderr: res.stderr }));
+  check('X-Fc the already-dispatched commit is kept (no fabricated rollback)',
+    (await vfs.exists('/tmp/xf.txt')) === true, 'commit write missing');
+  host.dispose();
+}
+
+// ---- X-G: the REAL Product tool router receives the failure ----
+{
+  const host = await createRuntime({ workerAssets: WA });
+  const s = host.createSession();
+  const vfs = makeVfs();
+  vfs.parkWrites((p) => p === '/tmp/xg.txt');
+  const toolPromise = executeTool('bash', 'echo pre && echo data > /tmp/xg.txt', vfs, { runtimeSession: s });
+  await vfs.waitFor('write:park:/tmp/xg.txt');
+  s.reset('x-g boundary');
+  vfs.openGate();
+  const toolRes = await toolPromise;
+  check('X-Ga executeTool reports success=false (not merely a boundary annotation)',
+    toolRes.success === false, JSON.stringify(toolRes));
+  check('X-Gb the tool output keeps the original text and carries the explanation',
+    /(^|\n)pre(\n|$)/.test(String(toolRes.output)) && /x-g boundary/.test(String(toolRes.output)),
+    JSON.stringify(toolRes));
   host.dispose();
 }
 

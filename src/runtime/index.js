@@ -63,6 +63,13 @@ function cancelled(what) {
   return e;
 }
 
+// UTF-8 byte length of an appended result note (io accounting).
+let noteEncoder = null;
+function utf8Length(s) {
+  noteEncoder = noteEncoder || new TextEncoder();
+  return noteEncoder.encode(s).length;
+}
+
 // ---------- core resolution ----------
 const CORE_REQUIRED = ['createPythonRuntime', 'runShellCommand', 'runPythonCode'];
 
@@ -389,7 +396,11 @@ function createRuntimeSession(core, workerAssets, onReleased) {
     // (between shell steps, before every write, before every commit)
     // WITHOUT depending on the caller ever aborting. Already-dispatched
     // provider operations settle and are reported honestly — a
-    // boundary-stopped run is never rewritten as a success.
+    // boundary-stopped run is never rewritten as a success. The result
+    // then passes the FINAL classification inside this closure: a run
+    // whose boundary struck (or whose caller aborted) while its last
+    // operation was dispatched-but-unsettled is downgraded to an honest
+    // failure with the original report kept and the reason appended.
     async execute(req) {
       if (sessionDisposed) throw new Error(sessionDisposed);
       const kind = req && req.kind;
@@ -409,19 +420,49 @@ function createRuntimeSession(core, workerAssets, onReleased) {
         else callerSignal.addEventListener('abort', onCallerAbort, { once: true });
       }
       const boundaryAtCall = boundaryGeneration;
-      // Report annotation for a run the boundary superseded: the session's
-      // cancellation plane may land BEFORE the instance's own generation
-      // check, so the honest report names the boundary through this
-      // additive field — the underlying report keeps every field.
-      const supersededNote = () => (boundaryGeneration !== boundaryAtCall
-        ? { boundary: boundaryReason || 'session boundary' }
-        : null);
+      // THIS run's first invalidation, captured IN THE CLOSURE at strike
+      // time: the session-global boundaryReason may be rewritten by a
+      // LATER reset before the result forms, so the report must name the
+      // boundary that struck THIS run (review round 2, gap F1).
+      let struck = null;
       const onBoundary = () => {
         if (boundaryGeneration !== boundaryAtCall) {
-          merged.abort(new Error(boundaryReason || 'session boundary'));
+          if (!struck) struck = boundaryReason || 'session boundary';
+          merged.abort(new Error(struck));
         }
       };
       boundaryListeners.add(onBoundary);
+      // The LAST honest word on the public result (review round 2, gap
+      // F1), applied before the result leaves the session — shell and
+      // direct python both pass through it.
+      //   - A run the BOUNDARY struck is NEVER a clean success, and the
+      //     boundary always names itself (the underlying report cannot
+      //     know the session reason — not even the instance generation
+      //     check covers a caller abort): the original report keeps every
+      //     field, the explanation is appended, io.out counts the note.
+      //   - A CALLER abort downgrades only a report that never saw it
+      //     (the abort landed while the last dispatched operation was
+      //     still unsettled, so no cancellation checkpoint ran): that
+      //     clean success becomes an honest failure. An ALREADY-FAILED
+      //     report ('bash: cancelled' / 'python: execution cancelled')
+      //     IS the cancellation report and stays byte-identical.
+      // An underlying THROW never reaches this at all (existing
+      // propagation, unchanged); real worker/provider errors keep
+      // precedence — the note is additive, never a downgrade of detail.
+      const classifyResult = (res, isShell) => {
+        const underFailed = isShell ? !!res.isError : res.success === false;
+        if (!struck && !(merged.signal.aborted && !underFailed)) return res;
+        const hit = struck || 'execution cancelled';
+        const note = 'runtime: ' + hit + ' — the run was superseded after its last'
+          + ' operation was already dispatched; the settled effect is kept'
+          + ' (no rollback), so the run is reported as failed';
+        const report = isShell
+          ? { ok: false, isError: true, output: (res.output ? res.output + '\n' : '') + note }
+          : { ok: false, success: false, stderr: (res.stderr ? res.stderr + '\n' : '') + note };
+        if (res.io) report.io = { in: res.io.in, out: res.io.out + utf8Length(note) };
+        if (struck) report.boundary = struck;
+        return Object.assign({}, res, report);
+      };
       const prevPrepare = prepareTail;
       const run = (async () => {
         try {
@@ -447,10 +488,10 @@ function createRuntimeSession(core, workerAssets, onReleased) {
             // filesystem OPTIONAL: absent → the shell's own fallback (a fresh
             // internal machine — the accepted asVfs semantics, unchanged).
             const res = await core.runShellCommand(req.input, ctx.filesystem, opts);
-            return Object.assign({ ok: !res.isError }, res, supersededNote());
+            return classifyResult(Object.assign({ ok: !res.isError }, res), true);
           }
           const res = await core.runPythonCode(req.input, ctx.filesystem, opts);
-          return Object.assign({ ok: !!res.success }, res, supersededNote());
+          return classifyResult(Object.assign({ ok: !!res.success }, res), false);
         } finally {
           // Exactly one release of every registration and the tracking seat.
           boundaryListeners.delete(onBoundary);
