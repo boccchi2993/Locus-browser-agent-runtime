@@ -87,6 +87,7 @@ function buildPage(shellUrl, workerSrc, localAssets, wheelB64, wheelSha, wheelSi
   return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>TPR v1A</title></head><body>'
     // index.html load order: extensions.js (canonical EXTENSION_ID_PATTERN
     // owner) BEFORE shell.js, which consumes the shared binding.
+    + '<script src="extension-composition.js"><\/script>'
     + '<script src="extensions.js"><\/script>'
     + '<script src="' + shellUrl + '"><\/script>'
     + '<script>'

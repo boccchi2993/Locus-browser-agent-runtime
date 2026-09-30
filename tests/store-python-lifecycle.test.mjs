@@ -121,6 +121,11 @@ globalThis.ApprovalController = (0, eval)(
 globalThis.VirtualWorkspace = (0, eval)(
   readFileSync(join(root, 'src', 'workspace.js'), 'utf8') + '\n'
   + readFileSync(join(root, 'src', 'vfs.js'), 'utf8') + '\n;VirtualWorkspace');
+// M2b: the store mounts task VFS mounts through the REAL product adapter
+// (extensions.js) over the fake manager's mount specs.
+globalThis.productTaskVfsMounts = (0, eval)(
+  readFileSync(join(root, 'src', 'extension-composition.js'), 'utf8') + '\n'
+  + readFileSync(join(root, 'src', 'extensions.js'), 'utf8') + '\n;productTaskVfsMounts');
 
 // ---------- gated capability manager (prepare-phase liveness, M1b fix) ----
 // Refreshes can hang (durability re-observation): these sections park a
@@ -134,7 +139,7 @@ class FakeCapabilityManager {
     return { capabilities: [], plugins: [], skills: [], mcps: [], pythonExtensionKey: null };
   }
   pythonExtensionPayload() { return null; }
-  taskVfsMounts() { return []; }
+  taskVfsMountSpecs() { return []; }
   listCapabilities() { return []; }
 }
 
@@ -143,6 +148,17 @@ class FakeCapabilityManager {
 const canonical = makeSession();
 globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: canonical } };
 
+// M2b: the suite seeds the declared harness core table with its fakes
+// (the same rule a classic page follows). The FakeAgentSession is the
+// AgentSession the entry hands to the store.
+globalThis.__LOCUS_HARNESS_CORE__ = Object.freeze({
+  contractVersion: 1,
+  AgentSession: FakeAgentSession,
+  ApprovalController: globalThis.ApprovalController,
+  buildSystemPrompt: () => 'test',
+  HISTORY_BUDGET_BYTES: 768 * 1024,
+  MAX_TOOL_ITERATIONS: 32,
+});
 const ui = await import('../src/ui/store.js');
 const { store, session, submit, newTask } = ui;
 

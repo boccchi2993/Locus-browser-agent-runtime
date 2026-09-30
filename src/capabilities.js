@@ -158,9 +158,12 @@ function builtinImageCapability(identity) {
 class ModelCapabilityRegistry {
   constructor(opts) {
     var o = opts || {};
-    this.persistence = o.persistence
-      || (typeof PersistenceServiceInstance !== 'undefined' ? PersistenceServiceInstance : null);
-    if (!this.persistence) throw new Error('ModelCapabilityRegistry: no persistence backend available');
+    // M2b (repository split): the storage backend is a REQUIRED explicit
+    // dependency — no PersistenceServiceInstance global fallback. The
+    // Product wiring injects it; a registry-less host simply never
+    // constructs this class.
+    this.persistence = o.persistence;
+    if (!this.persistence) throw new Error('ModelCapabilityRegistry: persistence backend is required');
   }
 
   identityKey(identity) { return capabilityIdentityKey(identity); }
@@ -614,13 +617,15 @@ function classifyProbeFailure(e) {
 // ------------------------------------------------------------
 async function runImageInputProbe(opts) {
   var o = opts || {};
-  var modelCall = o.callModelFn
-    || (typeof callModel === 'function' ? callModel : null);
+  // M2b (repository split): the model client is an EXPLICIT dependency —
+  // no callModel/Model global fallback. The caller passes the production
+  // path it wants probed (the Product passes its own client factory).
+  var modelCall = typeof o.callModelFn === 'function' ? o.callModelFn : null;
   if (!modelCall) return { state: 'unknown', reason: 'no-model-client' };
   var quadrantNames = probeShuffle(PROBE_COLOR_NAMES);
   var png = generateProbePng(quadrantNames);
   var body = {
-    model: o.model || (typeof Model !== 'undefined' ? Model.model : ''),
+    model: o.model || '',
     // Small but nonzero: a vision model only needs four words.
     max_tokens: 64,
     messages: [{
@@ -650,3 +655,14 @@ async function runImageInputProbe(opts) {
   // follow) the probe — capability stays unknown, never unsupported.
   return { state: 'unknown', reason: words.length === 4 ? 'probe-answer-mismatch' : 'probe-answer-unparseable' };
 }
+// ============================================================
+//  M2b: explicit publishes (ESM self-assembly mode). The harness entry
+//  (src/harness/index.js) resolves these names; the declared
+//  __LOCUS_HARNESS_CORE__ table (agent.js) carries the entry surface.
+//  Classic loading is unaffected.
+// ============================================================
+globalThis.ModelCapabilityRegistry = ModelCapabilityRegistry;
+globalThis.createImageInputGate = createImageInputGate;
+globalThis.runImageInputProbe = runImageInputProbe;
+globalThis.classifyImageProviderError = classifyImageProviderError;
+globalThis.imageInputUnavailableNotice = imageInputUnavailableNotice;

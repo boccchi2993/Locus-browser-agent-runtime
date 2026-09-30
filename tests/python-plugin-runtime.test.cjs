@@ -75,7 +75,7 @@ const SHELL_SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'shell.js'),
 // EXTENSION_ID_PATTERN / EXTENSION_PY_MODULE_PATTERN bindings shell.js
 // consumes (canonical plugin identity has ONE authoritative regex). The
 // same base trio as the capability suites, in production load order.
-const BASE_SRC = ['src/workspace.js', 'src/vfs.js', 'src/extensions.js']
+const BASE_SRC = ['src/workspace.js', 'src/vfs.js', 'src/extension-composition.js', 'src/extensions.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', f), 'utf8')).join('\n;\n');
 function evalShell() {
   global.window = { location: { protocol: 'https:' }, addEventListener: () => {} };

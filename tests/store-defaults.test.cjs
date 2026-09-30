@@ -22,6 +22,8 @@ const approvalSrc = fs.readFileSync(path.join(root, 'src', 'approval.js'), 'utf8
 const taskRunnerSrc = fs.readFileSync(path.join(root, 'src', 'harness', 'task-runner.js'), 'utf8');
 const providerSessionSrc = fs.readFileSync(path.join(root, 'src', 'harness', 'provider-session.js'), 'utf8');
 const productPromptSrc = fs.readFileSync(path.join(root, 'src', 'ui', 'product-prompt.js'), 'utf8');
+const modelAdaptersSrc = fs.readFileSync(path.join(root, 'src', 'model-adapters.js'), 'utf8');
+const modelSrc = fs.readFileSync(path.join(root, 'src', 'model.js'), 'utf8');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -52,12 +54,25 @@ function loadStore(sessionData) {
     projectEvent: () => {},
   };
 
+  // M2b: strip import declarations INCLUDING multi-line ones (the harness
+  // entry import spans several lines).
   const code = src
-    .replace(/^import[^\n]*\n/gm, '')
+    .replace(/^import[\s\S]*?from\s+'[^']*';[\s\S]*?\n/gm, '')
     .replace(/^export /gm, '');
   return eval(
     'const reactive = (o) => o;\n' +
     'const computed = (fn) => ({ get value() { return fn(); } });\n' +
+    // M2b: the entry functions the store imports, mapped over this eval scope.
+    'const createAgentSession = (o) => new AgentSession(o);\n' +
+    'const createApprovalController = (o) => new ApprovalController(o);\n' +
+    'const historyBudgetBytes = () => 768 * 1024;\n' +
+    'const createModelCapabilityRegistry = () => { throw new Error("registry not expected in store-defaults"); };\n' +
+    'const createImageInputGate = () => { throw new Error("image gate not expected in store-defaults"); };\n' +
+    'const runImageInputProbe = () => { throw new Error("probe not expected in store-defaults"); };\n' +
+    'const classifyImageProviderError = () => ({ kind: "none" });\n' +
+    'const imageInputUnavailableNotice = () => "notice";\n' +
+    modelAdaptersSrc + '\n' +
+    modelSrc + '\n' +
     workspaceSrc + '\n' +
     vfsSrc + '\n' +
     approvalSrc + '\n' +
@@ -112,19 +127,29 @@ function loadStore(sessionData) {
   }
 
   // ---------- D4. test connection uses the user-configured model ----------
+  // M2b: the check goes through the REAL entry client; a recorded
+  // transport fake stands in for the network hop and captures the request.
   {
     const m = loadStore(null);
     m.store.settings.model = 'user-picked-model';
-    let testedModel = null;
-    globalThis.verifyConnection = async () => { testedModel = globalThis.Model.model; };
+    const bodies = [];
+    globalThis.Model.transport = async (url, init) => {
+      bodies.push({ url: String(url), body: JSON.parse(init.body) });
+      return {
+        ok: true, status: 200,
+        headers: { get: () => 'application/json' },
+        text: async () => JSON.stringify({ content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn' }),
+      };
+    };
     await m.testConnection();
-    check('D4 test connection targets the user model', testedModel === 'user-picked-model',
-      String(testedModel));
+    check('D4 test connection targets the user model',
+      bodies.length >= 1 && bodies[0].body.model === 'user-picked-model',
+      JSON.stringify(bodies.map((b) => b.body.model)));
     check('D4 test connection reports that model',
       m.store.settingsResult && m.store.settingsResult.ok === true
         && m.store.settingsResult.message.includes('user-picked-model'),
       m.store.settingsResult && m.store.settingsResult.message);
-    delete globalThis.verifyConnection;
+    delete globalThis.Model.transport;
   }
 
   // ---------- D5. store boots ONE persistent VFS ----------

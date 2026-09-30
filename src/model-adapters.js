@@ -651,3 +651,16 @@ function projectNormalizedHistory(messages, dialect) {
   }
   return out;
 }
+// ============================================================
+//  M2b: explicit publishes (ESM self-assembly mode). model.js consumes
+//  getProviderAdapter across the file edge; the harness entry and the
+//  declared __LOCUS_HARNESS_CORE__ table (agent.js) resolve the rest.
+//  Classic loading is unaffected (same bindings).
+// ============================================================
+globalThis.getProviderAdapter = getProviderAdapter;
+globalThis.OpenAIAdapter = OpenAIAdapter;
+globalThis.AnthropicAdapter = AnthropicAdapter;
+globalThis.createProviderIdentity = createProviderIdentity;
+globalThis.createCredentialIdentity = createCredentialIdentity;
+globalThis.projectNormalizedHistory = projectNormalizedHistory;
+globalThis.rawReplayIdentityCompatible = rawReplayIdentityCompatible;

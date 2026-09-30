@@ -19,14 +19,14 @@ const { PY_WORKER_SOURCE } = require('./helpers/runtime.cjs');
 const read = (p) => fs.readFileSync(path.join(__dirname, '..', p), 'utf8');
 
 // ---- module under test (workspace.js + vfs.js are its base classes) ----
-const extSrc = ['src/workspace.js', 'src/vfs.js', 'src/extensions.js']
+const extSrc = ['src/workspace.js', 'src/vfs.js', 'src/extension-composition.js', 'src/extensions.js']
   .map((f) => read(f)).join('\n;\n');
 const M = eval(extSrc + '\n;({ CapabilityManager, StaticFileWorkspace, SkillSourceStore,'
   + ' SkillInstanceStorage, SkillInstanceWorkspace, validatePluginDescriptor,'
   + ' validateSkillDescriptor, validateCapabilityDescriptor, validateCatalogSet, registerPluginRuntimeProvider,'
   + ' unregisterPluginRuntimeProvider, pluginRuntimeProvider, CAPABILITY_CATALOG, PLUGIN_CATALOG,'
   + ' SKILL_CATALOG, MCP_CATALOG, CAPABILITY_STATES, MCP_STATES, VirtualWorkspace, MemoryWorkspace,'
-  + ' SKILL_INSTANCE_ROOT, skillInstancePath });');
+  + ' SKILL_INSTANCE_ROOT, skillInstancePath, productTaskVfsMounts });');
 
 // agent.js for prompt tests (tools.js supplies the tool registry global)
 const A = eval(read('src/tools.js') + '\n' + read('src/agent.js')
@@ -158,7 +158,8 @@ async function run() {
   const prod = newManager({});
   check('P6 empty production manager lists nothing', prod.listCapabilities().length === 0);
   check('P7 empty environment has no python key', prod.buildTaskEnvironment().pythonExtensionKey === null);
-  check('P8 empty environment mounts nothing', prod.taskVfsMounts(prod.buildTaskEnvironment()).length === 0);
+  check('P8 empty environment mounts nothing', M.productTaskVfsMounts(prod, prod.buildTaskEnvironment()).length === 0
+    && prod.taskVfsMountSpecs(prod.buildTaskEnvironment()).length === 0);
   check('P9 state vocabularies', M.CAPABILITY_STATES.join(',') === 'disabled,needs-connection,ready,error'
     && M.MCP_STATES.join(',') === 'connected,needs-connection,unavailable');
 
@@ -453,7 +454,11 @@ async function run() {
 
   // ================= task VFS mounts =================
   const vEnv = readyEnv;
-  const mounts = readyMgr.taskVfsMounts(vEnv);
+  // M2b: the manager returns pure SPECS; the product adapter builds the providers.
+  const specProbe = readyMgr.taskVfsMountSpecs(vEnv);
+  check('F0 mount specs are pure data (no provider objects from the composition core)',
+    specProbe.every((s) => !('provider' in s) && typeof s.path === 'string' && typeof s.files === 'object'));
+  const mounts = M.productTaskVfsMounts(readyMgr, vEnv);
   check('F1 two mounts for a skill-bearing environment (introspection only)', mounts.length === 2, String(mounts.length));
   check('F2 mount paths + system-read-only authority', mounts.every((m) => m.authority === 'system-read-only')
     && mounts.map((m) => m.path).sort().join() === '/mnt/plugins,/usr/local/share/locus/capabilities');
@@ -487,7 +492,7 @@ async function run() {
     const v2 = new M.VirtualWorkspace({ listCommands: () => [] });
     const f2 = v2.fork();
     const before = f2.mounts.length;
-    for (const m of newManager().taskVfsMounts(prod.buildTaskEnvironment())) f2.mount(m.path, m.provider, m.authority);
+    for (const m of M.productTaskVfsMounts(newManager(), prod.buildTaskEnvironment())) f2.mount(m.path, m.provider, m.authority);
     return f2.mounts.length === before;
   })());
   check('F11 mount count follows the resolved set (skills-only env)', (async () => {
@@ -496,7 +501,7 @@ async function run() {
       capabilities: [{ id: 's-only', version: '1', displayName: 'S', description: 'd', skills: ['synthetic-skill'] }],
     }, sources: synthSources(), instances: new M.SkillInstanceStorage({ resolveHome: () => synthHome() }) });
     await mOnly.enable('s-only');
-    return mOnly.taskVfsMounts(mOnly.buildTaskEnvironment()).length === 1; // capabilities introspection, no plugins
+    return M.productTaskVfsMounts(mOnly, mOnly.buildTaskEnvironment()).length === 1; // capabilities introspection, no plugins
   })());
   check('F12 StaticFileWorkspace byte tree works standalone', (() => {
     const w = new M.StaticFileWorkspace({ files: { 'a/plugin.json': 'x' } });

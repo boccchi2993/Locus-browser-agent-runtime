@@ -183,8 +183,10 @@ function raceSignal(promise, signal) {
 }
 
 // One POST with full-lifecycle deadline (headers AND body), optional
-// external cancellation, and a response size cap.
-async function fetchJsonPost(fetchUrl, headers, body, opts) {
+// external cancellation, and a response size cap. `ctx` is the captured
+// client context (M2b): { config, transport, relayEligible } — never a
+// read of a mutable global mid-request.
+async function fetchJsonPost(ctx, fetchUrl, headers, body, opts) {
   const o = opts || {};
   const timeoutMs = o.timeoutMs || MODEL_TIMEOUT_MS;
   const external = o.signal || null;
@@ -199,7 +201,7 @@ async function fetchJsonPost(fetchUrl, headers, body, opts) {
   let res;
   try {
     try {
-      const transport = o.transport || Model.transport || fetch;
+      const transport = o.transport || ctx.transport || fetch;
       res = await transport(fetchUrl, {
         method: 'POST',
         headers: headers,
@@ -258,26 +260,27 @@ function isNetworkError(e) {
   return e instanceof TypeError;
 }
 
-async function tryFetch(url, headers, body, parser, opts) {
+async function tryFetch(ctx, url, headers, body, parser, opts) {
   // 1. Explicit proxy configured → always use it.
-  if (Model.proxy) {
-    const proxy = Model.proxy.replace(/\/+$/, '');
-    const data = await fetchJsonPost(proxy, Object.assign({}, headers, { 'X-Target-URL': url }), body, opts);
+  if (ctx.config.proxy) {
+    const proxy = ctx.config.proxy.replace(/\/+$/, '');
+    const data = await fetchJsonPost(ctx, proxy, Object.assign({}, headers, { 'X-Target-URL': url }), body, opts);
     return parser(data);
   }
 
   // 2. Direct fetch first.
   try {
-    const data = await fetchJsonPost(url, headers, body, opts);
+    const data = await fetchJsonPost(ctx, url, headers, body, opts);
     return parser(data);
   } catch (e) {
-    // 3. Only on genuine network/CORS failure, and only when hosted
-    //    (non-file://), try the same-origin /proxy relay. Parse errors,
+    // 3. Only on genuine network/CORS failure, and only when the injected
+    //    hosting decision says a same-origin /proxy relay exists (the
+    //    product passes "not file://"), try the relay. Parse errors,
     //    timeouts, HTTP statuses and cancellations are NEVER relayed.
-    if (!isNetworkError(e) || window.location.protocol === 'file:') throw e;
+    if (!isNetworkError(e) || !ctx.relayEligible()) throw e;
     const directError = e;
     try {
-      const data = await fetchJsonPost('/proxy', Object.assign({}, headers, { 'X-Target-URL': url }), body, opts);
+      const data = await fetchJsonPost(ctx, '/proxy', Object.assign({}, headers, { 'X-Target-URL': url }), body, opts);
       return parser(data);
     } catch (e2) {
       // 4. The relay answered → its HTTP/parse error is the AUTHORITATIVE
@@ -315,21 +318,21 @@ function isFallbackableError(e) {
   return e.status === undefined || FALLBACK_STATUS.indexOf(e.status) !== -1;
 }
 
-// Structured model call. opts.signal cancels the request.
-// The adapter (selected from Model.dialect + Model.apiBase) owns every
+// Structured model call over one CAPTURED client context. The adapter
+// (selected from the captured dialect + apiBase) owns every
 // provider-specific decision: endpoint URLs, auth headers, request
 // serialization and response parsing. This function only orchestrates
 // transport attempts and the fallback/error lifecycle.
 // Returns the response envelope { content, reasoning, reasoningType,
 // toolCalls, rawMessage, stopReason, usage, providerMetadata, truncated }.
-async function runEndpointAttempts(adapter, headers, requestBody, opts) {
-  const attempts = adapter.buildEndpoints(Model.apiBase).map((url) => ({
+async function runEndpointAttempts(ctx, adapter, headers, requestBody, opts) {
+  const attempts = adapter.buildEndpoints(ctx.config.apiBase).map((url) => ({
     url: url, h: headers, b: requestBody, p: adapter.parseResponse,
   }));
   let firstErr = null;
   for (const attempt of attempts) {
     try {
-      return await tryFetch(attempt.url, attempt.h, attempt.b, attempt.p, opts);
+      return await tryFetch(ctx, attempt.url, attempt.h, attempt.b, attempt.p, opts);
     } catch (e) {
       if (isAuthoritativeError(e)) throw e;       // 401/402/403/429: stop now
       if (!isFallbackableError(e)) throw e;       // HTTP errors, parse errors, timeouts, cancellations
@@ -339,48 +342,134 @@ async function runEndpointAttempts(adapter, headers, requestBody, opts) {
   throw firstErr || new Error('连接失败');
 }
 
-async function callModel(body, opts) {
-  const key = sanitizeKey(Model.apiKey);
-  const adapter = getProviderAdapter({ dialect: Model.dialect, apiBase: Model.apiBase });
-  const headers = adapter.buildHeaders({ apiKey: key, apiBase: Model.apiBase });
+// ---------- the model client factory (M2b, repository split) ----------
+// Harness owns the model protocol and transport; the Product owns the
+// user's configuration, key entry and relay deployment. createModelClient
+// CAPTURES its config once: endpoint, credentials, dialect, proxy and the
+// transport/relay decisions of a request in flight can never observe a
+// mid-request settings change, and two clients never share a mutable
+// singleton. Everything above this factory is preserved verbatim:
+// endpoint/gateway path semantics, original provider replay, the
+// explicit-tools-rejection-only downgrade, timeout/parse/cancel/HTTP
+// error classification, network fallback rules and request-count caps.
+//
+//   opts.config         { apiKey, apiBase, model, proxy, dialect } — captured
+//   opts.transport      optional (url, init) => Response (default: global fetch)
+//   opts.relayEligible  optional () => boolean — whether a same-origin
+//                       /proxy relay exists (product: hosted page, not
+//                       file://). Default: () => false — a standalone
+//                       harness host never relays.
+function createModelClient(opts) {
+  const o = opts || {};
+  const c = o.config || {};
+  const config = Object.freeze({
+    apiKey: sanitizeKey(c.apiKey),
+    apiBase: c.apiBase,
+    model: c.model,
+    proxy: typeof c.proxy === 'string' ? c.proxy : '',
+    dialect: c.dialect || 'auto',
+  });
+  const transport = typeof o.transport === 'function' ? o.transport : null;
+  const relayEligible = typeof o.relayEligible === 'function' ? o.relayEligible : function () { return false; };
+  const ctx = { config: config, transport: transport, relayEligible: relayEligible };
 
-  try {
-    return await runEndpointAttempts(adapter, headers, adapter.serializeRequest(body), opts);
-  } catch (e) {
-    // One-time tools downgrade: only when the adapter classifies the
-    // error as an EXPLICIT request-validation rejection of the tools
-    // payload (HTTP 400/422 naming tools/tool_choice/function schema).
-    // Parse errors, timeouts, body-read failures, 401/402/403/429/5xx
-    // and cancellations NEVER re-send — the inference may already have
-    // happened and been billed. At most ONE downgrade per request.
-    if (body && Array.isArray(body.tools) && body.tools.length &&
-        typeof adapter.isToolingUnsupportedError === 'function' &&
-        adapter.isToolingUnsupportedError(e)) {
-      const reduced = Object.assign({}, body);
-      delete reduced.tools;
-      return await runEndpointAttempts(adapter, headers, adapter.serializeRequest(reduced), opts);
+  // Structured model call. opts.signal cancels the request.
+  async function call(body, opts2) {
+    const key = config.apiKey;
+    const adapter = getProviderAdapter({ dialect: config.dialect, apiBase: config.apiBase });
+    const headers = adapter.buildHeaders({ apiKey: key, apiBase: config.apiBase });
+
+    try {
+      return await runEndpointAttempts(ctx, adapter, headers, adapter.serializeRequest(body), opts2);
+    } catch (e) {
+      // One-time tools downgrade: only when the adapter classifies the
+      // error as an EXPLICIT request-validation rejection of the tools
+      // payload (HTTP 400/422 naming tools/tool_choice/function schema).
+      // Parse errors, timeouts, body-read failures, 401/402/403/429/5xx
+      // and cancellations NEVER re-send — the inference may already have
+      // happened and been billed. At most ONE downgrade per request.
+      if (body && Array.isArray(body.tools) && body.tools.length &&
+          typeof adapter.isToolingUnsupportedError === 'function' &&
+          adapter.isToolingUnsupportedError(e)) {
+        const reduced = Object.assign({}, body);
+        delete reduced.tools;
+        return await runEndpointAttempts(ctx, adapter, headers, adapter.serializeRequest(reduced), opts2);
+      }
+      throw e;
     }
-    throw e;
   }
+
+  // Compatibility wrapper for callers that only need visible text.
+  async function callText(body, opts2) {
+    const envelope = await call(body, opts2);
+    return envelope.content;
+  }
+
+  // Always test the model the user actually configured — never silently
+  // substitute a different model for the connection check.
+  async function verify() {
+    const body = {
+      model: config.model || 'deepseek-flash',
+      // 128: reasoning models may spend tokens on internal thinking before
+      // emitting the visible text block; 8 was too small to ever see one.
+      max_tokens: 128,
+      system: '只回复 OK。',
+      messages: [{ role: 'user', content: 'OK' }],
+    };
+    return callText(body);
+  }
+
+  return { config: config, call: call, callText: callText, verify: verify };
 }
 
-// Compatibility wrapper for callers that only need visible text
-// (e.g. verifyConnection).
+// ---------- legacy Product-side compat (Model singleton) ----------
+// The mutable Model config + these wrappers remain the Product-side
+// compatibility surface (settings wiring, the e2e Model.transport seam,
+// eval suites). They capture the WHOLE config at request start and
+// delegate to the SAME authoritative factory — never a second
+// implementation. Declared M3 removal once the Product passes config
+// objects directly.
+function legacyModelClient() {
+  return createModelClient({
+    config: {
+      apiKey: Model.apiKey,
+      apiBase: Model.apiBase,
+      model: Model.model,
+      proxy: Model.proxy,
+      dialect: Model.dialect,
+    },
+    transport: typeof Model.transport === 'function' ? Model.transport : null,
+    // Product-page hosting: the same-origin /proxy relay exists only on a
+    // hosted (non-file://) deployment. Guarded — Node hosts never relay.
+    relayEligible: function () {
+      return typeof window !== 'undefined' && !!window.location
+        && String(window.location.protocol) !== 'file:';
+    },
+  });
+}
+
+async function callModel(body, opts) {
+  return legacyModelClient().call(body, opts);
+}
+
 async function callModelText(body, opts) {
-  const envelope = await callModel(body, opts);
-  return envelope.content;
+  return legacyModelClient().callText(body, opts);
 }
 
 async function verifyConnection() {
-  // Always test the model the user actually configured — never silently
-  // substitute a different model for the connection check.
-  const body = {
-    model: Model.model || 'deepseek-flash',
-    // 128: reasoning models may spend tokens on internal thinking before
-    // emitting the visible text block; 8 was too small to ever see one.
-    max_tokens: 128,
-    system: '只回复 OK。',
-    messages: [{ role: 'user', content: 'OK' }],
-  };
-  return callModelText(body);
+  return legacyModelClient().verify();
 }
+// ============================================================
+//  M2b: explicit publishes (ESM self-assembly mode). model.js is the
+//  cross-file edge consumer (getProviderAdapter from model-adapters.js
+//  — published there); the harness entry and the declared
+//  __LOCUS_HARNESS_CORE__ table (agent.js) resolve these names.
+//  Classic loading is unaffected.
+// ============================================================
+globalThis.Model = Model;
+globalThis.createModelClient = createModelClient;
+globalThis.callModel = callModel;
+globalThis.callModelText = callModelText;
+globalThis.verifyConnection = verifyConnection;
+globalThis.MODEL_TIMEOUT_MS = MODEL_TIMEOUT_MS;
+globalThis.MODEL_MAX_RESPONSE_BYTES = MODEL_MAX_RESPONSE_BYTES;

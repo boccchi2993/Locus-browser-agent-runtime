@@ -1084,3 +1084,52 @@ class AgentSession {
     }
   }
 }
+// ============================================================
+//  M2b: explicit publishes + the DECLARED harness core table.
+//  agent.js is the LAST harness file in the classic page order, so it
+//  assembles the frozen __LOCUS_HARNESS_CORE__ table — the ONE declared
+//  seam the public ESM entry (src/harness/index.js) resolves through,
+//  exactly like the Runtime's __LOCUS_RUNTIME_CORE__ (M2a). A page that
+//  loaded the classic set keeps ONE copy of every definition; a host
+//  with none gets the entry's self-assembly of the SAME sources
+//  (src/harness/core.js). The per-file globalThis publishes above make
+//  the identical sources work as ES modules (cross-file bare references
+//  resolve through globalThis there). Classic loading is unaffected.
+//  Deleted at M3 when the harness files become the harness package.
+//  NOT a second state holder: a frozen table of the same definitions.
+// ============================================================
+if (typeof globalThis !== 'undefined') {
+  globalThis.AgentSession = AgentSession;
+  globalThis.buildSystemPrompt = buildSystemPrompt;
+  globalThis.HISTORY_BUDGET_BYTES = HISTORY_BUDGET_BYTES;
+  globalThis.MAX_TOOL_ITERATIONS = MAX_TOOL_ITERATIONS;
+  const __harnessTable = {
+    contractVersion: 1,
+    AgentSession: AgentSession,
+    buildSystemPrompt: buildSystemPrompt,
+    HISTORY_BUDGET_BYTES: HISTORY_BUDGET_BYTES,
+    MAX_TOOL_ITERATIONS: MAX_TOOL_ITERATIONS,
+  };
+  // Model layer (model-adapters.js + model.js load earlier).
+  if (typeof createModelClient === 'function') __harnessTable.createModelClient = createModelClient;
+  if (typeof getProviderAdapter === 'function') __harnessTable.getProviderAdapter = getProviderAdapter;
+  if (typeof createProviderIdentity === 'function') __harnessTable.createProviderIdentity = createProviderIdentity;
+  if (typeof createCredentialIdentity === 'function') __harnessTable.createCredentialIdentity = createCredentialIdentity;
+  if (typeof projectNormalizedHistory === 'function') __harnessTable.projectNormalizedHistory = projectNormalizedHistory;
+  // Perception (capabilities.js — image gating; explicit deps since M2b).
+  if (typeof ModelCapabilityRegistry === 'function') __harnessTable.ModelCapabilityRegistry = ModelCapabilityRegistry;
+  if (typeof createImageInputGate === 'function') __harnessTable.createImageInputGate = createImageInputGate;
+  if (typeof runImageInputProbe === 'function') __harnessTable.runImageInputProbe = runImageInputProbe;
+  if (typeof classifyImageProviderError === 'function') __harnessTable.classifyImageProviderError = classifyImageProviderError;
+  if (typeof imageInputUnavailableNotice === 'function') __harnessTable.imageInputUnavailableNotice = imageInputUnavailableNotice;
+  // Capability composition core (extension-composition.js).
+  if (typeof CapabilityManager === 'function') __harnessTable.CapabilityManager = CapabilityManager;
+  if (typeof SkillSourceStore === 'function') __harnessTable.SkillSourceStore = SkillSourceStore;
+  if (typeof pythonExtensionKeyOf === 'function') __harnessTable.pythonExtensionKeyOf = pythonExtensionKeyOf;
+  if (typeof validatePluginPayload === 'function') __harnessTable.validatePluginPayload = validatePluginPayload;
+  if (typeof registerPluginRuntimeProvider === 'function') __harnessTable.registerPluginRuntimeProvider = registerPluginRuntimeProvider;
+  // Approval semantics (approval.js).
+  if (typeof ApprovalController === 'function') __harnessTable.ApprovalController = ApprovalController;
+  if (typeof APPROVAL_KINDS !== 'undefined') __harnessTable.APPROVAL_KINDS = APPROVAL_KINDS;
+  globalThis.__LOCUS_HARNESS_CORE__ = Object.freeze(__harnessTable);
+}

@@ -123,7 +123,9 @@ async function main() {
     const imagePart = body.messages[0].content.find((p) => p.type === 'image');
     return envelope(await Promise.resolve(answerFromPixels(imagePart.dataBase64)));
   };
-  let out = await C.runImageInputProbe({ callModelFn: visionModel });
+  // M2b: the probe's model identity is an EXPLICIT dependency (no Model
+  // global fallback) — the caller passes the model it wants probed.
+  let out = await C.runImageInputProbe({ callModelFn: visionModel, model: 'current-configured-model' });
   check('V2 pixel-correct answer → supported', out.state === 'supported' && out.source === 'probe', JSON.stringify(out));
   check('V2b the probe request is isolated: no tools, no system, one user message',
     !!lastBody && !lastBody.tools && !lastBody.system && lastBody.messages.length === 1
@@ -134,8 +136,8 @@ async function main() {
     textPart.type === 'text' && imageWirePart.type === 'image'
       && imageWirePart.mimeType === 'image/png'
       && imageWirePart.dataBase64.startsWith('iVBORw0KGgo'));
-  check('V2d the probe uses the CURRENT configured model',
-    lastBody.model === (typeof Model !== 'undefined' ? Model.model : lastBody.model));
+  check('V2d the probe uses the CURRENT configured model (explicit model opt)',
+    lastBody.model === 'current-configured-model');
 
   // Wrong answer (a text-only model guessing) → unknown, NEVER unsupported.
   const blindModel = async () => envelope('red,red,red,red');

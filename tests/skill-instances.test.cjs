@@ -18,7 +18,7 @@ const path = require('path');
 
 const read = (p) => fs.readFileSync(path.join(__dirname, '..', p), 'utf8');
 
-const extSrc = ['src/workspace.js', 'src/vfs.js', 'src/extensions.js', 'src/approval.js']
+const extSrc = ['src/workspace.js', 'src/vfs.js', 'src/extension-composition.js', 'src/extensions.js', 'src/approval.js']
   .map((f) => read(f)).join('\n;\n');
 const M = eval(extSrc + '\n;({ CapabilityManager, SkillSourceStore, SkillInstanceStorage,'
   + ' SkillInstanceWorkspace, VirtualWorkspace, MemoryWorkspace, ApprovalController, skillInstancePath });');
