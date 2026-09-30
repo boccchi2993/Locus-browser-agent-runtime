@@ -22,7 +22,7 @@ const approvalSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'approval.
 const toolsSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'tools.js'), 'utf8');
 const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'agent.js'), 'utf8');
 const M = eval(approvalSrc + '\n' + toolsSrc + '\n' + src +
-  '\n;({ AgentSession, buildSystemPrompt, ApprovalController });');
+  '\n;({ AgentSession, buildSystemPrompt, ApprovalController, AGENT_TOOL_DEFINITIONS });');
 
 function envelope(text, extra) {
   return Object.assign({
@@ -38,6 +38,16 @@ const TOOL_CALL = envelope('```json\n{"tool":"bash","input":"ls"}\n```');
 const FINAL = envelope('done');
 
 let passed = 0, failed = 0;
+// M2b (repository split): AgentSession consumes a ToolPort
+// ({ definitions(), execute({ name, input, context }) }); this suite's
+// fakes keep the legacy executor shape and convert through the exact
+// mapping the contract documents (docs/REPOSITORY-SPLIT-CONTRACTS.md 3.2).
+const asToolPort = (executor) => ({
+  definitions: () => M.AGENT_TOOL_DEFINITIONS.slice(),
+  execute: ({ name, input, context }) =>
+    executor(name, input, (context && context.filesystem) || null, { signal: context && context.signal }),
+});
+
 function check(name, cond, detail) {
   if (cond) { passed++; console.log('PASS ' + name); }
   else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + JSON.stringify(detail).slice(0, 400) : '')); }
@@ -97,7 +107,7 @@ function approvalSession(overrides) {
       state.modelCalls++;
       return state.modelCalls === 1 ? TOOL_CALL : FINAL;
     },
-    toolExecutor: async (tool, input, workspace, opts) => {
+    toolPort: asToolPort(async (tool, input, workspace, opts) => {
       const signal = opts && opts.signal;
       state.toolEntries++;
       const decision = await c.request({
@@ -132,7 +142,7 @@ function approvalSession(overrides) {
       state.sideEffects++;
       if (state.sideEffectGate) await state.sideEffectGate;
       return { output: 'tool ran', success: true, backend: 'harness' };
-    },
+    }),
     buildSystemPrompt: M.buildSystemPrompt,
     emit: (e) => events.push(e),
   }, overrides || {}));

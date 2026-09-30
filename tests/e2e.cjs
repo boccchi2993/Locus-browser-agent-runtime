@@ -224,11 +224,43 @@ async function runtimeHostE2e() {
   }
 }
 
+// ---------- 8b. standalone harness host e2e (own build + preview + Chrome) ----------
+// M2b review round F4: dist/tests/harness-host.html (a real vite build
+// input) runs ONLY the packaged public harness entry — self-assembly, no
+// classic scripts, no Runtime/Product chunk — through a complete fake-
+// model/fake-ToolPort task battery plus provider-session restore with the
+// harness's REAL replay validators.
+async function harnessHostE2e() {
+  console.log('=== standalone harness host e2e (tests/e2e-harness-host.cjs) ===');
+  const build = spawnSync(process.execPath, [VITE_CLI, 'build'], { stdio: 'inherit', cwd: ROOT });
+  if (build.status !== 0) return false;
+  const port = await allocateFreePort();
+  const preview = launchManagedProcess(process.execPath, [
+    VITE_CLI, 'preview', '--host', '127.0.0.1', '--port', String(port), '--strictPort',
+  ], { cwd: ROOT, port, label: 'harness-host Vite preview', env: process.env });
+  const appRoot = `http://127.0.0.1:${port}/`;
+  try {
+    await waitForHttp(appRoot, { process: preview, timeoutMs: 15000 });
+    const env = { ...process.env, E2E_HARNESS_HOST_URL: `${appRoot}tests/harness-host.html` };
+    const r = spawnSync(process.execPath, [path.join(__dirname, 'e2e-harness-host.cjs')], {
+      stdio: 'inherit', env,
+    });
+    return r.status === 0;
+  } catch (error) {
+    console.error(error && error.stack || error);
+    return false;
+  } finally {
+    const cleanup = await closeManagedProcess(preview);
+    if (!cleanup.exited) console.error('harness-host Vite preview did not exit after bounded cleanup');
+  }
+}
+
 async function main() {
   const results = [];
   results.push(['runtime', await runtimeE2e()]);
   results.push(['active-content', activeContentE2e()]);
   results.push(['runtime-host', await runtimeHostE2e()]);
+  results.push(['harness-host', await harnessHostE2e()]);
   const pres = await presentationE2e();
   if (Array.isArray(pres)) results.push(...pres);
   else results.push(['presentation', !!pres], ['responsive', false]);

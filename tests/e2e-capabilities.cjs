@@ -351,7 +351,7 @@ async function main() {
       '(async function () { await window.__locus.capabilityComposition.enable("synthetic-capability");'
       + ' var env = window.__locus.capabilityComposition.taskEnvironment();'
       + ' var fork = window.__locus.vfs.fork();'
-      + ' var mounts = window.__locus.capabilityComposition.manager().taskVfsMounts(env);'
+      + ' var mounts = productTaskVfsMounts(window.__locus.capabilityComposition.manager(), env);'
       + ' for (var i = 0; i < mounts.length; i++) fork.mount(mounts[i].path, mounts[i].provider, mounts[i].authority);'
       + ' window.__capFork = fork; return mounts.length; })()');
     const e13 = await evaluate(cdp, '(async function () {'
@@ -360,7 +360,7 @@ async function main() {
       + ' return { writeBlocked: !w.success && /read-only/i.test(w.output), read: r.success && r.output.indexOf("\\"authority\\": \\"none\\"") !== -1 }; })()', 60000);
     check('E13 /mnt/plugins introspection readable + write refused', e13.writeBlocked && e13.read, JSON.stringify(e13));
     const e14 = await evaluate(cdp, '(async function () {'
-      + ' var mounts = window.__locus.capabilityComposition.manager().taskVfsMounts(window.__locus.capabilityComposition.taskEnvironment());'
+      + ' var mounts = productTaskVfsMounts(window.__locus.capabilityComposition.manager(), window.__locus.capabilityComposition.taskEnvironment());'
       + ' var paths = mounts.map(function (m) { return m.path; });'
       + ' var r = await window.executeTool("bash", "cat /home/locus/.skills/synthetic-capability/synthetic-skill.skill", window.__capFork, { runtimeSession: window.__locus.runtime() });'
       + ' return { oldMountGone: paths.indexOf("/usr/local/share/locus/skills") === -1,'

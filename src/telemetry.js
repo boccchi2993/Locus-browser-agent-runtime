@@ -29,7 +29,11 @@ const Telemetry = {
     // Trim in place: window.__telemetry holds a reference to this exact
     // array and must never be detached by reassignment.
     if (this.records.length > 500) this.records.splice(0, this.records.length - 500);
-    if (typeof renderDebugPanel === 'function') renderDebugPanel();
+    // M2b (repository split): the Product UI refresh hook
+    // (renderDebugPanel) is GONE — the sink never reaches back into a
+    // presentation layer. The Product subscribes/projections read the
+    // records (store.telemetryVersion bump on tool_result); a core must
+    // never depend on a renderer global.
     return rec;
   },
 };

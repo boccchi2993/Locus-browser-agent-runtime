@@ -117,11 +117,30 @@ async function executeTool(name, input, workspace, opts) {
     error,
   };
   if (operation) record.operation = operation;
-  Telemetry.record(record);
+  // M2b (repository split): the execution measurement goes through an
+  // explicit sink (opts.telemetry, wired by the store's ToolPort; the
+  // page Telemetry is the product default). Delivery is CONTAINED: a
+  // throwing sink — or one that returns a rejected promise — never
+  // breaks the tool result and never surfaces as an unhandled
+  // rejection. Exactly one record per execution (the Harness records
+  // nothing per tool execution, so there is no double metering).
+  emitTelemetry((opts && opts.telemetry)
+    || (typeof Telemetry !== 'undefined' ? Telemetry : null), record);
 
   return { output, success, backend, operation };
 }
 
 function firstLine(s) {
   return String(s || '').split('\n')[0];
+}
+
+// One contained delivery to a telemetry sink. A sync throw or a rejected
+// returned promise is swallowed by design — observability must never
+// break the execution it measured.
+function emitTelemetry(sink, record) {
+  if (!sink || typeof sink.record !== 'function') return;
+  try {
+    const r = sink.record(record);
+    if (r && typeof r.catch === 'function') r.catch(() => {});
+  } catch (e) { /* a failing sink never breaks execution */ }
 }

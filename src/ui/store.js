@@ -36,15 +36,27 @@
 // ============================================================
 
 import { reactive, computed } from 'vue';
+// M2b (repository split): the PUBLIC HARNESS entry — the agent session,
+// approval semantics, the model client factory and the image gate all
+// resolve through it (the declared __LOCUS_HARNESS_CORE__ table on this
+// page; self-assembly on a standalone host).
+import {
+  createAgentSession, createApprovalController, createModelClient, historyBudgetBytes,
+  createModelCapabilityRegistry, createImageInputGate, runImageInputProbe,
+  classifyImageProviderError, imageInputUnavailableNotice,
+} from '../harness/index.js';
 import { createTaskRunner, isPersistenceFailure } from '../harness/task-runner.js';
 import { createProviderSessions } from '../harness/provider-session.js';
+// M2b (repository split): the Product prompt inputs — behavior notes and
+// the descriptionPort adapter over the runtime's PUBLIC describeCommands().
+import { locusEnvironmentNotes, productDescriptionPort } from './product-prompt.js';
 // M2a (repository split): the PUBLIC runtime entry. The product chain
 // (prepare / execute / reset / dispose) goes through it — no page-global
 // runtime, no second interpreter, no worker sources read from this page.
 import { createRuntime } from '../runtime/index.js';
 import { PY_WORKER_SOURCE, GREP_WORKER_SOURCE } from '../runtime/worker-assets.js';
 
-/* global AgentSession, Model, callModel, executeTool, buildSystemPrompt,
+/* global Model, executeTool, AGENT_TOOL_DEFINITIONS,
    LocalDirectoryWorkspace, ensureWorkspacePermission, LocusMutationPolicy,
    Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS, LOCUS_HOME_SKELETON,
    CapabilityManager, CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
@@ -415,11 +427,44 @@ export const isViewingLive = computed(() =>
 
 // ---------- runtime wiring ----------
 
+// ---------- model client through the HARNESS entry (M2b) ----------
+// The Product owns the user's settings (applySettings maintains the Model
+// fields); the Harness owns the protocol. The client is built through the
+// entry factory with the config CAPTURED at request start: a mid-request
+// settings change can never alter this request's endpoint, credentials,
+// dialect or transport. No client shares the mutable Model singleton —
+// each request reads it once, here.
+function productModelConfig() {
+  return {
+    apiKey: Model.apiKey,
+    apiBase: Model.apiBase,
+    model: Model.model,
+    proxy: Model.proxy,
+    dialect: Model.dialect,
+  };
+}
+
+function productModelTransportOpts() {
+  return {
+    transport: typeof Model.transport === 'function' ? Model.transport : undefined,
+    // Product-page hosting: the same-origin /proxy relay exists only on a
+    // hosted (non-file://) deployment.
+    relayEligible: () => (typeof window !== 'undefined' && !!window.location
+      && String(window.location.protocol) !== 'file:'),
+  };
+}
+
+function productModelClient(body, opts) {
+  return createModelClient({ config: productModelConfig(), ...productModelTransportOpts() })
+    .call(Object.assign({ model: Model.model }, body), opts);
+}
+
 function wiredModelClient(body, opts) {
   const h = hooks();
   const invoke = () => (h && typeof h.modelClient === 'function')
     ? h.modelClient(body, opts)
-    : callModel(Object.assign({ model: Model.model }, body), opts);
+    : createModelClient({ config: productModelConfig(), ...productModelTransportOpts() })
+      .call(Object.assign({ model: Model.model }, body), opts);
   return invoke().catch(async (e) => {
     // Authoritative provider rejection of IMAGE input (docs/IMAGE-INPUT.md):
     // ONLY an explicit model-level capability rejection (classifier kind
@@ -432,8 +477,7 @@ function wiredModelClient(body, opts) {
     // unchanged — the agent's conservative fallback policy applies (no
     // automatic image-less resend, no double inference).
     try {
-      if (typeof classifyImageProviderError === 'function'
-        && classifyImageProviderError(e).kind === 'model_unsupported') {
+      if (classifyImageProviderError(e).kind === 'model_unsupported') {
         const identity = imageInputIdentity();
         const s = ensureImageStores();
         if (identity && s) await s.registry.recordProviderRejection(identity, e && e.message);
@@ -460,24 +504,43 @@ function productNetworkAuthorization() {
   };
 }
 
-async function wiredToolExecutor(tool, input, workspace, opts) {
-  const o = Object.assign({}, opts || {}, {
-    // M2a: bash routes through the public RuntimeSession entry — the
-    // session injects the interpreter instance and the grep worker asset
-    // itself; this wiring carries neither. The entry assembles
-    // asynchronously, so the task path awaits the one-time resolution.
-    runtimeSession: await whenRuntimeSession(),
-    // M1b: the product mutation policy — mv/rm refusals (skill identity
-    // among them) come from IT, never from hardcoded runtime rules.
-    mutationPolicy: taskMutationPolicy(),
-    // M2a: the execution authorization port (product adapter supplies the
-    // chat identity on its side; the runtime request carries none).
-    authorization: productNetworkAuthorization(),
-  });
-  const h = hooks();
-  if (h && typeof h.toolExecutor === 'function') return h.toolExecutor(tool, input, workspace, o);
-  return executeTool(tool, input, workspace, o);
-}
+// ---------- product ToolPort (M2b, contract §3.2) ----------
+// The Harness consumes { definitions(), execute({ name, input, context }) };
+// this adapter IS the product implementation over the classic tool layer:
+// definitions come from the product tool registry (src/tools.js — bash /
+// cloud_bash names, descriptions, schemas and refusals unchanged), and
+// execute routes exactly what wiredToolExecutor did — hooks seam first,
+// then executeTool with the runtime session, mutation policy and
+// authorization adapter wired. The task's context carries { filesystem,
+// signal }; everything Product-side closes over here, never travels
+// through the Harness.
+const productToolPort = {
+  definitions() {
+    return typeof AGENT_TOOL_DEFINITIONS !== 'undefined' ? AGENT_TOOL_DEFINITIONS.slice() : [];
+  },
+  async execute(call) {
+    const c = call && typeof call === 'object' ? call : {};
+    // The task context is the port's narrow per-call binding:
+    // { filesystem, signal } (contract 3.2).
+    const context = c.context && typeof c.context === 'object' ? c.context : {};
+    const workspace = context.filesystem || null;
+    const o = {
+      signal: context.signal,
+      // The public RuntimeSession entry assembles asynchronously, so the
+      // task path awaits the one-time resolution (M2a semantics).
+      runtimeSession: await whenRuntimeSession(),
+      // The product mutation policy — mv/rm refusals (skill identity
+      // among them) come from IT, never from hardcoded runtime rules.
+      mutationPolicy: taskMutationPolicy(),
+      // The execution authorization port (product adapter supplies the
+      // chat identity on its side; the runtime request carries none).
+      authorization: productNetworkAuthorization(),
+    };
+    const h = hooks();
+    if (h && typeof h.toolExecutor === 'function') return h.toolExecutor(c.name, c.input, workspace, o);
+    return executeTool(c.name, c.input, workspace, o);
+  },
+};
 
 // Conversation identity semantics — three DIFFERENT concepts, never merge:
 //   activeConversationId  — which conversation the user is looking at.
@@ -580,8 +643,9 @@ function providerSessionsAdapter() {
     providerConfig: providerConfig,
     createProviderIdentity: createProviderIdentity,
     projectHistory: (messages, dialect) => projectNormalizedHistory(messages, dialect),
-    validateReplayPrefix: (meta, frames, adapter) => validateReplayPrefix(meta, frames, adapter),
-    validateNormalizedPrefix: (conversationId, rows) => validateNormalizedPrefix(conversationId, rows),
+    // Review round F3: the replay validators are Harness semantics — the
+    // defaults in createProviderSessions (src/harness/replay-validation.js)
+    // apply; the Product provides only storage/config/projection adapters.
     durableId: durableId,
     now: () => new Date().toISOString(),
   });
@@ -635,10 +699,15 @@ function handleRuntimeEvent(event) {
   taskRunner.observeEvent(event);
 }
 
-export const session = new AgentSession({
+// M2b: the agent session resolves through the HARNESS public entry.
+export const session = createAgentSession({
   modelClient: wiredModelClient,
-  toolExecutor: wiredToolExecutor,
-  buildSystemPrompt: buildSystemPrompt,
+  // M2b: the session consumes the PRODUCT ToolPort (definitions snapshot
+  // + execution); the description port adapts the runtime's public
+  // describeCommands(); the Locus behavior notes come from product-prompt.
+  toolPort: productToolPort,
+  descriptionPort: productDescriptionPort(whenRuntimeSession),
+  environmentNotes: locusEnvironmentNotes,
   emit: handleRuntimeEvent,
   // M2a: the session boundary resets the runtime SESSION (the interpreter
   // inside it dies: globals/modules/tmp — verified assets and the session
@@ -695,7 +764,9 @@ function e2eObserverFailureWanted(kind) {
     && !!window.__e2eObserverFailure
     && window.__e2eObserverFailure[kind] === true;
 }
-export const approvals = new ApprovalController({
+// M2b: approval semantics resolve through the HARNESS entry (the same
+// class the page's classic set published — one copy per page).
+export const approvals = createApprovalController({
   onChange: (pending) => {
     if (e2eObserverFailureWanted('onChange')) throw new Error('e2e injected onChange failure');
     store.pendingApproval = pending;
@@ -747,13 +818,16 @@ let attachmentStoreInstance = null;
 let capabilityRegistryInstance = null;
 
 function ensureImageStores() {
-  if (typeof AttachmentStore === 'undefined' || typeof ModelCapabilityRegistry === 'undefined') return null;
+  // M2b: the registry class resolves through the HARNESS entry and its
+  // persistence dependency is REQUIRED (no global fallback); the
+  // AttachmentStore stays Product (attachment storage implementation).
+  if (typeof AttachmentStore === 'undefined') return null;
   if (typeof PersistenceServiceInstance === 'undefined') return null;
   if (!attachmentStoreInstance) {
     attachmentStoreInstance = new AttachmentStore({ persistence: PersistenceServiceInstance });
   }
   if (!capabilityRegistryInstance) {
-    capabilityRegistryInstance = new ModelCapabilityRegistry({ persistence: PersistenceServiceInstance });
+    capabilityRegistryInstance = createModelCapabilityRegistry({ persistence: PersistenceServiceInstance });
   }
   return { store: attachmentStoreInstance, registry: capabilityRegistryInstance };
 }
@@ -773,13 +847,16 @@ function imageInputIdentity() {
 // The ImageInputGate (docs/IMAGE-INPUT.md): consults the registry, asks
 // via the Approval Framework (kind 'capability') when unknown, and runs
 // the synthetic visual probe on "I don't know" — through the production
-// callModel path. Per-run askCache is supplied by AgentSession.run.
+// model path (the RAW product client, without the hooks seam, exactly
+// like the pre-split global callModel). Per-run askCache is supplied by
+// AgentSession.run. M2b: the gate + probe + classifier resolve through
+// the HARNESS entry.
 async function ensureImageCapability(opts) {
   const s = ensureImageStores();
   const gate = createImageInputGate({
     registry: s.registry,
     approvals: approvals,
-    runProbe: (probeOpts) => runImageInputProbe({ signal: probeOpts.signal }),
+    runProbe: (probeOpts) => runImageInputProbe({ signal: probeOpts.signal, callModelFn: productModelClient }),
     identityOf: imageInputIdentity,
   });
   return gate.ensure({
@@ -790,16 +867,14 @@ async function ensureImageCapability(opts) {
   });
 }
 
-if (typeof createImageInputGate === 'function' && typeof runImageInputProbe === 'function') {
-  session.imageInput = {
-    ensureCapability: ensureImageCapability,
-    resolveAttachment: (attachmentId) => {
-      const s = ensureImageStores();
-      return s ? s.store.resolveForWire(attachmentId) : Promise.resolve(null);
-    },
-    unavailableNotice: (result) => imageInputUnavailableNotice(result),
-  };
-}
+session.imageInput = {
+  ensureCapability: ensureImageCapability,
+  resolveAttachment: (attachmentId) => {
+    const s = ensureImageStores();
+    return s ? s.store.resolveForWire(attachmentId) : Promise.resolve(null);
+  },
+  unavailableNotice: (result) => imageInputUnavailableNotice(result),
+};
 
 // Exact base64 expansion estimate (identical formula to agent.js) for the
 // submit-time transport-budget pre-check.
@@ -902,7 +977,9 @@ export async function testConnection() {
   store.settingsTesting = true;
   store.settingsResult = null;
   try {
-    await verifyConnection(); // eslint-disable-line no-undef
+    // M2b: the connection check goes through the HARNESS entry client
+    // (verify always tests the user-configured model, captured now).
+    await createModelClient({ config: productModelConfig(), ...productModelTransportOpts() }).verify();
     await persistSettingsIfNeeded();
     store.settingsResult = { ok: true, message: 'Connected — ' + Model.model + ' via ' + Model.dialect + ' dialect.' };
   } catch (e) {
@@ -987,10 +1064,12 @@ async function buildImageUserContent(input) {
   // Submit-time transport-budget pre-check: resolved base64 must fit the
   // same budget enforceHistoryBudget enforces (exact arithmetic, not a
   // guess). Over budget → explicit error, no task, no silent dropping.
-  const budget = (typeof HISTORY_BUDGET_BYTES === 'number') ? HISTORY_BUDGET_BYTES : 768 * 1024;
+  // M2b: the Harness budget constant arrives through the entry (no
+  // typeof-global read anymore — inventory coupling #9 closed).
+  const budget = historyBudgetBytes();
   let imageBytes = 0;
   for (const p of parts) if (p.type === 'image') imageBytes += imageWireEstimate(p.size);
-  const projected = session.historyRequestBytes(vfs, capabilityManager ? capabilityManager.buildTaskEnvironment() : null) + imageBytes + new TextEncoder().encode(JSON.stringify({ role: 'user', content: parts })).byteLength + 16;
+  const projected = await session.historyRequestBytes(vfs, capabilityManager ? capabilityManager.buildTaskEnvironment() : null) + imageBytes + new TextEncoder().encode(JSON.stringify({ role: 'user', content: parts })).byteLength + 16;
   if (projected > budget) {
     const conv = store.conversations.find((c) => c.id === store.liveConversationId);
     if (conv) {
@@ -1191,7 +1270,9 @@ async function prepareTask(task) {
           },
         }), 'read-write');
       }
-      for (const mount of capabilityManager.taskVfsMounts(taskEnvironment)) {
+      // M2b: the manager returns mount SPECS; the product adapter (extensions.js)
+      // constructs the read-only providers.
+      for (const mount of productTaskVfsMounts(capabilityManager, taskEnvironment)) {
         taskVfs.mount(mount.path, mount.provider, mount.authority);
       }
     }

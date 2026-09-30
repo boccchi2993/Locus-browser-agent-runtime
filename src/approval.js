@@ -326,3 +326,10 @@ class ApprovalController {
     }
   }
 }
+// ============================================================
+//  M2b: explicit publishes (ESM self-assembly mode). The harness entry
+//  and the declared __LOCUS_HARNESS_CORE__ table (agent.js) resolve
+//  these names. Classic loading is unaffected.
+// ============================================================
+globalThis.ApprovalController = ApprovalController;
+globalThis.APPROVAL_KINDS = APPROVAL_KINDS;

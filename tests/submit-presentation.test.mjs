@@ -88,9 +88,19 @@ globalThis.createProviderIdentity = (config) => ({
 });
 globalThis.ApprovalController = (0, eval)(
   readFileSync(join(root, 'src', 'approval.js'), 'utf8') + '\n;ApprovalController');
-globalThis.validateNormalizedPrefix = () => {};
 globalThis.projectNormalizedHistory = (rows) => rows || [];
 
+// M2b: the suite acts as the HOST — it seeds the declared harness core
+// table with its fakes (the same rule a classic page follows: the table
+// is the one seam the public entry delegates to). No second production path.
+globalThis.__LOCUS_HARNESS_CORE__ = Object.freeze({
+  contractVersion: 1,
+  AgentSession: FakeAgentSession,
+  ApprovalController: globalThis.ApprovalController,
+  buildSystemPrompt: () => 'test',
+  HISTORY_BUDGET_BYTES: 768 * 1024,
+  MAX_TOOL_ITERATIONS: 32,
+});
 const ui = await import('../src/ui/store.js');
 const { store, session, submit, newTask, cancelTask } = ui;
 

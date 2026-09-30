@@ -26,19 +26,31 @@ const TOOL_CALL = envelope('```json\n{"tool":"bash","input":"ls"}\n```');
 const FINAL = envelope('done');
 
 let passed = 0, failed = 0;
+// M2b (repository split): AgentSession consumes a ToolPort
+// ({ definitions(), execute({ name, input, context }) }); this suite's
+// fakes keep the legacy executor shape and convert through the exact
+// mapping the contract documents (docs/REPOSITORY-SPLIT-CONTRACTS.md 3.2).
+const asToolPort = (executor) => ({
+  definitions: () => M.AGENT_TOOL_DEFINITIONS.slice(),
+  execute: ({ name, input, context }) =>
+    executor(name, input, (context && context.filesystem) || null, { signal: context && context.signal }),
+});
+
 function check(name, cond, detail) {
   if (cond) { passed++; console.log('PASS ' + name); }
   else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + detail : '')); }
 }
 
+let locusEnvironmentNotes; // assigned at runner start (product prompt notes)
 // A session wired only with injected fakes — no globals of any kind.
 function newSession(overrides) {
   const events = [];
   const resetCalls = { n: 0 };
   const session = new M.AgentSession(Object.assign({
     modelClient: async () => FINAL,
-    toolExecutor: async () => ({ output: 'ok', success: true }),
+    toolPort: asToolPort(async () => ({ output: 'ok', success: true })),
     buildSystemPrompt: M.buildSystemPrompt,
+    environmentNotes: locusEnvironmentNotes,
     emit: (e) => events.push(e),
     onSessionReset: () => { resetCalls.n++; },
   }, overrides || {}));
@@ -49,6 +61,8 @@ const evTypes = (events) => events.map((e) => e.type).join(',');
 const WS_A = { name: 'A' };
 
 async function run() {
+  // M2b: the product prompt notes come from the same module the store wires.
+  ({ locusEnvironmentNotes } = await import('../src/ui/product-prompt.js'));
   // ---------- S1. complete loop: events + history + DI, no DOM (P1-11) ----------
   {
     const seen = { tools: [], bodies: [] };
@@ -62,10 +76,10 @@ async function run() {
           ? envelope('```json\n{"tool":"bash","input":"ls"}\n```', { reasoning: longReasoning })
           : envelope('done');
       },
-      toolExecutor: async (tool, input, ws) => {
+      toolPort: asToolPort(async (tool, input, ws) => {
         seen.tools.push([tool, input, ws && ws.name]);
         return { output: 'file.txt', success: true, backend: 'browser-direct', operation: 'network' };
-      },
+      }),
     });
     await session.run('list files', { workspace: WS_A });
 
@@ -122,7 +136,7 @@ async function run() {
     const toolCalls = [];
     const { session, events, resetCalls } = newSession({
       modelClient: () => new Promise((r) => { resolveModel = r; }),
-      toolExecutor: async (t, input, ws) => { toolCalls.push(ws && ws.name); return { output: 'ok', success: true }; },
+      toolPort: asToolPort(async (t, input, ws) => { toolCalls.push(ws && ws.name); return { output: 'ok', success: true }; }),
     });
     const task = session.run('do something in A', { workspace: WS_A });
     await Promise.resolve();
@@ -146,10 +160,10 @@ async function run() {
     const toolCalls = [];
     const { session, events } = newSession({
       modelClient: async () => { modelCalls++; return modelCalls === 1 ? TOOL_CALL : FINAL; },
-      toolExecutor: async (t, input, ws) => {
+      toolPort: asToolPort(async (t, input, ws) => {
         toolCalls.push(ws && ws.name);
         return new Promise((r) => { resolveTool = () => r({ output: 'ok', success: true }); });
-      },
+      }),
     });
     const task = session.run('task in A', { workspace: WS_A });
     await new Promise((r) => setTimeout(r, 10)); // let the tool start
@@ -175,7 +189,7 @@ async function run() {
           const e = new Error('model request cancelled'); e.name = 'AbortError'; e.cancelled = true; reject(e);
         });
       }),
-      toolExecutor: async () => { throw new Error('must not run'); },
+      toolPort: asToolPort(async () => { throw new Error('must not run'); }),
     });
     const task = session.run('long task', { workspace: WS_A });
     await new Promise((r) => setTimeout(r, 10));
@@ -197,8 +211,8 @@ async function run() {
       session.history.push({ role: 'assistant', content: 'y'.repeat(30000) });
     }
     await session.run('final question', { workspace: WS_A });
-    check('S6 request bytes bounded by budget', session.historyRequestBytes(WS_A) <= M.HISTORY_BUDGET_BYTES,
-      'bytes=' + session.historyRequestBytes(WS_A));
+    check('S6 request bytes bounded by budget', (await session.historyRequestBytes(WS_A)) <= M.HISTORY_BUDGET_BYTES,
+      'bytes=' + (await session.historyRequestBytes(WS_A)));
     check('S6b first surviving message is a task boundary', session.history[0]._taskStart === true
       && session.history[0].role === 'user', JSON.stringify(session.history[0]).slice(0, 60));
     check('S6c whole tasks dropped (no orphan assistant first)',
@@ -222,7 +236,7 @@ async function run() {
   {
     const { session } = newSession();
     session.history.push({ role: 'user', content: '汉'.repeat(100000), _taskStart: true });
-    const bytes = session.historyRequestBytes(WS_A);
+    const bytes = await session.historyRequestBytes(WS_A);
     check('S8 multibyte content counted as UTF-8 bytes', bytes >= 300000, 'bytes=' + bytes);
   }
 
@@ -276,9 +290,9 @@ async function run() {
     let modelCalls = 0;
     const { session, events } = newSession({
       modelClient: async () => { modelCalls++; return modelCalls === 1 ? TOOL_CALL : FINAL; },
-      toolExecutor: () => new Promise((r) => setTimeout(() =>
+      toolPort: asToolPort(() => new Promise((r) => setTimeout(() =>
         r({ output: '[written to workspace: a.txt]\n[not persisted: b.txt (cancelled before write)]',
-          success: false }), 40)),
+          success: false }), 40))),
     });
     const task = session.run('make two files', { workspace: WS_A });
     await new Promise((r) => setTimeout(r, 10)); // tool started
@@ -309,8 +323,8 @@ async function run() {
     let resolveTool;
     const { session, events } = newSession({
       modelClient: async () => { modelCalls++; return modelCalls === 1 ? TOOL_CALL : FINAL; },
-      toolExecutor: () => new Promise((r) => { resolveTool = () =>
-        r({ output: '[written to workspace: secret.txt]', success: true }); }),
+      toolPort: asToolPort(() => new Promise((r) => { resolveTool = () =>
+        r({ output: '[written to workspace: secret.txt]', success: true }); })),
     });
     const task = session.run('task in A', { workspace: WS_A });
     await new Promise((r) => setTimeout(r, 10)); // tool started
@@ -331,7 +345,7 @@ async function run() {
     let toolExecs = 0;
     const { session, events } = newSession({
       modelClient: async () => { modelCalls++; return TOOL_CALL; },
-      toolExecutor: async () => { toolExecs++; return { output: 'ok', success: true }; },
+      toolPort: asToolPort(async () => { toolExecs++; return { output: 'ok', success: true }; }),
     });
     await session.run('loop forever', { workspace: WS_A });
     check('S14 iteration cap stops the loop at MAX_TOOL_ITERATIONS',
@@ -392,20 +406,35 @@ async function run() {
   }
 
   // ---------- S18. buildSystemPrompt is a pure function of its argument ----------
+  // M2b: the Harness prompt is product-agnostic — the workspace line and
+  // the product rules arrive through environmentNotes (src/ui/product-prompt.js,
+  // the same module the store wires), and the runtime capability text
+  // through the description snapshot. The full product parity (shell text,
+  // cloud_bash, python heredoc) is proven by tests/harness-prompt-parity.test.mjs.
   {
-    const withWs = M.buildSystemPrompt({ workspace: { name: 'W' } });
-    const without = M.buildSystemPrompt({ workspace: null });
+    const notesW = locusEnvironmentNotes({ workspace: { name: 'W' } });
+    const withWs = M.buildSystemPrompt({ tools: M.AGENT_TOOL_DEFINITIONS, environmentNotes: notesW });
+    const without = M.buildSystemPrompt({ tools: M.AGENT_TOOL_DEFINITIONS, environmentNotes: locusEnvironmentNotes({ workspace: null }) });
     check('S18 workspace named + mounted in prompt', withWs.includes('An external folder "W" is currently mounted at /mnt/workspace'));
     check('S18v VFS-shaped workspace object works too (workspaceName getter)',
-      M.buildSystemPrompt({ workspace: { workspaceName: 'V', name: 'ignored' } })
+      M.buildSystemPrompt({ tools: M.AGENT_TOOL_DEFINITIONS, environmentNotes: locusEnvironmentNotes({ workspace: { workspaceName: 'V', name: 'ignored' } }) })
         .includes('An external folder "V" is currently mounted at /mnt/workspace'));
     check('S18b no-workspace branch mentions the still-available paths',
       without.includes('/mnt/workspace is unavailable')
       && without.includes('/mnt/upload') && without.includes('/mnt/download')
       && without.includes('/tmp') && without.includes('/home/locus'));
-    check('S18c trust-boundary policy intact',
+    check('S18c trust-boundary policy intact (generic rules + product trust line)',
       withWs.includes('UNTRUSTED DATA') && withWs.includes('prompt-injection')
-      && withWs.includes('cloud_bash') && withWs.includes("python <<'PY'"));
+      && withWs.includes('fetch attempts from Python fail by design'));
+    check('S18d product-agnostic: no bash/cloud_bash/python claims without defs/description',
+      !M.buildSystemPrompt({}).includes('bash') && !M.buildSystemPrompt({}).includes('cloud_bash')
+      && !M.buildSystemPrompt({}).includes('/mnt/upload'));
+    // M2b: the session-level composition (the store's wiring shape) —
+    // environmentNotes + descriptionPort flow through the SAME snapshot the
+    // prompt and the budget use.
+    check('S18e environmentNotes compose into the session prompt',
+      M.buildSystemPrompt({ tools: M.AGENT_TOOL_DEFINITIONS, environmentNotes: notesW })
+        .indexOf('- bash: Execute a command in the local browser Linux-like compatibility runtime.') !== -1);
   }
 
   // ---------- S19. concurrent run() is rejected by the runtime itself (P1.1-1) ----------
@@ -422,7 +451,7 @@ async function run() {
           });
         });
       },
-      toolExecutor: async () => { throw new Error('must not run'); },
+      toolPort: asToolPort(async () => { throw new Error('must not run'); }),
     });
     const taskA = session.run('task A', { workspace: WS_A });
     await new Promise((r) => setTimeout(r, 10)); // task A is inside the model call
@@ -492,10 +521,10 @@ async function run() {
     let modelCalls = 0;
     const { session, events } = newSession({
       modelClient: async () => { modelCalls++; return modelCalls === 1 ? TOOL_CALL : FINAL; },
-      toolExecutor: (t, input, ws, opts) => {
+      toolPort: asToolPort((t, input, ws, opts) => {
         toolSignal = opts && opts.signal;
         return new Promise((r) => { resolveTool = () => r({ output: 'late secret', success: true }); });
-      },
+      }),
     });
     const task = session.run('task', { workspace: WS_A });
     await new Promise((r) => setTimeout(r, 10)); // tool started
@@ -528,7 +557,7 @@ async function run() {
           ? envelope('', { toolCalls: [{ id: 'call_1', name: 'bash', input: { input: 'pwd' }, argumentsError: null }], rawMessage: rawAssistant })
           : FINAL;
       },
-      toolExecutor: async (tool, input) => { execs.push([tool, input]); return { output: '/home/locus', success: true, backend: 'browser' }; },
+      toolPort: asToolPort(async (tool, input) => { execs.push([tool, input]); return { output: '/home/locus', success: true, backend: 'browser' }; }),
     });
     await session.run('where am I', { workspace: WS_A });
     check('N1 native call executed with the object input\'s command string',
@@ -566,7 +595,7 @@ async function run() {
             })
           : FINAL;
       },
-      toolExecutor: async (tool, input) => { execs.push(input); return { output: 'ok', success: true }; },
+      toolPort: asToolPort(async (tool, input) => { execs.push(input); return { output: 'ok', success: true }; }),
     });
     await session.run('task', { workspace: WS_A });
     check('N2 native call wins over the fenced block; executed exactly once',
@@ -584,7 +613,7 @@ async function run() {
     const execs = [];
     const { session, events } = newSession({
       modelClient: async () => envelope('我来看一下目录：\n```json\n{"tool":"bash","input":"ls"}\n```\n以上是调用。'),
-      toolExecutor: async (tool, input) => { execs.push(input); return { output: 'x', success: true }; },
+      toolPort: asToolPort(async (tool, input) => { execs.push(input); return { output: 'x', success: true }; }),
     });
     await session.run('task', { workspace: WS_A });
     check('N3 prose-wrapped fenced JSON never executes',
@@ -603,7 +632,7 @@ async function run() {
           ? envelope('', { toolCalls: [{ id: 'c9', name: 'delete_all', input: { input: 'rm -rf /' }, argumentsError: null }] })
           : FINAL;
       },
-      toolExecutor: async (tool, input) => { execs.push([tool, input]); return { output: 'x', success: true }; },
+      toolPort: asToolPort(async (tool, input) => { execs.push([tool, input]); return { output: 'x', success: true }; }),
     });
     await session.run('task', { workspace: WS_A });
     check('N4 unknown tool NEVER executed and never mapped to bash', execs.length === 0, JSON.stringify(execs));
@@ -632,7 +661,7 @@ async function run() {
             ] })
           : FINAL;
       },
-      toolExecutor: async (tool, input) => { execs.push(input); return { output: 'x', success: true }; },
+      toolPort: asToolPort(async (tool, input) => { execs.push(input); return { output: 'x', success: true }; }),
     });
     await session.run('task', { workspace: WS_A });
     check('N5 malformed arguments never execute (no coercion to shell)',
@@ -663,7 +692,7 @@ async function run() {
             ] })
           : FINAL;
       },
-      toolExecutor: async (tool, input) => { execs.push(input); return { output: 'out:' + input, success: true }; },
+      toolPort: asToolPort(async (tool, input) => { execs.push(input); return { output: 'out:' + input, success: true }; }),
     });
     await session.run('task', { workspace: WS_A });
     check('N6 batch executed sequentially in provider order',
@@ -683,7 +712,7 @@ async function run() {
     const { session, events } = newSession({
       modelClient: async () => envelope('', { toolCalls: [1, 2, 3, 4, 5].map((n) => ({
         id: 'b' + n, name: 'bash', input: { input: 'cmd' + n }, argumentsError: null })) }),
-      toolExecutor: async () => { execs++; return { output: 'ok', success: true }; },
+      toolPort: asToolPort(async () => { execs++; return { output: 'ok', success: true }; }),
     });
     await session.run('loop', { workspace: WS_A });
     check('N7 total executions bounded by 32 across batches (6×5=30, 7th batch refused)',
@@ -703,10 +732,10 @@ async function run() {
         { id: 'k2', name: 'bash', input: { input: 'second' }, argumentsError: null },
         { id: 'k3', name: 'bash', input: { input: 'third' }, argumentsError: null },
       ] }),
-      toolExecutor: (tool, input) => {
+      toolPort: asToolPort((tool, input) => {
         execs.push(input);
         return new Promise((r) => { resolveTool = () => r({ output: 'committed: ' + input, success: true }); });
-      },
+      }),
     });
     const task = session.run('task', { workspace: WS_A });
     await new Promise((r) => setTimeout(r, 10)); // first tool started
@@ -741,10 +770,10 @@ async function run() {
             ] })
           : FINAL;
       },
-      toolExecutor: (tool, input) => {
+      toolPort: asToolPort((tool, input) => {
         execs.push(input);
         return new Promise((r) => { resolveTool = () => r({ output: 'late: ' + input, success: true }); });
-      },
+      }),
     });
     const task = session.run('task', { workspace: WS_A });
     await new Promise((r) => setTimeout(r, 10));

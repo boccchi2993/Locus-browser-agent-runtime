@@ -125,7 +125,8 @@ for (const f of RUNTIME_FILES) {
 // ---------- G4: contract data stays in sync (declared mechanism) ----------
 {
   const shellSrc = read('src/shell.js');
-  const extSrc = read('src/extensions.js');
+  // M2b: the Harness identity-pattern copy lives in the composition core now.
+  const extSrc = read('src/extension-composition.js');
   const runtimeId = shellSrc.match(/RUNTIME_PLUGIN_ID_PATTERN\s*=\s*(\/[^/]+\/)\s*;/);
   const extId = extSrc.match(/EXTENSION_ID_PATTERN\s*=\s*(\/[^/]+\/)\s*;/);
   const runtimeMod = shellSrc.match(/RUNTIME_PY_MODULE_PATTERN\s*=\s*(\/[\s\S]*?\/)\s*;/);

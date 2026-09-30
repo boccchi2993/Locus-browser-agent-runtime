@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Locus Harness — standalone host</title>
+</head>
+<body>
+<!--
+  M2b review round (F4): TRULY STANDALONE HARNESS HOST (a test/example
+  page, never a second product implementation).
+
+  NO classic scripts at all — the page imports ONLY the public harness
+  entry as one ES module and awaits ensureHarnessCore() (self-assembly of
+  model-adapters/model/capabilities/extension-composition/approval/agent
+  plus the harness-owned task-runner/provider-session/replay-validation).
+  No Vue, no Locus product page, no persistence module, no real
+  IDB/OPFS, no Runtime (no shell/VFS/workers): tools arrive through a
+  lookup FAKE ToolPort, model responses through the REAL createModelClient
+  over a scripted fake transport, and durable state through an in-memory
+  store. The page proves, on the packaged artifacts: a complete native
+  tool → result → final answer task, strict text-fallback rules, task
+  cancellation, and provider-session restore validated by the harness's
+  REAL replay validators. Page errors, unhandled rejections and every
+  requested resource are recorded for the driver's assertions.
+-->
+<script type="module">
+import {
+  ensureHarnessCore, createAgentSession, createModelClient,
+  createProviderSessions, getProviderAdapter, createProviderIdentity,
+  projectNormalizedHistory, validateReplayPrefix,
+} from '../src/harness/index.js';
+
+const errors = [];
+window.addEventListener('error', (e) => errors.push(String(e.message || e)));
+window.addEventListener('unhandledrejection', (e) => errors.push('unhandledrejection: ' + String((e.reason && e.reason.message) || e.reason)));
+
+const log = [];
+
+function fakeEnvelope(text, extra) {
+  return Object.assign({
+    content: text,
+    reasoning: null,
+    stopReason: 'end_turn',
+    usage: null,
+    rawMessage: { role: 'assistant', content: text },
+    truncated: false,
+  }, extra || {});
+}
+
+// Scripted fake model over the REAL client factory + fake transport.
+// script: array of ({ toolCalls? , content }) — one entry per request.
+function makeScriptedModelClient(script, record) {
+  let step = 0;
+  return createModelClient({
+    config: { apiKey: 'host-key', apiBase: 'https://fake.model.test', model: 'scripted', dialect: 'openai' },
+    transport: async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (record) record.push({ url: String(url), tools: (body.tools || []).map((t) => (t && t.function && t.function.name) || t.name || null) });
+      const line = script[Math.min(step, script.length - 1)];
+      step++;
+      return {
+        ok: true, status: 200,
+        headers: { get: (h) => (h === 'content-type' ? 'application/json' : null) },
+        text: async () => JSON.stringify({
+          choices: [{
+            message: Object.assign(
+              { role: 'assistant', content: line.content || '' },
+              line.toolCalls ? {
+                tool_calls: line.toolCalls.map((c, i) => ({
+                  id: c.id, type: 'function',
+                  function: { name: c.name, arguments: JSON.stringify(c.input || {}) },
+                })),
+              } : {}),
+            finish_reason: line.toolCalls ? 'tool_calls' : 'stop',
+          }],
+        }),
+      };
+    },
+  });
+}
+
+const toolPort = {
+  definitions: () => [{
+    name: 'lookup',
+    description: 'Look things up (lookup).',
+    inputSchema: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] },
+  }],
+  async execute(call) {
+    log.push(['execute', call.name, call.input && call.input.input]);
+    return { output: 'OUT(' + (call.input && call.input.input) + ')', success: true, backend: 'fake' };
+  },
+};
+
+const evTypes = (events) => events.map((e) => e.type).join(',');
+
+(async () => {
+  const results = {};
+
+  // ---------- assembly: the entry self-assembles its own core ----------
+  const table = await ensureHarnessCore();
+  results.assembly = {
+    classicScriptTags: document.querySelectorAll('script[src]:not([type="module"])').length,
+    registryPresent: !!window.__LOCUS_HARNESS_CORE__,
+    contractVersion: table && table.contractVersion,
+    domProductNodes: document.querySelectorAll('#app, #sb-python, #py-worker-src, #grep-worker-src').length,
+  };
+
+  // ---------- 1. native tool → tool result → final answer ----------
+  {
+    const events = [];
+    const execs = [];
+    const requests = [];
+    // AgentSession consumes a modelClient FUNCTION — the real
+    // createModelClient's .call is the production wiring (adapter
+    // serialization + parse + transport all real; only the HTTP is fake).
+    const scripted = makeScriptedModelClient([
+      { toolCalls: [{ id: 't1', name: 'lookup', input: { input: 'q1' } }] },
+      { content: 'final answer after tool' },
+    ], requests);
+    const session = createAgentSession({
+      modelClient: (body, opts) => scripted.call(body, opts),
+      toolPort: {
+        definitions: toolPort.definitions,
+        execute: async (call) => { execs.push([call.name, call.input]); return { output: 'OUT(' + call.input + ')', success: true, backend: 'fake' }; },
+      },
+      emit: (e) => events.push(e),
+    });
+    await session.run('host native task', {});
+    results.native = {
+      chain: evTypes(events),
+      execs: execs,
+      requestTools: requests[0].tools || null,
+      historyRoles: session.history.map((h) => h.role),
+      toolCallId: (session.history.find((h) => h.role === 'tool_result') || {}).toolCallId || null,
+      finalText: (events.filter((e) => e.type === 'assistant_text').pop() || {}).content || null,
+    };
+  }
+
+  // ---------- 2. strict text fallback ----------
+  {
+    const execs = [];
+    const events = [];
+    const proseClient = makeScriptedModelClient([{ content: '看：\n```json\n{"tool":"lookup","input":"x"}\n```\n以上。' }]);
+    const prose = createAgentSession({
+      modelClient: (body, opts) => proseClient.call(body, opts),
+      toolPort: { definitions: toolPort.definitions, execute: async (c) => { execs.push(c.input); return { output: 'OUT', success: true, backend: 'fake' }; } },
+      emit: (e) => events.push(e),
+    });
+    await prose.run('prose fence', {});
+    const fencedEvents = [];
+    const fencedExecs = [];
+    const fencedClient = makeScriptedModelClient([
+      { content: '```json\n{"tool":"lookup","input":"fenced"}\n```' },
+      { content: 'after fence' },
+    ]);
+    const fenced = createAgentSession({
+      modelClient: (body, opts) => fencedClient.call(body, opts),
+      toolPort: { definitions: toolPort.definitions, execute: async (c) => { fencedExecs.push(c.input); return { output: 'OUT', success: true, backend: 'fake' }; } },
+      emit: (e) => fencedEvents.push(e),
+    });
+    await fenced.run('pure fence', {});
+    results.textFallback = {
+      proseExecuted: execs.length,
+      proseIsPlainText: events.some((e) => e.type === 'assistant_text' && (e.content || '').includes('```json')),
+      fencedExecuted: fencedExecs,
+      fencedCompleted: fencedEvents.some((e) => e.type === 'task_end' && e.reason === 'completed'),
+    };
+  }
+
+  // ---------- 3. cancellation ----------
+  {
+    const events = [];
+    // Parks forever, but reacts to the abort signal like a real fetch —
+    // otherwise run() could never settle.
+    const session = createAgentSession({
+      modelClient: (body, opts2) => new Promise((resolve, reject) => {
+        const signal = opts2 && opts2.signal;
+        const onAbort = () => reject(Object.assign(new Error('model request cancelled'), { name: 'AbortError', cancelled: true }));
+        if (signal && signal.aborted) return onAbort();
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      }),
+      toolPort,
+      emit: (e) => events.push(e),
+    });
+    const p = session.run('cancel me', {});
+    setTimeout(() => session.cancel(), 30);
+    await p;
+    results.cancel = {
+      chain: evTypes(events),
+      cancelled: events.some((e) => e.type === 'task_end' && e.reason === 'cancelled'),
+    };
+  }
+
+  // ---------- 4. provider-session restore with the REAL validators ----------
+  {
+    const sessionsMap = new Map();
+    const framesBySession = new Map();
+    const normalizedByConversation = new Map();
+    const store = {
+      async get(name, key) { return name === 'providerSessions' ? (sessionsMap.get(key) || null) : null; },
+      async loadProviderSession(conversationId) {
+        for (const s of sessionsMap.values()) if (s.conversationId === conversationId) return s;
+        return null;
+      },
+      async loadProviderFrames(sessionId) {
+        return (framesBySession.get(sessionId) || []).slice().sort((a, b) => a.sequence - b.sequence);
+      },
+      async loadNormalizedMessages(conversationId) {
+        return (normalizedByConversation.get(conversationId) || []).slice().sort((a, b) => a.sequence - b.sequence);
+      },
+      async saveProviderSession(row) { sessionsMap.set(row.id, row); return row; },
+      async appendProviderFrame(frame) {
+        if (!framesBySession.has(frame.sessionId)) framesBySession.set(frame.sessionId, []);
+        framesBySession.get(frame.sessionId).push(frame);
+        return frame;
+      },
+      async saveNormalizedMessage(row) {
+        if (!normalizedByConversation.has(row.conversationId)) normalizedByConversation.set(row.conversationId, []);
+        normalizedByConversation.get(row.conversationId).push(row);
+        return row;
+      },
+    };
+    const CONFIG = { dialect: 'openai', apiBase: 'https://api.example.test/v1', model: 'host-model' };
+    const fullConfig = () => Object.assign(
+      { dialect: CONFIG.dialect, apiBase: CONFIG.apiBase, model: CONFIG.model },
+      createProviderIdentity({ dialect: CONFIG.dialect, apiBase: CONFIG.apiBase, model: CONFIG.model }));
+    const sessions = createProviderSessions({
+      persistence: store,
+      persistConversation: async () => {},
+      reportIssue: () => {},
+      getAdapter: (config) => getProviderAdapter(config),
+      providerConfig: fullConfig,
+      createProviderIdentity: (config) => createProviderIdentity(config),
+      projectHistory: (messages, dialect) => projectNormalizedHistory(messages, dialect),
+      durableId: (prefix) => prefix + '-host',
+      now: () => '2026-10-01T00:00:00.000Z',
+    });
+
+    const conv = { id: 'conv-host', activeProviderSessionId: null, persistenceState: 'healthy' };
+    const row = await sessions.ensureSession(conv);
+    const ctx = sessions.makeContext(conv, row);
+    await ctx.onUserMessage('run lookup', null);
+    await ctx.onProviderFrame({
+      role: 'assistant', kind: 'assistant',
+      raw: { role: 'assistant', content: 'working', tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{}' } }] },
+    });
+    await ctx.onProviderFrame({ role: 'tool_result', kind: 'tool_result', toolCallId: 'call-1', raw: { role: 'tool_result', toolCallId: 'call-1', content: 'OUT' } });
+    await ctx.onCheckpoint({ frame: { sequence: 3 } });
+
+    const restored = { history: [], replayBlocked: false, reset() { this.history = []; this.replayBlocked = false; } };
+    const prev = await sessions.restoreInto(restored, conv);
+    const validRestore = {
+      id: prev && prev.id,
+      blocked: restored.replayBlocked,
+      historyRoles: restored.history.map((h) => h.role),
+      toolCallId: (restored.history.find((h) => h.role === 'tool_result') || {}).toolCallId || null,
+    };
+
+    // Corrupt the tail behind the checkpoint → the REAL validator must
+    // reject and the normalized fallback must block replay.
+    framesBySession.get(row.id).pop();
+    const broken = { history: [], replayBlocked: false, reset() { this.history = []; this.replayBlocked = false; } };
+    const prev2 = await sessions.restoreInto(broken, conv);
+    const invalidRestore = {
+      id: prev2 && prev2.id,
+      rawInvalid: row.rawReplayInvalid === true,
+      code: row.replayError && row.replayError.code,
+      blocked: broken.replayBlocked,
+    };
+
+    // The entry's direct validator export also runs in the browser.
+    let directValid = null;
+    try {
+      directValid = validateReplayPrefix(
+        { id: row.id, conversationId: conv.id, replayCheckpointSequence: 0 },
+        [],
+        getProviderAdapter({ dialect: 'openai', apiBase: CONFIG.apiBase }),
+      ).valid;
+    } catch (e) { directValid = 'threw: ' + (e && e.message); }
+
+    results.replay = { validRestore, invalidRestore, directValid };
+  }
+
+  results.log = log;
+  results.errors = errors;
+  results.resources = () => performance.getEntriesByType('resource').map((r) => r.name);
+  results.ready = true;
+  window.__harnessHost = results;
+  document.title = 'harness-host-ready';
+})().catch((e) => {
+  errors.push('boot failed: ' + (e && e.stack ? e.stack : String(e)));
+  window.__harnessHost = { ready: false, errors, resources: () => performance.getEntriesByType('resource').map((r) => r.name) };
+  document.title = 'harness-host-boot-failed';
+});
+</script>
+</body>
+</html>

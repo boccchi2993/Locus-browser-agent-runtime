@@ -20,6 +20,7 @@ const RUNTIME_SCRIPTS = [
   'src/workspace.js',
   'src/vfs.js',
   'src/conversation-history-workspace.js',
+  'src/extension-composition.js',
   'src/extensions.js',
   'src/capability-package.js',
   'src/attachments.js',
@@ -57,10 +58,13 @@ export default defineConfig({
     // M2a: the standalone runtime host (tests/runtime-host.html) is a REAL
     // build input so the gates run the packaged entry/worker-asset bundle,
     // not the dev-server sources.
+    // M2b review round: the standalone HARNESS host (tests/harness-host.html)
+    // likewise — the browser gate runs the packaged harness entry chunk.
     rollupOptions: {
       input: {
         main: 'index.html',
         runtimeHost: 'tests/runtime-host.html',
+        harnessHost: 'tests/harness-host.html',
       },
     },
   },

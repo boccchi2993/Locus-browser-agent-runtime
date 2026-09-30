@@ -40,7 +40,7 @@ const path = require('path');
 global.window = { location: { protocol: 'https:' }, addEventListener: () => {} };
 global.document = { getElementById: () => null };
 
-const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'extensions.js', 'shell.js']
+const src = ['telemetry.js', 'workspace.js', 'vfs.js', 'extension-composition.js', 'extensions.js', 'shell.js']
   .map((f) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'))
   .join('\n;\n');
 const M = eval(src + '\n;({ createPythonRuntime, runShellCommand, VirtualWorkspace, SHELL_COMMANDS });');

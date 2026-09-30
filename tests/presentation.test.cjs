@@ -13,6 +13,17 @@ const Projector = eval(projectorSrc + '\n;LocusProjector');
 const A = eval(agentSrc + '\n;({ AgentSession, buildSystemPrompt });');
 
 let passed = 0, failed = 0;
+// M2b (repository split): AgentSession consumes a ToolPort; this suite
+// evals agent.js without the product tool layer, so the port carries the
+// one definition the test envelopes reference.
+const TP_DEFS = [{ name: 'bash', description: 'local shell (test)',
+  inputSchema: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] } }];
+const asToolPort = (executor) => ({
+  definitions: () => TP_DEFS.slice(),
+  execute: ({ name, input, context }) =>
+    executor(name, input, (context && context.filesystem) || null, { signal: context && context.signal }),
+});
+
 function check(name, cond, detail) {
   if (cond) { passed++; console.log('PASS ' + name); }
   else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + detail : '')); }
@@ -120,7 +131,7 @@ function projectAll(events) {
   const conv = Projector.createConversation(1);
   const session = new A.AgentSession({
     modelClient: async () => replies.shift(),
-    toolExecutor: async (tool, input) => ({ output: 'sales.csv', success: true, backend: 'browser', operation: 'shell' }),
+    toolPort: asToolPort(async (tool, input) => ({ output: 'sales.csv', success: true, backend: 'browser', operation: 'shell' })),
     buildSystemPrompt: A.buildSystemPrompt,
     emit: (e) => Projector.projectEvent(conv, e),
   });
@@ -147,7 +158,7 @@ function projectAll(events) {
       modelClient: (body, opts) => new Promise((resolve, reject) => {
         opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
       }),
-      toolExecutor: async () => ({ output: '', success: true }),
+      toolPort: asToolPort(async () => ({ output: '', success: true })),
       buildSystemPrompt: A.buildSystemPrompt,
       emit: (e) => Projector.projectEvent(conv2, e),
     });

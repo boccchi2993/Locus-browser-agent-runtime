@@ -21,8 +21,12 @@
 //    providerConfig()                   — current provider configuration
 //    createProviderIdentity(config)
 //    projectHistory(messages, dialect)  — projectNormalizedHistory
-//    validateReplayPrefix(session, frames, adapter)
-//    validateNormalizedPrefix(conversationId, rows)
+//    validateReplayPrefix(session, frames, adapter)   — OPTIONAL since the
+//    validateNormalizedPrefix(conversationId, rows)   — review round F3:
+//        both default to the HARNESS algorithms in ./replay-validation.js;
+//        an explicit injection still wins (test seam). The Product wiring
+//        supplies only storage/config/projection adapters — never the
+//        validation algorithm.
 //    durableId(prefix), now()
 //  }
 //  `conv` is a plain conversation record; `session` is the AgentSession
@@ -30,13 +34,21 @@
 //  imported. The module never touches Vue, the DOM or other globals.
 // ============================================================
 
+import {
+  validateReplayPrefix as harnessValidateReplayPrefix,
+  validateNormalizedPrefix as harnessValidateNormalizedPrefix,
+} from './replay-validation.js';
+
 export function createProviderSessions(deps) {
   const required = ['persistence', 'persistConversation', 'reportIssue', 'getAdapter',
-    'providerConfig', 'createProviderIdentity', 'projectHistory',
-    'validateReplayPrefix', 'validateNormalizedPrefix', 'durableId', 'now'];
+    'providerConfig', 'createProviderIdentity', 'projectHistory', 'durableId', 'now'];
   for (const k of required) {
     if (!deps || !deps[k]) throw new Error('provider sessions: ' + k + ' is required');
   }
+  // Validation algorithms default to the Harness implementation (review
+  // round F3); an explicit injection keeps working as a test seam.
+  const validateReplayPrefix = deps.validateReplayPrefix || harnessValidateReplayPrefix;
+  const validateNormalizedPrefix = deps.validateNormalizedPrefix || harnessValidateNormalizedPrefix;
   const p = deps.persistence;
   for (const m of ['get', 'loadProviderSession', 'loadProviderFrames', 'loadNormalizedMessages',
     'saveProviderSession', 'appendProviderFrame', 'saveNormalizedMessage']) {
@@ -85,7 +97,7 @@ export function createProviderSessions(deps) {
     };
     row._projectedHistory = await p.loadNormalizedMessages(conv.id);
     row.nextNormalizedSequence = row._projectedHistory.reduce((n, message) => Math.max(n, message.sequence || 0), 0);
-    try { deps.validateNormalizedPrefix(conv.id, row._projectedHistory); }
+    try { validateNormalizedPrefix(conv.id, row._projectedHistory); }
     catch (e) {
       row._projectedHistory = [];
       row._replayBlocked = true;
@@ -113,7 +125,7 @@ export function createProviderSessions(deps) {
       const allFrames = await p.loadProviderFrames(previous.id);
       const frames = allFrames.filter((frame) => frame.sequence <= previous.replayCheckpointSequence);
       try {
-        deps.validateReplayPrefix(previous, frames, adapter);
+        validateReplayPrefix(previous, frames, adapter);
         // A durable suffix exists when a response/tool result was archived but
         // the checkpoint write failed.  It is intentionally not replay-safe:
         // reusing only the old checkpoint could execute an already-side-effecting
@@ -136,7 +148,7 @@ export function createProviderSessions(deps) {
         await persistConversation(conv);
         try {
           const normalized = await p.loadNormalizedMessages(conv.id);
-          deps.validateNormalizedPrefix(conv.id, normalized);
+          validateNormalizedPrefix(conv.id, normalized);
           // The semantic projection is useful for inspection/recovery, but a
           // corrupt raw checkpoint is never silently turned into a new provider
           // request. Starting a fresh task creates a new safe boundary.
@@ -153,7 +165,7 @@ export function createProviderSessions(deps) {
     } else {
       const normalized = await p.loadNormalizedMessages(conv.id);
       try {
-        deps.validateNormalizedPrefix(conv.id, normalized);
+        validateNormalizedPrefix(conv.id, normalized);
         session.history = deps.projectHistory(normalized, config.dialect);
       } catch (e) {
         session.history = [];

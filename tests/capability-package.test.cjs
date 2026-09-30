@@ -18,7 +18,7 @@ const crypto = require('crypto');
 const read = (p) => fs.readFileSync(path.join(__dirname, '..', p), 'utf8');
 
 // ---- module under test (workspace.js + vfs.js + extensions.js are base) ----
-const src = ['src/workspace.js', 'src/vfs.js', 'src/extensions.js', 'src/capability-package.js']
+const src = ['src/workspace.js', 'src/vfs.js', 'src/extension-composition.js', 'src/extensions.js', 'src/capability-package.js']
   .map((f) => read(f)).join('\n;\n');
 const M = eval(src + '\n;({ LocusCapabilityPackage: globalThis.LocusCapabilityPackage,'
   + ' MemoryWorkspace, WorkspaceAdapter });');

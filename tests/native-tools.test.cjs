@@ -39,6 +39,16 @@ global.fetch = async (url, opts) => {
 };
 
 let passed = 0, failed = 0;
+// M2b (repository split): AgentSession consumes a ToolPort
+// ({ definitions(), execute({ name, input, context }) }); this suite's
+// fakes keep the legacy executor shape and convert through the exact
+// mapping the contract documents (docs/REPOSITORY-SPLIT-CONTRACTS.md 3.2).
+const asToolPort = (executor) => ({
+  definitions: () => M.AGENT_TOOL_DEFINITIONS.slice(),
+  execute: ({ name, input, context }) =>
+    executor(name, input, (context && context.filesystem) || null, { signal: context && context.signal }),
+});
+
 function check(name, cond, detail) {
   if (cond) { passed++; console.log('PASS ' + name); }
   else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + detail : '')); }
@@ -58,10 +68,10 @@ function newSession(tools) {
   const execs = [];
   const session = new M.AgentSession({
     modelClient: (body, opts) => M.callModel(Object.assign({ model: 'm' }, body), opts),
-    toolExecutor: async (tool, input) => {
+    toolPort: asToolPort(async (tool, input) => {
       execs.push([tool, input]);
       return { output: 'OUT(' + input + ')', success: true, backend: 'browser' };
-    },
+    }),
     emit: (e) => events.push(e),
   });
   return { session, events, execs };
