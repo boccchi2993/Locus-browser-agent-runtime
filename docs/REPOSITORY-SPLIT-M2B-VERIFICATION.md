@@ -132,3 +132,27 @@ Branch head after the round: `refactor/repository-split-m2b` @ the four commits 
 - No real model/relay was contacted anywhere (fakes and deterministic transports only, both rounds). The review round re-verified the relay DECISION semantics deterministically (capture-once-at-entry, both flip directions, per-call read count, client isolation — fake transports); an end-to-end run against a deployed `/proxy` relay remains uncovered by design in this repository's gates.
 - ~~The replay validators remain in `persistence.js` — their physical relocation is M3~~ — CLOSED by the review round: the algorithms live in `src/harness/replay-validation.js` (re-exported by the entry); `persistence.js` retains only one-way delegates. What M3 still owns: turning the delegates' classic-script compat surface (and the `Model`/`callModel` wrappers) into plain imports once the eval-based suite model converts.
 - Python-related behavior is carried by this round's full e2e (python-authority, python-browser-authority, python-bootstrap-integrity, trusted-plugin-runtime all green); no NEW python-specific gates were added — neither M2b nor the review round touched worker/bootstrap code.
+
+## 9. Review round 2 (snapshot fidelity → closed, 2026-10-01)
+
+Scope: the tool-definition JSON snapshot only — `deepCopyToolData` + descriptor-guarded definition validation in `src/agent.js`, the F1b test block, docs. Relay capture (F2), replay validation (F3), the harness-host artifact gate (F4), task lifecycle and model retry policy untouched. The defect: `out[k] = value` reinterpreted a legal JSON own key `"__proto__"` as a prototype setter (field lost or rewritten, copy prototype influenced), and `Object.keys`/`value.map` silently dropped Symbol keys, non-index array properties and non-enumerable fields, skipped array holes, invoked getters, and dispatched through the source's own `map` (hijackable). Design record: M2B-DESIGN §11.
+
+**Baseline first-failure (this round's own execution, distinct from §7 history):** the F1b block was written first and run against the UNMODIFIED `dfc051c` sources — **73 PASS / 14 FAIL** (`tmp-f1b-firstfail.log`, not committed). Every failure is the defect itself: the own `"__proto__"` key vanished (`properties` serialized as `{}`), the copy's prototype was rewritten, and the OpenAI wire serialization lost the key; all seven hostile shapes (Symbol-keyed function, function in a non-index array property, sparse array, object accessor, accessor array element, own `map` override, non-enumerable property) were silently ACCEPTED with exactly one model request each — and the object getter, the element getter and the hostile `map` each executed exactly once during snapshotting.
+
+**After the fix — every gate re-run in this worktree, this round:**
+
+| Command | Result | Notes |
+|---|---|---|
+| `node tests/harness-standalone.test.mjs` | **87 PASS / 0 FAIL** (69 + 18 F1b checks) | no pre-existing assertion changed or loosened; F1b covers keys preserved (own `"__proto__"` through the real OpenAI adapter + `JSON.stringify` wire path), forbidden-shape rejections with zero model requests/zero executions, getter/`map` never-invoked counters, shared-acyclic-sub-object legality, deep freeze |
+| `node tests/harness-boundary.test.cjs` / `harness-prompt-parity.test.mjs` / `harness-replay.test.mjs` | 12 / 17 / 18 PASS, 0 FAIL | closure and parity unchanged |
+| agent / agent-approval / agent-image / model / model-adapters / model-adapters-image / native-tools | 105 / 54 / 26 / 62 / 84 / 14 / 21 PASS, 0 FAIL | the model-protocol and tool-call suites, green unmodified |
+| `node tests/run-unit.cjs` (full) | **PASS 54/54 suites, exit 0** | plain file redirection (no pipe — the §2 deadlock note) |
+| `npm run build` | PASS | harness self-assembly chunk rebuilt with the new copier (verified by content grep in `assets/core-*.js`) |
+| `node tests/e2e-harness-host.cjs` (post-build browser gate) | **12/12 PASS, exit 0** | H0–H1 green on the packaged artifacts; loaded chunks exactly {harnessHost, preload-helper, index, core}. The FIRST invocation failed for an OPERATIONAL reason, not a regression: the gate expects an external preview server (standalone runs need `npx vite preview --host 127.0.0.1 --port 4173 --strictPort`; the `tests/e2e.cjs` orchestrator normally starts it) — with no server, Chrome opened a connection-error page and readiness timed out. Re-run with the server: all green, zero page errors |
+
+Python/worker-specific e2e suites were not mechanically re-run this round: the diff is `src/agent.js` + one test file + docs (no worker/bootstrap/runtime code), and the full unit battery plus the post-build harness-host browser gate cover the changed path end to end — per the round's scope rule, no extra gates were required.
+
+### Unverified scope this round
+
+- No interactive human browser pass beyond the deterministic harness-host gate (the packaged-artifact battery drives the changed snapshot path in a real browser; the product-side interactive pass of §5 is unchanged and unaffected by a harness-internal copy change).
+- No real model/relay contacted (fake models and deterministic transports only, as in every M2b round); the wire-fidelity proof uses the real adapter serialization + real `JSON.stringify` over an in-process round trip.
