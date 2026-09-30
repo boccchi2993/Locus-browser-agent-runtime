@@ -467,6 +467,10 @@ async function verifyConnection() {
 //  Classic loading is unaffected.
 // ============================================================
 globalThis.Model = Model;
+// Cross-file ESM edge: model-adapters.js (loaded BEFORE this file) throws
+// the parse-error constructor at response-parsing time — the classic page
+// resolves it through the lexical chain, the ESM mode through globalThis.
+globalThis.makeParseError = makeParseError;
 globalThis.createModelClient = createModelClient;
 globalThis.callModel = callModel;
 globalThis.callModelText = callModelText;
