@@ -1,9 +1,12 @@
-// Standalone RUNTIME HOST browser e2e (M2a gate B/C/F — real build, real
-// Chrome, real workers, real Python).
+// Standalone RUNTIME HOST browser e2e (M2a gate B/C/F + review-round L —
+// real build, real Chrome, real workers, real Python).
 //
 // Drives dist/tests/runtime-host.html (a REAL vite build input): the page
-// loads only the runtime core + the public entry + the worker-asset
-// bundle. Proves, on the packaged artifacts:
+// imports ONLY the public entry + the worker-asset bundle as ES modules —
+// ZERO classic scripts; the entry assembles its own core. Proves, on the
+// packaged artifacts:
+//   H0b/c the entry self-assembled (no classic script tags; registry +
+//         command surface published);
 //   B1  cold load performs ZERO Pyodide CDN fetches (lazy python);
 //   B2  shell text work runs and stays cold (no DOM ids anywhere);
 //   B3  grep uses a REAL worker compiled from the packaged asset and a
@@ -12,7 +15,11 @@
 //   B4  REAL Python boots from the pinned manifest, executes, and reports
 //       VFS write-back through the public entry;
 //   B5  status transitions arrive as events (subscribe path), never DOM;
-//   C   a second session on the same host is independent (state + dispose).
+//   C   a second session on the same host is independent (state + dispose),
+//       with filesystems built through the entry's VFS exports;
+//   L   boundary semantics LIVE: a parked composite shell is stopped by
+//       reset, the dispatched write commits honestly, the crossed prepare
+//       refuses, busy drains.
 // Run: node tests/e2e-runtime-host.cjs   (E2E_HOST_URL or the default preview URL)
 const fs = require('fs/promises');
 const os = require('os');
@@ -56,6 +63,13 @@ async function main() {
     await waitForRuntimeCondition(cdp, 'document.title === "runtime-host-ready"',
       { process: chrome, phase: 'runtime-host-boot', timeoutMs: 15000 });
     check('H0 the standalone host page is ready', true);
+
+    // ---- H0b/c: the entry ASSEMBLED itself (M2a review round) ----
+    const asm = await evaluate(cdp, 'window.__host.assembly()');
+    check('H0b the page carries ZERO classic scripts (pure module self-assembly)',
+      asm.classicScriptTags === 0, JSON.stringify(asm));
+    check('H0c the self-assembled core published the registry and the command surface',
+      asm.registryPresent === true && asm.shellCommands > 0, JSON.stringify(asm));
 
     // ---- B1: cold load = zero CDN fetches ----
     check('B1 cold load performed ZERO Pyodide CDN fetches (lazy python)',
@@ -121,11 +135,12 @@ async function main() {
       JSON.stringify(statusKinds));
 
     // ---- C: a second session on the same host is independent ----
+    // (filesystems come from the entry's VFS exports — no global
+    // constructors exist on this page.)
     const c = await evaluate(cdp, `(async () => {
       const h = window.__host;
       const s2 = h.host.createSession();
-      const v2 = new VirtualWorkspace({ listCommands: () => Object.keys(SHELL_COMMANDS) });
-      v2.mount('/mnt/workspace', new MemoryWorkspace({ name: 'ws2' }), 'read-write');
+      const v2 = h.makeVfs();
       await h.session.execute({ kind: 'shell', input: 'echo A > /mnt/workspace/w.txt', context: { filesystem: h.vfs } });
       await s2.execute({ kind: 'shell', input: 'echo B > /mnt/workspace/w.txt', context: { filesystem: v2 } });
       const ra = await h.session.execute({ kind: 'shell', input: 'cat /mnt/workspace/w.txt', context: { filesystem: h.vfs } });
@@ -142,6 +157,61 @@ async function main() {
     check('C2 the disposed session refuses; the survivor still executes',
       /disposed/.test(c.refused || '') && c.alive === 'alive' && c.survivorAlive === true,
       JSON.stringify(c));
+
+    // ---- L: boundary semantics LIVE on the packaged entry (review round).
+    // A dedicated session's composite shell is parked mid-write; the gate
+    // is a real event barrier (the park event, then the driver opens it).
+    // The small settle window before the reset only bounds the NEGATIVE
+    // check (nothing applied yet) — the ordering proof itself lives in the
+    // deterministic Node suites (runtime-session-lifecycle).
+    const L = await evaluate(cdp, `(async () => {
+      const h = window.__host;
+      const pk = h.makeParkingVfs();
+      pk.hold('/tmp/first');
+      const runPromise = pk.session.execute({
+        kind: 'shell',
+        input: 'echo first > /tmp/first; echo second > /tmp/second',
+        context: { filesystem: pk.vfs },
+      });
+      await new Promise((r) => {
+        const t = setInterval(() => {
+          if (pk.log.includes('write:park:/tmp/first')) { clearInterval(t); r(); }
+        }, 5);
+      });
+      const busyWhileParked = pk.session.status().busyExecutions;
+      let prepareApplied = false;
+      const pp = pk.session.prepare({ python: { key: 'env-live', modules: [
+        { pluginId: 'locus-live-plugin', imports: ['locus_live_plugin'], files: { '__init__.py': 'x = 1\\n' } },
+      ] } }).then((r) => { prepareApplied = true; return r; }).catch((e) => e);
+      await new Promise((r) => setTimeout(r, 25));
+      const prepareWaited = prepareApplied === false && pk.session.status().extensionKey === null;
+      pk.session.reset('live boundary');
+      pk.open();
+      const res = await runPromise;
+      const prepareOutcome = await pp;
+      return {
+        busyWhileParked,
+        prepareWaited,
+        secondWrite: pk.log.includes('write:enter:/tmp/second'),
+        firstCommitted: pk.log.includes('write:commit:/tmp/first'),
+        ok: res.ok,
+        boundary: res.boundary || null,
+        busyAfter: pk.session.status().busyExecutions,
+        keyAfter: pk.session.status().extensionKey,
+        prepareRefused: prepareOutcome instanceof Error
+          && /reset while preparation waited/.test(String(prepareOutcome.message)),
+      };
+    })()`, 60000);
+    check('L1 the parked composite shell is tracked (busy=1)',
+      L.busyWhileParked === 1, JSON.stringify(L));
+    check('L2 prepare waits while the non-python execution is in flight',
+      L.prepareWaited === true, JSON.stringify(L));
+    check('L3 the boundary blocked the post-boundary write; the dispatched write committed',
+      L.secondWrite === false && L.firstCommitted === true, JSON.stringify(L));
+    check('L4 the boundary-stopped run settles honestly and names the boundary',
+      L.ok === false && /live boundary/.test(String(L.boundary || '')), JSON.stringify(L));
+    check('L5 the crossed prepare refused; busy drained; nothing applied',
+      L.prepareRefused === true && L.busyAfter === 0 && L.keyAfter === null, JSON.stringify(L));
 
     // ---- console hygiene ----
     check('H1 zero page errors / unhandled rejections',

@@ -1722,10 +1722,17 @@ async function bootPersistence() {
       rows.forEach((c) => { if (c.runState === 'running') { c.runState = 'interrupted'; c.status = 'interrupted'; } });
       store.conversations = rows;
       const continuation = rows.find((c) => c.items && c.items.length || c.status && c.status !== 'idle') || rows[0];
+      // Rebind the session ONLY onto a DIFFERENT conversation: the
+      // brand-new conversation this very boot created has no durable
+      // transcript, and restoreInto would just reset a runtime session
+      // that has no state to drop — a spurious boundary that (since the
+      // session owns execution invalidation) would cancel unrelated
+      // in-flight work. Archived conversations still rebind and replay.
+      const rebindNeeded = continuation.id !== store.liveConversationId;
       store.activeConversationId = continuation.id;
       store.liveConversationId = continuation.id;
       const providerSessions = providerSessionsAdapter();
-      if (providerSessions) await providerSessions.restoreInto(session, continuation);
+      if (providerSessions && rebindNeeded) await providerSessions.restoreInto(session, continuation);
       for (const c of rows) await persistConversation(c);
     }
     await restoreWorkspaceHandle();

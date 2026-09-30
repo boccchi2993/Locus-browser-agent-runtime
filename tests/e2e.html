@@ -84,7 +84,7 @@ import { createRuntime } from '../src/runtime/index.js';
     // executeTool and routes every bash call through the M2a public entry
     // session (which injects the instance and the grep worker asset
     // itself); the reset/worker assertions below drive the SAME instance.
-    const __host = createRuntime({
+    const __host = await createRuntime({
       workerAssets: { pyWorkerSource: PY_WORKER_SOURCE, grepWorkerSource: GREP_WORKER_SOURCE },
     });
     const __session = __host.createSession();
