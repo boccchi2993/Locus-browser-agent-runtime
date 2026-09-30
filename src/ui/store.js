@@ -38,13 +38,16 @@
 import { reactive, computed } from 'vue';
 import { createTaskRunner, isPersistenceFailure } from '../harness/task-runner.js';
 import { createProviderSessions } from '../harness/provider-session.js';
+// M2b (repository split): the Product prompt inputs — behavior notes and
+// the descriptionPort adapter over the runtime's PUBLIC describeCommands().
+import { locusEnvironmentNotes, productDescriptionPort } from './product-prompt.js';
 // M2a (repository split): the PUBLIC runtime entry. The product chain
 // (prepare / execute / reset / dispose) goes through it — no page-global
 // runtime, no second interpreter, no worker sources read from this page.
 import { createRuntime } from '../runtime/index.js';
 import { PY_WORKER_SOURCE, GREP_WORKER_SOURCE } from '../runtime/worker-assets.js';
 
-/* global AgentSession, Model, callModel, executeTool, buildSystemPrompt,
+/* global AgentSession, Model, callModel, executeTool, AGENT_TOOL_DEFINITIONS,
    LocalDirectoryWorkspace, ensureWorkspacePermission, LocusMutationPolicy,
    Telemetry, LocusProjector, VirtualWorkspace, SHELL_COMMANDS, LOCUS_HOME_SKELETON,
    CapabilityManager, CAPABILITY_CATALOG, PLUGIN_CATALOG, SKILL_CATALOG, MCP_CATALOG,
@@ -460,24 +463,40 @@ function productNetworkAuthorization() {
   };
 }
 
-async function wiredToolExecutor(tool, input, workspace, opts) {
-  const o = Object.assign({}, opts || {}, {
-    // M2a: bash routes through the public RuntimeSession entry — the
-    // session injects the interpreter instance and the grep worker asset
-    // itself; this wiring carries neither. The entry assembles
-    // asynchronously, so the task path awaits the one-time resolution.
-    runtimeSession: await whenRuntimeSession(),
-    // M1b: the product mutation policy — mv/rm refusals (skill identity
-    // among them) come from IT, never from hardcoded runtime rules.
-    mutationPolicy: taskMutationPolicy(),
-    // M2a: the execution authorization port (product adapter supplies the
-    // chat identity on its side; the runtime request carries none).
-    authorization: productNetworkAuthorization(),
-  });
-  const h = hooks();
-  if (h && typeof h.toolExecutor === 'function') return h.toolExecutor(tool, input, workspace, o);
-  return executeTool(tool, input, workspace, o);
-}
+// ---------- product ToolPort (M2b, contract §3.2) ----------
+// The Harness consumes { definitions(), execute({ name, input, context }) };
+// this adapter IS the product implementation over the classic tool layer:
+// definitions come from the product tool registry (src/tools.js — bash /
+// cloud_bash names, descriptions, schemas and refusals unchanged), and
+// execute routes exactly what wiredToolExecutor did — hooks seam first,
+// then executeTool with the runtime session, mutation policy and
+// authorization adapter wired. The task's context carries { filesystem,
+// signal }; everything Product-side closes over here, never travels
+// through the Harness.
+const productToolPort = {
+  definitions() {
+    return typeof AGENT_TOOL_DEFINITIONS !== 'undefined' ? AGENT_TOOL_DEFINITIONS.slice() : [];
+  },
+  async execute(call) {
+    const c = call && typeof call === 'object' ? call : {};
+    const workspace = c.filesystem || null;
+    const o = {
+      signal: c.signal,
+      // The public RuntimeSession entry assembles asynchronously, so the
+      // task path awaits the one-time resolution (M2a semantics).
+      runtimeSession: await whenRuntimeSession(),
+      // The product mutation policy — mv/rm refusals (skill identity
+      // among them) come from IT, never from hardcoded runtime rules.
+      mutationPolicy: taskMutationPolicy(),
+      // The execution authorization port (product adapter supplies the
+      // chat identity on its side; the runtime request carries none).
+      authorization: productNetworkAuthorization(),
+    };
+    const h = hooks();
+    if (h && typeof h.toolExecutor === 'function') return h.toolExecutor(c.name, c.input, workspace, o);
+    return executeTool(c.name, c.input, workspace, o);
+  },
+};
 
 // Conversation identity semantics — three DIFFERENT concepts, never merge:
 //   activeConversationId  — which conversation the user is looking at.
@@ -637,8 +656,12 @@ function handleRuntimeEvent(event) {
 
 export const session = new AgentSession({
   modelClient: wiredModelClient,
-  toolExecutor: wiredToolExecutor,
-  buildSystemPrompt: buildSystemPrompt,
+  // M2b: the session consumes the PRODUCT ToolPort (definitions snapshot
+  // + execution); the description port adapts the runtime's public
+  // describeCommands(); the Locus behavior notes come from product-prompt.
+  toolPort: productToolPort,
+  descriptionPort: productDescriptionPort(whenRuntimeSession),
+  environmentNotes: locusEnvironmentNotes,
   emit: handleRuntimeEvent,
   // M2a: the session boundary resets the runtime SESSION (the interpreter
   // inside it dies: globals/modules/tmp — verified assets and the session
@@ -990,7 +1013,7 @@ async function buildImageUserContent(input) {
   const budget = (typeof HISTORY_BUDGET_BYTES === 'number') ? HISTORY_BUDGET_BYTES : 768 * 1024;
   let imageBytes = 0;
   for (const p of parts) if (p.type === 'image') imageBytes += imageWireEstimate(p.size);
-  const projected = session.historyRequestBytes(vfs, capabilityManager ? capabilityManager.buildTaskEnvironment() : null) + imageBytes + new TextEncoder().encode(JSON.stringify({ role: 'user', content: parts })).byteLength + 16;
+  const projected = await session.historyRequestBytes(vfs, capabilityManager ? capabilityManager.buildTaskEnvironment() : null) + imageBytes + new TextEncoder().encode(JSON.stringify({ role: 'user', content: parts })).byteLength + 16;
   if (projected > budget) {
     const conv = store.conversations.find((c) => c.id === store.liveConversationId);
     if (conv) {

@@ -33,6 +33,16 @@ const A = eval(read('src/tools.js') + '\n' + read('src/agent.js')
   + '\n;({ buildSystemPrompt, AgentSession, AGENT_TOOL_DEFINITIONS });');
 
 let passed = 0, failed = 0;
+// M2b (repository split): AgentSession consumes a ToolPort
+// ({ definitions(), execute({ name, input, context }) }); this suite's
+// fakes keep the legacy executor shape and convert through the exact
+// mapping the contract documents (docs/REPOSITORY-SPLIT-CONTRACTS.md 3.2).
+const asToolPort = (executor) => ({
+  definitions: () => A.AGENT_TOOL_DEFINITIONS.slice(),
+  execute: ({ name, input, context }) =>
+    executor(name, input, (context && context.filesystem) || null, { signal: context && context.signal }),
+});
+
 function check(name, cond, detail) {
   if (cond) { passed++; console.log('PASS ' + name); }
   else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + detail : '')); }
@@ -434,10 +444,10 @@ async function run() {
   // budget integration: the index is inside the counted system prompt
   const session = new A.AgentSession({
     modelClient: async () => ({ content: 'done', rawMessage: { role: 'assistant', content: 'done' }, stopReason: 'end_turn', truncated: false }),
-    toolExecutor: async () => ({ output: 'ok', success: true }),
+    toolPort: asToolPort(async () => ({ output: 'ok', success: true })),
   });
-  const bytesWithout = session.historyRequestBytes(null, null);
-  const bytesWith = session.historyRequestBytes(null, pEnv);
+  const bytesWithout = await session.historyRequestBytes(null, null);
+  const bytesWith = await session.historyRequestBytes(null, pEnv);
   check('S12 capability index counts into the request byte budget', bytesWith > bytesWithout && bytesWith - bytesWithout < 4096,
     String(bytesWith - bytesWithout));
 

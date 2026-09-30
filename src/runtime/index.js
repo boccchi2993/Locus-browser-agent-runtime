@@ -559,6 +559,18 @@ function createRuntimeSession(core, workerAssets, onReleased) {
       if (onReleased) onReleased();
     },
 
+    // ---- capability description (M2b, contract §3.7) ----
+    // The command/capability description GENERATED from this runtime's
+    // own command registry (the same text `help` renders). The Product
+    // adapts this public method into the Harness descriptionPort; no
+    // consumer reads shellSystemPromptSection as a global anymore.
+    // Returns null when the resolved core does not provide a description
+    // (never a fabricated capability).
+    describeCommands() {
+      const describe = core.shellSystemPromptSection;
+      return typeof describe === 'function' ? describe() : null;
+    },
+
     // Runtime-internal accessor for test/e2e seams ONLY (documented
     // users: window.__locus, Node suites). The product execution chain
     // goes through execute/prepare/reset/dispose — never through this.

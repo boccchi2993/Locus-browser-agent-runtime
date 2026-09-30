@@ -21,6 +21,7 @@ const vfsSrc = fs.readFileSync(path.join(root, 'src', 'vfs.js'), 'utf8');
 const approvalSrc = fs.readFileSync(path.join(root, 'src', 'approval.js'), 'utf8');
 const taskRunnerSrc = fs.readFileSync(path.join(root, 'src', 'harness', 'task-runner.js'), 'utf8');
 const providerSessionSrc = fs.readFileSync(path.join(root, 'src', 'harness', 'provider-session.js'), 'utf8');
+const productPromptSrc = fs.readFileSync(path.join(root, 'src', 'ui', 'product-prompt.js'), 'utf8');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -64,6 +65,8 @@ function loadStore(sessionData) {
     // modules; strip their export keywords and inline them like the rest.
     taskRunnerSrc.replace(/^export /gm, '') + '\n' +
     providerSessionSrc.replace(/^export /gm, '') + '\n' +
+    // M2b: the product prompt inputs module (pure, no vue).
+    productPromptSrc.replace(/^export /gm, '') + '\n' +
     'const SHELL_COMMANDS = {};\n' +
     code + '\n;({ store, vfs, applySettings, persistSettingsIfNeeded, testConnection, addUploadFiles, removeAttachment, refreshArtifacts, downloadArtifact });'
   );

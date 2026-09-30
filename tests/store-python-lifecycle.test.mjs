@@ -66,7 +66,7 @@ class FakeAgentSession {
   constructor(deps) {
     this.emit = deps.emit;
     this.onSessionReset = deps.onSessionReset;
-    this.toolExecutor = deps.toolExecutor; // the store's wiredToolExecutor (SP2 drives it)
+    this.toolPort = deps.toolPort; // the store's product ToolPort (SP2 drives it)
     this.history = [];
     this.generation = 0;
     this.task = null;
@@ -166,9 +166,9 @@ const createdBefore = createdSessions.length;
 
 // ---------- SP1 + SP2 + SP3: one task end to end ----------
 {
-  // session.toolExecutor IS the store's wiredToolExecutor (the exact
+  // session.toolPort IS the store's product ToolPort (the exact
   // function the real agent loop invokes for every tool call).
-  await session.toolExecutor('bash', 'echo probe', ui.vfs, { signal: new AbortController().signal });
+  await session.toolPort.execute({ name: 'bash', input: 'echo probe', context: { filesystem: ui.vfs, signal: new AbortController().signal } });
   const done = submit('run python and report');
   await done;
   check('SP1 task preparation configured the CANONICAL runtime session',
@@ -210,7 +210,7 @@ const createdBefore = createdSessions.length;
 // ---------- SP6: the product mutation policy rides every bash call -------
 {
   toolCalls.length = 0;
-  await session.toolExecutor('bash', 'mv /home/locus/.skills/x /tmp/x', ui.vfs, { signal: new AbortController().signal });
+  await session.toolPort.execute({ name: 'bash', input: 'mv /home/locus/.skills/x /tmp/x', context: { filesystem: ui.vfs, signal: new AbortController().signal } });
   const injected = toolCalls[0] && toolCalls[0].opts && toolCalls[0].opts.mutationPolicy;
   check('SP6 the executor opts carry a REAL product mutation policy',
     !!injected && typeof injected.checkMove === 'function' && typeof injected.checkRemove === 'function'
@@ -259,7 +259,7 @@ const createdBefore = createdSessions.length;
   delete globalThis.LocusMutationPolicy;
   const ui3 = await import('../src/ui/store.js?no-policy');
   let refused = null;
-  try { await ui3.session.toolExecutor('bash', 'echo hi', ui3.vfs, {}); }
+  try { await ui3.session.toolPort.execute({ name: 'bash', input: 'echo hi', context: { filesystem: ui3.vfs } }); }
   catch (e) { refused = e; }
   check('SP7 a missing product policy refuses execution loudly',
     !!refused && /mutation policy unavailable/.test(String(refused && refused.message)),

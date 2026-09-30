@@ -27,7 +27,7 @@ const M = eval(
   read('shell.js') + '\n' +
   read('tools.js') + '\n' +
   read('agent.js') +
-  '\n;({ NetworkRuntime, safeNetworkUrlForDisplay, nativeResultContent, executeTool, Telemetry, AgentSession, buildSystemPrompt, VirtualWorkspace });'
+  '\n;({ NetworkRuntime, safeNetworkUrlForDisplay, nativeResultContent, executeTool, Telemetry, AgentSession, buildSystemPrompt, VirtualWorkspace, AGENT_TOOL_DEFINITIONS });'
 );
 
 // M2a: bash routes through the PUBLIC runtime entry (the eval'd shell.js
@@ -43,6 +43,16 @@ let __session = null;
 const withSession = (opts) => Object.assign({ runtimeSession: __session }, opts || {});
 
 let passed = 0, failed = 0;
+// M2b (repository split): AgentSession consumes a ToolPort
+// ({ definitions(), execute({ name, input, context }) }); this suite's
+// fakes keep the legacy executor shape and convert through the exact
+// mapping the contract documents (docs/REPOSITORY-SPLIT-CONTRACTS.md 3.2).
+const asToolPort = (executor) => ({
+  definitions: () => M.AGENT_TOOL_DEFINITIONS.slice(),
+  execute: ({ name, input, context }) =>
+    executor(name, input, (context && context.filesystem) || null, { signal: context && context.signal }),
+});
+
 function check(name, cond, detail) {
   if (cond) { passed++; console.log('PASS ' + name); }
   else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + detail : '')); }
@@ -72,7 +82,7 @@ function newSession(overrides) {
   const bodies = [];
   const session = new M.AgentSession(Object.assign({
     modelClient: async (body) => { bodies.push(body); return envelope('done'); },
-    toolExecutor: async () => ({ output: 'ok', success: true }),
+    toolPort: asToolPort(async () => ({ output: 'ok', success: true })),
     buildSystemPrompt: M.buildSystemPrompt,
     emit: (e) => events.push(e),
   }, overrides || {}));
@@ -179,7 +189,7 @@ async function run() {
             : envelope('done');
         };
       })(),
-      toolExecutor: (tool, input, ws, opts) => M.executeTool(tool, input, newVfs(), withSession(opts)),
+      toolPort: asToolPort((tool, input, ws, opts) => M.executeTool(tool, input, newVfs(), withSession(opts))),
     });
     await session.run('fetch that url', { workspace: WS });
     const tr = session.history.find((m) => m.role === 'tool_result');
@@ -201,7 +211,7 @@ async function run() {
           ? envelope('', { toolCalls: [{ id: 'call_v6', name: 'bash', input: { input: 'ls' } }] })
           : envelope('done');
       },
-      toolExecutor: async () => ({ output: 'semantic output', success: true, backend: 'SECRET_BACKEND_SENTINEL' }),
+      toolPort: asToolPort(async () => ({ output: 'semantic output', success: true, backend: 'SECRET_BACKEND_SENTINEL' })),
     });
     await session.run('task', { workspace: WS });
     const tr = session.history.find((m) => m.role === 'tool_result');
@@ -231,7 +241,7 @@ async function run() {
         bodies.push(body);
         return envelope('```json\n{"tool":"bash","input":"ls"}\n```');
       },
-      toolExecutor: async () => ({ output: 'fallback output', success: true, backend: 'SECRET_FALLBACK_SENTINEL' }),
+      toolPort: asToolPort(async () => ({ output: 'fallback output', success: true, backend: 'SECRET_FALLBACK_SENTINEL' })),
     });
     await session.run('task', { workspace: WS });
     const fb = session.history.find((m) => m.role === 'user' && String(m.content).includes('<tool_result>'));

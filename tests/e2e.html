@@ -248,6 +248,8 @@ import { createRuntime } from '../src/runtime/index.js';
     // reaching the model client ends the task with no residual state.)
     {
       let modelAborted = 0;
+      // M2b: sessions consume a ToolPort — the harness page adapts the
+      // product tool registry directly (same mapping as the store).
       const hanging = new AgentSession({
         modelClient: (req, opts) => new Promise((resolve, reject) => {
           opts.signal.addEventListener('abort', () => {
@@ -255,7 +257,10 @@ import { createRuntime } from '../src/runtime/index.js';
             reject(Object.assign(new Error('model request aborted'), { name: 'AbortError' }));
           });
         }),
-        toolExecutor: async () => ({ output: 'ok', success: true }),
+        toolPort: {
+          definitions: () => AGENT_TOOL_DEFINITIONS.slice(),
+          execute: async ({ name, input, context }) => ({ output: 'ok', success: true, backend: 'browser' }),
+        },
         buildSystemPrompt: buildSystemPrompt,
         emit: () => {},
       });

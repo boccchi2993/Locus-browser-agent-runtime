@@ -12,10 +12,20 @@ const toolsSrc = fs.readFileSync(path.join(root, 'src', 'tools.js'), 'utf8');
 const agentSrc = fs.readFileSync(path.join(root, 'src', 'agent.js'), 'utf8');
 const P = (0, eval)(persistenceSrc + '\n;({ PersistenceService, validateReplayPrefix, validateNormalizedPrefix });');
 const A = (0, eval)(adapterSrc + '\n;({ OpenAIAdapter, AnthropicAdapter, createCredentialIdentity, createProviderIdentity, normalizeCredentialEndpoint });');
-const G = (0, eval)(toolsSrc + '\n' + agentSrc + '\n;({ AgentSession });');
+const G = (0, eval)(toolsSrc + '\n' + agentSrc + '\n;({ AgentSession, AGENT_TOOL_DEFINITIONS });');
 
 let passed = 0;
 let failed = 0;
+// M2b (repository split): AgentSession consumes a ToolPort
+// ({ definitions(), execute({ name, input, context }) }); this suite's
+// fakes keep the legacy executor shape and convert through the exact
+// mapping the contract documents (docs/REPOSITORY-SPLIT-CONTRACTS.md 3.2).
+const asToolPort = (executor) => ({
+  definitions: () => G.AGENT_TOOL_DEFINITIONS.slice(),
+  execute: ({ name, input, context }) =>
+    executor(name, input, (context && context.filesystem) || null, { signal: context && context.signal }),
+});
+
 function check(name, condition, detail) {
   if (condition) { passed++; console.log('PASS ' + name); }
   else { failed++; console.log('FAIL ' + name + (detail ? ' | ' + detail : '')); }
@@ -262,7 +272,7 @@ async function run() {
         modelCalls++;
         return modelCalls === 1 ? native : { content: 'must not be requested', rawMessage: { role: 'assistant', content: 'must not be requested' } };
       },
-      toolExecutor: async () => { toolCalls++; return { output: '/home/locus', success: true, backend: 'browser' }; },
+      toolPort: asToolPort(async () => { toolCalls++; return { output: '/home/locus', success: true, backend: 'browser' }; }),
       buildSystemPrompt: () => 'audit',
       emit: (event) => events.push(event),
       persistence: {

@@ -34,6 +34,16 @@ const C = eval(
 );
 
 let passed = 0, failed = 0;
+// M2b (repository split): AgentSession consumes a ToolPort
+// ({ definitions(), execute({ name, input, context }) }); this suite's
+// fakes keep the legacy executor shape and convert through the exact
+// mapping the contract documents (docs/REPOSITORY-SPLIT-CONTRACTS.md 3.2).
+const asToolPort = (executor) => ({
+  definitions: () => globalThis.AGENT_TOOL_DEFINITIONS.slice(),
+  execute: ({ name, input, context }) =>
+    executor(name, input, (context && context.filesystem) || null, { signal: context && context.signal }),
+});
+
 function check(name, cond, detail) {
   if (cond) { passed++; console.log('PASS ' + name); }
   else { failed++; console.log('FAIL ' + name + (detail !== undefined ? ' | ' + detail : '')); }
@@ -65,7 +75,7 @@ function makeHarness(imageInput, modelClient) {
       modelCalls.push(body);
       return FINAL_ENVELOPE;
     }),
-    toolExecutor: async () => ({ output: 'tool-out', success: true, backend: 'browser' }),
+    toolPort: asToolPort(async () => ({ output: 'tool-out', success: true, backend: 'browser' })),
     buildSystemPrompt: () => 'SYSTEM',
     emit: (e) => events.push(e),
     imageInput,
@@ -337,8 +347,8 @@ async function main() {
       { type: 'text', text: 'x' },
       { type: 'image', attachmentId: 'att_small', mimeType: 'image/png', size: 1200 },
     ] });
-    const withImage = small.historyRequestBytes(null);
-    const withoutImage = (() => {
+    const withImage = await small.historyRequestBytes(null);
+    const withoutImage = await (async () => {
       const s = makeHarness(null).session;
       s.history.push({ role: 'user', _taskStart: true, content: [{ type: 'text', text: 'x' }] });
       return s.historyRequestBytes(null);
