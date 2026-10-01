@@ -146,6 +146,10 @@ if (e2eMode) {
   // M2a seam: the runtime session (prepare/reset/status/execute) — the
   // public entry object the product chain drives.
   window.__locus.runtime = () => ui.runtimeSession();
+  // M2c seam: the RETAINED runtime host — the public capabilities()
+  // declaration owner the Product compatibility check reads. Browser e2e
+  // drives REAL incompatible-declaration negatives through it.
+  window.__locus.runtimeHost = () => ui.runtimeHost();
   // M2a seam: the runtime worker assets this build carries (worker-source
   // instrumentation in e2e; never part of the product chain).
   window.__locus.runtimeAssets = () => ui.runtimeWorkerAssets();

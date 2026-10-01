@@ -55,6 +55,14 @@ import { locusEnvironmentNotes, productDescriptionPort } from './product-prompt.
 // runtime, no second interpreter, no worker sources read from this page.
 import { createRuntime } from '../runtime/index.js';
 import { PY_WORKER_SOURCE, GREP_WORKER_SOURCE } from '../runtime/worker-assets.js';
+// M2c (repository split): the PUBLIC capability declarations + the Product
+// compatibility check. The Product owns the decision (contract §5); the
+// cores only declare.
+import { harnessCapabilities } from '../harness/index.js';
+import {
+  checkCoreCompatibility, CompatibilityError, PRODUCT_CORE_REQUIREMENTS,
+} from '../product/core-compatibility.js';
+import { createLocusToolPort } from '../product/tool-adapter.js';
 
 /* global Model, executeTool, AGENT_TOOL_DEFINITIONS,
    LocalDirectoryWorkspace, ensureWorkspacePermission, LocusMutationPolicy,
@@ -189,11 +197,20 @@ export function setMcpConnectionState(id, state) {
 // whenRuntimeSession(), which performs the one-time assembly.
 let runtimeSessionResolved; // undefined = unresolved; null = resolved: none available
 let runtimeSessionBootstrap = null;
+// M2c: the RETAINED RuntimeHost reference — the Product's declaration
+// source for the compatibility check (contract §5). Never re-derived from
+// private session/interpreter objects; when the session comes from the
+// window.__LOCUS_HOOKS__.runtimeSession seam, the declaration comes from
+// the EXPLICIT hooks.runtimeCapabilities instead (test hooks must assemble
+// declarations; there is no "skip the check" mode).
+let runtimeHostResolved = null;
+let runtimeHooksDeclaration = null;
 
 function resolveSessionFromHooks() {
   const h = hooks();
   if (h && h.runtimeSession) {
     runtimeSessionResolved = h.runtimeSession;
+    runtimeHooksDeclaration = h.runtimeCapabilities || null;
     return true;
   }
   return false;
@@ -218,7 +235,10 @@ function whenRuntimeSession() {
     runtimeSessionBootstrap = createRuntime({
       workerAssets: { pyWorkerSource: PY_WORKER_SOURCE, grepWorkerSource: GREP_WORKER_SOURCE },
     }).then((host) => {
-      if (runtimeSessionResolved === undefined) runtimeSessionResolved = host.createSession();
+      if (runtimeSessionResolved === undefined) {
+        runtimeHostResolved = host;
+        runtimeSessionResolved = host.createSession();
+      }
       return runtimeSessionResolved;
     }, () => {
       if (runtimeSessionResolved === undefined) runtimeSessionResolved = null;
@@ -229,6 +249,23 @@ function whenRuntimeSession() {
 }
 
 export { whenRuntimeSession };
+
+// M2c: the retained runtime HOST (the capabilities() owner). Null when the
+// session was hooks-injected or no runtime is available.
+export function runtimeHost() {
+  return runtimeHostResolved;
+}
+
+// M2c: the runtime capability DECLARATION this deployment runs with —
+// the retained host's public declaration, or the explicit hooks-seam
+// declaration for injected sessions; null when neither exists (the
+// compatibility check then fails closed — undefined is never compatible).
+function runtimeCapabilitiesDeclaration() {
+  if (runtimeHostResolved && typeof runtimeHostResolved.capabilities === 'function') {
+    return runtimeHostResolved.capabilities();
+  }
+  return runtimeHooksDeclaration;
+}
 
 // Canonical accessor for callers outside this module (the ?e2e=1 seam and
 // the status subscription). Returns null when this deployment has no
@@ -504,43 +541,38 @@ function productNetworkAuthorization() {
   };
 }
 
-// ---------- product ToolPort (M2b, contract §3.2) ----------
-// The Harness consumes { definitions(), execute({ name, input, context }) };
-// this adapter IS the product implementation over the classic tool layer:
-// definitions come from the product tool registry (src/tools.js — bash /
-// cloud_bash names, descriptions, schemas and refusals unchanged), and
-// execute routes exactly what wiredToolExecutor did — hooks seam first,
-// then executeTool with the runtime session, mutation policy and
-// authorization adapter wired. The task's context carries { filesystem,
-// signal }; everything Product-side closes over here, never travels
-// through the Harness.
-const productToolPort = {
-  definitions() {
-    return typeof AGENT_TOOL_DEFINITIONS !== 'undefined' ? AGENT_TOOL_DEFINITIONS.slice() : [];
-  },
-  async execute(call) {
-    const c = call && typeof call === 'object' ? call : {};
-    // The task context is the port's narrow per-call binding:
-    // { filesystem, signal } (contract 3.2).
-    const context = c.context && typeof c.context === 'object' ? c.context : {};
-    const workspace = context.filesystem || null;
-    const o = {
-      signal: context.signal,
-      // The public RuntimeSession entry assembles asynchronously, so the
-      // task path awaits the one-time resolution (M2a semantics).
-      runtimeSession: await whenRuntimeSession(),
-      // The product mutation policy — mv/rm refusals (skill identity
-      // among them) come from IT, never from hardcoded runtime rules.
-      mutationPolicy: taskMutationPolicy(),
-      // The execution authorization port (product adapter supplies the
-      // chat identity on its side; the runtime request carries none).
-      authorization: productNetworkAuthorization(),
-    };
+// ---------- product ToolPort (M2b contract §3.2; M2c shared factory) ----
+// The Harness consumes { definitions(), execute({ name, input, context }) }.
+// Since M2c the composition lives in src/product/tool-adapter.js — the SAME
+// factory the joint integration suites drive; this wiring supplies the
+// production pieces: the product tool registry (src/tools.js — bash /
+// cloud_bash names, descriptions, schemas and refusals unchanged), the
+// hooks-seam/executeTool execution path, the one-time runtime session
+// resolution, the Locus mutation policy and the authorization adapter. The
+// task's context carries { filesystem, signal }; everything Product-side
+// closes over here, never travels through the Harness.
+const productToolPort = createLocusToolPort({
+  definitions: () => (typeof AGENT_TOOL_DEFINITIONS !== 'undefined' ? AGENT_TOOL_DEFINITIONS.slice() : []),
+  execute: (name, input, workspace, o) => {
     const h = hooks();
-    if (h && typeof h.toolExecutor === 'function') return h.toolExecutor(c.name, c.input, workspace, o);
-    return executeTool(c.name, c.input, workspace, o);
+    if (h && typeof h.toolExecutor === 'function') return h.toolExecutor(name, input, workspace, o);
+    return executeTool(name, input, workspace, o);
   },
-};
+  resolveRuntimeSession: whenRuntimeSession,
+  mutationPolicy: taskMutationPolicy,
+  authorization: productNetworkAuthorization,
+});
+
+// M2c: the explicit product rule for a missing OPTIONAL harness capability
+// (imageInputGate — see PRODUCT_CORE_REQUIREMENTS): image attachments
+// degrade to text-only through the SAME visible path as a missing
+// attachment store (explicit warning, text still goes out). No approval,
+// cancellation, persistence or execution guarantee is affected.
+function imageInputGateAvailable() {
+  const declared = runtimeCapabilitiesDeclaration();
+  if (!declared || !declared.capabilities) return true; // not yet resolvable → existing behavior
+  return declared.capabilities.imageInputGate !== false;
+}
 
 // Conversation identity semantics — three DIFFERENT concepts, never merge:
 //   activeConversationId  — which conversation the user is looking at.
@@ -1039,6 +1071,18 @@ export function openConversation(id) {
 async function buildImageUserContent(input) {
   const images = store.attachments.filter((a) => a && String(a.type || '').toLowerCase().startsWith('image/'));
   if (!images.length) return { parts: null, blocked: false };
+  // M2c: the explicit product rule for a missing OPTIONAL harness
+  // capability (imageInputGate — PRODUCT_CORE_REQUIREMENTS): text-only
+  // degrade with the same visible warning path as a missing store. This
+  // never touches approval/cancellation/persistence guarantees.
+  if (!imageInputGateAvailable()) {
+    const conv = store.conversations.find((c) => c.id === store.liveConversationId);
+    if (conv) {
+      LocusProjector.projectEvent(conv, { type: 'warning', code: 'image_attachment_rejected',
+        message: 'Images cannot be attached: the harness does not declare the imageInputGate capability; the text was sent without them.' });
+    }
+    return { parts: null, blocked: false };
+  }
   const s = ensureImageStores();
   const warn = (message) => {
     const conv = store.conversations.find((c) => c.id === store.liveConversationId);
@@ -1108,6 +1152,46 @@ async function prepareTask(task) {
   // runner's pre-run terminals emitted before that still route here.
   taskEventTargets.set(task.id, store.liveConversationId);
   const input = task.input;
+
+  // (0) M2c — the Product compatibility gate (contract §5). Runs BEFORE
+  // any task side effect: no required persistence, no image attachment
+  // ingest, no capability refresh / environment build, no Runtime
+  // prepare, no model request, no tool dispatch. Resolving the one-time
+  // runtime assembly and reading the two cores' PUBLIC declarations is
+  // module resolution + static reads, not a task side effect. A task
+  // whose signal already aborted skips the check — its honest terminal is
+  // the runner's existing cancellation classification.
+  if (!task.signal.aborted) {
+    await whenRuntimeSession();
+    if (!task.signal.aborted) {
+      try {
+        checkCoreCompatibility({
+          runtime: runtimeCapabilitiesDeclaration(),
+          harness: harnessCapabilities(),
+          requirements: PRODUCT_CORE_REQUIREMENTS,
+        });
+      } catch (e) {
+        // The EXISTING runner rejection mechanism: { status: 'blocked' }
+        // → error { code, message } + one task_end, the slot released by
+        // complete(). No second task_end or release path is created. The
+        // structured CompatibilityError rides along for programmatic
+        // consumers; its fields are rendered into the message for the UI.
+        if (e instanceof CompatibilityError) {
+          // Event routing: this exit happens BEFORE prepareTask's rebind
+          // step, so bind the task to the conversation the rebind WOULD
+          // have chosen (the archived conversation the user opened) — the
+          // rejection must project where the user is looking, never into
+          // a leftover live conversation.
+          const routeTarget = (store.activeConversationId && store.activeConversationId !== store.liveConversationId)
+            ? store.activeConversationId
+            : store.liveConversationId;
+          if (routeTarget != null) taskEventTargets.set(task.id, routeTarget);
+          return { status: 'blocked', code: 'core_incompatible', message: e.message, error: e };
+        }
+        throw e; // a core ASSEMBLY error stays an honest task error
+      }
+    }
+  }
 
   // (1) The page can become interactive before IndexedDB/OPFS restoration
   // has finished. Hold the task while boot settles so it cannot race

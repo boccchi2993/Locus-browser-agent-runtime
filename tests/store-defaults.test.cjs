@@ -27,6 +27,11 @@ const replayValidationSrc = fs.readFileSync(path.join(root, 'src', 'harness', 'r
 const productPromptSrc = fs.readFileSync(path.join(root, 'src', 'ui', 'product-prompt.js'), 'utf8');
 const modelAdaptersSrc = fs.readFileSync(path.join(root, 'src', 'model-adapters.js'), 'utf8');
 const modelSrc = fs.readFileSync(path.join(root, 'src', 'model.js'), 'utf8');
+// M2c: the store composes its ToolPort through the product tool-adapter
+// factory and runs the compatibility check through the product checker —
+// inline the REAL implementations (pure ESM modules, no vue).
+const toolAdapterSrc = fs.readFileSync(path.join(root, 'src', 'product', 'tool-adapter.js'), 'utf8');
+const coreCompatSrc = fs.readFileSync(path.join(root, 'src', 'product', 'core-compatibility.js'), 'utf8');
 
 let passed = 0, failed = 0;
 function check(name, cond, detail) {
@@ -74,6 +79,9 @@ function loadStore(sessionData) {
     'const runImageInputProbe = () => { throw new Error("probe not expected in store-defaults"); };\n' +
     'const classifyImageProviderError = () => ({ kind: "none" });\n' +
     'const imageInputUnavailableNotice = () => "notice";\n' +
+    // M2c: the store reads the harness declaration through the entry —
+    // never exercised by these settings suites.
+    'const harnessCapabilities = () => { throw new Error("harness entry not expected in store-defaults"); };' +
     modelAdaptersSrc + '\n' +
     modelSrc + '\n' +
     workspaceSrc + '\n' +
@@ -88,6 +96,9 @@ function loadStore(sessionData) {
     providerSessionSrc.replace(/^import[\s\S]*?from\s+'[^']*';[\s\S]*?\n/gm, '').replace(/^export /gm, '') + '\n' +
     // M2b: the product prompt inputs module (pure, no vue).
     productPromptSrc.replace(/^export /gm, '') + '\n' +
+    // M2c: the product tool-adapter factory + compatibility checker (REAL).
+    toolAdapterSrc.replace(/^export /gm, '') + '\n' +
+    coreCompatSrc.replace(/^export /gm, '') + '\n' +
     'const SHELL_COMMANDS = {};\n' +
     code + '\n;({ store, vfs, applySettings, persistSettingsIfNeeded, testConnection, addUploadFiles, removeAttachment, refreshArtifacts, downloadArtifact });'
   );

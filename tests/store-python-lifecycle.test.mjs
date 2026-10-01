@@ -56,6 +56,21 @@ const makeSession = () => {
   return s;
 };
 
+// M2c: test hooks must assemble the runtime DECLARATION explicitly (the
+// product compatibility check reads it when a session is injected through
+// the seam) — the same shape RuntimeHost.capabilities() publishes.
+const HOOKS_RUNTIME_DECLARATION = Object.freeze({
+  contractVersion: 1,
+  executionKinds: ['shell', 'python'],
+  bootstrap: { shaPinned: true },
+  policyMechanisms: ['mutationPolicy', 'authorization'],
+  commands: ['cat', 'echo'],
+});
+const hooksWith = (session, declaration) => ({
+  runtimeSession: session,
+  runtimeCapabilities: declaration === undefined ? HOOKS_RUNTIME_DECLARATION : declaration,
+});
+
 // index.html loads src/mutation-policy.js as a classic script before the
 // store module runs; mirror that here.
 globalThis.LocusMutationPolicy = (0, eval)(
@@ -146,7 +161,7 @@ class FakeCapabilityManager {
 // The canonical runtime session for THIS module graph, injected through the
 // hooks seam BEFORE the store resolves it (the exact production seam).
 const canonical = makeSession();
-globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: canonical } };
+globalThis.window = { __LOCUS_HOOKS__: hooksWith(canonical) };
 
 // M2b: the suite seeds the declared harness core table with its fakes
 // (the same rule a classic page follows). The FakeAgentSession is the
@@ -256,7 +271,7 @@ const createdBefore = createdSessions.length;
   // Fresh module graph: hooks must be set BEFORE the first resolution of
   // that graph. Use a query string so the store module re-evaluates.
   const hookedSession = makeSession();
-  globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: hookedSession } };
+  globalThis.window = { __LOCUS_HOOKS__: hooksWith(hookedSession) };
   const ui2 = await import('../src/ui/store.js?hooks-seam');
   const resolved = ui2.runtimeSession();
   check('SP5 window.__LOCUS_HOOKS__.runtimeSession substitutes the session',
@@ -296,7 +311,7 @@ const createdBefore = createdSessions.length;
   globalThis.SKILL_CATALOG = [];
   globalThis.MCP_CATALOG = [];
   const s8 = makeSession();
-  globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: s8 } };
+  globalThis.window = { __LOCUS_HOOKS__: hooksWith(s8) };
   const ui8 = await import('../src/ui/store.js?presence-cancel');
   const cm8 = ui8.capabilityManager;
   let release8 = null;
@@ -324,7 +339,7 @@ const createdBefore = createdSessions.length;
 // ---------- SP9: session boundary while refreshSkillPresence hangs ----------
 {
   const s9 = makeSession();
-  globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: s9 } };
+  globalThis.window = { __LOCUS_HOOKS__: hooksWith(s9) };
   const ui9 = await import('../src/ui/store.js?presence-boundary');
   const cm9 = ui9.capabilityManager;
   let release9 = null;
@@ -347,7 +362,7 @@ const createdBefore = createdSessions.length;
 // ---------- SP10: normal flow still prepares — with the task signal ----------
 {
   const s10 = makeSession();
-  globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: s10 } };
+  globalThis.window = { __LOCUS_HOOKS__: hooksWith(s10) };
   const ui10 = await import('../src/ui/store.js?presence-normal');
   const cm10 = ui10.capabilityManager;
   const done10 = ui10.submit('normal presence task');
@@ -363,6 +378,52 @@ const createdBefore = createdSessions.length;
   check('SP10c same-key tasks cause no interpreter churn (prepare only, zero resets)',
     s10.prepared.length === 2 && s10.resets.length === 0,
     JSON.stringify({ prepared: s10.prepared.length, resets: s10.resets.length }));
+}
+
+// ---------- SP11: the compatibility gate requires an explicit declaration --
+// M2c: a hooks-injected session WITHOUT an assembled declaration (or with
+// an unsupported one) must reject every task through the REAL product entry
+// — an absent declaration is never defaulted to compatible.
+{
+  const s11 = makeSession();
+  globalThis.window = { __LOCUS_HOOKS__: { runtimeSession: s11 } }; // no declaration
+  const ui11 = await import('../src/ui/store.js?compat-no-decl');
+  const done11 = ui11.submit('no declaration task');
+  await done11;
+  const evts11 = ui11.store.conversations.flatMap((c) => c.items);
+  check('SP11 a session without a declaration rejects tasks (declaration_missing)',
+    (ui11.session.ranCount || 0) === 0
+      && s11.prepared.length === 0
+      && evts11.some((i) => i.kind === 'error' && String(i.code) === 'core_incompatible'),
+    JSON.stringify({ ran: ui11.session.ranCount || 0, prepared: s11.prepared.length,
+      codes: evts11.map((i) => i.kind + ':' + i.code) }));
+
+  const s11b = makeSession();
+  globalThis.window = { __LOCUS_HOOKS__: hooksWith(s11b, Object.freeze({
+    contractVersion: 999,
+    executionKinds: ['shell', 'python'],
+    bootstrap: { shaPinned: true },
+    policyMechanisms: ['mutationPolicy', 'authorization'],
+    commands: ['echo'],
+  })) };
+  const ui11b = await import('../src/ui/store.js?compat-bad-version');
+  const done11b = ui11b.submit('bad version task');
+  await done11b;
+  const evts11b = ui11b.store.conversations.flatMap((c) => c.items);
+  check('SP11b an unsupported runtime contract version rejects the task before any model request',
+    (ui11b.session.ranCount || 0) === 0 && s11b.prepared.length === 0
+      && evts11b.some((i) => i.kind === 'error' && String(i.code) === 'core_incompatible'
+        && String(i.message || '').includes('999')),
+    JSON.stringify({ ran: ui11b.session.ranCount || 0,
+      msgs: evts11b.map((i) => (i.message || '').slice(0, 120)) }));
+  // The slot is released: the next (legal) task is admitted.
+  globalThis.window = { __LOCUS_HOOKS__: hooksWith(s11b) };
+  const follow11b = await import('../src/ui/store.js?compat-recovery');
+  const done11c = follow11b.submit('legal follow-up');
+  check('SP11c the slot was released and the next legal task is admitted', !!done11c);
+  await done11c;
+  check('SP11d the legal task ran on the same (now compatible) session',
+    follow11b.session.ranCount === 1, JSON.stringify({ ran: follow11b.session.ranCount }));
 }
 
 // Presence-fixture globals are section-local: remove them so nothing after
