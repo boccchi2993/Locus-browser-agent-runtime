@@ -104,15 +104,15 @@ export const PRODUCT_CORE_REQUIREMENTS = Object.freeze({
     optionalCapabilities: Object.freeze([
       Object.freeze({
         capability: 'nativeToolCalls',
-        rule: 'the strict text-fallback protocol remains functional without native tool calls',
+        rule: 'the strict text-fallback protocol remains functional without native tool calls (the product chain completes fenced-JSON tool round trips)',
       }),
       Object.freeze({
         capability: 'imageInputGate',
-        rule: 'image attachments degrade to text-only with an explicit warning; approval/persistence semantics unchanged',
+        rule: 'image attachments degrade to text-only with an explicit warning: no attachment read, no ingest, no capability probe, no image send; the user\'s uploaded files are kept; approval/persistence/execution guarantees unchanged',
       }),
       Object.freeze({
         capability: 'capabilityComposition',
-        rule: 'capability features are disabled (the existing null-manager product guards)',
+        rule: 'capability features are disabled for the task (no refresh, no task environment, no plugin payload, no skill mounts; the runtime returns to core-only); a task with user-enabled capabilities is refused explicitly before any side effect',
       }),
     ]),
   }),

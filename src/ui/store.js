@@ -267,6 +267,36 @@ function runtimeCapabilitiesDeclaration() {
   return runtimeHooksDeclaration;
 }
 
+// M2c review (F1): the harness declaration source, mirroring the runtime
+// side — the hooks seam may host a genuinely different-declaring harness
+// generation (a standalone host that self-assembles its own harness).
+// The seam substitutes the DECLARATION ONLY: the compatibility CHECK
+// always runs on whatever arrives (there is no skip mode), and an
+// injected declaration is checked exactly like a real one — undefined
+// never defaults to compatible.
+function harnessDeclaration() {
+  const h = hooks();
+  if (h && typeof h.harnessCapabilities === 'function') return h.harnessCapabilities();
+  return harnessCapabilities();
+}
+
+// M2c review (F1): the frozen PER-TASK compatibility decision. Built ONCE,
+// at the task's compatibility gate, from that gate's frozen check result;
+// every later consumer of an optional capability on this task's path (the
+// image attachment processing, the capability environment work) reads THIS
+// object — never a fresh declaration read, and never a page-level mutable
+// "current compatibility state". A mid-task declaration change cannot
+// rebind a decision that was already adopted; the next task re-checks.
+function taskCompatibilityDecision(compatibility) {
+  const missing = compatibility.optional.harness.missing;
+  return Object.freeze({
+    check: compatibility,
+    imageInputGate: !missing.includes('imageInputGate'),
+    capabilityComposition: !missing.includes('capabilityComposition'),
+    nativeToolCalls: !missing.includes('nativeToolCalls'),
+  });
+}
+
 // Canonical accessor for callers outside this module (the ?e2e=1 seam and
 // the status subscription). Returns null when this deployment has no
 // runtime session.
@@ -562,17 +592,6 @@ const productToolPort = createLocusToolPort({
   mutationPolicy: taskMutationPolicy,
   authorization: productNetworkAuthorization,
 });
-
-// M2c: the explicit product rule for a missing OPTIONAL harness capability
-// (imageInputGate — see PRODUCT_CORE_REQUIREMENTS): image attachments
-// degrade to text-only through the SAME visible path as a missing
-// attachment store (explicit warning, text still goes out). No approval,
-// cancellation, persistence or execution guarantee is affected.
-function imageInputGateAvailable() {
-  const declared = runtimeCapabilitiesDeclaration();
-  if (!declared || !declared.capabilities) return true; // not yet resolvable → existing behavior
-  return declared.capabilities.imageInputGate !== false;
-}
 
 // Conversation identity semantics — three DIFFERENT concepts, never merge:
 //   activeConversationId  — which conversation the user is looking at.
@@ -1068,14 +1087,18 @@ export function openConversation(id) {
 // persisted, so persisted history references durable bytes, never the
 // ephemeral File. Files stay in /mnt/upload regardless — a rejected or
 // unsent image never deletes the user's upload.
-async function buildImageUserContent(input) {
+async function buildImageUserContent(input, taskCompat) {
   const images = store.attachments.filter((a) => a && String(a.type || '').toLowerCase().startsWith('image/'));
   if (!images.length) return { parts: null, blocked: false };
-  // M2c: the explicit product rule for a missing OPTIONAL harness
-  // capability (imageInputGate — PRODUCT_CORE_REQUIREMENTS): text-only
-  // degrade with the same visible warning path as a missing store. This
-  // never touches approval/cancellation/persistence guarantees.
-  if (!imageInputGateAvailable()) {
+  // M2c review (F1): the explicit product rule for a missing OPTIONAL
+  // harness capability (imageInputGate — PRODUCT_CORE_REQUIREMENTS),
+  // consumed from THIS task's frozen compatibility decision (never a fresh
+  // declaration read): text-only degrade through the SAME visible warning
+  // path as a missing attachment store — no attachment read, no ingest, no
+  // capability probe, no image send; the user's uploaded files are kept.
+  // No approval/cancellation/persistence guarantee is affected. A null
+  // decision (task already dead at the gate) keeps the pre-existing path.
+  if (taskCompat && !taskCompat.imageInputGate) {
     const conv = store.conversations.find((c) => c.id === store.liveConversationId);
     if (conv) {
       LocusProjector.projectEvent(conv, { type: 'warning', code: 'image_attachment_rejected',
@@ -1113,7 +1136,7 @@ async function buildImageUserContent(input) {
   const budget = historyBudgetBytes();
   let imageBytes = 0;
   for (const p of parts) if (p.type === 'image') imageBytes += imageWireEstimate(p.size);
-  const projected = await session.historyRequestBytes(vfs, capabilityManager ? capabilityManager.buildTaskEnvironment() : null) + imageBytes + new TextEncoder().encode(JSON.stringify({ role: 'user', content: parts })).byteLength + 16;
+  const projected = await session.historyRequestBytes(vfs, capabilityManager && (!taskCompat || taskCompat.capabilityComposition) ? capabilityManager.buildTaskEnvironment() : null) + imageBytes + new TextEncoder().encode(JSON.stringify({ role: 'user', content: parts })).byteLength + 16;
   if (projected > budget) {
     const conv = store.conversations.find((c) => c.id === store.liveConversationId);
     if (conv) {
@@ -1161,34 +1184,58 @@ async function prepareTask(task) {
   // module resolution + static reads, not a task side effect. A task
   // whose signal already aborted skips the check — its honest terminal is
   // the runner's existing cancellation classification.
+  //
+  // M2c review (F1): the check RESULT is no longer discarded. It is kept
+  // as THIS task's frozen compatibility decision and consumed by every
+  // later optional-capability step below (image processing, capability
+  // environment work) — no later async phase re-reads a declaration that
+  // may have changed, and no page-level mutable state binds the task.
+  let taskCompat = null; // null only for a task already dead at the gate
+  // The EXISTING runner rejection mechanism: { status: 'blocked' } →
+  // error { code, message } + one task_end, the slot released by
+  // complete(). No second task_end or release path is created. The
+  // structured CompatibilityError rides along for programmatic
+  // consumers; its fields are rendered into the message for the UI.
+  const blockTask = (code, message, error) => {
+    // Event routing: this exit happens BEFORE prepareTask's rebind step,
+    // so bind the task to the conversation the rebind WOULD have chosen
+    // (the archived conversation the user opened) — the rejection must
+    // project where the user is looking, never into a leftover live
+    // conversation.
+    const routeTarget = (store.activeConversationId && store.activeConversationId !== store.liveConversationId)
+      ? store.activeConversationId
+      : store.liveConversationId;
+    if (routeTarget != null) taskEventTargets.set(task.id, routeTarget);
+    return { status: 'blocked', code, message, error };
+  };
   if (!task.signal.aborted) {
     await whenRuntimeSession();
     if (!task.signal.aborted) {
       try {
-        checkCoreCompatibility({
+        taskCompat = taskCompatibilityDecision(checkCoreCompatibility({
           runtime: runtimeCapabilitiesDeclaration(),
-          harness: harnessCapabilities(),
+          harness: harnessDeclaration(),
           requirements: PRODUCT_CORE_REQUIREMENTS,
-        });
+        }));
       } catch (e) {
-        // The EXISTING runner rejection mechanism: { status: 'blocked' }
-        // → error { code, message } + one task_end, the slot released by
-        // complete(). No second task_end or release path is created. The
-        // structured CompatibilityError rides along for programmatic
-        // consumers; its fields are rendered into the message for the UI.
         if (e instanceof CompatibilityError) {
-          // Event routing: this exit happens BEFORE prepareTask's rebind
-          // step, so bind the task to the conversation the rebind WOULD
-          // have chosen (the archived conversation the user opened) — the
-          // rejection must project where the user is looking, never into
-          // a leftover live conversation.
-          const routeTarget = (store.activeConversationId && store.activeConversationId !== store.liveConversationId)
-            ? store.activeConversationId
-            : store.liveConversationId;
-          if (routeTarget != null) taskEventTargets.set(task.id, routeTarget);
-          return { status: 'blocked', code: 'core_incompatible', message: e.message, error: e };
+          return blockTask('core_incompatible', e.message, e);
         }
         throw e; // a core ASSEMBLY error stays an honest task error
+      }
+      // The declared capabilityComposition degrade disables capability
+      // features for this task — but silently ignoring capabilities the
+      // USER enabled is not a safe degrade. With any enabled capability
+      // present, refuse explicitly, still before every side effect.
+      if (capabilityManager && !taskCompat.capabilityComposition
+          && capabilityManager.listCapabilities().some((c) => c.enabled)) {
+        const enabled = capabilityManager.listCapabilities()
+          .filter((c) => c.enabled).map((c) => c.id);
+        return blockTask('capability_composition_unavailable',
+          'This task was refused before it started: the harness does not declare the '
+            + 'capabilityComposition capability, so enabled capabilities ('
+            + enabled.join(', ') + ') cannot run. Disable them or use a harness that declares the capability.',
+          null);
       }
     }
   }
@@ -1242,8 +1289,9 @@ async function prepareTask(task) {
   // (3) Image attachments (docs/IMAGE-INPUT.md): durable snapshot +
   // semantic parts BEFORE any task state moves. Budget overflow blocks the
   // task with an explicit error; individual rejected images degrade to a
-  // warning and the text still goes out.
-  const imageBuild = await buildImageUserContent(input);
+  // warning and the text still goes out. M2c review (F1): the step
+  // consumes THIS task's frozen compatibility decision.
+  const imageBuild = await buildImageUserContent(input, taskCompat);
   if (imageBuild.blocked) return { status: 'silent' };
   const userContent = imageBuild.parts;
 
@@ -1320,7 +1368,16 @@ async function prepareTask(task) {
     // mid-task can never rebind this task's filesystem routing — its late
     // async operations keep touching the OLD provider, and the
     // generation/abort guards drop its results.
-    if (capabilityManager) await capabilityManager.refreshSkillPresence();
+    //
+    // M2c review (F1): the PER-TASK decision governs. A harness that does
+    // not declare capabilityComposition gets ZERO capability work on this
+    // task — no refreshSkillPresence, no buildTaskEnvironment, no plugin
+    // payload generation (the runtime returns to core-only), no skill
+    // mounts — the declared rule, consumed from the frozen decision, not
+    // the null-manager fallback shape. (Enabled capabilities never reach
+    // this branch: that combination was already rejected at the gate.)
+    const compositionActive = !!(capabilityManager && (!taskCompat || taskCompat.capabilityComposition));
+    if (compositionActive) await capabilityManager.refreshSkillPresence();
     // The refresh AWAITED: a cancel or session boundary that landed while
     // it hung ends THIS task here. The canonical interpreter is never
     // prepared/reset/reconfigured for a task that will not run, and no
@@ -1328,13 +1385,13 @@ async function prepareTask(task) {
     // the epoch in the ready result below stays the SUBMIT-time pin, so a
     // boundary is detected instead of adopted by accident).
     if (preRunStopped()) return stopReady();
-    const taskEnvironment = capabilityManager ? capabilityManager.buildTaskEnvironment() : null;
+    const taskEnvironment = compositionActive ? capabilityManager.buildTaskEnvironment() : null;
     await preparePythonRuntimeForEnvironment(taskEnvironment, task.signal);
     // prepare awaited too (runtime-side signal refusal): the same liveness
     // rule before any task-scoped mount is bound for this task.
     if (preRunStopped()) return stopReady();
     const taskVfs = vfs.fork();
-    if (capabilityManager && taskEnvironment) {
+    if (compositionActive && taskEnvironment) {
       if (taskEnvironment.skills.length && typeof SkillInstanceWorkspace === 'function') {
         // Task-bound approval-guarded view of /home/locus/.skills: every
         // skill mutation of this task (shell redirects, rm, curl -o,

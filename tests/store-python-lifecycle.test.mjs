@@ -165,7 +165,11 @@ globalThis.window = { __LOCUS_HOOKS__: hooksWith(canonical) };
 
 // M2b: the suite seeds the declared harness core table with its fakes
 // (the same rule a classic page follows). The FakeAgentSession is the
-// AgentSession the entry hands to the store.
+// AgentSession the entry hands to the store. Review F1: the host provides
+// the capability-composition core fakes TOO (FakeCapabilityManager below),
+// so the REAL harnessCapabilities() declares capabilityComposition — the
+// product's declared degrade (skip capability work) must NOT fire for a
+// host that assembles that core.
 globalThis.__LOCUS_HARNESS_CORE__ = Object.freeze({
   contractVersion: 1,
   AgentSession: FakeAgentSession,
@@ -173,6 +177,9 @@ globalThis.__LOCUS_HARNESS_CORE__ = Object.freeze({
   buildSystemPrompt: () => 'test',
   HISTORY_BUDGET_BYTES: 768 * 1024,
   MAX_TOOL_ITERATIONS: 32,
+  CapabilityManager: FakeCapabilityManager,
+  validatePluginPayload: () => { throw new Error('composition-core fake: payload validation not exercised by this suite'); },
+  pythonExtensionKeyOf: () => null,
 });
 const ui = await import('../src/ui/store.js');
 const { store, session, submit, newTask } = ui;
