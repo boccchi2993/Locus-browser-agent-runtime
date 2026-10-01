@@ -143,3 +143,43 @@ All recorded on this round's head, Windows 10 / Git Bash / Node v24.10.0, same e
 - The optional-capability degrade/refusal rules are behavior-proven on the real chain in Node (OPT/I8 blocks); no packaged-browser gate drives the degraded UI itself (the product-joint J-gate still covers the full-capability path end to end).
 - The F3 root cause remains unconfirmed (§8.3); the SystemError presentation divergence was not reproduced by experiment.
 - The review's F2 ask "tool results cannot be turned into success by the Product" is evidenced at the telemetry level (I8a) and the result-shape level (I2); a dedicated browser-gate duplicate was not added.
+
+## 9. Review round 2 — historical images obey the frozen per-task decision (review finding: the round-1 wiring reached only NEW attachments)
+
+**Defect (confirmed on the unmodified implementation before any fix).** The frozen `taskCompat` governed `buildImageUserContent` (new attachments) only. `AgentSession.run` scanned the ENTIRE history for image parts and consulted the session-level image gate regardless of the task's decision, so in the real product chain (available `AttachmentStore` + in-memory persistence) a task following a normal image task — with a frozen `imageInputGate:false` decision — still raised the image-capability approval and, once confirmed, still sent `image_url` for the historical references. First-failure evidence (logs in `/tmp/m2c-r2-evidence/`): `product-integration` IMG-1's degrade submit NEVER SETTLES — `Warning: Detected unsettled top-level await … await ui.submit('joint IMG-1: historical image degrades to text')` (the task suspended on the image-capability ask the decision says must never happen; 75 checks PASS before the hang, including IMG-1's own task-1 baseline); standalone `agent-image` run-binding cases `R1/R1b/R2/R3/R4` all FAIL (`{"deny":0,"session":1,"sent":["text:earlier turn","image:"]}` — the session-level gate answered and the image went out; 26 passed / 5 failed, exit 1).
+
+**Landed** (append-only; base head `ccc84ba`):
+
+| Piece | Files |
+|---|---|
+| Run-scoped image input binding | `src/agent.js` (`AgentSession.run(input, { imageInput })` — captured ONCE at run entry; the gate consultation and `_materializeImageContent(messages, gate, runImageInput)` use the one captured object; default absent → the session-level port, unchanged) |
+| Product binding from the frozen decision | `src/ui/store.js` (`taskImageInputDenial(conversationId)` — no real gate, no approval/probe/registry write, no attachment byte read; existing unavailable-image projection; once-per-run `image_input_unavailable` user warning; `prepareTask` builds it from `taskCompat` and hands it to `session.run`) |
+| Browser declaration seam | `src/main.js` (`window.__locus.harnessCapabilities` — the REAL entry declaration, for variant derivation in the packaged gate) |
+| Joint suites | `tests/product-integration.test.mjs` (IMG-1 in-memory history; IMG-2 restored history + archive append-only oracle; IMG-3 missing→recovered; IMG-4 mid-task declaration flip; I8d dispose-while-unsettled; shared-stub `get` now serves the capabilities kv so a persisted decision answers without a new ask) |
+| Standalone seam suites | `tests/agent-image.test.cjs` (R1/R1b/R2/R3/R4: binding governs gate + materialization, askCache shared, per-task capture, no cross-task leak, tool-loop included) |
+| Browser gate | `tests/e2e-product-joint.cjs` (J7: packaged build — image task completes, gate-less declaration hosts the SAME-history text follow-up → zero image blocks + notice + explicit warning + no card, real declaration restored → the same history sends the image again, no new card) |
+
+### 9.1 Gates (this round's head)
+
+| Command | Result | Notes |
+|---|---|---|
+| `node tests/agent-image.test.cjs` | **31 PASS / 0 FAIL** (was 26; +5 R cases) | pre-fix run: 5 FAIL (quoted above) |
+| `node tests/product-integration.test.mjs` | **110 PASS / 0 FAIL** (was 87; +16 IMG, +7 I8d) | pre-fix run: unsettled await at the IMG-1 degrade submit |
+| `npm test` (full run-unit) | **all 56 suites passed, exit 0** | no suite weakened; the memory-stub `get` extension is additive |
+| `npm run build` | PASS | dist rebuilt; the deny binding + seam strings verified in the fresh bundles |
+| `node tests/e2e-product-joint.cjs` (packaged build + preview) | **20 PASS / 0 FAIL** (was 16; +4 J7) | J7 covers existing-image-history + `imageInputGate:false` → text-only outbound in the PACKAGED browser (not a reuse of the normal image gate) |
+| `node tests/e2e-image.cjs` | **56 PASS / 0 FAIL** | the full image battery around the new seam |
+
+Suite-level coverage named by the task: replay-related (`harness-replay`, `provider-session`, `provider-replay-persistence`), task-runner and Runtime lifecycle (`task-runner` 99 checks, `runtime-session-lifecycle`), image protocol/adapter (`image-probe` 20, `model-adapters-image` 14, `attachments` 40, `capabilities` 48) — all green inside the full `npm test` run.
+
+### 9.2 New-test first failures this round (all fixed in tests/fixtures, none by loosening)
+
+1. **Memory persistence stub `get` never served the `capabilities` kv** (round 1 added `put`/`delete` only) — the IMG-3 recovery task's registry lookup always read `unknown`, so it raised a NEW capability ask and hung (unsettled await). Fix: `get` serves the kv; a persisted 'supported' now answers without an ask.
+2. **IMG-1's ingest counter baseline** — the counter was installed before the seeding task, so the assertion saw task 1's legitimate ingest. Fix: delta assertion from the post-seed baseline.
+3. **J7's degrade step queued no response** — the first browser run timed out on `joint-j7-degrade` because the wire queue served the default answer while the predicate waited for the scripted one. Fix: push the response before submitting.
+
+### 9.3 Honest boundary of this round
+
+- The runtime lifecycle semantics exercised by I8d are the ALREADY-LANDED dispose/boundary/classification behavior (M2a review rounds) — I8d adds the missing evidence for dispose-while-unsettled; it reproduced no runtime defect (the block passed on the first post-fix run).
+- The degrade path is exercised on the packaged build for the image-history scenario (J7) only; the other IMG scenarios remain Node-joint evidence (same boundary statement as round 1, §6).
+- F3 (python-authority sequential-run first failure) remains root-cause NOT confirmed (§8.3); this round touched no Python path and re-validated nothing about it. Model retry policy untouched; no assertion loosened anywhere.
