@@ -14,6 +14,10 @@ The repository keeps documentation beside code so architecture changes, tests, a
 | [REPOSITORY-SPLIT-CONTRACTS.md](REPOSITORY-SPLIT-CONTRACTS.md) | M0 interface drafts: lifecycle, ports, ownership answers, error and versioning semantics |
 | [REPOSITORY-SPLIT-BASELINE.md](REPOSITORY-SPLIT-BASELINE.md) | M0 verification record: environment, commands, results, untested scope, findings |
 | [REPOSITORY-SPLIT-M1A-VERIFICATION.md](REPOSITORY-SPLIT-M1A-VERIFICATION.md) | M1a verification record: extracted modules, lifecycle test evidence, gate results |
+| [REPOSITORY-SPLIT-M2A-DESIGN.md](REPOSITORY-SPLIT-M2A-DESIGN.md) | M2a design record: Runtime entry, packaging, authorization port (symbol-level, deviations recorded) |
+| [REPOSITORY-SPLIT-M2B-DESIGN.md](REPOSITORY-SPLIT-M2B-DESIGN.md) | M2b design record: Harness entry, ToolPort snapshots, model client factory |
+| [REPOSITORY-SPLIT-M2C-DESIGN.md](REPOSITORY-SPLIT-M2C-DESIGN.md) | M2c design record: public capability declarations, the Product compatibility check, the shared tool adapter, joint suites |
+| [REPOSITORY-SPLIT-M2C-VERIFICATION.md](REPOSITORY-SPLIT-M2C-VERIFICATION.md) | M2c verification record: I1–I7 joint evidence, browser joint gate, first failures, unverified scope |
 | [DESIGN-PRINCIPLES.md](DESIGN-PRINCIPLES.md) | Rules used to decide where functionality belongs |
 | [CONCEPTS.md](CONCEPTS.md) | Canonical vocabulary and terms |
 | [RUNTIME-MODEL.md](RUNTIME-MODEL.md) | One task from user input to local execution/provider replay |
@@ -30,7 +34,7 @@ The repository keeps documentation beside code so architecture changes, tests, a
 | [PERSISTENCE.md](PERSISTENCE.md) | IndexedDB/OPFS and recovery semantics |
 | [IMAGE-INPUT.md](IMAGE-INPUT.md) | Image/perception boundary |
 
-The three-repository split is a target architecture, not an implemented feature. Its migration gates precede further extension-layer expansion; current behavior remains documented in the existing contracts. The M0 audit and contract round is complete (see the REPOSITORY-SPLIT-\* documents above); migration steps M1–M4 remain pending.
+The three-repository split is a target architecture, not an implemented feature. The migration M0 audit and contract round, M1 (task assembly + interpreter lifecycle), M2a (Runtime independentization), M2b (Harness independentization) and M2c (public capability declarations + the Product compatibility gate + joint integration gates) are complete (see the REPOSITORY-SPLIT-\* documents above); M3 (repository extraction) and M4 (integration/lock) remain pending.
 
 Project status lives in [../ROADMAP.md](../ROADMAP.md). Implementation backlog lives in [../TODO.md](../TODO.md).
 
