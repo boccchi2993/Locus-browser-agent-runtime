@@ -50,6 +50,8 @@ const SUITES = [
   'harness-standalone.test.mjs',
   'harness-boundary.test.cjs',
   'harness-prompt-parity.test.mjs',
+  'core-compatibility.test.mjs',
+  'product-integration.test.mjs',
   'mutation-policy.test.cjs',
   'vfs-audit.test.cjs',
   'attachments.test.cjs',
