@@ -167,13 +167,28 @@ function createRuntimeHost(core, workerAssets) {
     contractVersion: 1,
 
     // Declared, checked capabilities (contract §5) — never version-guessed.
+    // M2c: `commands` comes from the RESOLVED core's actual SHELL_COMMANDS
+    // registry and `limits` from the core's own frozen constants table —
+    // a core that does not provide them makes the section OMITTED, never
+    // fabricated (the same no-port-no-claim rule as describeCommands()).
     capabilities() {
-      return Object.freeze({
+      const declared = {
         contractVersion: 1,
         executionKinds: Object.freeze(['shell', 'python']),
         bootstrap: Object.freeze({ shaPinned: true }),
         policyMechanisms: Object.freeze(['mutationPolicy', 'authorization']),
-      });
+      };
+      if (core.SHELL_COMMANDS && typeof core.SHELL_COMMANDS === 'object') {
+        declared.commands = Object.freeze(Object.keys(core.SHELL_COMMANDS).sort());
+      }
+      if (core.limits && typeof core.limits === 'object') {
+        const limits = {};
+        for (const k of ['shellPipeMaxBytes', 'headTailMaxOutputBytes', 'pythonTimeoutMs']) {
+          if (typeof core.limits[k] === 'number' && isFinite(core.limits[k])) limits[k] = core.limits[k];
+        }
+        if (Object.keys(limits).length) declared.limits = Object.freeze(limits);
+      }
+      return Object.freeze(declared);
     },
 
     createSession() {

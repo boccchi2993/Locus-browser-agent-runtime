@@ -4054,6 +4054,15 @@ if (typeof globalThis !== 'undefined') {
       pluginIdPattern: RUNTIME_PLUGIN_ID_PATTERN,
       pyModulePattern: RUNTIME_PY_MODULE_PATTERN,
     }),
+    // M2c: REAL bound constants for the host's public capabilities()
+    // declaration (contract §5 — declared limits are this module's own
+    // constants, never retyped numbers). A core without the entry makes
+    // capabilities() OMIT the limits section — never a fabricated limit.
+    limits: Object.freeze({
+      shellPipeMaxBytes: SHELL_PIPE_MAX_BYTES,
+      headTailMaxOutputBytes: HEAD_TAIL_MAX_OUTPUT_BYTES,
+      pythonTimeoutMs: PYTHON_TIMEOUT_MS,
+    }),
     // interpreter + execution (always defined in this module)
     createPythonRuntime,
     runShellCommand,

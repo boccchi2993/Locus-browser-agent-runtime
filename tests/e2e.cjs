@@ -88,6 +88,13 @@ async function presentationE2e() {
     const wire = spawnSync(process.execPath, [path.join(__dirname, 'e2e-wire.cjs')], {
       stdio: 'inherit', env,
     });
+
+    // M2c joint browser gate: the packaged product page driven through the
+    // REAL production chain (real store/harness/runtime/VFS; the scripted
+    // transport lives below the real model boundary).
+    const productJoint = spawnSync(process.execPath, [path.join(__dirname, 'e2e-product-joint.cjs')], {
+      stdio: 'inherit', env,
+    });
     const approval = spawnSync(process.execPath, [path.join(__dirname, 'e2e-approval.cjs')], {
       stdio: 'inherit', env,
     });
@@ -106,6 +113,7 @@ async function presentationE2e() {
       ['persistence', persistence.status === 0],
       ['wire', wire.status === 0],
       ['approval', approval.status === 0],
+      ['product-joint', productJoint.status === 0],
       ['image', image.status === 0],
       ['grep', grep.status === 0],
       ['python-authority', pythonAuthority.status === 0],

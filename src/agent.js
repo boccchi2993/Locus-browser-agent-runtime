@@ -640,8 +640,10 @@ class AgentSession {
   //     effect (docs/IMAGE-INPUT.md, "Read-path integrity": a corrupted
   //     blob must never be quietly swapped for a notice-and-continue).
   // Returns new message objects — history keeps its semantic refs.
-  async _materializeImageContent(messages, gateResult) {
-    const imageInput = this.imageInput;
+  async _materializeImageContent(messages, gateResult, imageInputOverride) {
+    // The SAME run-scoped binding the gate consultation used (M2c review
+    // round 2); undefined → the session-level port, unchanged.
+    const imageInput = imageInputOverride !== undefined ? imageInputOverride : this.imageInput;
     let out = null; // lazily copy-on-write
     let missingAttachment = false;
     for (let i = 0; i < messages.length; i++) {
@@ -719,6 +721,17 @@ class AgentSession {
   // task can never be attributed to a later one. Omitted → this.emit,
   // unchanged. The override is stored for helpers that emit through
   // this.emit (_materializeImageContent) and cleared in the run finally.
+  //
+  // opts.imageInput (M2c review round 2): the RUN-SCOPED image input
+  // binding — the same port shape as the session-level imageInput dep
+  // ({ ensureCapability, resolveAttachment?, unavailableNotice? }). The
+  // caller's per-task image decision arrives as this ONE object; the
+  // session captures it at run entry and both the gate consultation and
+  // every materialization of this task (current input, session history,
+  // restored/persisted history) use the captured object. The Harness
+  // never reads the caller's decision structure — only this port.
+  // Omitted → the session-level port: standalone-harness behavior is
+  // unchanged.
   async run(userText, opts) {
     if (this.task) {
       throw new Error('AgentSession already has a running task');
@@ -741,6 +754,13 @@ class AgentSession {
     const taskEmitOverride = (o.emit && typeof o.emit === 'function') ? o.emit : null;
     const emit = taskEmitOverride || this.emit;
     this._taskEmit = taskEmitOverride;
+    // The run's ONE image input binding (M2c review round 2): captured
+    // HERE, before any model request, so a mid-task change to whatever
+    // produced the caller's decision cannot re-bind a running task, and
+    // one task's binding can never leak into the next. Every consumer
+    // below (the gate consultation and _materializeImageContent) reads
+    // THIS captured object and nothing else.
+    const runImageInput = (o.imageInput && typeof o.imageInput === 'object') ? o.imageInput : this.imageInput;
     // Session switch (workspace change / reset) and current-session cancel
     // are DIFFERENT events: the former makes every late result foreign to
     // the new session (discard silently), the latter stops the loop but
@@ -825,10 +845,10 @@ class AgentSession {
         // is re-checked before serialization, and again immediately before
         // the provider request (docs/APPROVALS.md, consumer contract).
         let requestMessages = stripInternalFields(this.history);
-        if (this.imageInput && historyImageParts(requestMessages).length) {
+        if (runImageInput && historyImageParts(requestMessages).length) {
           let gate = null;
           try {
-            gate = await this.imageInput.ensureCapability({
+            gate = await runImageInput.ensureCapability({
               signal: controller.signal,
               taskGeneration: generation,
               askCache: imageAskCache,
@@ -853,7 +873,7 @@ class AgentSession {
             });
           }
           try {
-            requestMessages = await this._materializeImageContent(requestMessages, gate);
+            requestMessages = await this._materializeImageContent(requestMessages, gate, runImageInput);
           } catch (e) {
             if (e && (e.name === 'AttachmentIntegrityError' || e.code === 'attachment_integrity_error')) {
               // Fail closed BEFORE any provider side effect (provider call

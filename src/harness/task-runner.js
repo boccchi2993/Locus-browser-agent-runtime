@@ -155,6 +155,16 @@
 const PREPARE_CANCELLED_MESSAGE = '任务已取消，尚未开始模型请求。';
 const SESSION_CHANGED_MESSAGE = '会话已切换，丢弃本次任务的后续结果。';
 
+// M2c: the REAL outcome-reason enum of this runner, exported so the public
+// entry's harnessCapabilities() declares the actual taskLifecycle semantics
+// (contract §5 — declared from the implementation, never hand-copied).
+// Any change here is a taskLifecycle port change and belongs in the public
+// declaration.
+export const TASK_OUTCOME_REASONS = Object.freeze([
+  'completed', 'cancelled', 'session_changed', 'error',
+  'persistence_error', 'iteration_limit', 'interrupted', 'rejected',
+]);
+
 export function isPersistenceFailure(error) {
   return !!(error && (error.persistenceFailure || error.code === 'persistence_write_failed'
     || error.name === 'PersistenceError' || error.name === 'StorageClearError'));
