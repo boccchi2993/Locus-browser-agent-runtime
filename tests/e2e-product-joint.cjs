@@ -250,6 +250,93 @@ async function main() {
     const callsAfterRestore = await evaluate(cdp, 'window.__locusWire.calls.length');
     check('J5 the slot was released and the next legal task ran', callsAfterRestore === callsBeforeRestore + 1, JSON.stringify({ before: callsBeforeRestore, after: callsAfterRestore }));
 
+    // ---------- J7: historical images obey the frozen per-task decision ----------
+    // Review round 2. A normal image task completes under the REAL
+    // declaration (registry preseeded supported → the image goes out and
+    // the conversation history keeps the reference). The harness
+    // declaration seam then hosts a generation WITHOUT imageInputGate and
+    // a TEXT follow-up in the SAME conversation must send zero image
+    // blocks (the deterministic notice instead), raise no capability
+    // card, and complete; with the real declaration restored, the SAME
+    // history sends the image again (per-task re-check, no sticky state).
+    const J7_PNG = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10, 9, 9, 9, 9, 7, 7, 7, 7]);
+    const j7PngB64 = Buffer.from(J7_PNG).toString('base64');
+    await evaluate(cdp, `window.__locus.actions.newTask()`);
+    await evaluate(cdp, `(async () => {
+      const id = createProviderIdentity({ provider: 'openai', adapterId: 'openai-compatible', dialect: 'openai', apiBase: 'https://joint.invalid/v1', model: 'joint-model' });
+      await window.__locus.capabilities.registry().setUserDecision(id, 'supported');
+      const bytes = Uint8Array.from(${literal([...J7_PNG])});
+      window.__locus.actions.addUploadFiles([new File([bytes], 'joint-j7.png', { type: 'image/png' })]);
+    })()`);
+    await evaluate(cdp, `window.__locusWire.responses.push(${literal({
+      choices: [{ message: { role: 'assistant', content: 'Joint J7 image answer' }, finish_reason: 'stop' }],
+    })}); window.__locus.actions.submit('joint J7: image task')`);
+    await waitForRuntimeCondition(cdp, `(() => {
+      const c = window.__locus.store.conversations.find(x => x.title === 'joint J7: image task');
+      return !!c && c.status === 'completed';
+    })()`, { process: chrome, phase: 'joint-j7-image', timeoutMs: 30000 });
+    const j7Seeded = await evaluate(cdp, `(() => {
+      const call = window.__locusWire.calls[window.__locusWire.calls.length - 1];
+      return { hasImage: JSON.stringify(call.body.messages).includes('image_url') };
+    })()`);
+    check('J7 task 1 sent the image through the real gate (a live history reference exists)',
+      j7Seeded.hasImage === true, JSON.stringify(j7Seeded));
+
+    // The degrade follow-up in the SAME conversation, hosted through the
+    // narrow declaration seam with only imageInputGate removed (derived
+    // from the REAL declaration via the new ?e2e=1 seam — never a
+    // hand-written shape).
+    await evaluate(cdp, `(async () => {
+      const real = JSON.parse(JSON.stringify(window.__locus.harnessCapabilities()));
+      real.capabilities.imageInputGate = false;
+      window.__jointRealHarnessDecl = real;
+      window.__LOCUS_HOOKS__.harnessCapabilities = () => Object.freeze(JSON.parse(JSON.stringify(real)));
+      window.__jointJ7CallsBefore = window.__locusWire.calls.length;
+    })()`);
+    await evaluate(cdp, `window.__locusWire.responses.push(${literal({
+      choices: [{ message: { role: 'assistant', content: 'Joint J7 degrade answer' }, finish_reason: 'stop' }],
+    })}); (function () { window.__locus.actions.submit('joint J7: historical image degrades to text'); return 'submitted'; })()`);
+    await waitForRuntimeCondition(cdp, `(() => {
+      const c = window.__locus.store.conversations.find(x => x.title === 'joint J7: image task');
+      return !!c && c.status === 'completed' && c.items.some(i => i.kind === 'assistant' && String(i.content).includes('degrade answer'));
+    })()`, { process: chrome, phase: 'joint-j7-degrade', timeoutMs: 30000 });
+    const j7 = await evaluate(cdp, `(async () => {
+      const call = window.__locusWire.calls[window.__jointJ7CallsBefore];
+      const body = JSON.stringify(call.body.messages);
+      const c = window.__locus.store.conversations.find(x => x.title === 'joint J7: image task');
+      return {
+        callsDelta: window.__locusWire.calls.length - window.__jointJ7CallsBefore,
+        hasImage: body.includes('image_url') || body.includes('data:image') || body.includes(${literal(j7PngB64)}),
+        hasNotice: body.includes('Image input is disabled for this task'),
+        historyIntact: body.includes('Joint J7 image answer'),
+        warning: c.items.some(i => i.kind === 'warning' && i.code === 'image_input_unavailable'),
+        noCard: !window.__locus.store.pendingApproval,
+      };
+    })()`);
+    check('J7 the degrade follow-up sent the notice instead of every image block, history text intact',
+      j7.callsDelta === 1 && j7.hasImage === false && j7.hasNotice === true && j7.historyIntact === true,
+      JSON.stringify(j7));
+    check('J7 the degrade follow-up raised no capability card and warned the user explicitly',
+      j7.warning === true && j7.noCard === true, JSON.stringify(j7));
+
+    // The real declaration is back: the SAME history sends the image
+    // again (per-task re-check; the registry answer needs no new card).
+    await evaluate(cdp, `(() => { delete window.__LOCUS_HOOKS__.harnessCapabilities; })()`);
+    await evaluate(cdp, `window.__locusWire.responses.push(${literal({
+      choices: [{ message: { role: 'assistant', content: 'Joint J7 recovery answer' }, finish_reason: 'stop' }],
+    })}); window.__locus.actions.submit('joint J7: recovery')`);
+    await waitForRuntimeCondition(cdp, `(() => {
+      const c = window.__locus.store.conversations.find(x => x.title === 'joint J7: image task');
+      return !!c && c.items.some(i => i.kind === 'assistant' && String(i.content).includes('recovery answer'));
+    })()`, { process: chrome, phase: 'joint-j7-recovery', timeoutMs: 30000 });
+    const j7Recovery = await evaluate(cdp, `(() => {
+      const call = window.__locusWire.calls[window.__locusWire.calls.length - 1];
+      return { hasImage: JSON.stringify(call.body.messages).includes('image_url'),
+        noCard: !window.__locus.store.pendingApproval };
+    })()`);
+    check('J7 the recovered task re-sent the history image under the real declaration (no new card)',
+      j7Recovery.hasImage === true && j7Recovery.noCard === true, JSON.stringify(j7Recovery));
+
     // ---------- J6: page health ----------
     const errors = await evaluate(cdp, '(window.__e2eErrors || []).slice(0, 5)');
     check('J6 the browser reported no unhandled errors or rejections', errors.length === 0, JSON.stringify(errors));

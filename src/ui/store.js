@@ -1162,6 +1162,44 @@ async function buildImageUserContent(input, taskCompat) {
   return { parts, blocked: false };
 }
 
+// M2c review round 2: the PER-RUN image input binding for a task whose
+// frozen compatibility decision says the harness does not declare
+// imageInputGate. It is the SAME port shape the session's imageInput
+// exposes (ensureCapability / resolveAttachment / unavailableNotice), so
+// the Harness consumes it unchanged and never learns what a taskCompat
+// is. ensureCapability never touches the real gate: no approval ask, no
+// probe, no registry write; resolveAttachment never reads attachment
+// bytes; the model-request projection reuses the EXISTING
+// unavailable-image path (copy-on-write — the semantic history and the
+// durable archive are never edited in place). The user warning is
+// raised once per run, keyed through the run's own askCache, and only
+// when images were actually about to enter a request.
+const TASK_IMAGE_DENIAL_CACHE_KEY = '__locus_task_image_denial__';
+
+function taskImageInputDenial(conversationId) {
+  const gateResult = Object.freeze({ state: 'unsupported', source: 'task' });
+  return {
+    ensureCapability: (opts) => {
+      const cache = opts && opts.askCache;
+      if (!cache || !cache.has(TASK_IMAGE_DENIAL_CACHE_KEY)) {
+        if (cache) cache.set(TASK_IMAGE_DENIAL_CACHE_KEY, gateResult);
+        const conv = store.conversations.find((c) => c.id === (conversationId != null ? conversationId : store.liveConversationId));
+        if (conv) {
+          LocusProjector.projectEvent(conv, { type: 'warning', code: 'image_input_unavailable',
+            message: 'Images are not sent to the model in this task: the harness does not declare the imageInputGate capability. Images already in this conversation and any new attachments were replaced with a text notice; the task continues as text.'
+          });
+        }
+      }
+      return Promise.resolve(gateResult);
+    },
+    // Materialization consults the resolver only on a 'supported'
+    // verdict, which this binding never produces; a null keeps zero byte
+    // reads even if a future path ever asked.
+    resolveAttachment: () => Promise.resolve(null),
+    unavailableNotice: () => 'Image input is disabled for this task: the harness does not declare the image input capability, so the image was not sent to the model.',
+  };
+}
+
 // Product preparation for one ACCEPTED task, invoked by the harness task
 // runner after the task has taken the active slot (admission and the task
 // controller already exist — pre-run cancellation is task.cancel()).
@@ -1417,6 +1455,13 @@ async function prepareTask(task) {
         taskVfs.mount(mount.path, mount.provider, mount.authority);
       }
     }
+    // M2c review round 2: the run-scoped image input binding for THIS
+    // task, built from the frozen per-task decision (never re-read
+    // later). A harness that declares the gate keeps the session's own
+    // imageInput — the default path — unchanged.
+    const taskImageInput = (taskCompat && !taskCompat.imageInputGate)
+      ? taskImageInputDenial(runningConversationId)
+      : null;
     return {
       status: 'ready',
       epoch: session.generation,
@@ -1427,7 +1472,7 @@ async function prepareTask(task) {
         // flight. One user turn: text + selected image attachments bind
         // into a single provider turn; run() emits ONE task_start.
         try {
-          await session.run(input, { workspace: taskVfs, taskEnvironment, userContent, controller: ctx.controller, emit: ctx.emit });
+          await session.run(input, { workspace: taskVfs, taskEnvironment, userContent, controller: ctx.controller, emit: ctx.emit, imageInput: taskImageInput || undefined });
         } catch (e) {
           // The runner emits the error/terminal pair; this is the Product
           // side of the old catch block (degraded marking + snapshot).

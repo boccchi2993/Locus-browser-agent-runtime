@@ -377,6 +377,77 @@ async function main() {
         && h.events[0].images === undefined);
   }
 
+  // ---------- M2c review round 2: the RUN-SCOPED image input binding ----------
+  // run() captures ONE image-input binding at entry: the gate consultation
+  // and every materialization of the task (current input, session history,
+  // restored history) use that one captured object. Default (no override)
+  // stays the session-level port, byte-for-byte the old behavior. The
+  // binding is PER TASK: a successor run never sees it, and the harness
+  // never reads anything but the port object itself.
+  {
+    const sessionLevelCalls = [];
+    const sessionLevel = {
+      ensureCapability: async (o) => { sessionLevelCalls.push(o); return { state: 'supported', source: 'user' }; },
+      resolveAttachment: async () => ({ mimeType: 'image/png', dataBase64: SENTINEL_B64 }),
+      unavailableNotice: C.imageInputUnavailableNotice,
+    };
+    const denyCalls = [];
+    const makeDeny = (into) => ({
+      ensureCapability: async (o) => { into.push(o); return { state: 'unsupported', source: 'task' }; },
+      resolveAttachment: async () => { throw new Error('must not resolve under the task denial'); },
+      unavailableNotice: () => 'Image input is disabled for this task: the harness does not declare the image input capability, so the image was not sent to the model.',
+    });
+    const h = makeHarness(sessionLevel);
+    // History carries an image from an EARLIER task of the same session.
+    h.session.history.push({ role: 'user', _taskStart: true, content: [{ type: 'text', text: 'earlier turn' }, IMAGE_PART] });
+    await h.session.run('text-only now', { imageInput: makeDeny(denyCalls) });
+    const sent = h.modelCalls[0].messages[0].content;
+    check('R1 the run-scoped binding governs BOTH the gate and the materialization (never the session port)',
+      denyCalls.length === 1 && sessionLevelCalls.length === 0
+        && !sent.some((p) => p.type === 'image')
+        && sent.some((p) => p.type === 'text' && p.text.includes('disabled for this task'))
+        && sent.some((p) => p.type === 'text' && p.text === 'earlier turn'),
+      JSON.stringify({ deny: denyCalls.length, session: sessionLevelCalls.length,
+        sent: sent.map((p) => p.type + ':' + String(p.text || '').slice(0, 40)) }));
+    check('R1b the binding received the run askCache; the task completed; history keeps the semantic ref',
+      denyCalls[0] && denyCalls[0].askCache instanceof Map
+        && h.events.some((e) => e.type === 'task_end' && e.reason === 'completed')
+        && h.session.history[0].content[1].attachmentId === 'att_1');
+    // Successor task, NO override: the session-level port again — no
+    // cross-task leak of the denial, the image crosses normally.
+    await h.session.run('images are back');
+    check('R2 the next run falls back to the session-level port (the denial never leaks across tasks)',
+      h.modelCalls.length === 2
+        && h.modelCalls[1].messages[0].content.some((p) => p.type === 'image' && p.dataBase64 === SENTINEL_B64)
+        && sessionLevelCalls.length === 1 && denyCalls.length === 1);
+    // Another task, a DIFFERENT binding object: per-task capture.
+    const deny2Calls = [];
+    await h.session.run('text-only again', { imageInput: makeDeny(deny2Calls) });
+    check('R3 each task binds its own override; a new decision object is captured fresh',
+      deny2Calls.length === 1 && denyCalls.length === 1 && sessionLevelCalls.length === 1
+        && !h.modelCalls[2].messages[0].content.some((p) => p.type === 'image'));
+  }
+  // ---------- the same captured binding across the tool loop ----------
+  {
+    const denyCalls = [];
+    const deny = {
+      ensureCapability: async (o) => { denyCalls.push(o); return { state: 'unsupported', source: 'task' }; },
+      resolveAttachment: async () => { throw new Error('must not resolve'); },
+      unavailableNotice: () => 'Image input is disabled for this task.',
+    };
+    const h = makeHarness(null); // NO session-level port at all
+    h.session.history.push({ role: 'user', _taskStart: true, content: [{ type: 'text', text: 'earlier' }, IMAGE_PART] });
+    h.session.modelClient = async (body) => {
+      h.modelCalls.push(body);
+      return h.modelCalls.length === 1 ? TOOL_ENVELOPE : FINAL_ENVELOPE;
+    };
+    await h.session.run('loop with a tool turn', { imageInput: deny });
+    check('R4 every model request of the task uses the SAME captured binding (tool turn included)',
+      h.modelCalls.length === 2 && denyCalls.length === 2
+        && denyCalls.every((o) => o && o.askCache === denyCalls[0].askCache)
+        && h.modelCalls.every((b) => !b.messages[0].content.some((p) => p.type === 'image')),
+      JSON.stringify({ calls: h.modelCalls.length, deny: denyCalls.length }));
+  }
   console.log('---');
   console.log('agent-image.test.cjs: ' + passed + ' passed, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);

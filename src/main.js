@@ -22,6 +22,9 @@
 import { createApp, nextTick } from 'vue';
 import App from './App.vue';
 import * as ui from './ui/store.js';
+// M2c review round 2: the real harness declaration resolver, exposed to the
+// browser gates below (the same entry the Product compatibility check reads).
+import { harnessCapabilities } from './harness/index.js';
 import './ui/theme.css';
 
 const params = new URLSearchParams(window.location.search);
@@ -150,6 +153,11 @@ if (e2eMode) {
   // declaration owner the Product compatibility check reads. Browser e2e
   // drives REAL incompatible-declaration negatives through it.
   window.__locus.runtimeHost = () => ui.runtimeHost();
+  // M2c review round 2 seam: the REAL harness declaration exactly as the
+  // compatibility check resolves it. Browser gates host a variant of THIS
+  // object through window.__LOCUS_HOOKS__.harnessCapabilities (the narrow
+  // declaration seam the store reads per task; never a skip mode).
+  window.__locus.harnessCapabilities = () => harnessCapabilities();
   // M2a seam: the runtime worker assets this build carries (worker-source
   // instrumentation in e2e; never part of the product chain).
   window.__locus.runtimeAssets = () => ui.runtimeWorkerAssets();

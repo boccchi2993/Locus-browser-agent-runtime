@@ -873,6 +873,13 @@ function createMemoryPersistence() {
     async appendPresentationEvent(convId, seq, event) { counts.presentation++; /* recorded implicitly via conversations */ },
     async notePersistenceError() {},
     async get(name, key) {
+      // The capability registry's kv must be READABLE too: the image gate
+      // consults it on every real-gate run, and a persisted 'supported'
+      // decision must answer WITHOUT a new ask (the IMG-3 recovery).
+      if (name === 'capabilities') {
+        const s = kvStores.get(name);
+        return (s && s.get(key)) || null;
+      }
       return name === 'providerSessions' ? (providerSessions.get(key) || null) : null;
     },
     // Generic kv (the capability registry's store): enough for the image
@@ -1327,10 +1334,272 @@ function sessionCheckpointOf(persist, sessionId) {
     ui.store.conversations.find((c) => c.id === convF).status === 'completed'
       && inst.counts.tool === 1 && typeof file === 'string' && file.includes('opt-f-ok')
       && !itemsOf(ui).some((i) => i.conv === convF && i.code === 'core_incompatible'),
-    JSON.stringify({ status: ui.store.conversations.find((c) => c.id === convF).status,
+      JSON.stringify({ status: ui.store.conversations.find((c) => c.id === convF).status,
       tools: inst.counts.tool, file: String(file).slice(0, 40) }));
   inst.restore();
   configureModel(null);
+}
+
+// =====================================================================
+// IMG — review round 2: HISTORICAL images must obey the frozen per-task
+// compatibility decision. OPT-A proved the degrade for NEW attachments;
+// these blocks prove the decision also governs the model-request image
+// boundary for images ALREADY in the session — in-memory history (IMG-1)
+// and persistence-restored history (IMG-2) — with zero approval asks /
+// probes / registry writes / attachment-byte reads, the deterministic
+// text notice replacing every outbound image block, an explicit user
+// warning, a normally completed text task, and an untouched durable
+// archive (frames, normalized history, attachment bytes). IMG-3 proves
+// the missing→recovered direction (the same history sends the image
+// again once the real declaration is back, nothing was degraded on
+// disk). IMG-4 freezes the decision across the tool-result boundary: a
+// mid-task declaration flip cannot re-open the gate within the task.
+// =====================================================================
+const IMG_PNG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4, 5, 6, 7, 8]);
+const IMG_NOTICE = 'Image input is disabled for this task';
+const IMG_PNG_B64 = Buffer.from(IMG_PNG).toString('base64');
+
+// Counters wrapped ONTO one graph's REAL stores: resolveForWire is the
+// only path attachment bytes may take toward a model request, the
+// durable byte store is beneath it, and the capability registry is what
+// an ask/probe would write. A zero delta around a degraded submit is
+// direct observation, never inference.
+function instrumentImageReads(ui, persist) {
+  const counts = { resolveWire: 0, durableReads: 0, registryWrites: 0 };
+  const att = ui.getAttachmentStore();
+  const origResolve = att.resolveForWire.bind(att);
+  att.resolveForWire = async (id) => { counts.resolveWire++; return origResolve(id); };
+  const origRead = persist.readAttachmentBytes.bind(persist);
+  persist.readAttachmentBytes = async (k) => { counts.durableReads++; return origRead(k); };
+  const origPut = persist.put.bind(persist);
+  persist.put = async (name, row) => {
+    if (name === 'capabilities') counts.registryWrites++;
+    return origPut(name, row);
+  };
+  return counts;
+}
+
+// Count every approval REQUEST raised through the real controller (the
+// capability ask included) so a degraded task proves zero asks instead
+// of silently hanging on one.
+function instrumentApprovalRequests(ui) {
+  const counts = { requests: 0 };
+  const orig = ui.approvals.request.bind(ui.approvals);
+  ui.approvals.request = (req, opts) => { counts.requests++; return orig(req, opts); };
+  return counts;
+}
+
+// Shared task-1 prologue: a normal image task under the REAL declaration
+// (registry ask confirmed once) leaves a live image reference in the
+// session history of conversation `convA`.
+async function imgSeedHistory(wire, ui) {
+  ui.addUploadFiles([new File([IMG_PNG], 'joint-img-seed.png', { type: 'image/png' })]);
+  wire.push(wire.openai('joint img seed answer'));
+  const convA = ui.store.liveConversationId;
+  const done = ui.submit('joint IMG: image task');
+  await waitFor('IMG seed the capability ask is pending', () => !!ui.store.pendingApproval);
+  ui.resolveApproval(ui.store.pendingApproval.id, { outcome: 'confirm', scope: 'once' });
+  await done;
+  return convA;
+}
+
+// IMG-1 (A) — in-memory history: normal image task, then a text task in
+// the SAME conversation under a harness generation without imageInputGate.
+{
+  const wire = createWire('joint-img-1');
+  wires.set('joint-img-1', wire);
+  configureModel(wire);
+  const persist = createMemoryPersistence();
+  globalThis.PersistenceServiceInstance = persist;
+  try {
+    const ui = await freshStore('joint-img-1');
+    const inst = await instrument(ui);
+    const ingest = instrumentAttachmentIngest(ui);
+    applyJointSettings(ui);
+    const convA = await imgSeedHistory(wire, ui);
+    check('IMG-1 task 1 sent the image through the real gate (a live history reference exists)',
+      ui.store.conversations.find((c) => c.id === convA).status === 'completed'
+        && JSON.stringify(wire.calls[0].body.messages).includes('image_url'),
+      JSON.stringify({ status: ui.store.conversations.find((c) => c.id === convA).status }));
+
+    const reads = instrumentImageReads(ui, persist);
+    const asks = instrumentApprovalRequests(ui);
+    const ingestBefore = ingest.counts.ingest;
+    globalThis.__LOCUS_HOOKS__ = {
+      harnessCapabilities: () => harnessDeclarationVariant({ imageInputGate: false }),
+    };
+    // NO newTask: the in-memory session history still holds the image
+    // ref. The composer still carries task 1's upload too (kept — never
+    // deleted by a degrade), so the new-attachment degrade runs as well.
+    wire.push(wire.openai('joint img-1 degrade answer'));
+    const callsBefore = wire.calls.length;
+    await ui.submit('joint IMG-1: historical image degrades to text');
+    const degradeBody = JSON.stringify(wire.calls[callsBefore].body.messages);
+    check('IMG-1 the degrade task completed as text (the historical image neither suspended nor failed it)',
+      ui.store.conversations.find((c) => c.id === convA).status === 'completed'
+        && !ui.store.pendingApproval,
+      JSON.stringify({ status: ui.store.conversations.find((c) => c.id === convA).status }));
+    check('IMG-1 ZERO asks/probes/registry writes/attachment reads for the degraded task (exactly one model request)',
+      asks.requests === 0 && reads.resolveWire === 0 && reads.durableReads === 0
+        && reads.registryWrites === 0 && ingest.counts.ingest - ingestBefore === 0
+        && wire.calls.length === callsBefore + 1,
+      JSON.stringify({ asks: asks.requests, ...reads, ingest: ingest.counts.ingest - ingestBefore, calls: wire.calls.length - callsBefore }));
+    check('IMG-1 the outbound request projects the text notice instead of every image block (history text intact)',
+      !degradeBody.includes('image_url') && !degradeBody.includes('data:image')
+        && !degradeBody.includes(IMG_PNG_B64) && degradeBody.includes(IMG_NOTICE)
+        && degradeBody.includes('joint img seed answer'),
+      degradeBody.slice(0, 320));
+    check('IMG-1 the user was warned explicitly (task-level degrade warning)',
+      itemsOf(ui).some((i) => i.conv === convA && i.kind === 'warning' && i.code === 'image_input_unavailable'
+        && String(i.text).includes('imageInputGate')),
+      JSON.stringify(itemsOf(ui).filter((i) => i.conv === convA && i.kind === 'warning').map((i) => i.code)));
+    inst.restore();
+    ingest.restore();
+  } finally {
+    delete globalThis.__LOCUS_HOOKS__;
+    delete globalThis.PersistenceServiceInstance;
+    configureModel(null);
+  }
+}
+
+// IMG-2 + IMG-3 (B, C) — persistence-restored history obeys the decision,
+// and the missing→recovered direction leaves nothing degraded on disk.
+{
+  const wire = createWire('joint-img-2');
+  wires.set('joint-img-2', wire);
+  configureModel(wire);
+  const persist = createMemoryPersistence();
+  globalThis.PersistenceServiceInstance = persist;
+  try {
+    const ui = await freshStore('joint-img-2');
+    const inst = await instrument(ui);
+    applyJointSettings(ui);
+    const convA = await imgSeedHistory(wire, ui);
+    const convObj = ui.store.conversations.find((c) => c.id === convA);
+    const sessionId = convObj.activeProviderSessionId;
+    const framesBefore = (persist._frames.get(sessionId) || []).length;
+    const archiveSnapshot = JSON.stringify(persist._frames.get(sessionId) || []);
+
+    // (B) restore the conversation under the gate-less declaration.
+    ui.newTask();
+    ui.openConversation(convA);
+    const reads = instrumentImageReads(ui, persist);
+    const asks = instrumentApprovalRequests(ui);
+    globalThis.__LOCUS_HOOKS__ = {
+      harnessCapabilities: () => harnessDeclarationVariant({ imageInputGate: false }),
+    };
+    wire.push(wire.openai('joint img-2 degrade answer'));
+    const callsBefore = wire.calls.length;
+    await ui.submit('joint IMG-2: restored history degrades to text');
+    const degradeBody = JSON.stringify(wire.calls[callsBefore].body.messages);
+    check('IMG-2 the RESTORED image reference was projected as the text notice (zero image blocks, history text intact)',
+      !degradeBody.includes('image_url') && !degradeBody.includes('data:image')
+        && !degradeBody.includes(IMG_PNG_B64) && degradeBody.includes(IMG_NOTICE)
+        && degradeBody.includes('joint img seed answer'),
+      degradeBody.slice(0, 320));
+    check('IMG-2 zero asks/reads/writes on the restored path; the task completed',
+      asks.requests === 0 && reads.resolveWire === 0 && reads.durableReads === 0
+        && reads.registryWrites === 0
+        && ui.store.conversations.find((c) => c.id === convA).status === 'completed'
+        && !ui.store.pendingApproval,
+      JSON.stringify({ asks: asks.requests, ...reads }));
+    check('IMG-2 the degrade warning was projected to the user',
+      itemsOf(ui).some((i) => i.conv === convA && i.kind === 'warning' && i.code === 'image_input_unavailable'),
+      JSON.stringify(itemsOf(ui).filter((i) => i.conv === convA && i.kind === 'warning').map((i) => i.code)));
+    const framesAfterDegrade = persist._frames.get(sessionId) || [];
+    check('IMG-2 the durable archive was only APPENDED to (no in-place rewrite of the pre-degrade frames)',
+      framesAfterDegrade.length === framesBefore + 2
+        && JSON.stringify(framesAfterDegrade.slice(0, framesBefore)) === archiveSnapshot,
+      JSON.stringify({ before: framesBefore, after: framesAfterDegrade.length }));
+    check('IMG-2 the pre-degrade frames still carry the semantic image reference (attachmentId kept)',
+      framesAfterDegrade.slice(0, framesBefore).some((f) => f.raw && Array.isArray(f.raw.content)
+        && f.raw.content.some((p) => p && p.type === 'image' && p.attachmentId)),
+      'no image part found in the archive prefix');
+
+    // (C) the real declaration is back: the SAME history sends the image
+    // again through the normal gate (registry 'supported' → no new ask),
+    // reading the durable bytes through the real resolver.
+    delete globalThis.__LOCUS_HOOKS__;
+    wire.push(wire.openai('joint img-3 recovered answer'));
+    const callsBefore3 = wire.calls.length;
+    await ui.submit('joint IMG-3: recovery sends the history image again');
+    const recoveryBody = JSON.stringify(wire.calls[callsBefore3].body.messages);
+    check('IMG-3 the recovered task re-sent the historical image (normal gate, still zero asks)',
+      recoveryBody.includes('image_url') && recoveryBody.includes('data:image')
+        && asks.requests === 0
+        && ui.store.conversations.find((c) => c.id === convA).status === 'completed',
+      JSON.stringify({ asks: asks.requests, sent: recoveryBody.includes('image_url') }));
+    check('IMG-3 the recovery read the attachment bytes through the real resolver',
+      reads.resolveWire >= 1 && reads.durableReads >= 1, JSON.stringify(reads));
+    const imageRef = framesAfterDegrade.slice(0, framesBefore)
+      .flatMap((f) => (f.raw && Array.isArray(f.raw.content) ? f.raw.content : []))
+      .find((p) => p && p.type === 'image');
+    const resolved = imageRef ? await ui.getAttachmentStore().resolveForWire(imageRef.attachmentId).catch(() => null) : null;
+    check('IMG-3 the durable attachment survived the degraded task untouched (bytes still resolve)',
+      !!resolved && resolved.dataBase64 === IMG_PNG_B64,
+      JSON.stringify({ hasRef: !!imageRef, resolved: !!resolved }));
+    inst.restore();
+  } finally {
+    delete globalThis.__LOCUS_HOOKS__;
+    delete globalThis.PersistenceServiceInstance;
+    configureModel(null);
+  }
+}
+
+// IMG-4 (D) — the SAME task's every model request uses the frozen
+// decision: a declaration flip MID-TASK (between the tool result and the
+// second request) cannot re-open the image gate within the task.
+{
+  const wire = createWire('joint-img-4');
+  wires.set('joint-img-4', wire);
+  configureModel(wire);
+  const persist = createMemoryPersistence();
+  globalThis.PersistenceServiceInstance = persist;
+  try {
+    const ui = await freshStore('joint-img-4');
+    const inst = await instrument(ui);
+    applyJointSettings(ui);
+    const convA = await imgSeedHistory(wire, ui);
+    const asks = instrumentApprovalRequests(ui);
+    globalThis.__LOCUS_HOOKS__ = {
+      harnessCapabilities: () => harnessDeclarationVariant({ imageInputGate: false }),
+    };
+    // First response: the declaration flips back to the REAL one the
+    // moment the first request is dispatched — MID-TASK.
+    wire.push((record, respond) => {
+      globalThis.__LOCUS_HOOKS__ = {
+        harnessCapabilities: () => harnessDeclarationVariant({}),
+      };
+      return respond(wire.openai(null, [wire.toolCall('img4-call-1', 'echo img4-tool > /tmp/joint-img-4.txt')]));
+    });
+    wire.push(wire.openai('joint img-4 final answer'));
+    const callsBefore = wire.calls.length;
+    await ui.submit('joint IMG-4: frozen decision across the tool turn');
+    const firstBody = JSON.stringify(wire.calls[callsBefore].body.messages);
+    const secondBody = JSON.stringify(wire.calls[callsBefore + 1].body.messages);
+    check('IMG-4 both requests of the SAME task stayed text-only despite the mid-task flip',
+      !firstBody.includes('image_url') && !secondBody.includes('image_url')
+        && firstBody.includes(IMG_NOTICE) && secondBody.includes(IMG_NOTICE)
+        && secondBody.includes('img4-tool'),
+      JSON.stringify({ first: firstBody.slice(0, 120), second: secondBody.slice(0, 160) }));
+    check('IMG-4 zero approval asks across the whole task (the flip did not re-open the gate)',
+      asks.requests === 0
+        && ui.store.conversations.find((c) => c.id === convA).status === 'completed'
+        && !ui.store.pendingApproval,
+      JSON.stringify({ asks: asks.requests }));
+    // The NEXT task re-checks: under the restored real declaration the
+    // image crosses again (per-task decision, no sticky state).
+    wire.push(wire.openai('joint img-4 successor answer'));
+    await ui.submit('joint IMG-4: next task re-checks');
+    check('IMG-4 the successor task re-checked and sent the history image again',
+      JSON.stringify(wire.calls[wire.calls.length - 1].body.messages).includes('image_url'),
+      'successor request carried no image');
+    inst.restore();
+  } finally {
+    delete globalThis.__LOCUS_HOOKS__;
+    delete globalThis.PersistenceServiceInstance;
+    configureModel(null);
+  }
 }
 
 // =====================================================================
@@ -1486,6 +1755,78 @@ function parkProviderWrite(ui, marker) {
     events.some((i) => i.kind === 'error' && String(i.text).includes('disposed'))
       && wire.calls.length === callsBefore && inst.counts.tool === 1,
     JSON.stringify({ calls: wire.calls.length - callsBefore, tools: inst.counts.tool }));
+  inst.restore();
+  configureModel(null);
+}
+
+// I8d — review round 2: dispose WHILE the dispatched provider operation
+// is unsettled (the evidence I8c left missing: it disposed only after a
+// clean task boundary). The real chain parks inside the provider write;
+// the dispose strikes MID-EXECUTION. The task must NOT end early while
+// the write is unsettled; admission stays closed; releasing the write
+// settles the dispatched effect honestly (committed bytes stay, the run
+// is reported FAILED — never a fake success); zero further provider
+// dispatch follows; and the disposal permanently refuses the port
+// (execute/prepare) and every later product task, before side effects.
+{
+  const wire = createWire('joint-i8d');
+  wires.set('joint-i8d', wire);
+  configureModel(wire);
+  const ui = await freshStore('joint-i8d');
+  const inst = await instrument(ui);
+  applyJointSettings(ui);
+  const park = parkProviderWrite(ui, 'joint-i8d');
+  wire.push(wire.openai(null, [wire.toolCall('i8d-call-1', 'echo i8d-committed > /tmp/joint-i8d.txt')]));
+  wire.push(wire.openai('joint I8d final answer'));
+  const bashRecordsBefore = globalThis.Telemetry.records.filter((r) => r.tool === 'bash').length;
+  const conv8d = ui.store.liveConversationId;
+  const done8d = ui.submit('joint I8d: parked provider write then dispose');
+  await waitFor('I8d the real execution parked inside the provider write', () => park.entered === 1 && !!park.release);
+  const sess = await ui.whenRuntimeSession();
+  sess.dispose('joint i8d mid-execution disposal');
+  let endedEarly = false;
+  done8d.then(() => { endedEarly = true; }, () => { endedEarly = true; });
+  await new Promise((r) => setTimeout(r, 150));
+  const convObj = ui.store.conversations.find((c) => c.id === conv8d);
+  check('I8d the dispose cannot end the task while its dispatched write is unsettled',
+    endedEarly === false && ui.store.busy === true && convObj.status !== 'completed'
+      && inst.counts.tool === 1 && inst.counts.execute === 1,
+    JSON.stringify({ endedEarly, busy: ui.store.busy, status: convObj.status, ...inst.counts }));
+  check('I8d admission stays closed while the disposed task is still settling',
+    (await ui.submit('joint I8d: must not be admitted')) === undefined
+      && ui.store.conversations.length === 1,
+    JSON.stringify({ convs: ui.store.conversations.length }));
+  park.release(); // the dispatched operation settles on the real provider
+  await done8d;
+  const file = await ui.vfs.read('/tmp/joint-i8d.txt').catch(() => null);
+  check('I8d the dispatched operation settled honestly: the committed bytes STAY (no fake rollback)',
+    typeof file === 'string' && file.includes('i8d-committed'),
+    JSON.stringify(String(file).slice(0, 40)));
+  const bashRecords = globalThis.Telemetry.records.filter((r) => r.tool === 'bash');
+  check('I8d the superseded run is reported as FAILED (never converted into a success)',
+    bashRecords.length === bashRecordsBefore + 1 && bashRecords[bashRecords.length - 1].success === false,
+    JSON.stringify(bashRecords[bashRecords.length - 1] || null).slice(0, 200));
+  const endConv = ui.store.conversations.find((c) => c.id === conv8d);
+  check('I8d zero further provider dispatch after the settle; the task ended honestly exactly once',
+    inst.counts.tool === 1 && inst.counts.execute === 1 && wire.calls.length === 2
+      && endConv.status === 'completed' && ui.store.busy === false,
+    JSON.stringify({ ...inst.counts, calls: wire.calls.length, status: endConv.status, busy: ui.store.busy }));
+  let execErr = null;
+  try { await sess.execute({ kind: 'shell', input: 'echo never', context: {} }); } catch (e) { execErr = e; }
+  let prepErr = null;
+  try { await sess.prepare({ python: null }); } catch (e) { prepErr = e; }
+  check('I8d the public port permanently refuses execute/prepare after the mid-execution dispose',
+    execErr && String(execErr.message).includes('disposed')
+      && prepErr && String(prepErr.message).includes('disposed'),
+    JSON.stringify({ exec: execErr && execErr.message, prep: prepErr && prepErr.message }));
+  const callsBeforeRefusal = wire.calls.length;
+  await ui.submit('joint I8d: must be refused after dispose');
+  const refusalEvents = itemsOf(ui).filter((i) => i.conv === conv8d);
+  check('I8d the post-dispose task was refused through the REAL entry (zero model, zero further tool)',
+    refusalEvents.some((i) => i.kind === 'error' && String(i.text).includes('disposed'))
+      && wire.calls.length === callsBeforeRefusal && inst.counts.tool === 1,
+    JSON.stringify({ calls: wire.calls.length - callsBeforeRefusal, tools: inst.counts.tool }));
+  park.restore();
   inst.restore();
   configureModel(null);
 }
