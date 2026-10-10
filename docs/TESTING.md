@@ -100,3 +100,20 @@ request-counter proof that boot, install, and every post-READY package
 escape contribute ZERO unauthorized network requests). Package Core
 identity is therefore proven distinct from runtime installability: an
 identity-valid non-wheel fails the boot closed at the install step.
+
+## 9. CI and global dependency baseline
+
+CI runs on pushes to `main` and all pull requests using Ubuntu and Node 22.
+It runs `npm ci`, `npm test`, `npm run check:globals`, then `npm run build`.
+It excludes Chrome E2E (`npm run test:e2e`) and the external-CDN
+`scripts/verify-python-bootstrap-manifest.mjs` check.
+`check:globals` verifies classic-script order against Vite and inventories
+scope-resolved references from classic scripts and module/Vue consumers.
+It records direct, `typeof`-guarded and global-object property references,
+rejects duplicate/undefined globals, and requires an exact baseline match.
+After an intentional dependency change, run
+`node scripts/check-globals.mjs --write` in the same PR and commit the baseline.
+`--write` records findings; it does not waive duplicate/undefined failures.
+Review added AND removed edges, symbols, reference kinds and layer ownership;
+a baseline update is evidence to review, not approval of a new dependency.
+Layer counts are informational; mixed files still require later extraction.
