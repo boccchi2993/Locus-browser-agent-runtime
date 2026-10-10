@@ -104,7 +104,7 @@ function skillInstanceMarkerPayload(capability, plans) {
 
 // SHA-256 hex of bytes via Web Crypto (async — materialization and the
 // mutation guard are async anyway). Fails loudly when unavailable.
-async function sha256Hex(bytes) {
+async function extensionSha256Hex(bytes) {
   const subtle = (typeof crypto !== 'undefined' && crypto && crypto.subtle) ? crypto.subtle : null;
   if (!subtle) throw new Error('Web Crypto SHA-256 is unavailable in this context');
   const digest = await subtle.digest('SHA-256', bytes);
@@ -732,7 +732,7 @@ class SkillInstanceWorkspace extends WorkspaceAdapter {
     }
     const skillDef = this._skillMetadata(cap, ref.skillId);
     const before = await this._storage.readBytes(ref.rel);
-    const beforeHash = await sha256Hex(before);
+    const beforeHash = await extensionSha256Hex(before);
     const signal = this._liveSignal();
     const decision = await this._requestConfirmation('skill-delete', cap, ref,
       'Delete capability guidance: ' + (skillDef.displayName || ref.skillId),
@@ -748,7 +748,7 @@ class SkillInstanceWorkspace extends WorkspaceAdapter {
         'skill_mutation_cancelled');
     }
     const current = await this._storage.readBytes(ref.rel);
-    if ((await sha256Hex(current)) !== beforeHash) {
+    if ((await extensionSha256Hex(current)) !== beforeHash) {
       throw this._mutationError('skill changed while the deletion was awaiting approval; nothing was deleted',
         'skill_mutation_conflict');
     }
@@ -780,8 +780,8 @@ class SkillInstanceWorkspace extends WorkspaceAdapter {
     try { before = await this._storage.readBytes(ref.rel); } catch (e) {
       if (!e || e.name !== 'NotFoundError') throw e;
     }
-    const beforeHash = before ? await sha256Hex(before) : null;
-    if (before && (await sha256Hex(bytes)) === beforeHash) return; // no-op write: no mutation, no approval
+    const beforeHash = before ? await extensionSha256Hex(before) : null;
+    if (before && (await extensionSha256Hex(bytes)) === beforeHash) return; // no-op write: no mutation, no approval
 
     const creating = !before;
     const beforeText = before ? new TextDecoder('utf-8').decode(before) : '';
@@ -815,7 +815,7 @@ class SkillInstanceWorkspace extends WorkspaceAdapter {
     try { current = await this._storage.readBytes(ref.rel); } catch (e) {
       if (!e || e.name !== 'NotFoundError') throw e;
     }
-    const currentHash = current ? await sha256Hex(current) : null;
+    const currentHash = current ? await extensionSha256Hex(current) : null;
     if (currentHash !== beforeHash) {
       throw this._mutationError('skill changed while the change was awaiting approval; the edit was not applied',
         'skill_mutation_conflict');
@@ -1140,7 +1140,7 @@ class CapabilityManager {
       if (!source) {
         return 'skill ' + skillId + ': no default source in the skill source store for version ' + def.version;
       }
-      const hash = await sha256Hex(source.bytes);
+      const hash = await extensionSha256Hex(source.bytes);
       plans.push({ skillId: skillId, version: def.version, bytes: source.bytes, hash: hash });
     }
     const markerRel = cap.id + '/' + SKILL_INSTANCE_MARKER;
@@ -1173,7 +1173,7 @@ class CapabilityManager {
       }
       for (const p of plans) {
         const back = await storage.readBytes(cap.id + '/' + p.skillId + '.skill');
-        if ((await sha256Hex(back)) !== p.hash) {
+        if ((await extensionSha256Hex(back)) !== p.hash) {
           throw new Error('verification failed for ' + skillInstancePath(cap.id, p.skillId));
         }
       }

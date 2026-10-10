@@ -281,7 +281,7 @@ function sha256Available() {
     && typeof crypto.subtle.digest === 'function';
 }
 
-async function sha256Hex(bytes) {
+async function bootstrapSha256Hex(bytes) {
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   let hex = '';
   const view = new Uint8Array(digest);
@@ -673,7 +673,7 @@ const PythonRuntime = {
       if (signal.aborted) throw (signal.reason || e);
       throw e;
     }
-    const hex = await sha256Hex(bytes);
+    const hex = await bootstrapSha256Hex(bytes);
     if (hex !== entry.sha256) {
       throw pythonAssetIntegrityError(entry.name, 'sha256 mismatch');
     }

@@ -850,7 +850,7 @@ async function readBytesCapped(res, maxBytes, signal) {
       if (done) break;
       received += value.byteLength;
       if (received > maxBytes) {
-        cancelReaderQuietly(reader);
+        cancelNetworkReaderQuietly(reader);
         throw makeNetTooLargeError(maxBytes);
       }
       chunks.push(value);
@@ -858,7 +858,7 @@ async function readBytesCapped(res, maxBytes, signal) {
   } catch (e) {
     if (e && e.tooLarge) throw e;
     if (e && (e.cancelled || e.name === 'AbortError')) {
-      cancelReaderQuietly(reader);
+      cancelNetworkReaderQuietly(reader);
       throw makeNetCancelledError();
     }
     throw e; // genuine mid-body network failure (TypeError) or stream error
@@ -881,7 +881,7 @@ async function readBytesCapped(res, maxBytes, signal) {
 // indefinitely — after the race was already lost. The rejection handler
 // is attached immediately so a failed cleanup never surfaces as an
 // unhandled rejection.
-function cancelReaderQuietly(reader) {
+function cancelNetworkReaderQuietly(reader) {
   try {
     const p = reader.cancel();
     if (p && typeof p.catch === 'function') p.catch(() => {});

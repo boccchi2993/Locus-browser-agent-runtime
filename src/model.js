@@ -134,14 +134,14 @@ async function readTextCapped(res, maxBytes, signal) {
       if (done) break;
       received += value.byteLength;
       if (received > maxBytes) {
-        cancelReaderQuietly(reader);
+        cancelModelReaderQuietly(reader);
         throw makeParseError('response too large (>' + maxBytes + ' bytes)');
       }
       chunks.push(value);
     }
   } catch (e) {
     if (e && (e.cancelled || e.name === 'AbortError')) {
-      cancelReaderQuietly(reader);
+      cancelModelReaderQuietly(reader);
     }
     throw e;
   } finally {
@@ -160,7 +160,7 @@ async function readTextCapped(res, maxBytes, signal) {
 // indefinitely — after the race was already lost. The rejection handler
 // is attached immediately so a failed cleanup never surfaces as an
 // unhandled rejection.
-function cancelReaderQuietly(reader) {
+function cancelModelReaderQuietly(reader) {
   try {
     const p = reader.cancel();
     if (p && typeof p.catch === 'function') p.catch(() => {});
