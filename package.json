@@ -9,13 +9,19 @@
     "build": "vite build",
     "preview": "vite preview --port 4173 --strictPort",
     "test": "node tests/run-unit.cjs",
-    "test:e2e": "node tests/e2e.cjs"
+    "test:e2e": "node tests/e2e.cjs",
+    "check:globals": "node scripts/check-globals.mjs"
   },
   "dependencies": {
     "vue": "^3.5.13"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/compiler-sfc": "3.5.42",
+    "eslint-scope": "9.1.2",
+    "espree": "11.2.0",
+    "globals": "17.13.0",
+    "parse5": "8.0.1",
     "vite": "^6.0.7"
   }
 }

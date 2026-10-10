@@ -1,0 +1,1014 @@
+{
+  "edges": [
+    {
+      "from": "src/App.vue",
+      "to": null,
+      "symbol": "getComputedStyle",
+      "kind": "window-property",
+      "fromLayer": "product",
+      "toLayer": null
+    },
+    {
+      "from": "src/agent.js",
+      "to": "src/shell.js",
+      "symbol": "shellSystemPromptSection",
+      "kind": "direct",
+      "fromLayer": "harness",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/agent.js",
+      "to": "src/shell.js",
+      "symbol": "shellSystemPromptSection",
+      "kind": "guarded",
+      "fromLayer": "harness",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/agent.js",
+      "to": "src/tools.js",
+      "symbol": "AGENT_TOOL_DEFINITIONS",
+      "kind": "direct",
+      "fromLayer": "harness",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/agent.js",
+      "to": "src/tools.js",
+      "symbol": "AGENT_TOOL_DEFINITIONS",
+      "kind": "guarded",
+      "fromLayer": "harness",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/attachments.js",
+      "to": "src/persistence.js",
+      "symbol": "PersistenceServiceInstance",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/attachments.js",
+      "to": "src/persistence.js",
+      "symbol": "PersistenceServiceInstance",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capabilities.js",
+      "to": "src/attachments.js",
+      "symbol": "uint8ToBase64",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capabilities.js",
+      "to": "src/model.js",
+      "symbol": "Model",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/capabilities.js",
+      "to": "src/model.js",
+      "symbol": "Model",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/capabilities.js",
+      "to": "src/model.js",
+      "symbol": "callModel",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/capabilities.js",
+      "to": "src/model.js",
+      "symbol": "callModel",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/capabilities.js",
+      "to": "src/persistence.js",
+      "symbol": "PersistenceServiceInstance",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capabilities.js",
+      "to": "src/persistence.js",
+      "symbol": "PersistenceServiceInstance",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capability-package.js",
+      "to": "src/capability-package.js",
+      "symbol": "LocusCapabilityPackage",
+      "kind": "window-property",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capability-package.js",
+      "to": "src/extensions.js",
+      "symbol": "EXTENSION_ID_PATTERN",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capability-package.js",
+      "to": "src/extensions.js",
+      "symbol": "SKILL_INSTANCE_MAX_BYTES",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capability-package.js",
+      "to": "src/extensions.js",
+      "symbol": "validateCapabilityDescriptor",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capability-package.js",
+      "to": "src/extensions.js",
+      "symbol": "validateMcpDescriptor",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capability-package.js",
+      "to": "src/extensions.js",
+      "symbol": "validatePluginDescriptor",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capability-package.js",
+      "to": "src/extensions.js",
+      "symbol": "validateSkillDescriptor",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capability-package.js",
+      "to": "src/workspace.js",
+      "symbol": "WorkspaceAdapter",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/capability-package.js",
+      "to": "src/workspace.js",
+      "symbol": "normalizeWorkspacePath",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/components/ContextRail.vue",
+      "to": "src/telemetry.js",
+      "symbol": "Telemetry",
+      "kind": "direct",
+      "fromLayer": "product",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/components/ContextRail.vue",
+      "to": "src/telemetry.js",
+      "symbol": "Telemetry",
+      "kind": "guarded",
+      "fromLayer": "product",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/components/Timeline.vue",
+      "to": "src/ui/markdown.js",
+      "symbol": "LocusMarkdown",
+      "kind": "direct",
+      "fromLayer": "product",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/extensions.js",
+      "to": "src/vfs.js",
+      "symbol": "vfsError",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/extensions.js",
+      "to": "src/vfs.js",
+      "symbol": "vfsNotFound",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/extensions.js",
+      "to": "src/vfs.js",
+      "symbol": "vfsReadOnly",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/extensions.js",
+      "to": "src/workspace.js",
+      "symbol": "WorkspaceAdapter",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/extensions.js",
+      "to": "src/workspace.js",
+      "symbol": "normalizeWorkspacePath",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/main.js",
+      "to": "src/main.js",
+      "symbol": "__LOCUS_HOOKS__",
+      "kind": "window-property",
+      "fromLayer": "product",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/main.js",
+      "to": "src/main.js",
+      "symbol": "__e2eErrors",
+      "kind": "window-property",
+      "fromLayer": "product",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/main.js",
+      "to": "src/main.js",
+      "symbol": "__e2eReplies",
+      "kind": "window-property",
+      "fromLayer": "product",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/main.js",
+      "to": "src/main.js",
+      "symbol": "__locus",
+      "kind": "window-property",
+      "fromLayer": "product",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/main.js",
+      "to": "src/main.js",
+      "symbol": "__locusWire",
+      "kind": "window-property",
+      "fromLayer": "product",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/main.js",
+      "to": "src/model.js",
+      "symbol": "Model",
+      "kind": "direct",
+      "fromLayer": "product",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/main.js",
+      "to": "src/shell.js",
+      "symbol": "PythonRuntime",
+      "kind": "direct",
+      "fromLayer": "product",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/main.js",
+      "to": "src/shell.js",
+      "symbol": "PythonRuntime",
+      "kind": "guarded",
+      "fromLayer": "product",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/main.js",
+      "to": "src/tools.js",
+      "symbol": "executeTool",
+      "kind": "direct",
+      "fromLayer": "product",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/main.js",
+      "to": null,
+      "symbol": "__e2eToolExecutor",
+      "kind": "window-property",
+      "fromLayer": "product",
+      "toLayer": null
+    },
+    {
+      "from": "src/main.js",
+      "to": null,
+      "symbol": "addEventListener",
+      "kind": "window-property",
+      "fromLayer": "product",
+      "toLayer": null
+    },
+    {
+      "from": "src/main.js",
+      "to": null,
+      "symbol": "location",
+      "kind": "window-property",
+      "fromLayer": "product",
+      "toLayer": null
+    },
+    {
+      "from": "src/model-adapters.js",
+      "to": "src/model.js",
+      "symbol": "makeParseError",
+      "kind": "direct",
+      "fromLayer": "harness",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/model.js",
+      "to": "src/model-adapters.js",
+      "symbol": "getProviderAdapter",
+      "kind": "direct",
+      "fromLayer": "harness",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/model.js",
+      "to": null,
+      "symbol": "location",
+      "kind": "window-property",
+      "fromLayer": "harness",
+      "toLayer": null
+    },
+    {
+      "from": "src/network.js",
+      "to": null,
+      "symbol": "location",
+      "kind": "window-property",
+      "fromLayer": "runtime",
+      "toLayer": null
+    },
+    {
+      "from": "src/persistence.js",
+      "to": "src/model-adapters.js",
+      "symbol": "createCredentialIdentity",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/persistence.js",
+      "to": "src/model-adapters.js",
+      "symbol": "createCredentialIdentity",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/shell.js",
+      "to": "src/extensions.js",
+      "symbol": "EXTENSION_ID_PATTERN",
+      "kind": "direct",
+      "fromLayer": "runtime",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/shell.js",
+      "to": "src/extensions.js",
+      "symbol": "EXTENSION_PY_MODULE_PATTERN",
+      "kind": "direct",
+      "fromLayer": "runtime",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/shell.js",
+      "to": "src/network.js",
+      "symbol": "NetworkRuntime",
+      "kind": "direct",
+      "fromLayer": "runtime",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/shell.js",
+      "to": "src/network.js",
+      "symbol": "safeNetworkUrlForDisplay",
+      "kind": "direct",
+      "fromLayer": "runtime",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/shell.js",
+      "to": "src/telemetry.js",
+      "symbol": "utf8ByteLength",
+      "kind": "direct",
+      "fromLayer": "runtime",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/shell.js",
+      "to": "src/vfs.js",
+      "symbol": "VirtualWorkspace",
+      "kind": "direct",
+      "fromLayer": "runtime",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/shell.js",
+      "to": "src/vfs.js",
+      "symbol": "normalizeVfsPath",
+      "kind": "direct",
+      "fromLayer": "runtime",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/shell.js",
+      "to": "src/vfs.js",
+      "symbol": "vfsError",
+      "kind": "direct",
+      "fromLayer": "runtime",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/shell.js",
+      "to": null,
+      "symbol": "addEventListener",
+      "kind": "window-property",
+      "fromLayer": "runtime",
+      "toLayer": null
+    },
+    {
+      "from": "src/shell.js",
+      "to": null,
+      "symbol": "removeEventListener",
+      "kind": "window-property",
+      "fromLayer": "runtime",
+      "toLayer": null
+    },
+    {
+      "from": "src/telemetry.js",
+      "to": "src/telemetry.js",
+      "symbol": "__telemetry",
+      "kind": "window-property",
+      "fromLayer": "product",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/tools.js",
+      "to": "src/shell.js",
+      "symbol": "runShellCommand",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/tools.js",
+      "to": "src/telemetry.js",
+      "symbol": "Telemetry",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/tools.js",
+      "to": "src/telemetry.js",
+      "symbol": "utf8ByteLength",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/agent.js",
+      "symbol": "AgentSession",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/agent.js",
+      "symbol": "HISTORY_BUDGET_BYTES",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/agent.js",
+      "symbol": "HISTORY_BUDGET_BYTES",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/agent.js",
+      "symbol": "buildSystemPrompt",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/approval.js",
+      "symbol": "ApprovalController",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/attachments.js",
+      "symbol": "AttachmentStore",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/attachments.js",
+      "symbol": "AttachmentStore",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/attachments.js",
+      "symbol": "imageContentPart",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/attachments.js",
+      "symbol": "textContentPart",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/capabilities.js",
+      "symbol": "ModelCapabilityRegistry",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/capabilities.js",
+      "symbol": "ModelCapabilityRegistry",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/capabilities.js",
+      "symbol": "classifyImageProviderError",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/capabilities.js",
+      "symbol": "classifyImageProviderError",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/capabilities.js",
+      "symbol": "createImageInputGate",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/capabilities.js",
+      "symbol": "createImageInputGate",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/capabilities.js",
+      "symbol": "imageInputUnavailableNotice",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/capabilities.js",
+      "symbol": "runImageInputProbe",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/capabilities.js",
+      "symbol": "runImageInputProbe",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "CAPABILITY_CATALOG",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "CapabilityManager",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "CapabilityManager",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "MCP_CATALOG",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "PLUGIN_CATALOG",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "SKILL_CATALOG",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "SkillInstanceStorage",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "SkillInstanceStorage",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "SkillInstanceWorkspace",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "SkillInstanceWorkspace",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "SkillSourceStore",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/extensions.js",
+      "symbol": "SkillSourceStore",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/main.js",
+      "symbol": "__LOCUS_HOOKS__",
+      "kind": "window-property",
+      "fromLayer": "mixed",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/model-adapters.js",
+      "symbol": "createCredentialIdentity",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/model-adapters.js",
+      "symbol": "createProviderIdentity",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/model-adapters.js",
+      "symbol": "createProviderIdentity",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/model-adapters.js",
+      "symbol": "getProviderAdapter",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/model-adapters.js",
+      "symbol": "getProviderAdapter",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/model-adapters.js",
+      "symbol": "projectNormalizedHistory",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/model.js",
+      "symbol": "Model",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/model.js",
+      "symbol": "callModel",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/model.js",
+      "symbol": "verifyConnection",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "harness"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/persistence.js",
+      "symbol": "PersistenceServiceInstance",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/persistence.js",
+      "symbol": "PersistenceServiceInstance",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/persistence.js",
+      "symbol": "validateNormalizedPrefix",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/persistence.js",
+      "symbol": "validateReplayPrefix",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/shell.js",
+      "symbol": "PythonRuntime",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/shell.js",
+      "symbol": "PythonRuntime",
+      "kind": "guarded",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/shell.js",
+      "symbol": "SHELL_COMMANDS",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/tools.js",
+      "symbol": "executeTool",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/ui/projector.js",
+      "symbol": "LocusProjector",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "product"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/vfs.js",
+      "symbol": "VirtualWorkspace",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/workspace.js",
+      "symbol": "ConversationHistoryWorkspace",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/workspace.js",
+      "symbol": "LocalDirectoryWorkspace",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/workspace.js",
+      "symbol": "OPFSWorkspace",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": "src/workspace.js",
+      "symbol": "ensureWorkspacePermission",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": null,
+      "symbol": "__e2eObserverFailure",
+      "kind": "window-property",
+      "fromLayer": "mixed",
+      "toLayer": null
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": null,
+      "symbol": "matchMedia",
+      "kind": "window-property",
+      "fromLayer": "mixed",
+      "toLayer": null
+    },
+    {
+      "from": "src/ui/store.js",
+      "to": null,
+      "symbol": "showDirectoryPicker",
+      "kind": "window-property",
+      "fromLayer": "mixed",
+      "toLayer": null
+    },
+    {
+      "from": "src/vfs.js",
+      "to": "src/persistence.js",
+      "symbol": "LOCUS_HOME_SKELETON",
+      "kind": "direct",
+      "fromLayer": "runtime",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/vfs.js",
+      "to": "src/persistence.js",
+      "symbol": "LOCUS_HOME_SKELETON",
+      "kind": "guarded",
+      "fromLayer": "runtime",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/vfs.js",
+      "to": "src/workspace.js",
+      "symbol": "WorkspaceAdapter",
+      "kind": "direct",
+      "fromLayer": "runtime",
+      "toLayer": "runtime"
+    },
+    {
+      "from": "src/vfs.js",
+      "to": "src/workspace.js",
+      "symbol": "normalizeWorkspacePath",
+      "kind": "direct",
+      "fromLayer": "runtime",
+      "toLayer": "runtime"
+    }
+  ],
+  "duplicates": [],
+  "undefined": [
+    {
+      "from": "src/capability-package.js",
+      "symbol": "sha256Hex",
+      "kind": "direct"
+    },
+    {
+      "from": "src/telemetry.js",
+      "symbol": "renderDebugPanel",
+      "kind": "direct"
+    },
+    {
+      "from": "src/telemetry.js",
+      "symbol": "renderDebugPanel",
+      "kind": "guarded"
+    }
+  ]
+}

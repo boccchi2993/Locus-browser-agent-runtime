@@ -1,0 +1,102 @@
+{
+  "src/App.vue": {
+    "layer": "product"
+  },
+  "src/agent.js": {
+    "layer": "harness"
+  },
+  "src/approval.js": {
+    "layer": "harness"
+  },
+  "src/attachments.js": {
+    "layer": "mixed",
+    "note": "Split portable replay/image-gating logic from browser storage and application configuration; do not move whole files by name"
+  },
+  "src/capabilities.js": {
+    "layer": "mixed",
+    "note": "Split portable replay/image-gating logic from browser storage and application configuration; do not move whole files by name"
+  },
+  "src/capability-package.js": {
+    "layer": "mixed",
+    "note": "Split portable composition/validation from storage, concrete runtime payload preparation and product catalogs"
+  },
+  "src/components/ApprovalCard.vue": {
+    "layer": "product"
+  },
+  "src/components/Composer.vue": {
+    "layer": "product"
+  },
+  "src/components/ContextRail.vue": {
+    "layer": "product"
+  },
+  "src/components/MainWorkspace.vue": {
+    "layer": "product"
+  },
+  "src/components/ReasoningItem.vue": {
+    "layer": "product"
+  },
+  "src/components/SettingsPanel.vue": {
+    "layer": "product"
+  },
+  "src/components/Sidebar.vue": {
+    "layer": "product"
+  },
+  "src/components/TerminalPanel.vue": {
+    "layer": "product"
+  },
+  "src/components/Timeline.vue": {
+    "layer": "product"
+  },
+  "src/components/ToolCallItem.vue": {
+    "layer": "product"
+  },
+  "src/components/ToolResultItem.vue": {
+    "layer": "product"
+  },
+  "src/extensions.js": {
+    "layer": "mixed",
+    "note": "Split portable composition/validation from storage, concrete runtime payload preparation and product catalogs"
+  },
+  "src/main.js": {
+    "layer": "product"
+  },
+  "src/model-adapters.js": {
+    "layer": "harness"
+  },
+  "src/model.js": {
+    "layer": "harness"
+  },
+  "src/network.js": {
+    "layer": "runtime"
+  },
+  "src/persistence.js": {
+    "layer": "mixed",
+    "note": "Split portable replay/image-gating logic from browser storage and application configuration; do not move whole files by name"
+  },
+  "src/shell.js": {
+    "layer": "runtime"
+  },
+  "src/telemetry.js": {
+    "layer": "product"
+  },
+  "src/tools.js": {
+    "layer": "mixed",
+    "note": "Split model-visible tool definitions/result adaptation from runtime execution and telemetry sinks"
+  },
+  "src/ui/markdown.js": {
+    "layer": "product"
+  },
+  "src/ui/projector.js": {
+    "layer": "product"
+  },
+  "src/ui/store.js": {
+    "layer": "mixed",
+    "note": "Extract task orchestration and runtime preparation; leave UI projection and application wiring in Product"
+  },
+  "src/vfs.js": {
+    "layer": "runtime"
+  },
+  "src/workspace.js": {
+    "layer": "runtime"
+  }
+}
