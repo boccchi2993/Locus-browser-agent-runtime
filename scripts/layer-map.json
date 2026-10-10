@@ -77,17 +77,20 @@
     "layer": "runtime"
   },
   "src/telemetry.js": {
-    "layer": "product"
+    "layer": "mixed",
+    "note": "Not mapped by REPOSITORY-SPLIT §3; ownership to be decided in M0"
   },
   "src/tools.js": {
     "layer": "mixed",
     "note": "Split model-visible tool definitions/result adaptation from runtime execution and telemetry sinks"
   },
   "src/ui/markdown.js": {
-    "layer": "product"
+    "layer": "mixed",
+    "note": "Not mapped by REPOSITORY-SPLIT §3; ownership to be decided in M0"
   },
   "src/ui/projector.js": {
-    "layer": "product"
+    "layer": "mixed",
+    "note": "Not mapped by REPOSITORY-SPLIT §3; ownership to be decided in M0"
   },
   "src/ui/store.js": {
     "layer": "mixed",

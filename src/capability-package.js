@@ -17,7 +17,7 @@
 //  Layering:
 //    - depends only on workspace.js (WorkspaceAdapter,
 //      normalizeWorkspacePath) and extensions.js (the canonical
-//      runtime descriptor validators, sha256Hex, id pattern, the
+//      runtime descriptor validators, extensionSha256Hex, id pattern, the
 //      256 KiB skill contract). Input is an existing
 //      WorkspaceAdapter-compatible reader + a project root path;
 //      there is NO second filesystem abstraction, no File System
@@ -931,7 +931,7 @@ async function buildProject(opts) {
       continue; // stop materializing further weight, keep scanning cheaply
     }
     totalBytes += bytes.byteLength;
-    const hash = await sha256Hex(bytes);
+    const hash = await extensionSha256Hex(bytes);
     files.set(entry.logicalPath, bytes);
     integrity.set(entry.logicalPath, { size: bytes.byteLength, sha256: hash });
     if (entry.kind === 'artifact') {

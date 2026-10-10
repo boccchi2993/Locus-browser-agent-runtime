@@ -139,6 +139,14 @@
     {
       "from": "src/capability-package.js",
       "to": "src/extensions.js",
+      "symbol": "extensionSha256Hex",
+      "kind": "direct",
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
+    },
+    {
+      "from": "src/capability-package.js",
+      "to": "src/extensions.js",
       "symbol": "validateCapabilityDescriptor",
       "kind": "direct",
       "fromLayer": "mixed",
@@ -190,7 +198,7 @@
       "symbol": "Telemetry",
       "kind": "direct",
       "fromLayer": "product",
-      "toLayer": "product"
+      "toLayer": "mixed"
     },
     {
       "from": "src/components/ContextRail.vue",
@@ -198,7 +206,7 @@
       "symbol": "Telemetry",
       "kind": "guarded",
       "fromLayer": "product",
-      "toLayer": "product"
+      "toLayer": "mixed"
     },
     {
       "from": "src/components/Timeline.vue",
@@ -206,7 +214,7 @@
       "symbol": "LocusMarkdown",
       "kind": "direct",
       "fromLayer": "product",
-      "toLayer": "product"
+      "toLayer": "mixed"
     },
     {
       "from": "src/extensions.js",
@@ -430,7 +438,7 @@
       "symbol": "utf8ByteLength",
       "kind": "direct",
       "fromLayer": "runtime",
-      "toLayer": "product"
+      "toLayer": "mixed"
     },
     {
       "from": "src/shell.js",
@@ -477,8 +485,8 @@
       "to": "src/telemetry.js",
       "symbol": "__telemetry",
       "kind": "window-property",
-      "fromLayer": "product",
-      "toLayer": "product"
+      "fromLayer": "mixed",
+      "toLayer": "mixed"
     },
     {
       "from": "src/tools.js",
@@ -494,7 +502,7 @@
       "symbol": "Telemetry",
       "kind": "direct",
       "fromLayer": "mixed",
-      "toLayer": "product"
+      "toLayer": "mixed"
     },
     {
       "from": "src/tools.js",
@@ -502,7 +510,7 @@
       "symbol": "utf8ByteLength",
       "kind": "direct",
       "fromLayer": "mixed",
-      "toLayer": "product"
+      "toLayer": "mixed"
     },
     {
       "from": "src/ui/store.js",
@@ -894,7 +902,7 @@
       "symbol": "LocusProjector",
       "kind": "direct",
       "fromLayer": "mixed",
-      "toLayer": "product"
+      "toLayer": "mixed"
     },
     {
       "from": "src/ui/store.js",
@@ -994,21 +1002,5 @@
     }
   ],
   "duplicates": [],
-  "undefined": [
-    {
-      "from": "src/capability-package.js",
-      "symbol": "sha256Hex",
-      "kind": "direct"
-    },
-    {
-      "from": "src/telemetry.js",
-      "symbol": "renderDebugPanel",
-      "kind": "direct"
-    },
-    {
-      "from": "src/telemetry.js",
-      "symbol": "renderDebugPanel",
-      "kind": "guarded"
-    }
-  ]
+  "undefined": []
 }

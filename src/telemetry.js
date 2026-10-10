@@ -29,7 +29,6 @@ const Telemetry = {
     // Trim in place: window.__telemetry holds a reference to this exact
     // array and must never be detached by reassignment.
     if (this.records.length > 500) this.records.splice(0, this.records.length - 500);
-    if (typeof renderDebugPanel === 'function') renderDebugPanel();
     return rec;
   },
 };
