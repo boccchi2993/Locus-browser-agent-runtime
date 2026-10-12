@@ -1,3 +1,16 @@
+> [!WARNING]
+> **This repository has been superseded by the three-repository split and is no longer maintained.**
+>
+> The codebase was split into three repositories, and development continues there:
+>
+> - **[locus-runtime](https://github.com/boccchi2993/locus-runtime)** — the browser-side execution substrate (runtime core).
+> - **[locus-harness](https://github.com/boccchi2993/locus-harness)** — agent orchestration on top of the runtime.
+> - **[locus-product](https://github.com/boccchi2993/locus-product)** — the application itself.
+>
+> **The current implementation lives in [locus-product](https://github.com/boccchi2993/locus-product)** — start there for up-to-date code. Everything below is preserved as a pre-split historical snapshot.
+
+---
+
 # Browser Agent Runtime (Locus)
 
 A Unix-like execution substrate for AI agents, implemented inside a browser tab. Locus aims to handle lightweight computation, files and Internet access locally without requiring a remote sandbox, Docker, local daemon, CLI, or localhost server.
